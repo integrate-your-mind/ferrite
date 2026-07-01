@@ -25,6 +25,7 @@ import {
 } from "../dist/index.js";
 import {
   applyServerPayload,
+  createServerPayloadNavigator,
   fetchAndApplyServerPayload,
   hydrate,
   hydrateClientReference,
@@ -44,8 +45,8 @@ import {
   renderPageModuleToStreamPacket,
 } from "../dist/server.js";
 
-function createContainer() {
-  const window = new Window();
+function createContainer(url) {
+  const window = url ? new Window({ url }) : new Window();
   const container = window.document.createElement("div");
   window.document.body.append(container);
   return { window, container };
@@ -874,6 +875,214 @@ test("fetchAndApplyServerPayload rejects failed responses without changing DOM",
   );
 
   assert.equal(container.innerHTML, before);
+});
+
+test("server payload navigator applies same-origin document payloads and updates history", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(
+    createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, createElement("h1", null, "Old")),
+    container,
+  );
+  let requested;
+  const payload = {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [
+      2,
+      "html",
+      { lang: "en" },
+      [
+        [2, "head", {}, [[2, "title", {}, [[0, "Post next"]]]]],
+        [
+          2,
+          "body",
+          {},
+          [
+            [
+              2,
+              "div",
+              { id: "ferrite-root", "data-route": "/posts/next", "data-route-pattern": "/posts/:id" },
+              [
+                [2, "h1", {}, [[0, "Post next"]]],
+                [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[0, "Loading"]]],
+              ],
+            ],
+          ],
+        ],
+      ],
+    ],
+    clientReferences: [],
+    chunks: [{ id: "s0", root: [2, "strong", {}, [[0, "Loaded details"]]], clientReferences: [] }],
+  };
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async (input) => {
+      requested = input;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => payload,
+      };
+    },
+  });
+
+  const applied = await navigator.navigate("/posts/next?tab=details");
+
+  assert.equal(requested, "https://example.com/posts/next?tab=details&__ferrite_payload=server");
+  assert.equal(applied, payload);
+  assert.equal(window.location.href, "https://example.com/posts/next?tab=details");
+  assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/next");
+  assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route-pattern"), "/posts/:id");
+  assert.equal(container.querySelector("html"), null);
+  assert.equal(container.textContent, "Post nextLoaded details");
+
+  navigator.destroy();
+});
+
+test("server payload navigator intercepts same-origin link clicks", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("main", { "data-route": "/posts/old" }, "Old"), container);
+  const link = window.document.createElement("a");
+  link.href = "/posts/clicked";
+  link.textContent = "Next";
+  window.document.body.append(link);
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({
+        ferrite: "server-payload",
+        version: 1,
+        shell: [2, "main", { "data-route": "/posts/clicked" }, [[0, "Clicked route"]]],
+        clientReferences: [],
+        chunks: [],
+      }),
+    }),
+  });
+
+  const event = new window.MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+  link.dispatchEvent(event);
+  await flushScheduledWork();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(window.location.href, "https://example.com/posts/clicked");
+  assert.equal(container.textContent, "Clicked route");
+
+  navigator.destroy();
+});
+
+test("server payload navigator falls back after failed click payload requests", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("main", { "data-route": "/posts/old" }, "Old"), container);
+  const link = window.document.createElement("a");
+  link.href = "/missing";
+  link.textContent = "Missing";
+  window.document.body.append(link);
+  const fallbackUrls = [];
+  const errors = [];
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => ({
+      ok: false,
+      status: 404,
+      statusText: "Not Found",
+      json: async () => ({ error: "missing" }),
+    }),
+    fallback: (url) => fallbackUrls.push(url.href),
+    onError: (error) => errors.push(error),
+  });
+
+  const event = new window.MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+  link.dispatchEvent(event);
+  await flushScheduledWork();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.deepEqual(fallbackUrls, ["https://example.com/missing"]);
+  assert.equal(errors.length, 1);
+  assert.equal(container.innerHTML, '<main data-route="/posts/old">Old</main>');
+  assert.equal(window.location.href, "https://example.com/posts/old");
+
+  navigator.destroy();
+});
+
+test("server payload navigator rejects malformed navigation payloads without changing DOM or history", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("main", { "data-route": "/posts/old" }, "Old"), container);
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({
+        ferrite: "server-payload",
+        version: 1,
+        shell: [9],
+        clientReferences: [],
+        chunks: [],
+      }),
+    }),
+  });
+
+  await assert.rejects(() => navigator.navigate("/posts/bad"), /unsupported opcode 9/);
+
+  assert.equal(container.innerHTML, '<main data-route="/posts/old">Old</main>');
+  assert.equal(window.location.href, "https://example.com/posts/old");
+
+  navigator.destroy();
+});
+
+test("server payload navigator bypasses links that should use normal browser navigation", () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("main", null, "Old"), container);
+  let fetchCalls = 0;
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => {
+      fetchCalls += 1;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({ ferrite: "server-payload", version: 1, shell: [0, ""], clientReferences: [], chunks: [] }),
+      };
+    },
+  });
+  const cases = [
+    { href: "https://other.example/posts/next" },
+    { href: "/download", download: "" },
+    { href: "/target", target: "_blank" },
+    { href: "/modified", metaKey: true },
+  ];
+
+  for (const entry of cases) {
+    const link = window.document.createElement("a");
+    link.href = entry.href;
+    if ("download" in entry) {
+      link.setAttribute("download", entry.download);
+    }
+    if (entry.target) {
+      link.target = entry.target;
+    }
+    window.document.body.append(link);
+
+    const event = new window.MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      metaKey: entry.metaKey === true,
+    });
+    link.dispatchEvent(event);
+    assert.equal(event.defaultPrevented, false);
+  }
+
+  assert.equal(fetchCalls, 0);
+  assert.equal(container.textContent, "Old");
+
+  navigator.destroy();
 });
 
 test("server render serializes ErrorBoundary fallback for child render errors", async () => {

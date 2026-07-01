@@ -100,6 +100,24 @@ export type FetchServerPayloadOptions = {
   requestInit?: RequestInit;
 };
 
+export type ServerPayloadNavigationOptions = FetchServerPayloadOptions & {
+  window?: Window;
+  eventRoot?: ParentNode;
+  routeRootId?: string | null;
+  fallback?: (url: URL) => void;
+  onError?: (error: unknown, url: URL) => void;
+};
+
+export type ServerPayloadNavigateOptions = {
+  replace?: boolean;
+  fallbackOnError?: boolean;
+};
+
+export type ServerPayloadNavigator = {
+  navigate(input: string | URL, options?: ServerPayloadNavigateOptions): Promise<ServerPayloadPacket | null>;
+  destroy(): void;
+};
+
 export function mount(child: Child, container: Element): RootHandle {
   if (!container.ownerDocument) {
     throw new TypeError("Ferrite mount requires a container attached to a document.");
@@ -198,6 +216,77 @@ export async function fetchAndApplyServerPayload(
 ): Promise<ServerPayloadPacket> {
   const packet = await fetchServerPayload(input, options);
   return applyServerPayload(root, packet);
+}
+
+export function createServerPayloadNavigator(
+  root: RootHandle,
+  options: ServerPayloadNavigationOptions = {},
+): ServerPayloadNavigator {
+  if (!root || typeof root.update !== "function") {
+    throw new TypeError("Ferrite server payload navigator requires a root handle.");
+  }
+
+  const navigationWindow = options.window ?? globalThis.window;
+  if (!navigationWindow?.document) {
+    throw new TypeError("Ferrite server payload navigator requires a browser window.");
+  }
+
+  const eventRoot = options.eventRoot ?? navigationWindow.document;
+  if (
+    typeof eventRoot.addEventListener !== "function" ||
+    typeof eventRoot.removeEventListener !== "function"
+  ) {
+    throw new TypeError("Ferrite server payload navigator event root must support event listeners.");
+  }
+
+  const fallback = options.fallback ?? ((url: URL) => navigationWindow.location.assign(url.href));
+  const fetchOptions: FetchServerPayloadOptions = {
+    fetch: options.fetch,
+    requestInit: options.requestInit,
+  };
+
+  const navigate = async (
+    input: string | URL,
+    navigateOptions: ServerPayloadNavigateOptions = {},
+  ): Promise<ServerPayloadPacket | null> => {
+    const url = navigationUrl(input, navigationWindow);
+    if (!isSameOriginNavigation(url, navigationWindow)) {
+      return null;
+    }
+
+    try {
+      const packet = await fetchServerPayload(url, fetchOptions);
+      root.update(navigationPayloadToChild(packet, options.routeRootId));
+      updateNavigationHistory(navigationWindow, url, navigateOptions.replace === true);
+      return packet;
+    } catch (error) {
+      options.onError?.(error, url);
+      if (navigateOptions.fallbackOnError) {
+        fallback(url);
+        return null;
+      }
+      throw error;
+    }
+  };
+
+  const handleClick = (event: Event) => {
+    const url = navigationClickUrl(event, navigationWindow);
+    if (!url) {
+      return;
+    }
+
+    event.preventDefault();
+    void navigate(url, { fallbackOnError: true });
+  };
+
+  eventRoot.addEventListener("click", handleClick);
+
+  return {
+    navigate,
+    destroy() {
+      eventRoot.removeEventListener("click", handleClick);
+    },
+  };
 }
 
 export function hydrateClientReference(
@@ -337,6 +426,124 @@ function validatedServerPayloadToChild(packet: ServerPayloadPacket): Child {
     }
   }
   return child;
+}
+
+function navigationPayloadToChild(packet: ServerPayloadPacket, routeRootId: string | null | undefined): Child {
+  if (routeRootId === null) {
+    return validatedServerPayloadToChild(packet);
+  }
+
+  const shell = navigationRouteRoot(packet.shell, routeRootId) ?? packet.shell;
+  return validatedServerPayloadToChild({ ...packet, shell });
+}
+
+function navigationRouteRoot(node: CompactNode, routeRootId: string | undefined): CompactNode | undefined {
+  if (!Array.isArray(node) || node[0] !== COMPACT_ELEMENT_OPCODE || node.length !== 4) {
+    return undefined;
+  }
+
+  const props = node[2];
+  if (props && typeof props === "object" && !Array.isArray(props)) {
+    const id = (props as Record<string, unknown>).id;
+    if (typeof routeRootId === "string") {
+      if (id === routeRootId) {
+        return node;
+      }
+    } else if (id === "ferrite-root" || id === "ferrite-dev-root") {
+      return node;
+    }
+  }
+
+  return node[3].find((child) => navigationRouteRoot(child, routeRootId));
+}
+
+function navigationUrl(input: string | URL, navigationWindow: Window): URL {
+  if (input instanceof URL) {
+    return new URL(input.href);
+  }
+  if (typeof input !== "string" || input.length === 0) {
+    throw new TypeError("Ferrite navigation requires a non-empty URL.");
+  }
+  return new URL(input, navigationWindow.location.href);
+}
+
+function navigationClickUrl(event: Event, navigationWindow: Window): URL | null {
+  if (event.defaultPrevented || !isMouseNavigationEvent(event)) {
+    return null;
+  }
+
+  const mouseEvent = event as MouseEvent;
+  if (
+    mouseEvent.button !== 0 ||
+    mouseEvent.metaKey ||
+    mouseEvent.ctrlKey ||
+    mouseEvent.shiftKey ||
+    mouseEvent.altKey
+  ) {
+    return null;
+  }
+
+  const anchor = closestAnchor(mouseEvent.target);
+  if (!anchor) {
+    return null;
+  }
+
+  if (anchor.hasAttribute("download")) {
+    return null;
+  }
+
+  const target = anchor.getAttribute("target");
+  if (target && target.toLowerCase() !== "_self") {
+    return null;
+  }
+
+  const href = anchor.getAttribute("href");
+  if (!href || href.startsWith("#")) {
+    return null;
+  }
+
+  const url = navigationUrl(href, navigationWindow);
+  if (!isSameOriginNavigation(url, navigationWindow)) {
+    return null;
+  }
+
+  return url;
+}
+
+function isMouseNavigationEvent(event: Event): event is MouseEvent {
+  const candidate = event as Partial<MouseEvent>;
+  return (
+    typeof candidate.button === "number" &&
+    typeof candidate.metaKey === "boolean" &&
+    typeof candidate.ctrlKey === "boolean" &&
+    typeof candidate.shiftKey === "boolean" &&
+    typeof candidate.altKey === "boolean"
+  );
+}
+
+function closestAnchor(target: EventTarget | null): HTMLAnchorElement | null {
+  if (!target || !("closest" in target) || typeof target.closest !== "function") {
+    return null;
+  }
+
+  const anchor = target.closest("a[href]");
+  if (!anchor || !("href" in anchor)) {
+    return null;
+  }
+  return anchor as HTMLAnchorElement;
+}
+
+function isSameOriginNavigation(url: URL, navigationWindow: Window): boolean {
+  return url.origin === navigationWindow.location.origin;
+}
+
+function updateNavigationHistory(navigationWindow: Window, url: URL, replace: boolean): void {
+  const next = `${url.pathname}${url.search}${url.hash}`;
+  if (replace) {
+    navigationWindow.history.replaceState(null, "", next);
+  } else {
+    navigationWindow.history.pushState(null, "", next);
+  }
 }
 
 function compactNodeToChildWithChunks(
