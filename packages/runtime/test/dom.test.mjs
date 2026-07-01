@@ -1,0 +1,1720 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { Window } from "happy-dom";
+
+import {
+  ErrorBoundary,
+  Fragment,
+  Suspense,
+  createElement,
+  serializableNodeToRenderPacket,
+  startTransition,
+  toRenderPacket,
+  unstable_scheduleCallback,
+  unstable_setSchedulerRenderBudget,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useTransition,
+} from "../dist/index.js";
+import { hydrate, hydrateClientReference, mount } from "../dist/dom.js";
+import {
+  collectPageMetadata,
+  collectStaticParams,
+  createClientReference,
+  renderDocumentModule,
+  renderDocumentModuleToPacket,
+  renderDocumentModuleToStreamPacket,
+  renderPageModule,
+  renderPageModuleToPacket,
+  renderPageModuleToStreamPacket,
+} from "../dist/server.js";
+
+function createContainer() {
+  const window = new Window();
+  const container = window.document.createElement("div");
+  window.document.body.append(container);
+  return { window, container };
+}
+
+async function flushScheduledWork() {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+test("mount renders function components and updates state from events", () => {
+  const { window, container } = createContainer();
+  let initializers = 0;
+
+  function Counter() {
+    const [count, setCount] = useState(() => {
+      initializers += 1;
+      return 0;
+    });
+
+    return createElement(
+      "button",
+      {
+        type: "button",
+        "data-count": count,
+        onClick: () => setCount((previous) => previous + 1),
+      },
+      "Count: ",
+      count,
+    );
+  }
+
+  mount(createElement(Counter, null), container);
+
+  const firstButton = container.querySelector("button");
+  assert.equal(firstButton?.textContent, "Count: 0");
+  assert.equal(firstButton?.getAttribute("data-count"), "0");
+
+  firstButton?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  const updatedButton = container.querySelector("button");
+  assert.equal(updatedButton, firstButton);
+  assert.equal(updatedButton?.textContent, "Count: 1");
+  assert.equal(updatedButton?.getAttribute("data-count"), "1");
+  assert.equal(initializers, 1);
+});
+
+test("update replaces props and children", () => {
+  const { container } = createContainer();
+
+  function Label({ active }) {
+    return createElement("div", { className: active ? "on" : "off", hidden: !active }, active ? "On" : "Off");
+  }
+
+  const root = mount(createElement(Label, { active: false }), container);
+
+  assert.equal(container.innerHTML, '<div class="off" hidden="">Off</div>');
+  const div = container.querySelector("div");
+
+  root.update(createElement(Label, { active: true }));
+
+  assert.equal(container.querySelector("div"), div);
+  assert.equal(container.innerHTML, '<div class="on">On</div>');
+});
+
+test("update replaces event handlers and removes stale handlers", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+  const root = mount(createElement("button", { onClick: () => calls.push("first") }, "Save"), container);
+  const button = container.querySelector("button");
+
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+  root.update(createElement("button", { onClick: () => calls.push("second") }, "Save"));
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+  root.update(createElement("button", null, "Save"));
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.querySelector("button"), button);
+  assert.deepEqual(calls, ["first", "second"]);
+});
+
+test("keyed child updates reorder existing DOM nodes", () => {
+  const { container } = createContainer();
+
+  function List({ items }) {
+    return createElement(
+      "ul",
+      null,
+      items.map((item) => createElement("li", { key: item.id, "data-id": item.id }, item.label)),
+    );
+  }
+
+  const root = mount(
+    createElement(List, {
+      items: [
+        { id: "a", label: "Alpha" },
+        { id: "b", label: "Beta" },
+        { id: "c", label: "Gamma" },
+      ],
+    }),
+    container,
+  );
+  const alpha = container.querySelector('[data-id="a"]');
+  const beta = container.querySelector('[data-id="b"]');
+  const gamma = container.querySelector('[data-id="c"]');
+
+  root.update(
+    createElement(List, {
+      items: [
+        { id: "c", label: "Gamma updated" },
+        { id: "a", label: "Alpha updated" },
+      ],
+    }),
+  );
+
+  const items = Array.from(container.querySelectorAll("li"));
+  assert.deepEqual(
+    items.map((item) => item.getAttribute("data-id")),
+    ["c", "a"],
+  );
+  assert.equal(items[0], gamma);
+  assert.equal(items[0].textContent, "Gamma updated");
+  assert.equal(items[1], alpha);
+  assert.equal(items[1].textContent, "Alpha updated");
+  assert.equal(beta?.isConnected, false);
+});
+
+test("update replaces incompatible node types", () => {
+  const { container } = createContainer();
+  const root = mount(createElement("span", null, "Save"), container);
+  const span = container.querySelector("span");
+
+  root.update(createElement("button", { type: "button" }, "Save"));
+
+  assert.notEqual(container.querySelector("button"), span);
+  assert.equal(container.innerHTML, '<button type="button">Save</button>');
+});
+
+test("failed update leaves existing DOM unchanged", () => {
+  const { container } = createContainer();
+  const root = mount(createElement("button", { type: "button" }, "Save"), container);
+  const button = container.querySelector("button");
+
+  assert.throws(
+    () => root.update(createElement("button", { type: "button", onClick: "not a function" }, "Bad")),
+    /event prop "onClick" must be a function/,
+  );
+
+  assert.equal(container.querySelector("button"), button);
+  assert.equal(container.innerHTML, '<button type="button">Save</button>');
+});
+
+test("fragments and arrays mount without wrapper nodes", () => {
+  const { container } = createContainer();
+
+  mount(
+    createElement(
+      Fragment,
+      null,
+      createElement("span", null, "A"),
+      [false, createElement("span", null, "B"), null],
+      "C",
+    ),
+    container,
+  );
+
+  assert.equal(container.innerHTML, "<span>A</span><span>B</span>C");
+});
+
+test("Suspense mounts ready children without a wrapper", () => {
+  const { container } = createContainer();
+
+  mount(
+    createElement(
+      Suspense,
+      { fallback: createElement("span", null, "Loading") },
+      createElement("strong", null, "Ready"),
+    ),
+    container,
+  );
+
+  assert.equal(container.innerHTML, "<strong>Ready</strong>");
+});
+
+test("async components fail clearly in the DOM renderer", () => {
+  const { container } = createContainer();
+
+  async function AsyncPanel() {
+    return createElement("strong", null, "Loaded");
+  }
+
+  assert.throws(
+    () => mount(createElement(AsyncPanel, null), container),
+    /DOM rendering does not support async components/,
+  );
+  assert.equal(container.innerHTML, "");
+});
+
+test("invalid event handler fails before mounting partial UI", () => {
+  const { container } = createContainer();
+
+  assert.throws(
+    () => mount(createElement("button", { onClick: "not a function" }, "Bad"), container),
+    /event prop "onClick" must be a function/,
+  );
+  assert.equal(container.innerHTML, "");
+});
+
+test("ErrorBoundary renders fallback for child render errors", () => {
+  const { container } = createContainer();
+
+  function Broken() {
+    throw new Error("boom");
+  }
+
+  mount(
+    createElement(
+      ErrorBoundary,
+      {
+        fallback: ({ error }) => createElement("strong", { role: "alert" }, errorMessage(error)),
+      },
+      createElement(Broken, null),
+    ),
+    container,
+  );
+
+  assert.equal(container.innerHTML, '<strong role="alert">boom</strong>');
+});
+
+test("ErrorBoundary reset retries children", () => {
+  const { window, container } = createContainer();
+
+  function Broken({ fail }) {
+    if (fail) {
+      throw new Error("boom");
+    }
+
+    return createElement("span", null, "Recovered");
+  }
+
+  function App() {
+    const [fail, setFail] = useState(true);
+    return createElement(
+      ErrorBoundary,
+      {
+        fallback: ({ reset }) =>
+          createElement(
+            "button",
+            {
+              type: "button",
+              onClick: () => {
+                setFail(false);
+                reset();
+              },
+            },
+            "Retry",
+          ),
+      },
+      createElement(Broken, { fail }),
+    );
+  }
+
+  mount(createElement(App, null), container);
+  assert.equal(container.innerHTML, '<button type="button">Retry</button>');
+
+  container.querySelector("button")?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.innerHTML, "<span>Recovered</span>");
+});
+
+test("ErrorBoundary catches render errors caused by transition updates", async () => {
+  const { window, container } = createContainer();
+
+  function MaybeBroken({ fail }) {
+    if (fail) {
+      throw new Error("transition boom");
+    }
+
+    return createElement("span", null, "Stable");
+  }
+
+  function App() {
+    const [fail, setFail] = useState(false);
+    return createElement(
+      Fragment,
+      null,
+      createElement(
+        "button",
+        {
+          type: "button",
+          onClick: () => startTransition(() => setFail(true)),
+        },
+        "Break",
+      ),
+      createElement(
+        ErrorBoundary,
+        {
+          fallback: ({ error }) => createElement("strong", { role: "alert" }, errorMessage(error)),
+        },
+        createElement(MaybeBroken, { fail }),
+      ),
+    );
+  }
+
+  mount(createElement(App, null), container);
+  container.querySelector("button")?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.querySelector("strong"), null);
+
+  await flushScheduledWork();
+
+  assert.equal(container.querySelector("strong")?.textContent, "transition boom");
+});
+
+test("ErrorBoundary requires a fallback prop", () => {
+  const { container } = createContainer();
+
+  function Broken() {
+    throw new Error("boom");
+  }
+
+  assert.throws(
+    () => mount(createElement(ErrorBoundary, null, createElement(Broken, null)), container),
+    /ErrorBoundary requires a fallback prop/,
+  );
+});
+
+test("unmount clears DOM and rejects later updates", () => {
+  const { container } = createContainer();
+  const root = mount(createElement("p", null, "Mounted"), container);
+
+  assert.equal(container.innerHTML, "<p>Mounted</p>");
+
+  root.unmount();
+
+  assert.equal(container.innerHTML, "");
+  assert.throws(() => root.update(createElement("p", null, "Again")), /root is unmounted/);
+});
+
+test("useState outside render fails clearly", () => {
+  assert.throws(() => useState(0), /only be called while rendering/);
+});
+
+test("useLayoutEffect outside render fails clearly", () => {
+  assert.throws(() => useLayoutEffect(() => undefined, []), /only be called while rendering/);
+});
+
+test("useEffect runs after commit and cleans up on dependency changes and unmount", () => {
+  const { container } = createContainer();
+  const effects = [];
+  const cleanups = [];
+
+  function Probe({ value }) {
+    useEffect(() => {
+      effects.push(value);
+      return () => cleanups.push(value);
+    }, [value]);
+
+    return createElement("p", null, value);
+  }
+
+  const root = mount(createElement(Probe, { value: "one" }), container);
+  assert.deepEqual(effects, ["one"]);
+  assert.deepEqual(cleanups, []);
+
+  root.update(createElement(Probe, { value: "one" }));
+  assert.deepEqual(effects, ["one"]);
+  assert.deepEqual(cleanups, []);
+
+  root.update(createElement(Probe, { value: "two" }));
+  assert.deepEqual(effects, ["one", "two"]);
+  assert.deepEqual(cleanups, ["one"]);
+
+  root.unmount();
+  assert.deepEqual(cleanups, ["one", "two"]);
+});
+
+test("useEffect cleanup runs when a component is removed", () => {
+  const { container } = createContainer();
+  const events = [];
+
+  function Child() {
+    useEffect(() => {
+      events.push("mount");
+      return () => events.push("cleanup");
+    }, []);
+
+    return createElement("span", null, "Child");
+  }
+
+  function App({ show }) {
+    return show ? createElement(Child, null) : createElement("p", null, "Empty");
+  }
+
+  const root = mount(createElement(App, { show: true }), container);
+  assert.deepEqual(events, ["mount"]);
+
+  root.update(createElement(App, { show: false }));
+
+  assert.deepEqual(events, ["mount", "cleanup"]);
+  assert.equal(container.innerHTML, "<p>Empty</p>");
+});
+
+test("useLayoutEffect runs before passive effects and cleans up first on dependency changes", () => {
+  const { container } = createContainer();
+  const events = [];
+
+  function Probe({ value }) {
+    useEffect(() => {
+      events.push(`effect ${value}`);
+      return () => events.push(`effect cleanup ${value}`);
+    }, [value]);
+    useLayoutEffect(() => {
+      events.push(`layout ${value}`);
+      return () => events.push(`layout cleanup ${value}`);
+    }, [value]);
+
+    return createElement("p", null, value);
+  }
+
+  const root = mount(createElement(Probe, { value: "one" }), container);
+  assert.deepEqual(events, ["layout one", "effect one"]);
+
+  root.update(createElement(Probe, { value: "two" }));
+  assert.deepEqual(events, [
+    "layout one",
+    "effect one",
+    "layout cleanup one",
+    "layout two",
+    "effect cleanup one",
+    "effect two",
+  ]);
+
+  root.unmount();
+  assert.deepEqual(events, [
+    "layout one",
+    "effect one",
+    "layout cleanup one",
+    "layout two",
+    "effect cleanup one",
+    "effect two",
+    "layout cleanup two",
+    "effect cleanup two",
+  ]);
+});
+
+test("failed update does not run pending effects or cleanups", () => {
+  const { container } = createContainer();
+  const events = [];
+
+  function Probe({ fail }) {
+    useEffect(() => {
+      events.push(fail ? "bad-effect" : "good-effect");
+      return () => events.push(fail ? "bad-cleanup" : "good-cleanup");
+    }, [fail]);
+
+    return createElement("button", { type: "button", onClick: fail ? "not a function" : undefined }, "Save");
+  }
+
+  const root = mount(createElement(Probe, { fail: false }), container);
+  assert.deepEqual(events, ["good-effect"]);
+
+  assert.throws(() => root.update(createElement(Probe, { fail: true })), /event prop "onClick" must be a function/);
+
+  assert.deepEqual(events, ["good-effect"]);
+  assert.equal(container.innerHTML, '<button type="button">Save</button>');
+});
+
+test("server render accepts useEffect without running it", async () => {
+  let ran = false;
+
+  function Page() {
+    useEffect(() => {
+      ran = true;
+    }, []);
+
+    return createElement("p", null, "Server");
+  }
+
+  const rendered = await renderPageModule({ default: Page });
+
+  assert.equal(ran, false);
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "p",
+    props: {},
+    children: [{ kind: "text", value: "Server" }],
+  });
+});
+
+test("server render accepts useLayoutEffect without running it", async () => {
+  let ran = false;
+
+  function Page() {
+    useLayoutEffect(() => {
+      ran = true;
+    }, []);
+
+    return createElement("p", null, "Server layout");
+  }
+
+  const rendered = await renderPageModule({ default: Page });
+
+  assert.equal(ran, false);
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "p",
+    props: {},
+    children: [{ kind: "text", value: "Server layout" }],
+  });
+});
+
+test("createClientReference renders a marked island with server fallback HTML", async () => {
+  function IslandButton({ id }) {
+    const [likes] = useState(0);
+    return createElement(
+      "button",
+      { type: "button", "data-client-island": "post-actions" },
+      `Like ${id}: ${likes}`,
+    );
+  }
+
+  const PostActions = createClientReference({
+    id: "app/posts/[id]/PostActions.tsx#default",
+    render: IslandButton,
+  });
+
+  function Page() {
+    return createElement("article", null, createElement(PostActions, { id: "alpha" }));
+  }
+
+  const rendered = await renderPageModule({ default: Page });
+
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "article",
+    props: {},
+    children: [
+      {
+        kind: "element",
+        tag: "span",
+        props: {
+          "data-ferrite-client-reference": "app/posts/[id]/PostActions.tsx#default",
+          "data-ferrite-client-props": '{"id":"alpha"}',
+        },
+        children: [
+          {
+            kind: "element",
+            tag: "button",
+            props: { type: "button", "data-client-island": "post-actions" },
+            children: [{ kind: "text", value: "Like alpha: 0" }],
+          },
+        ],
+      },
+    ],
+  });
+});
+
+test("createClientReference rejects non JSON-serializable props", async () => {
+  const Action = createClientReference({
+    id: "app/Action.tsx#default",
+    render: () => createElement("button", { type: "button" }, "Action"),
+  });
+
+  function Page() {
+    return createElement(Action, { onSave: () => undefined });
+  }
+
+  await assert.rejects(
+    () => renderPageModule({ default: Page }),
+    /client reference prop "onSave" must be JSON-serializable/,
+  );
+});
+
+test("createClientReference renders duplicate references with separate serialized props", async () => {
+  function Badge({ id }) {
+    return createElement("strong", null, `Post ${id}`);
+  }
+
+  const BadgeReference = createClientReference({
+    id: "app/Badge.tsx#default",
+    render: Badge,
+  });
+
+  function Page() {
+    return createElement(Fragment, null, createElement(BadgeReference, { id: "alpha" }), createElement(BadgeReference, { id: "beta" }));
+  }
+
+  const rendered = await renderPageModule({ default: Page });
+
+  assert.equal(rendered.kind, "fragment");
+  assert.equal(rendered.children.length, 2);
+  assert.deepEqual(
+    rendered.children.map((child) => child.props["data-ferrite-client-props"]),
+    ['{"id":"alpha"}', '{"id":"beta"}'],
+  );
+  assert.deepEqual(
+    rendered.children.map((child) => child.children[0].children[0].value),
+    ["Post alpha", "Post beta"],
+  );
+});
+
+test("server render serializes ErrorBoundary fallback for child render errors", async () => {
+  function Broken() {
+    throw new Error("server boom");
+  }
+
+  function Page() {
+    return createElement(
+      ErrorBoundary,
+      {
+        fallback: ({ error }) => createElement("strong", { role: "alert" }, errorMessage(error)),
+      },
+      createElement(Broken, null),
+    );
+  }
+
+  const rendered = await renderPageModule({ default: Page });
+
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "strong",
+    props: { role: "alert" },
+    children: [{ kind: "text", value: "server boom" }],
+  });
+});
+
+test("toRenderPacket emits compact text, fragment, and element nodes", () => {
+  const packet = toRenderPacket(
+    createElement(
+      Fragment,
+      null,
+      createElement("h1", { className: "title" }, "Ferrite"),
+      " bridge",
+    ),
+  );
+
+  assert.deepEqual(packet, {
+    ferrite: "render-packet",
+    version: 1,
+    root: [1, [[2, "h1", { class: "title" }, [[0, "Ferrite"]]], [0, " bridge"]]],
+  });
+});
+
+test("toRenderPacket uses an empty fragment for empty output", () => {
+  assert.deepEqual(toRenderPacket(null), {
+    ferrite: "render-packet",
+    version: 1,
+    root: [1, []],
+  });
+});
+
+test("toRenderPacket rejects unserializable props before packet output", () => {
+  assert.throws(
+    () => toRenderPacket(createElement("button", { data: { nested: true } }, "Save")),
+    /Cannot serialize prop "data"/,
+  );
+});
+
+test("renderPageModuleToPacket emits a smaller render packet than legacy JSON", async () => {
+  function Page() {
+    return createElement(
+      "main",
+      { className: "shell", "data-count": 2 },
+      createElement("h1", null, "Ferrite"),
+      createElement("p", null, "Rust bridge"),
+    );
+  }
+
+  const legacy = await renderPageModule({ default: Page });
+  const packet = await renderPageModuleToPacket({ default: Page });
+
+  assert.deepEqual(packet, serializableNodeToRenderPacket(legacy));
+  assert.equal(packet.ferrite, "render-packet");
+  assert.equal(packet.version, 1);
+  assert.ok(JSON.stringify(packet).length < JSON.stringify(legacy).length);
+});
+
+test("server render awaits async child components outside Suspense", async () => {
+  async function AsyncMessage() {
+    return createElement("strong", null, "Loaded");
+  }
+
+  function Page() {
+    return createElement("main", null, createElement(AsyncMessage, null));
+  }
+
+  const rendered = await renderPageModule({ default: Page });
+
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "main",
+    props: {},
+    children: [{ kind: "element", tag: "strong", props: {}, children: [{ kind: "text", value: "Loaded" }] }],
+  });
+});
+
+test("renderPageModuleToStreamPacket emits a Suspense fallback shell and resolved chunk", async () => {
+  async function AsyncPanel() {
+    return createElement("strong", null, "Loaded");
+  }
+
+  function Page() {
+    return createElement(
+      Suspense,
+      { fallback: createElement("span", { role: "status" }, "Loading") },
+      createElement(AsyncPanel, null),
+    );
+  }
+
+  const packet = await renderPageModuleToStreamPacket({ default: Page });
+
+  assert.deepEqual(packet, {
+    ferrite: "render-stream",
+    version: 1,
+    shell: [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[2, "span", { role: "status" }, [[0, "Loading"]]]]],
+    chunks: [{ id: "s0", root: [2, "strong", {}, [[0, "Loaded"]]] }],
+  });
+});
+
+test("renderPageModuleToStreamPacket keeps ready Suspense content in the shell", async () => {
+  function Page() {
+    return createElement(
+      Suspense,
+      { fallback: createElement("span", null, "Loading") },
+      createElement("strong", null, "Ready"),
+    );
+  }
+
+  const packet = await renderPageModuleToStreamPacket({ default: Page });
+
+  assert.deepEqual(packet, {
+    ferrite: "render-stream",
+    version: 1,
+    shell: [2, "strong", {}, [[0, "Ready"]]],
+    chunks: [],
+  });
+});
+
+test("renderPageModuleToStreamPacket rejects async Suspense fallbacks", async () => {
+  async function AsyncFallback() {
+    return createElement("span", null, "Loading");
+  }
+
+  async function AsyncPanel() {
+    return createElement("strong", null, "Loaded");
+  }
+
+  function Page() {
+    return createElement(
+      Suspense,
+      { fallback: createElement(AsyncFallback, null) },
+      createElement(AsyncPanel, null),
+    );
+  }
+
+  await assert.rejects(
+    () => renderPageModuleToStreamPacket({ default: Page }),
+    /Suspense fallback must render synchronously/,
+  );
+});
+
+test("route loading convention streams an async page behind a fallback", async () => {
+  async function Page() {
+    return createElement("strong", null, "Loaded route");
+  }
+
+  function Loading() {
+    return createElement("span", { role: "status" }, "Loading route");
+  }
+
+  const packet = await renderPageModuleToStreamPacket({ default: Page }, {}, [], {
+    loading: { default: Loading },
+  });
+
+  assert.deepEqual(packet, {
+    ferrite: "render-stream",
+    version: 1,
+    shell: [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[2, "span", { role: "status" }, [[0, "Loading route"]]]]],
+    chunks: [{ id: "s0", root: [2, "strong", {}, [[0, "Loaded route"]]] }],
+  });
+});
+
+test("route error convention catches page render failures", async () => {
+  function Page() {
+    throw new Error("route boom");
+  }
+
+  function ErrorFile({ error }) {
+    return createElement("strong", { role: "alert" }, errorMessage(error));
+  }
+
+  const rendered = await renderPageModule({ default: Page }, {}, [], {
+    error: { default: ErrorFile },
+  });
+
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "strong",
+    props: { role: "alert" },
+    children: [{ kind: "text", value: "route boom" }],
+  });
+});
+
+test("route loading and error conventions stream rejected async pages as error chunks", async () => {
+  async function Page() {
+    throw new Error("async route boom");
+  }
+
+  function Loading() {
+    return createElement("span", null, "Loading route");
+  }
+
+  function ErrorFile({ error }) {
+    return createElement("strong", { role: "alert" }, errorMessage(error));
+  }
+
+  const packet = await renderPageModuleToStreamPacket({ default: Page }, {}, [], {
+    loading: { default: Loading },
+    error: { default: ErrorFile },
+  });
+
+  assert.deepEqual(packet, {
+    ferrite: "render-stream",
+    version: 1,
+    shell: [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[2, "span", {}, [[0, "Loading route"]]]]],
+    chunks: [{ id: "s0", root: [2, "strong", { role: "alert" }, [[0, "async route boom"]]] }],
+  });
+});
+
+test("collectPageMetadata merges layouts and lets pages override", async () => {
+  const metadata = await collectPageMetadata(
+    {
+      default: () => createElement("p", null, "Page"),
+      generateMetadata: ({ params }) => ({
+        title: `Post ${params.id}`,
+      }),
+    },
+    { params: { id: "abc" } },
+    [
+      {
+        default: ({ children }) => children,
+        metadata: { title: "Site", description: "Site description" },
+      },
+      {
+        default: ({ children }) => children,
+        generateMetadata: ({ params }) => ({
+          description: `Post ${params.id} description`,
+        }),
+      },
+    ],
+  );
+
+  assert.deepEqual(metadata, {
+    title: "Post abc",
+    description: "Post abc description",
+  });
+});
+
+test("collectPageMetadata merges rich metadata fields", async () => {
+  const metadata = await collectPageMetadata(
+    {
+      default: () => createElement("p", null, "Page"),
+      metadata: {
+        openGraph: {
+          title: "Page OG",
+          images: [{ url: "/page.png", alt: "Page image", width: 1200, height: 630 }],
+        },
+        icons: [{ url: "/page-icon.svg", type: "image/svg+xml" }],
+        alternates: {
+          canonical: "https://example.com/page",
+          languages: {
+            fr: "https://example.com/fr/page",
+          },
+        },
+      },
+    },
+    {},
+    [
+      {
+        default: ({ children }) => children,
+        metadata: {
+          openGraph: {
+            siteName: "Ferrite",
+            type: "website",
+            images: ["/layout.png"],
+          },
+          icons: ["/favicon.ico"],
+          alternates: {
+            canonical: "https://example.com",
+            languages: {
+              en: "https://example.com/page",
+            },
+          },
+        },
+      },
+    ],
+  );
+
+  assert.deepEqual(metadata, {
+    openGraph: {
+      siteName: "Ferrite",
+      type: "website",
+      title: "Page OG",
+      images: [{ url: "/page.png", alt: "Page image", width: 1200, height: 630 }],
+    },
+    icons: [{ url: "/favicon.ico" }, { url: "/page-icon.svg", type: "image/svg+xml" }],
+    alternates: {
+      canonical: "https://example.com/page",
+      languages: {
+        en: "https://example.com/page",
+        fr: "https://example.com/fr/page",
+      },
+    },
+  });
+});
+
+test("collectPageMetadata rejects malformed metadata", async () => {
+  await assert.rejects(
+    () =>
+      collectPageMetadata({
+        default: () => createElement("p", null, "Page"),
+        metadata: { title: 42 },
+      }),
+    /metadata\.title must be a string/,
+  );
+});
+
+test("collectPageMetadata rejects malformed rich metadata", async () => {
+  await assert.rejects(
+    () =>
+      collectPageMetadata({
+        default: () => createElement("p", null, "Page"),
+        metadata: { openGraph: { images: [{ url: "/og.png", width: 1.5 }] } },
+      }),
+    /openGraph\.images\[0\]\.width must be a non-negative integer/,
+  );
+
+  await assert.rejects(
+    () =>
+      collectPageMetadata({
+        default: () => createElement("p", null, "Page"),
+        metadata: { icons: [{ rel: "icon" }] },
+      }),
+    /metadata\.icons\[0\]\.url must be a string/,
+  );
+
+  await assert.rejects(
+    () =>
+      collectPageMetadata({
+        default: () => createElement("p", null, "Page"),
+        metadata: { alternates: { languages: { en: 42 } } },
+      }),
+    /metadata\.alternates\.languages\.en must be a string/,
+  );
+});
+
+test("collectPageMetadata validates generated metadata before static fallback", async () => {
+  await assert.rejects(
+    () =>
+      collectPageMetadata({
+        default: () => createElement("p", null, "Page"),
+        metadata: { title: "Static" },
+        generateMetadata: () => null,
+      }),
+    /metadata must be an object/,
+  );
+});
+
+test("collectPageMetadata rejects non-function generateMetadata exports", async () => {
+  await assert.rejects(
+    () =>
+      collectPageMetadata({
+        default: () => createElement("p", null, "Page"),
+        generateMetadata: "bad",
+      }),
+    /generateMetadata export must be a function/,
+  );
+});
+
+test("collectStaticParams accepts catch-all arrays and omits undefined optionals", async () => {
+  const result = await collectStaticParams({
+    default: () => createElement("p", null, "Page"),
+    generateStaticParams: () => [{ slug: ["guide", "intro"], tag: "rust", optional: undefined }],
+  });
+
+  assert.deepEqual(result, {
+    has_generate_static_params: true,
+    params: [{ slug: ["guide", "intro"], tag: "rust" }],
+  });
+});
+
+test("collectStaticParams rejects non-string catch-all array entries", async () => {
+  await assert.rejects(
+    () =>
+      collectStaticParams({
+        default: () => createElement("p", null, "Page"),
+        generateStaticParams: () => [{ slug: ["guide", 1] }],
+      }),
+    /array values must be strings/,
+  );
+});
+
+test("renderDocumentModule composes head and hydration root", async () => {
+  function Page() {
+    return createElement("main", null, "Page");
+  }
+
+  function Document({ head, children }) {
+    return createElement(
+      "html",
+      { lang: "en", "data-document": "custom" },
+      createElement("head", null, head),
+      createElement("body", null, children),
+    );
+  }
+
+  const rendered = await renderDocumentModule({ default: Page }, {}, [], { default: Document }, {
+    rootId: "ferrite-root",
+    routePath: "/",
+    metadata: { title: "Home", description: "Home route" },
+    styles: ["/app.css"],
+    scripts: ["/app.js"],
+    defaultTitle: "Fallback",
+  });
+
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "html",
+    props: { lang: "en", "data-document": "custom" },
+    children: [
+      {
+        kind: "element",
+        tag: "head",
+        props: {},
+        children: [
+          { kind: "element", tag: "meta", props: { charset: "utf-8" }, children: [] },
+          { kind: "element", tag: "title", props: {}, children: [{ kind: "text", value: "Home" }] },
+          {
+            kind: "element",
+            tag: "meta",
+            props: { name: "description", content: "Home route" },
+            children: [],
+          },
+          { kind: "element", tag: "link", props: { rel: "stylesheet", href: "/app.css" }, children: [] },
+          { kind: "element", tag: "script", props: { type: "module", src: "/app.js" }, children: [] },
+        ],
+      },
+      {
+        kind: "element",
+        tag: "body",
+        props: {},
+        children: [
+          {
+            kind: "element",
+            tag: "div",
+            props: { id: "ferrite-root", "data-route": "/" },
+            children: [
+              {
+                kind: "element",
+                tag: "main",
+                props: {},
+                children: [{ kind: "text", value: "Page" }],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+});
+
+test("renderDocumentModuleToPacket wraps document output in a render packet", async () => {
+  function Page() {
+    return createElement("main", null, "Page");
+  }
+
+  function Document({ children }) {
+    return createElement("html", null, createElement("body", null, children));
+  }
+
+  const packet = await renderDocumentModuleToPacket({ default: Page }, {}, [], { default: Document }, {
+    rootId: "ferrite-root",
+    routePath: "/packet",
+    metadata: {},
+  });
+
+  assert.deepEqual(packet, {
+    ferrite: "render-packet",
+    version: 1,
+    root: [
+      2,
+      "html",
+      {},
+      [
+        [
+          2,
+          "body",
+          {},
+          [
+            [
+              2,
+              "div",
+              { id: "ferrite-root", "data-route": "/packet" },
+              [[2, "main", {}, [[0, "Page"]]]],
+            ],
+          ],
+        ],
+      ],
+    ],
+  });
+});
+
+test("renderDocumentModuleToStreamPacket streams page Suspense chunks inside the document shell", async () => {
+  async function AsyncPanel() {
+    return createElement("strong", null, "Loaded");
+  }
+
+  function Page() {
+    return createElement(
+      Suspense,
+      { fallback: createElement("span", null, "Loading") },
+      createElement(AsyncPanel, null),
+    );
+  }
+
+  function Document({ children }) {
+    return createElement("html", null, createElement("body", null, children));
+  }
+
+  const packet = await renderDocumentModuleToStreamPacket({ default: Page }, {}, [], { default: Document }, {
+    rootId: "ferrite-root",
+    routePath: "/stream",
+    metadata: {},
+  });
+
+  assert.deepEqual(packet, {
+    ferrite: "render-stream",
+    version: 1,
+    shell: [
+      2,
+      "html",
+      {},
+      [
+        [
+          2,
+          "body",
+          {},
+          [
+            [
+              2,
+              "div",
+              { id: "ferrite-root", "data-route": "/stream" },
+              [[2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[2, "span", {}, [[0, "Loading"]]]]]],
+            ],
+          ],
+        ],
+      ],
+    ],
+    chunks: [{ id: "s0", root: [2, "strong", {}, [[0, "Loaded"]]] }],
+  });
+});
+
+test("renderDocumentModule emits rich metadata head tags", async () => {
+  function Page() {
+    return createElement("main", null, "Page");
+  }
+
+  function Document({ head, children }) {
+    return createElement("html", null, createElement("head", null, head), createElement("body", null, children));
+  }
+
+  const rendered = await renderDocumentModule({ default: Page }, {}, [], { default: Document }, {
+    rootId: "ferrite-root",
+    routePath: "/",
+    metadata: {
+      title: "Home",
+      openGraph: {
+        title: "Home OG",
+        url: "https://example.com/",
+        siteName: "Ferrite",
+        type: "website",
+        images: [{ url: "/og.png", alt: "OG", width: 1200, height: 630 }],
+      },
+      icons: [{ url: "/favicon.svg", type: "image/svg+xml", sizes: "any" }],
+      alternates: {
+        canonical: "https://example.com/",
+        languages: {
+          en: "https://example.com/",
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(rendered.children[0].children.slice(0, 12), [
+    { kind: "element", tag: "meta", props: { charset: "utf-8" }, children: [] },
+    { kind: "element", tag: "title", props: {}, children: [{ kind: "text", value: "Home" }] },
+    { kind: "element", tag: "meta", props: { property: "og:title", content: "Home OG" }, children: [] },
+    { kind: "element", tag: "meta", props: { property: "og:url", content: "https://example.com/" }, children: [] },
+    { kind: "element", tag: "meta", props: { property: "og:site_name", content: "Ferrite" }, children: [] },
+    { kind: "element", tag: "meta", props: { property: "og:type", content: "website" }, children: [] },
+    { kind: "element", tag: "meta", props: { property: "og:image", content: "/og.png" }, children: [] },
+    { kind: "element", tag: "meta", props: { property: "og:image:alt", content: "OG" }, children: [] },
+    { kind: "element", tag: "meta", props: { property: "og:image:width", content: 1200 }, children: [] },
+    { kind: "element", tag: "meta", props: { property: "og:image:height", content: 630 }, children: [] },
+    {
+      kind: "element",
+      tag: "link",
+      props: { rel: "icon", href: "/favicon.svg", type: "image/svg+xml", sizes: "any" },
+      children: [],
+    },
+    { kind: "element", tag: "link", props: { rel: "canonical", href: "https://example.com/" }, children: [] },
+  ]);
+});
+
+test("renderDocumentModule rejects non-html documents", async () => {
+  await assert.rejects(
+    () =>
+      renderDocumentModule(
+        { default: () => createElement("main", null, "Page") },
+        {},
+        [],
+        { default: ({ children }) => createElement("div", null, children) },
+        { rootId: "ferrite-root", routePath: "/", defaultTitle: "Ferrite" },
+      ),
+    /must render an <html> element/,
+  );
+});
+
+test("useRef preserves a mutable object across renders", () => {
+  const { container } = createContainer();
+  const refs = [];
+
+  function Probe({ label }) {
+    const ref = useRef(0);
+    ref.current += 1;
+    refs.push(ref);
+    return createElement("p", null, `${label}:${ref.current}`);
+  }
+
+  const root = mount(createElement(Probe, { label: "A" }), container);
+  assert.equal(container.textContent, "A:1");
+
+  root.update(createElement(Probe, { label: "B" }));
+
+  assert.equal(container.textContent, "B:2");
+  assert.equal(refs[0], refs[1]);
+});
+
+test("useMemo and useCallback reuse values until dependencies change", () => {
+  const { container } = createContainer();
+  let computations = 0;
+  const callbacks = [];
+
+  function Probe({ value }) {
+    const memo = useMemo(() => {
+      computations += 1;
+      return value.toUpperCase();
+    }, [value]);
+    const callback = useCallback(() => memo, [memo]);
+    callbacks.push(callback);
+    return createElement("p", null, memo);
+  }
+
+  const root = mount(createElement(Probe, { value: "one" }), container);
+  assert.equal(container.textContent, "ONE");
+  assert.equal(computations, 1);
+
+  root.update(createElement(Probe, { value: "one" }));
+  assert.equal(container.textContent, "ONE");
+  assert.equal(computations, 1);
+  assert.equal(callbacks[0], callbacks[1]);
+
+  root.update(createElement(Probe, { value: "two" }));
+  assert.equal(container.textContent, "TWO");
+  assert.equal(computations, 2);
+  assert.notEqual(callbacks[1], callbacks[2]);
+});
+
+test("server render accepts useRef and useMemo", async () => {
+  function Page() {
+    const ref = useRef("server");
+    const value = useMemo(() => ref.current.toUpperCase(), [ref.current]);
+    return createElement("p", null, value);
+  }
+
+  const rendered = await renderPageModule({ default: Page });
+
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "p",
+    props: {},
+    children: [{ kind: "text", value: "SERVER" }],
+  });
+});
+
+test("startTransition defers state updates to a later scheduler task", async () => {
+  const { window, container } = createContainer();
+
+  function Counter() {
+    const [count, setCount] = useState(0);
+    return createElement(
+      "button",
+      {
+        onClick: () => startTransition(() => setCount((previous) => previous + 1)),
+      },
+      `Count: ${count}`,
+    );
+  }
+
+  mount(createElement(Counter, null), container);
+
+  const button = container.querySelector("button");
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.textContent, "Count: 0");
+
+  await flushScheduledWork();
+
+  assert.equal(container.textContent, "Count: 1");
+});
+
+test("scheduler runs sync callbacks before transition callbacks", async () => {
+  const events = [];
+
+  unstable_scheduleCallback("transition", () => events.push("transition"));
+  unstable_scheduleCallback("sync", () => events.push("sync"));
+
+  assert.deepEqual(events, ["sync"]);
+
+  await flushScheduledWork();
+
+  assert.deepEqual(events, ["sync", "transition"]);
+});
+
+test("transition render can yield before committing DOM", async () => {
+  const { window, container } = createContainer();
+
+  function Panel() {
+    const [label, setLabel] = useState("idle");
+    const [pending, start] = useTransition();
+    return createElement(
+      "button",
+      {
+        type: "button",
+        onClick: () => start(() => setLabel("done")),
+      },
+      pending ? `Pending ${label}` : `Ready ${label}`,
+    );
+  }
+
+  mount(createElement(Panel, null), container);
+  const button = container.querySelector("button");
+
+  unstable_setSchedulerRenderBudget(0);
+  try {
+    button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+    assert.equal(container.textContent, "Pending idle");
+
+    await flushScheduledWork();
+
+    assert.equal(container.textContent, "Pending idle");
+
+    unstable_setSchedulerRenderBudget(null);
+    await flushScheduledWork();
+
+    assert.equal(container.textContent, "Ready done");
+  } finally {
+    unstable_setSchedulerRenderBudget(null);
+  }
+});
+
+test("useTransition exposes pending state around deferred updates", async () => {
+  const { window, container } = createContainer();
+
+  function Panel() {
+    const [label, setLabel] = useState("idle");
+    const [pending, start] = useTransition();
+    return createElement(
+      "button",
+      {
+        "data-pending": pending ? "yes" : "no",
+        onClick: () => start(() => setLabel("done")),
+      },
+      pending ? `Pending ${label}` : `Ready ${label}`,
+    );
+  }
+
+  mount(createElement(Panel, null), container);
+  const button = container.querySelector("button");
+
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.querySelector("button")?.getAttribute("data-pending"), "yes");
+  assert.equal(container.textContent, "Pending idle");
+
+  await flushScheduledWork();
+
+  assert.equal(container.querySelector("button")?.getAttribute("data-pending"), "no");
+  assert.equal(container.textContent, "Ready done");
+});
+
+test("urgent updates commit before transition updates", async () => {
+  const { window, container } = createContainer();
+
+  function Panel() {
+    const [urgent, setUrgent] = useState("old urgent");
+    const [slow, setSlow] = useState("old slow");
+    return createElement(
+      "button",
+      {
+        onClick: () => {
+          startTransition(() => setSlow("new slow"));
+          setUrgent("new urgent");
+        },
+      },
+      `${urgent} / ${slow}`,
+    );
+  }
+
+  mount(createElement(Panel, null), container);
+  const button = container.querySelector("button");
+
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.textContent, "new urgent / old slow");
+
+  await flushScheduledWork();
+
+  assert.equal(container.textContent, "new urgent / new slow");
+});
+
+test("useDeferredValue lags behind urgent values until transition flush", async () => {
+  const { window, container } = createContainer();
+
+  function Search() {
+    const [query, setQuery] = useState("alpha");
+    const deferred = useDeferredValue(query);
+    return createElement(
+      "button",
+      {
+        onClick: () => setQuery("beta"),
+      },
+      `${query} / ${deferred}`,
+    );
+  }
+
+  mount(createElement(Search, null), container);
+  const button = container.querySelector("button");
+
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.textContent, "beta / alpha");
+
+  await flushScheduledWork();
+
+  assert.equal(container.textContent, "beta / beta");
+});
+
+test("server render accepts transition hooks without scheduling", async () => {
+  function Page() {
+    const [pending] = useTransition();
+    const value = useDeferredValue("server");
+    return createElement("p", null, `${pending ? "pending" : "ready"}:${value}`);
+  }
+
+  const rendered = await renderPageModule({ default: Page });
+
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "p",
+    props: {},
+    children: [{ kind: "text", value: "ready:server" }],
+  });
+});
+
+test("startTransition rejects non-functions", () => {
+  assert.throws(() => startTransition(null), /requires a function/);
+});
+
+test("scheduler render budget rejects invalid values", () => {
+  assert.throws(() => unstable_setSchedulerRenderBudget(1.5), /must be an integer/);
+  assert.throws(() => unstable_setSchedulerRenderBudget(-1), /must be non-negative/);
+});
+
+test("transition updates are ignored after unmount", async () => {
+  const { window, container } = createContainer();
+
+  function Counter() {
+    const [count, setCount] = useState(0);
+    return createElement(
+      "button",
+      {
+        onClick: () => startTransition(() => setCount(count + 1)),
+      },
+      `Count: ${count}`,
+    );
+  }
+
+  const root = mount(createElement(Counter, null), container);
+  const button = container.querySelector("button");
+
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+  root.unmount();
+  await flushScheduledWork();
+
+  assert.equal(container.innerHTML, "");
+});
+
+test("thrown transition scopes reset transition mode", () => {
+  const { container } = createContainer();
+  let setCount;
+
+  function Counter() {
+    const [count, nextSetCount] = useState(0);
+    setCount = nextSetCount;
+    return createElement("p", null, `Count: ${count}`);
+  }
+
+  mount(createElement(Counter, null), container);
+
+  assert.throws(
+    () =>
+      startTransition(() => {
+        throw new Error("transition failed");
+      }),
+    /transition failed/,
+  );
+
+  setCount(1);
+
+  assert.equal(container.textContent, "Count: 1");
+});
+
+test("hydrate attaches event handlers without replacing matching DOM", () => {
+  const { window, container } = createContainer();
+  container.innerHTML = '<button type="button" data-count="0">Count: 0</button>';
+  const serverButton = container.querySelector("button");
+  let initializers = 0;
+
+  function Counter() {
+    const [count, setCount] = useState(() => {
+      initializers += 1;
+      return 0;
+    });
+
+    return createElement(
+      "button",
+      {
+        type: "button",
+        "data-count": count,
+        onClick: () => setCount((previous) => previous + 1),
+      },
+      "Count: ",
+      count,
+    );
+  }
+
+  hydrate(createElement(Counter, null), container);
+
+  assert.equal(container.querySelector("button"), serverButton);
+  assert.equal(initializers, 1);
+
+  serverButton?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.querySelector("button")?.textContent, "Count: 1");
+  assert.equal(container.querySelector("button")?.getAttribute("data-count"), "1");
+});
+
+test("hydrateClientReference hydrates matching marked islands", () => {
+  const { window, container } = createContainer();
+  container.innerHTML =
+    '<span data-ferrite-client-reference="app/Button.tsx#default" data-ferrite-client-props="{&quot;id&quot;:&quot;alpha&quot;}"><button type="button">Like alpha: 0</button></span>';
+  const island = container.querySelector("[data-ferrite-client-reference]");
+  const serverButton = container.querySelector("button");
+
+  function IslandButton({ id }) {
+    const [likes, setLikes] = useState(0);
+    return createElement("button", { type: "button", onClick: () => setLikes(likes + 1) }, `Like ${id}: ${likes}`);
+  }
+
+  const handles = hydrateClientReference(
+    {
+      id: "app/Button.tsx#default",
+      component: IslandButton,
+    },
+    container,
+  );
+
+  assert.equal(handles.length, 1);
+  assert.equal(container.querySelector("button"), serverButton);
+  assert.equal(island?.getAttribute("data-ferrite-client-hydrated"), "true");
+
+  serverButton?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.querySelector("button")?.textContent, "Like alpha: 1");
+});
+
+test("hydrateClientReference returns no handles when no marker matches", () => {
+  const { container } = createContainer();
+  container.innerHTML = '<span data-ferrite-client-reference="app/Other.tsx#default"><button>Other</button></span>';
+
+  const handles = hydrateClientReference(
+    {
+      id: "app/Button.tsx#default",
+      component: () => createElement("button", null, "Missing"),
+    },
+    container,
+  );
+
+  assert.deepEqual(handles, []);
+  assert.equal(container.textContent, "Other");
+});
+
+test("hydrateClientReference rejects malformed serialized props", () => {
+  const { container } = createContainer();
+  container.innerHTML =
+    '<span data-ferrite-client-reference="app/Button.tsx#default" data-ferrite-client-props="not-json"><button>Bad</button></span>';
+
+  assert.throws(
+    () =>
+      hydrateClientReference(
+        {
+          id: "app/Button.tsx#default",
+          component: () => createElement("button", null, "Bad"),
+        },
+        container,
+      ),
+    /client reference props must be valid JSON/,
+  );
+  assert.equal(container.querySelector("[data-ferrite-client-hydrated]"), null);
+});
+
+test("hydrate attaches ErrorBoundary fallback rendered by the server", () => {
+  const { container } = createContainer();
+  container.innerHTML = '<strong role="alert">hydrate boom</strong>';
+  const serverFallback = container.querySelector("strong");
+
+  function Broken() {
+    throw new Error("hydrate boom");
+  }
+
+  hydrate(
+    createElement(
+      ErrorBoundary,
+      {
+        fallback: ({ error }) => createElement("strong", { role: "alert" }, errorMessage(error)),
+      },
+      createElement(Broken, null),
+    ),
+    container,
+  );
+
+  assert.equal(container.querySelector("strong"), serverFallback);
+  assert.equal(container.textContent, "hydrate boom");
+});
+
+test("hydrate rejects tag mismatches without changing existing DOM", () => {
+  const { container } = createContainer();
+  container.innerHTML = "<span>Count: 0</span>";
+
+  assert.throws(
+    () => hydrate(createElement("button", { type: "button" }, "Count: 0"), container),
+    /expected <button>.*found <span>/,
+  );
+  assert.equal(container.innerHTML, "<span>Count: 0</span>");
+});
+
+test("hydrate rejects attribute mismatches", () => {
+  const { container } = createContainer();
+  container.innerHTML = '<button type="submit">Save</button>';
+
+  assert.throws(
+    () => hydrate(createElement("button", { type: "button" }, "Save"), container),
+    /attribute mismatch for "type"/,
+  );
+});

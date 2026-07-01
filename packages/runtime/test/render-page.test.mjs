@@ -1,0 +1,151 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { platform } from "node:process";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const renderPageScript = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
+const runtimePackage = join(workspaceRoot, "packages/runtime");
+
+async function withTempProject(run) {
+  const projectRoot = await mkdtemp(join(tmpdir(), "ferrite-render-page-"));
+  try {
+    await writeFile(
+      join(projectRoot, "package.json"),
+      JSON.stringify({ private: true, type: "module" }, null, 2),
+    );
+    await linkRuntimePackage(projectRoot);
+    await run(projectRoot);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+}
+
+async function linkRuntimePackage(projectRoot) {
+  const scopeDir = join(projectRoot, "node_modules/@ferrite");
+  await mkdir(scopeDir, { recursive: true });
+  await symlink(runtimePackage, join(scopeDir, "runtime"), platform === "win32" ? "junction" : "dir");
+}
+
+async function renderPage(projectRoot, pageFile, props = {}) {
+  const { stdout } = await execFileAsync(
+    "node",
+    [renderPageScript, pageFile, JSON.stringify(props), "[]"],
+    {
+      cwd: projectRoot,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  return JSON.parse(stdout);
+}
+
+test("render-page proxies nested use client imports into client reference markers", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
+    const clientFile = join(projectRoot, "app/posts/[id]/PostActions.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `import PostActions from "./PostActions";`,
+        "",
+        `export default function Page({ params }) {`,
+        `  return <article data-route="/posts/:id"><PostActions id={params.id} /></article>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      clientFile,
+      [
+        `"use client";`,
+        "",
+        `import { useState } from "@ferrite/runtime";`,
+        "",
+        `export default function PostActions({ id }) {`,
+        `  const [likes] = useState(0);`,
+        `  return <button type="button" data-client-island="post-actions">Like {id}: {likes}</button>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
+    const packet = await renderPage(projectRoot, pageFile, { params: { id: "alpha" } });
+
+    assert.deepEqual(packet, {
+      ferrite: "render-packet",
+      version: 1,
+      root: [
+        2,
+        "article",
+        { "data-route": "/posts/:id" },
+        [
+          [
+            2,
+            "span",
+            {
+              "data-ferrite-client-reference": "app/posts/[id]/PostActions.tsx#default",
+              "data-ferrite-client-props": '{"id":"alpha"}',
+            },
+            [
+              [
+                2,
+                "button",
+                { type: "button", "data-client-island": "post-actions" },
+                [
+                  [0, "Like "],
+                  [0, "alpha"],
+                  [0, ": "],
+                  [0, "0"],
+                ],
+              ],
+            ],
+          ],
+        ],
+      ],
+    });
+  });
+});
+
+test("render-page does not proxy a route entry with use client", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `"use client";`,
+        "",
+        `import { useState } from "@ferrite/runtime";`,
+        "",
+        `export default function Page() {`,
+        `  const [count] = useState(0);`,
+        `  return <button type="button">Client route {count}</button>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
+    const packet = await renderPage(projectRoot, pageFile);
+
+    assert.deepEqual(packet, {
+      ferrite: "render-packet",
+      version: 1,
+      root: [
+        2,
+        "button",
+        { type: "button" },
+        [
+          [0, "Client route "],
+          [0, "0"],
+        ],
+      ],
+    });
+  });
+});

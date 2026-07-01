@@ -1,0 +1,22 @@
+{
+  "name": "@ferrite/node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "index.d.ts",
+    "index.js"
+  ],
+  "scripts": {
+    "build": "cargo build -p ferrite-node && node scripts/copy-native.mjs",
+    "test": "pnpm build && node --test test/*.test.mjs",
+    "typecheck": "node --check index.js && node --check scripts/copy-native.mjs"
+  }
+}

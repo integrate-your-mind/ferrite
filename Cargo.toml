@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/ferrite-cli",
+  "crates/ferrite-builder",
+  "crates/ferrite-client-bundler",
+  "crates/ferrite-core",
+  "crates/ferrite-dev-server",
+  "crates/ferrite-page-renderer",
+  "crates/ferrite-node",
+  "crates/ferrite-protocol",
+  "crates/ferrite-router",
+  "crates/ferrite-ssr",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://example.invalid/ferrite"
+version = "0.1.0"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
