@@ -32,6 +32,7 @@ import {
   hydrateClientReference,
   mount,
   serverPayloadRequestUrl,
+  serverPayloadStreamRequestUrl,
 } from "../dist/dom.js";
 import {
   collectPageMetadata,
@@ -807,17 +808,32 @@ test("renderPageModuleToServerPayload rejects malformed embedded client payloads
 
 test("serverPayloadRequestUrl adds and replaces the payload query flag", () => {
   assert.equal(serverPayloadRequestUrl("/posts/abc"), "/posts/abc?__ferrite_payload=server");
+  assert.equal(serverPayloadRequestUrl("/posts/abc", "stream"), "/posts/abc?__ferrite_payload=stream");
+  assert.equal(serverPayloadStreamRequestUrl("/posts/abc"), "/posts/abc?__ferrite_payload=stream");
   assert.equal(
     serverPayloadRequestUrl("/posts/abc?tab=comments#section"),
     "/posts/abc?tab=comments&__ferrite_payload=server#section",
   );
   assert.equal(
+    serverPayloadStreamRequestUrl("/posts/abc?tab=comments#section"),
+    "/posts/abc?tab=comments&__ferrite_payload=stream#section",
+  );
+  assert.equal(
     serverPayloadRequestUrl("/posts/abc?__ferrite_payload=flight&tab=comments"),
     "/posts/abc?tab=comments&__ferrite_payload=server",
+  );
+  assert.equal(
+    serverPayloadRequestUrl("/posts/abc?__ferrite_payload=flight&tab=comments", "stream"),
+    "/posts/abc?tab=comments&__ferrite_payload=stream",
   );
 
   const url = new URL("https://example.com/posts/abc?tab=comments");
   assert.equal(serverPayloadRequestUrl(url), "https://example.com/posts/abc?tab=comments&__ferrite_payload=server");
+  assert.equal(
+    serverPayloadRequestUrl(url, "stream"),
+    "https://example.com/posts/abc?tab=comments&__ferrite_payload=stream",
+  );
+  assert.throws(() => serverPayloadRequestUrl("/posts/abc", "flight"), /must be "server" or "stream"/);
 });
 
 test("fetchAndApplyServerPayload updates a mounted root from shell and chunks", async () => {
@@ -987,7 +1003,7 @@ test("fetchAndApplyServerPayloadStream commits shell before deferred chunks", as
     },
   });
 
-  assert.equal(requested, "/posts/stream?__ferrite_payload=server");
+  assert.equal(requested, "/posts/stream?__ferrite_payload=stream");
   assert.equal(packet.ferrite, "server-payload");
   assert.equal(packet.chunks.length, 1);
   assert.deepEqual(observed, [
@@ -1167,6 +1183,140 @@ test("server payload navigator applies same-origin document payloads and updates
   navigator.destroy();
 });
 
+test("server payload navigator streams shell before chunks and updates history after completion", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  window.document.head.innerHTML = "<title>Old title</title>";
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const encoder = new TextEncoder();
+  const requests = [];
+  let controller;
+  const response = {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    body: new ReadableStream({
+      start(innerController) {
+        controller = innerController;
+      },
+    }),
+  };
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    stream: true,
+    fetch: async (input) => {
+      requests.push(input);
+      return response;
+    },
+  });
+
+  const navigation = navigator.navigate("/posts/stream");
+  await flushScheduledWork();
+
+  assert.ok(controller);
+  controller.enqueue(
+    encoder.encode(
+      `${JSON.stringify(
+        serverPayloadStreamFrame({
+          kind: "shell",
+          shell: [
+            2,
+            "html",
+            {},
+            [
+              [2, "head", {}, [[2, "title", {}, [[0, "Stream title"]]]]],
+              [
+                2,
+                "body",
+                {},
+                [
+                  [
+                    2,
+                    "div",
+                    { id: "ferrite-root", "data-route": "/posts/stream" },
+                    [
+                      [2, "h1", {}, [[0, "Stream route"]]],
+                      [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[0, "Loading chunk"]]],
+                    ],
+                  ],
+                ],
+              ],
+            ],
+          ],
+          clientReferences: [],
+        }),
+      )}\n`,
+    ),
+  );
+  await flushScheduledWork();
+
+  assert.deepEqual(requests, ["https://example.com/posts/stream?__ferrite_payload=stream"]);
+  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(window.document.title, "Stream title");
+  assert.equal(container.textContent, "Stream routeLoading chunk");
+
+  controller.enqueue(
+    encoder.encode(
+      `${JSON.stringify(
+        serverPayloadStreamFrame({
+          kind: "chunk",
+          chunk: { id: "s0", root: [2, "strong", {}, [[0, "Loaded chunk"]]], clientReferences: [] },
+        }),
+      )}\n`,
+    ),
+  );
+  controller.close();
+  const applied = await navigation;
+
+  assert.equal(applied.chunks.length, 1);
+  assert.equal(window.location.href, "https://example.com/posts/stream");
+  assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/stream");
+  assert.equal(container.textContent, "Stream routeLoaded chunk");
+
+  navigator.destroy();
+});
+
+test("server payload navigator falls back to JSON when stream bodies are unavailable", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const requests = [];
+  const payload = navigationDocumentPayload("/posts/fallback", "Fallback route", "Fallback title");
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    stream: true,
+    fetch: async (input) => {
+      requests.push(input);
+      if (input.endsWith("__ferrite_payload=stream")) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          body: null,
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => payload,
+      };
+    },
+  });
+
+  const applied = await navigator.navigate("/posts/fallback");
+
+  assert.equal(applied, payload);
+  assert.deepEqual(requests, [
+    "https://example.com/posts/fallback?__ferrite_payload=stream",
+    "https://example.com/posts/fallback?__ferrite_payload=server",
+  ]);
+  assert.equal(window.location.href, "https://example.com/posts/fallback");
+  assert.equal(window.document.title, "Fallback title");
+  assert.equal(container.textContent, "Fallback route");
+
+  navigator.destroy();
+});
+
 test("server payload navigator intercepts same-origin link clicks", async () => {
   const { window, container } = createContainer("https://example.com/posts/old");
   const root = mount(createElement("main", { "data-route": "/posts/old" }, "Old"), container);
@@ -1232,6 +1382,38 @@ test("server payload navigator prefetches and consumes payloads for navigation",
   assert.equal(window.location.href, "https://example.com/posts/prefetched");
   assert.equal(window.document.title, "Prefetched title");
   assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/prefetched");
+  assert.equal(container.textContent, "Prefetched route");
+
+  navigator.destroy();
+});
+
+test("server payload navigator stream mode consumes JSON prefetches", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const requests = [];
+  const payload = navigationDocumentPayload("/posts/prefetched", "Prefetched route", "Prefetched title");
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    stream: true,
+    fetch: async (input) => {
+      requests.push(input);
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => payload,
+      };
+    },
+  });
+
+  const prefetched = await navigator.prefetch("/posts/prefetched");
+  const applied = await navigator.navigate("/posts/prefetched");
+
+  assert.equal(prefetched, payload);
+  assert.equal(applied, payload);
+  assert.deepEqual(requests, ["https://example.com/posts/prefetched?__ferrite_payload=server"]);
+  assert.equal(window.location.href, "https://example.com/posts/prefetched");
+  assert.equal(window.document.title, "Prefetched title");
   assert.equal(container.textContent, "Prefetched route");
 
   navigator.destroy();
@@ -1721,6 +1903,63 @@ test("server payload navigator restores back and forward entries from payload hi
     "https://example.com/posts/new?__ferrite_payload=server",
     "https://example.com/posts/old?__ferrite_payload=server",
     "https://example.com/posts/new?__ferrite_payload=server",
+  ]);
+
+  navigator.destroy();
+});
+
+test("server payload navigator uses stream mode for popstate restoration", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const requests = [];
+  const streams = new Map([
+    [
+      "https://example.com/posts/old?__ferrite_payload=stream",
+      [
+        serverPayloadStreamFrame({
+          kind: "shell",
+          shell: navigationDocumentPayload("/posts/old", "Old restored", "Old restored title").shell,
+          clientReferences: [],
+        }),
+      ],
+    ],
+    [
+      "https://example.com/posts/new?__ferrite_payload=stream",
+      [
+        serverPayloadStreamFrame({
+          kind: "shell",
+          shell: navigationDocumentPayload("/posts/new", "New route", "New title").shell,
+          clientReferences: [],
+        }),
+      ],
+    ],
+  ]);
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    stream: true,
+    fetch: async (input) => {
+      requests.push(input);
+      const frames = streams.get(input);
+      assert.ok(frames, `unexpected stream request ${input}`);
+      return serverPayloadStreamResponse(frames);
+    },
+  });
+
+  await navigator.navigate("/posts/new");
+  assert.equal(window.location.href, "https://example.com/posts/new");
+  assert.equal(window.document.title, "New title");
+  assert.equal(container.textContent, "New route");
+
+  window.history.back();
+  await flushScheduledWork();
+
+  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(window.document.title, "Old restored title");
+  assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/old");
+  assert.equal(container.textContent, "Old restored");
+  assert.deepEqual(requests, [
+    "https://example.com/posts/new?__ferrite_payload=stream",
+    "https://example.com/posts/old?__ferrite_payload=stream",
   ]);
 
   navigator.destroy();

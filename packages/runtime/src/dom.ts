@@ -105,6 +105,8 @@ export type FetchServerPayloadOptions = {
   requestInit?: RequestInit;
 };
 
+export type ServerPayloadRequestMode = "server" | "stream";
+
 export type FetchServerPayloadStreamOptions = FetchServerPayloadOptions & {
   window?: Window;
   routeRootId?: string | null;
@@ -119,6 +121,7 @@ export type ServerPayloadNavigationOptions = FetchServerPayloadOptions & {
   routeRootId?: string | null;
   reconcileHead?: boolean;
   prefetch?: boolean;
+  stream?: boolean;
   fallback?: (url: URL) => void;
   onError?: (error: unknown, url: URL) => void;
 };
@@ -152,10 +155,14 @@ export function mount(child: Child, container: Element): RootHandle {
   };
 }
 
-export function serverPayloadRequestUrl(input: string | URL): string {
+export function serverPayloadRequestUrl(input: string | URL, mode: ServerPayloadRequestMode = "server"): string {
+  if (mode !== "server" && mode !== "stream") {
+    throw new TypeError('Ferrite server payload request mode must be "server" or "stream".');
+  }
+
   if (input instanceof URL) {
     const url = new URL(input.href);
-    url.searchParams.set("__ferrite_payload", "server");
+    url.searchParams.set("__ferrite_payload", mode);
     return url.toString();
   }
 
@@ -173,8 +180,12 @@ export function serverPayloadRequestUrl(input: string | URL): string {
     .split("&")
     .filter((pair) => pair.length > 0)
     .filter((pair) => pair.split("=", 1)[0] !== "__ferrite_payload");
-  params.push("__ferrite_payload=server");
+  params.push(`__ferrite_payload=${mode}`);
   return `${path}?${params.join("&")}${hash}`;
+}
+
+export function serverPayloadStreamRequestUrl(input: string | URL): string {
+  return serverPayloadRequestUrl(input, "stream");
 }
 
 export async function fetchServerPayload(
@@ -248,7 +259,7 @@ export async function fetchAndApplyServerPayloadStream(
     throw new TypeError("Ferrite server payload stream fetch requires a fetch implementation.");
   }
 
-  const response = await fetchImpl(serverPayloadRequestUrl(input), options.requestInit);
+  const response = await fetchImpl(serverPayloadStreamRequestUrl(input), options.requestInit);
   if (!response.ok) {
     throw new Error(
       `Ferrite server payload stream request failed with ${response.status} ${response.statusText || "Unknown Status"}.`,
@@ -406,12 +417,55 @@ export function createServerPayloadNavigator(
 
   seedNavigationHistory(navigationWindow);
 
+  const assertNavigatorActive = (): void => {
+    if (destroyed) {
+      throw new TypeError("Ferrite server payload navigator has been destroyed.");
+    }
+  };
+
   const applyNavigationPacket = (packet: ServerPayloadPacket): void => {
+    assertNavigatorActive();
     const headPlan =
       options.reconcileHead === false ? null : prepareHeadReconciliation(packet, navigationWindow.document);
     const child = navigationPayloadToChild(packet, options.routeRootId);
     root.update(child);
     headPlan?.apply();
+  };
+
+  const fetchApplyNavigationPacket = async (url: URL): Promise<ServerPayloadPacket> => {
+    const packet = await fetchServerPayload(url, fetchOptions);
+    applyNavigationPacket(packet);
+    return packet;
+  };
+
+  const fetchApplyNavigationStream = async (url: URL): Promise<ServerPayloadPacket> => {
+    let shellCommitted = false;
+    const guardedRoot: RootHandle = {
+      update(nextChild) {
+        assertNavigatorActive();
+        root.update(nextChild);
+      },
+      unmount() {
+        root.unmount();
+      },
+    };
+
+    try {
+      return await fetchAndApplyServerPayloadStream(guardedRoot, url, {
+        ...fetchOptions,
+        window: navigationWindow,
+        routeRootId: options.routeRootId,
+        reconcileHead: options.reconcileHead,
+        onShell: () => {
+          shellCommitted = true;
+        },
+      });
+    } catch (error) {
+      if (!shellCommitted && !destroyed) {
+        return fetchApplyNavigationPacket(url);
+      }
+      throw error;
+    }
   };
 
   const prefetch = async (input: string | URL): Promise<ServerPayloadPacket | null> => {
@@ -442,14 +496,28 @@ export function createServerPayloadNavigator(
     return request;
   };
 
-  const loadNavigationPacket = async (url: URL): Promise<ServerPayloadPacket> => {
+  const takePrefetchedNavigationPacket = (url: URL): ServerPayloadPacket | Promise<ServerPayloadPacket> | undefined => {
     const key = navigationCacheKey(url);
     const prefetched = prefetchedPayloads.get(key);
     if (prefetched) {
       prefetchedPayloads.delete(key);
-      return prefetched;
     }
-    return fetchServerPayload(url, fetchOptions);
+    return prefetched;
+  };
+
+  const applyNavigationUrl = async (url: URL): Promise<ServerPayloadPacket> => {
+    const prefetched = takePrefetchedNavigationPacket(url);
+    if (prefetched) {
+      const packet = await prefetched;
+      applyNavigationPacket(packet);
+      return packet;
+    }
+
+    if (options.stream === true) {
+      return fetchApplyNavigationStream(url);
+    }
+
+    return fetchApplyNavigationPacket(url);
   };
 
   const navigate = async (
@@ -462,8 +530,7 @@ export function createServerPayloadNavigator(
     }
 
     try {
-      const packet = await loadNavigationPacket(url);
-      applyNavigationPacket(packet);
+      const packet = await applyNavigationUrl(url);
       updateNavigationHistory(navigationWindow, url, navigateOptions.replace === true);
       return packet;
     } catch (error) {
@@ -488,11 +555,10 @@ export function createServerPayloadNavigator(
 
   const restore = async (url: URL): Promise<void> => {
     try {
-      const packet = await loadNavigationPacket(url);
+      const packet = await applyNavigationUrl(url);
       if (destroyed) {
         return;
       }
-      applyNavigationPacket(packet);
     } catch (error) {
       if (destroyed) {
         return;
