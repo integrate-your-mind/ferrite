@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -148,6 +149,131 @@ impl ClientBundle {
     }
 }
 
+pub fn fingerprint_client_bundle(
+    bundle: &mut ClientBundle,
+    out_dir: &Path,
+    public_path: &str,
+) -> Result<()> {
+    let mut replacements = BTreeMap::new();
+
+    if let Some(script) = bundle.script.as_mut() {
+        fingerprint_public_url(script, out_dir, public_path, &mut replacements)?;
+    }
+    for style in &mut bundle.styles {
+        fingerprint_public_url(style, out_dir, public_path, &mut replacements)?;
+    }
+    for reference in &mut bundle.client_references {
+        if let Some(script) = reference.script.as_mut() {
+            fingerprint_public_url(script, out_dir, public_path, &mut replacements)?;
+        }
+        for style in &mut reference.styles {
+            fingerprint_public_url(style, out_dir, public_path, &mut replacements)?;
+        }
+        rewrite_output_paths(&mut reference.outputs, &replacements);
+    }
+
+    rewrite_output_paths(&mut bundle.outputs, &replacements);
+    Ok(())
+}
+
+fn fingerprint_public_url(
+    url: &mut String,
+    out_dir: &Path,
+    public_path: &str,
+    replacements: &mut BTreeMap<PathBuf, PathBuf>,
+) -> Result<()> {
+    let Some(relative) = public_url_relative_path(url, public_path) else {
+        return Ok(());
+    };
+    if !is_fingerprint_candidate(&relative) {
+        return Ok(());
+    }
+
+    let replacement = match replacements.get(&relative) {
+        Some(replacement) => replacement.clone(),
+        None => {
+            let replacement = fingerprint_output_file(out_dir, &relative)?;
+            replacements.insert(relative.clone(), replacement.clone());
+            replacement
+        }
+    };
+    *url = public_url(public_path, &replacement);
+    Ok(())
+}
+
+fn public_url_relative_path(url: &str, public_path: &str) -> Option<PathBuf> {
+    let public_path = public_path.trim_end_matches('/');
+    let prefix = format!("{public_path}/");
+    let relative = url.strip_prefix(&prefix)?;
+    if relative.is_empty() || relative.contains("..") {
+        return None;
+    }
+    Some(PathBuf::from(relative))
+}
+
+fn is_fingerprint_candidate(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("js" | "css")
+    )
+}
+
+fn fingerprint_output_file(out_dir: &Path, relative: &Path) -> Result<PathBuf> {
+    let source = out_dir.join(relative);
+    let bytes = fs::read(&source)?;
+    let hash = content_hash(&bytes);
+    let extension = relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .expect("fingerprint candidate has extension");
+    let stem = relative
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("asset");
+    let fingerprinted_name = format!("{stem}.{hash}.{extension}");
+    let replacement = relative.with_file_name(fingerprinted_name);
+    if replacement == relative {
+        return Ok(replacement);
+    }
+
+    let target = out_dir.join(&replacement);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if target.exists() {
+        fs::remove_file(&target)?;
+    }
+    fs::rename(source, &target)?;
+    Ok(replacement)
+}
+
+fn rewrite_output_paths(outputs: &mut Vec<PathBuf>, replacements: &BTreeMap<PathBuf, PathBuf>) {
+    let mut seen = BTreeSet::new();
+    let mut rewritten = Vec::new();
+    for output in outputs.drain(..) {
+        let next = replacements.get(&output).cloned().unwrap_or(output);
+        if seen.insert(next.clone()) {
+            rewritten.push(next);
+        }
+    }
+    *outputs = rewritten;
+}
+
+fn public_url(public_path: &str, relative: &Path) -> String {
+    let public_path = public_path.trim_end_matches('/');
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    format!("{public_path}/{relative}")
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 #[derive(Debug, Serialize)]
 struct ClientProps {
     params: BTreeMap<String, Value>,
@@ -221,6 +347,108 @@ process.stdout.write(JSON.stringify({
                 sourcemaps: Vec::new(),
                 assets: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn fingerprints_client_bundle_scripts_and_styles() {
+        let temp = tempfile::tempdir().unwrap();
+        let out_dir = temp.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(out_dir.join("route-index.js"), "console.log('route');").unwrap();
+        fs::write(out_dir.join("route-index.css"), ".page{color:red}").unwrap();
+        fs::write(
+            out_dir.join("client-reference-app-Counter-tsx-default.js"),
+            "console.log('counter');",
+        )
+        .unwrap();
+        fs::write(
+            out_dir.join("client-reference-app-Counter-tsx-default.css"),
+            ".counter{color:blue}",
+        )
+        .unwrap();
+        fs::write(out_dir.join("route-index.js.map"), "{}").unwrap();
+        let route_js_hash = content_hash("console.log('route');".as_bytes());
+        let route_css_hash = content_hash(".page{color:red}".as_bytes());
+        let reference_js_hash = content_hash("console.log('counter');".as_bytes());
+        let reference_css_hash = content_hash(".counter{color:blue}".as_bytes());
+        let mut bundle = ClientBundle {
+            script: Some("/_ferrite/static/route-index.js".to_owned()),
+            styles: vec!["/_ferrite/static/route-index.css".to_owned()],
+            outputs: vec![
+                PathBuf::from("route-index.js"),
+                PathBuf::from("route-index.css"),
+                PathBuf::from("route-index.js.map"),
+                PathBuf::from("client-reference-app-Counter-tsx-default.js"),
+                PathBuf::from("client-reference-app-Counter-tsx-default.css"),
+            ],
+            sourcemaps: vec![PathBuf::from("route-index.js.map")],
+            assets: Vec::new(),
+            client_references: vec![ClientReference {
+                id: "app/Counter.tsx#default".to_owned(),
+                module: "app/Counter.tsx".to_owned(),
+                export_name: "default".to_owned(),
+                script: Some(
+                    "/_ferrite/static/client-reference-app-Counter-tsx-default.js".to_owned(),
+                ),
+                styles: vec![
+                    "/_ferrite/static/client-reference-app-Counter-tsx-default.css".to_owned(),
+                ],
+                outputs: vec![
+                    PathBuf::from("client-reference-app-Counter-tsx-default.js"),
+                    PathBuf::from("client-reference-app-Counter-tsx-default.css"),
+                ],
+                sourcemaps: Vec::new(),
+                assets: Vec::new(),
+            }],
+        };
+
+        fingerprint_client_bundle(&mut bundle, &out_dir, "/_ferrite/static").unwrap();
+
+        let route_script = format!("/_ferrite/static/route-index.{route_js_hash}.js");
+        let reference_script = format!(
+            "/_ferrite/static/client-reference-app-Counter-tsx-default.{reference_js_hash}.js"
+        );
+        assert_eq!(bundle.script.as_deref(), Some(route_script.as_str()));
+        assert_eq!(
+            bundle.styles,
+            vec![format!("/_ferrite/static/route-index.{route_css_hash}.css")]
+        );
+        assert_eq!(
+            bundle.client_references[0].script.as_deref(),
+            Some(reference_script.as_str())
+        );
+        assert_eq!(
+            bundle.client_references[0].styles,
+            vec![format!(
+                "/_ferrite/static/client-reference-app-Counter-tsx-default.{reference_css_hash}.css"
+            )]
+        );
+        assert!(
+            out_dir
+                .join(format!("route-index.{route_js_hash}.js"))
+                .is_file()
+        );
+        assert!(!out_dir.join("route-index.js").exists());
+        assert!(
+            out_dir
+                .join(format!(
+                    "client-reference-app-Counter-tsx-default.{reference_js_hash}.js"
+                ))
+                .is_file()
+        );
+        assert!(
+            bundle
+                .outputs
+                .contains(&PathBuf::from(format!("route-index.{route_js_hash}.js")))
+        );
+        assert!(bundle.outputs.contains(&PathBuf::from(format!(
+            "client-reference-app-Counter-tsx-default.{reference_css_hash}.css"
+        ))));
+        assert!(
+            bundle
+                .outputs
+                .contains(&PathBuf::from("route-index.js.map"))
         );
     }
 

@@ -3,7 +3,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ferrite_client_bundler::{ClientBundle, ClientBundleError, ClientBundler};
+use ferrite_client_bundler::{
+    ClientBundle, ClientBundleError, ClientBundler, fingerprint_client_bundle,
+};
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
 };
@@ -73,6 +75,8 @@ impl From<serde_json::Error> for BuildError {
 }
 
 pub type Result<T> = std::result::Result<T, BuildError>;
+
+const CLIENT_PUBLIC_PATH: &str = "/_ferrite/static";
 
 #[derive(Debug, Clone)]
 pub struct BuildConfig {
@@ -176,13 +180,13 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
             {
                 let metadata =
                     page_renderer.collect_metadata(&route.file, &route.layouts, &ordered_params)?;
-                let client_bundle = client_bundler.bundle_route(
+                let client_bundle = bundle_production_route(
+                    &client_bundler,
                     &route.file,
                     &route.layouts,
                     &route_path,
                     &ordered_params,
                     &client_out_dir,
-                    "/_ferrite/static",
                 )?;
                 page_renderer
                     .render_document_to_html_with_conventions(
@@ -212,13 +216,13 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                 )?;
                 let metadata =
                     page_renderer.collect_metadata(&route.file, &route.layouts, &ordered_params)?;
-                let client_bundle = client_bundler.bundle_route(
+                let client_bundle = bundle_production_route(
+                    &client_bundler,
                     &route.file,
                     &route.layouts,
                     &route_path,
                     &ordered_params,
                     &client_out_dir,
-                    "/_ferrite/static",
                 )?;
                 (
                     render_static_document(&route_path, &page_html, &client_bundle, &metadata),
@@ -262,6 +266,26 @@ fn route_conventions(route: &Route) -> RouteConventions {
         loading: route.loading.clone(),
         error: route.error.clone(),
     }
+}
+
+fn bundle_production_route(
+    client_bundler: &ClientBundler,
+    page_file: &Path,
+    layouts: &[PathBuf],
+    route_path: &str,
+    params: &[(String, Value)],
+    client_out_dir: &Path,
+) -> Result<ClientBundle> {
+    let mut client_bundle = client_bundler.bundle_route(
+        page_file,
+        layouts,
+        route_path,
+        params,
+        client_out_dir,
+        CLIENT_PUBLIC_PATH,
+    )?;
+    fingerprint_client_bundle(&mut client_bundle, client_out_dir, CLIENT_PUBLIC_PATH)?;
+    Ok(client_bundle)
 }
 
 fn output_html_path(out_dir: &Path, route_path: &str) -> PathBuf {
@@ -611,6 +635,22 @@ mod tests {
         fs::write(path, value).unwrap();
     }
 
+    fn assert_fingerprinted_public_path(path: &str, extension: &str) {
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("public path has file name");
+        let stem = file_name
+            .strip_suffix(extension)
+            .expect("public path has expected extension");
+        let hash = stem
+            .rsplit_once('.')
+            .map(|(_name, hash)| hash)
+            .expect("public path has fingerprint segment");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|char| char.is_ascii_hexdigit()));
+    }
+
     #[cfg(unix)]
     fn make_script(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -786,6 +826,27 @@ process.stdout.write(JSON.stringify({
         );
         assert_eq!(report.client_bundles.len(), 2);
         assert!(report.client_bundles[0].sourcemaps.len() == 1);
+        let static_dir = temp.path().join(".ferrite/build/_ferrite/static");
+        for bundle in &report.client_bundles {
+            let script = bundle.script.as_deref().expect("route script");
+            assert!(script.starts_with("/_ferrite/static/route-"));
+            assert_fingerprinted_public_path(script, ".js");
+            assert!(
+                static_dir
+                    .join(script.trim_start_matches("/_ferrite/static/"))
+                    .is_file()
+            );
+            for style in &bundle.styles {
+                assert!(style.starts_with("/_ferrite/static/route-"));
+                assert_fingerprinted_public_path(style, ".css");
+                assert!(
+                    static_dir
+                        .join(style.trim_start_matches("/_ferrite/static/"))
+                        .is_file()
+                );
+            }
+        }
+        assert!(!static_dir.join("route-index.js").exists());
         assert!(report.skipped_dynamic_routes.is_empty());
     }
 
@@ -834,6 +895,12 @@ process.stdout.write(JSON.stringify({
         make_script(
             &config.client_bundler,
             r#"
+const outDir = process.argv[3];
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+await fs.mkdir(outDir, { recursive: true });
+await fs.writeFile(path.join(outDir, "client-reference-app-Counter-tsx-default.js"), "console.log('counter');");
+await fs.writeFile(path.join(outDir, "client-reference-app-Counter-tsx-default.css"), ".counter{color:blue}");
 process.stdout.write(JSON.stringify({
   script: null,
   styles: [],
@@ -863,27 +930,51 @@ process.stdout.write(JSON.stringify({
             &fs::read_to_string(config.out_dir.join("ferrite-build.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            manifest["client_bundles"][0]["clientReferences"][0],
-            serde_json::json!({
-                "id": "app/Counter.tsx#default",
-                "module": "app/Counter.tsx",
-                "exportName": "default",
-                "script": "/_ferrite/static/client-reference-app-Counter-tsx-default.js",
-                "styles": ["/_ferrite/static/client-reference-app-Counter-tsx-default.css"],
-                "outputs": [
-                    "client-reference-app-Counter-tsx-default.css",
-                    "client-reference-app-Counter-tsx-default.js"
-                ]
-            })
+        let reference = &manifest["client_bundles"][0]["clientReferences"][0];
+        assert_eq!(reference["id"].as_str(), Some("app/Counter.tsx#default"));
+        assert_eq!(reference["module"].as_str(), Some("app/Counter.tsx"));
+        assert_eq!(reference["exportName"].as_str(), Some("default"));
+        let script = reference["script"]
+            .as_str()
+            .expect("client reference script");
+        let style = reference["styles"][0]
+            .as_str()
+            .expect("client reference style");
+        assert!(script.starts_with("/_ferrite/static/client-reference-app-Counter-tsx-default."));
+        assert_fingerprinted_public_path(script, ".js");
+        assert!(style.starts_with("/_ferrite/static/client-reference-app-Counter-tsx-default."));
+        assert_fingerprinted_public_path(style, ".css");
+        let outputs = reference["outputs"]
+            .as_array()
+            .expect("client reference outputs")
+            .iter()
+            .map(|output| output.as_str().expect("output path"))
+            .collect::<Vec<_>>();
+        let script_output = script.trim_start_matches("/_ferrite/static/");
+        let style_output = style.trim_start_matches("/_ferrite/static/");
+        assert!(outputs.contains(&script_output));
+        assert!(outputs.contains(&style_output));
+        assert!(!outputs.contains(&"client-reference-app-Counter-tsx-default.js"));
+        assert!(!outputs.contains(&"client-reference-app-Counter-tsx-default.css"));
+        assert!(
+            config
+                .out_dir
+                .join("_ferrite/static")
+                .join(script_output)
+                .is_file()
+        );
+        assert!(
+            config
+                .out_dir
+                .join("_ferrite/static")
+                .join(style_output)
+                .is_file()
         );
         let html = fs::read_to_string(config.out_dir.join("index.html")).unwrap();
-        assert!(html.contains(
-            r#"<link rel="stylesheet" href="/_ferrite/static/client-reference-app-Counter-tsx-default.css">"#
-        ));
-        assert!(html.contains(
-            r#"<script type="module" src="/_ferrite/static/client-reference-app-Counter-tsx-default.js"></script>"#
-        ));
+        assert!(html.contains(&format!(r#"<link rel="stylesheet" href="{style}">"#)));
+        assert!(html.contains(&format!(
+            r#"<script type="module" src="{script}"></script>"#
+        )));
         assert!(!html.contains(r#"<script type="module" src="/_ferrite/static/route-index.js"#));
     }
 
@@ -1401,7 +1492,7 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
             &bundler,
             r#"
 process.stdout.write(JSON.stringify({
-  script: "/_ferrite/static/app.js",
+  script: null,
   styles: [],
   outputs: [],
   sourcemaps: [],
@@ -1458,7 +1549,7 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
             &bundler,
             r#"
 process.stdout.write(JSON.stringify({
-  script: "/_ferrite/static/app.js",
+  script: null,
   styles: [],
   outputs: [],
   sourcemaps: [],

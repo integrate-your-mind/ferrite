@@ -6,7 +6,9 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use ferrite_client_bundler::{ClientBundle, ClientBundleError, ClientBundler};
+use ferrite_client_bundler::{
+    ClientBundle, ClientBundleError, ClientBundler, fingerprint_client_bundle,
+};
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
 };
@@ -534,7 +536,7 @@ impl ProductionProject {
                 &self.config.client_public_path,
                 &self.config.client_out_dir,
             )
-            .with_cache_control("public, max-age=0, must-revalidate"));
+            .with_cache_control(static_asset_cache_control(path)));
         }
 
         match route_response_mode(raw_path) {
@@ -550,6 +552,9 @@ impl ProductionProject {
 
         let routes = scan_app_dir(&self.config.app_dir)?;
         write_route_types(&routes, &self.config.types_out)?;
+        if self.config.client_out_dir.exists() {
+            fs::remove_dir_all(&self.config.client_out_dir)?;
+        }
         let document_file = find_document_file(&self.config.app_dir);
         self.snapshot = Some(ProductionRouteSnapshot {
             routes,
@@ -623,7 +628,8 @@ impl ProductionProject {
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
                         );
-                        match bundler.bundle_route(
+                        match production_client_bundle(
+                            &bundler,
                             &match_result.route.file,
                             &match_result.route.layouts,
                             &match_result.route.path,
@@ -685,7 +691,8 @@ impl ProductionProject {
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
                         );
-                        match bundler.bundle_route(
+                        match production_client_bundle(
+                            &bundler,
                             &match_result.route.file,
                             &match_result.route.layouts,
                             &match_result.route.path,
@@ -747,7 +754,8 @@ impl ProductionProject {
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
                         );
-                        match bundler.bundle_route(
+                        match production_client_bundle(
+                            &bundler,
                             &match_result.route.file,
                             &match_result.route.layouts,
                             &match_result.route.path,
@@ -1005,6 +1013,27 @@ fn route_conventions(route: &Route) -> RouteConventions {
         loading: route.loading.clone(),
         error: route.error.clone(),
     }
+}
+
+fn production_client_bundle(
+    bundler: &ClientBundler,
+    page_file: &Path,
+    layouts: &[PathBuf],
+    route_path: &str,
+    params: &[(String, Value)],
+    client_out_dir: &Path,
+    client_public_path: &str,
+) -> std::result::Result<ClientBundle, ClientBundleError> {
+    let mut client_bundle = bundler.bundle_route(
+        page_file,
+        layouts,
+        route_path,
+        params,
+        client_out_dir,
+        client_public_path,
+    )?;
+    fingerprint_client_bundle(&mut client_bundle, client_out_dir, client_public_path)?;
+    Ok(client_bundle)
 }
 
 fn dev_document_scripts(client_bundle: &ClientBundle) -> Vec<String> {
@@ -1593,6 +1622,58 @@ fn static_asset_response(path: &str, public_path: &str, out_dir: &Path) -> DevRe
     }
 }
 
+fn static_asset_cache_control(path: &str) -> &'static str {
+    if is_immutable_static_asset_path(path) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=0, must-revalidate"
+    }
+}
+
+fn is_immutable_static_asset_path(path: &str) -> bool {
+    let path = Path::new(path);
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((stem, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    if !matches!(
+        extension,
+        "css" | "gif" | "jpeg" | "jpg" | "js" | "png" | "svg" | "webp" | "woff" | "woff2"
+    ) {
+        return false;
+    }
+
+    if stem
+        .rsplit_once('.')
+        .is_some_and(|(_name, hash)| is_hex_hash(hash))
+    {
+        return true;
+    }
+
+    let is_bundled_asset = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("assets");
+    is_bundled_asset
+        && stem
+            .rsplit_once('-')
+            .is_some_and(|(_name, hash)| is_esbuild_hash(hash))
+}
+
+fn is_hex_hash(value: &str) -> bool {
+    value.len() >= 8 && value.chars().all(|char| char.is_ascii_hexdigit())
+}
+
+fn is_esbuild_hash(value: &str) -> bool {
+    value.len() >= 8
+        && value
+            .chars()
+            .all(|char| char.is_ascii_digit() || char.is_ascii_uppercase())
+}
+
 fn content_type_for(path: &Path) -> &'static str {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("css") => "text/css; charset=utf-8",
@@ -1973,6 +2054,22 @@ mod tests {
     fn write(path: &Path, value: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, value).unwrap();
+    }
+
+    fn assert_fingerprinted_public_path(path: &str, extension: &str) {
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("public path has file name");
+        let stem = file_name
+            .strip_suffix(extension)
+            .expect("public path has expected extension");
+        let hash = stem
+            .rsplit_once('.')
+            .map(|(_name, hash)| hash)
+            .expect("public path has fingerprint segment");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|char| char.is_ascii_hexdigit()));
     }
 
     fn project_for(app: &Path) -> DevProject {
@@ -2690,10 +2787,55 @@ process.stdout.write(JSON.stringify({
         assert!(body.contains("<title>Post abc</title>"));
         assert!(body.contains("<h1>Post abc</h1>"));
         assert!(body.contains(r#"<script type="module" src="/_ferrite/static/"#));
+        let script = body
+            .split("src=\"")
+            .find_map(|part| part.strip_prefix("/_ferrite/static/"))
+            .and_then(|part| part.split('"').next())
+            .map(|path| format!("/_ferrite/static/{path}"))
+            .expect("client script");
+        assert_fingerprinted_public_path(&script, ".js");
         assert!(!body.contains("/__ferrite/client.js"));
         assert!(!body.contains("data-ferrite-build-id"));
         assert!(!body.contains("ferrite-dev-root"));
         assert!(temp.path().join(".ferrite/types/routes.d.ts").is_file());
+    }
+
+    #[test]
+    fn production_adapter_cleans_stale_static_assets_before_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = production_project_for(&app);
+        let stale_file = project
+            .config()
+            .client_out_dir
+            .join("route-index.deadbeefdeadbeef.js");
+        write(&stale_file, "console.log('stale');");
+
+        let response = project.handle_get("/").unwrap();
+
+        assert_eq!(response.status, 200);
+        assert!(!stale_file.exists());
+    }
+
+    #[test]
+    fn static_asset_cache_control_is_hash_aware() {
+        assert_eq!(
+            static_asset_cache_control("/_ferrite/static/route-index.0123456789abcdef.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            static_asset_cache_control("/_ferrite/static/assets/logo-2WMCNJ6H.png"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            static_asset_cache_control("/_ferrite/static/route-index.js"),
+            "public, max-age=0, must-revalidate"
+        );
+        assert_eq!(
+            static_asset_cache_control("/_ferrite/static/admin-bundle.js"),
+            "public, max-age=0, must-revalidate"
+        );
     }
 
     #[test]
@@ -2711,16 +2853,26 @@ process.stdout.write(JSON.stringify({
             .and_then(|part| part.split('"').next())
             .map(|path| format!("/_ferrite/static/{path}"))
             .expect("client script");
+        assert_fingerprinted_public_path(&script, ".js");
         let response = project.handle_get(&script).unwrap();
 
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "text/javascript; charset=utf-8");
         assert_eq!(
             response.cache_control,
-            Some("public, max-age=0, must-revalidate")
+            Some("public, max-age=31536000, immutable")
         );
         assert_eq!(response.route_pattern_header, None);
         assert!(response.body_text().contains("console.log('client')"));
+
+        let unhashed = project.config().client_out_dir.join("manual.js");
+        write(&unhashed, "console.log('manual');");
+        let unhashed_response = project.handle_get("/_ferrite/static/manual.js").unwrap();
+        assert_eq!(unhashed_response.status, 200);
+        assert_eq!(
+            unhashed_response.cache_control,
+            Some("public, max-age=0, must-revalidate")
+        );
     }
 
     #[test]
