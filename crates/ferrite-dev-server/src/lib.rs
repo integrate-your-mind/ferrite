@@ -12,6 +12,8 @@ use ferrite_page_renderer::{
 };
 use ferrite_protocol::{SERVER_PAYLOAD_STREAM_FRAME_MARKER, SERVER_PAYLOAD_STREAM_FRAME_VERSION};
 use ferrite_router::{Route, find_document_file, scan_app_dir, write_route_types};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -1177,39 +1179,72 @@ fn handle_production_stream(stream: &mut TcpStream, project: &mut ProductionProj
     let mut buffer = [0_u8; 8192];
     let bytes = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..bytes]);
+    let write_options = ResponseWriteOptions {
+        gzip: client_accepts_gzip(&request),
+    };
     let response = match parse_request_line(&request) {
         Some(("GET", path)) => project.handle_get(path)?,
         Some((_method, _path)) => DevResponse::method_not_allowed(),
         None => DevResponse::bad_request("invalid HTTP request line"),
     };
 
-    write_response(stream, &response)?;
+    write_response_with_options(stream, &response, write_options)?;
     Ok(())
 }
 
 fn write_response(stream: &mut TcpStream, response: &DevResponse) -> Result<()> {
+    write_response_with_options(stream, response, ResponseWriteOptions::default())
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+struct ResponseWriteOptions {
+    gzip: bool,
+}
+
+fn write_response_with_options(
+    stream: &mut TcpStream,
+    response: &DevResponse,
+    options: ResponseWriteOptions,
+) -> Result<()> {
+    let should_gzip = options.gzip && is_gzip_eligible(response);
+
     if let Some(body_stream) = response.stream.as_ref() {
         write!(
             stream,
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
             response.status, response.reason, response.content_type
         )?;
+        write_response_compression_headers(stream, should_gzip)?;
         write_response_metadata_headers(stream, response)?;
         stream.write_all(b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
-        write_chunk(stream, &body_stream.shell)?;
-        for chunk in &body_stream.chunks {
-            write_chunk(stream, chunk)?;
+        if should_gzip {
+            let compressed = gzip_stream_body(body_stream)?;
+            for chunk in &compressed {
+                write_chunk(stream, chunk)?;
+            }
+        } else {
+            write_chunk(stream, &body_stream.shell)?;
+            for chunk in &body_stream.chunks {
+                write_chunk(stream, chunk)?;
+            }
         }
         stream.write_all(b"0\r\n\r\n")?;
         return Ok(());
     }
 
-    let bytes = &response.body;
+    let compressed_body;
+    let bytes = if should_gzip {
+        compressed_body = gzip_bytes(&response.body)?;
+        &compressed_body
+    } else {
+        &response.body
+    };
     write!(
         stream,
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
         response.status, response.reason, response.content_type,
     )?;
+    write_response_compression_headers(stream, should_gzip)?;
     write_response_metadata_headers(stream, response)?;
     write!(
         stream,
@@ -1218,6 +1253,129 @@ fn write_response(stream: &mut TcpStream, response: &DevResponse) -> Result<()> 
     )?;
     stream.write_all(bytes)?;
     Ok(())
+}
+
+fn write_response_compression_headers(stream: &mut TcpStream, gzip: bool) -> Result<()> {
+    if gzip {
+        stream.write_all(b"Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")?;
+    }
+    Ok(())
+}
+
+fn is_gzip_eligible(response: &DevResponse) -> bool {
+    if response.status != 200 {
+        return false;
+    }
+
+    let has_body = response
+        .stream
+        .as_ref()
+        .map_or(!response.body.is_empty(), |stream| {
+            !stream.shell.is_empty() || stream.chunks.iter().any(|chunk| !chunk.is_empty())
+        });
+    if !has_body {
+        return false;
+    }
+
+    let content_type = response
+        .content_type
+        .split_once(';')
+        .map_or(response.content_type, |(mime, _params)| mime)
+        .trim();
+    matches!(
+        content_type,
+        "text/html"
+            | "application/json"
+            | "application/vnd.ferrite.server-payload+json"
+            | "application/vnd.ferrite.server-payload-stream+jsonl"
+    )
+}
+
+fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes)?;
+    Ok(encoder.finish()?)
+}
+
+fn gzip_stream_body(body: &DevStreamBody) -> Result<Vec<Vec<u8>>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut offset = 0;
+    let mut chunks = Vec::new();
+
+    write_gzip_stream_part(&mut encoder, &mut offset, &mut chunks, &body.shell)?;
+    for chunk in &body.chunks {
+        write_gzip_stream_part(&mut encoder, &mut offset, &mut chunks, chunk)?;
+    }
+
+    let compressed = encoder.finish()?;
+    if compressed.len() > offset {
+        chunks.push(compressed[offset..].to_vec());
+    }
+
+    Ok(chunks)
+}
+
+fn write_gzip_stream_part(
+    encoder: &mut GzEncoder<Vec<u8>>,
+    offset: &mut usize,
+    chunks: &mut Vec<Vec<u8>>,
+    bytes: &[u8],
+) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    encoder.write_all(bytes)?;
+    encoder.flush()?;
+    let compressed = encoder.get_ref();
+    if compressed.len() > *offset {
+        chunks.push(compressed[*offset..].to_vec());
+        *offset = compressed.len();
+    }
+    Ok(())
+}
+
+fn client_accepts_gzip(request: &str) -> bool {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _value)| name.trim().eq_ignore_ascii_case("accept-encoding"))
+        .any(|(_name, value)| accept_encoding_value_allows_gzip(value))
+}
+
+fn accept_encoding_value_allows_gzip(value: &str) -> bool {
+    let mut gzip_quality = None;
+    let mut wildcard_quality = None;
+
+    for item in value.split(',') {
+        let mut parts = item.split(';');
+        let token = parts.next().unwrap_or("").trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        let mut quality = 1.0_f32;
+        for parameter in parts {
+            let Some((name, value)) = parameter.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("q") {
+                quality = value.trim().parse::<f32>().unwrap_or(0.0);
+            }
+        }
+
+        if token.eq_ignore_ascii_case("gzip") {
+            gzip_quality = Some(quality);
+        } else if token == "*" {
+            wildcard_quality = Some(quality);
+        }
+    }
+
+    gzip_quality
+        .or(wildcard_quality)
+        .is_some_and(|quality| quality > 0.0)
 }
 
 fn write_response_metadata_headers(stream: &mut TcpStream, response: &DevResponse) -> Result<()> {
@@ -1807,6 +1965,7 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::thread;
@@ -1995,6 +2154,87 @@ process.stdout.write(JSON.stringify({
     #[cfg(not(unix))]
     fn make_script(path: &Path, body: &str) {
         write(path, body);
+    }
+
+    fn production_http_request(project: ProductionProject, request: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut project = project;
+            serve_production_listener_once(listener, &mut project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.write_all(request).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    fn response_headers(response: &[u8]) -> String {
+        let Some(index) = find_header_end(response) else {
+            panic!("response did not contain HTTP header terminator");
+        };
+        String::from_utf8_lossy(&response[..index]).into_owned()
+    }
+
+    fn response_body(response: &[u8]) -> &[u8] {
+        let Some(index) = find_header_end(response) else {
+            panic!("response did not contain HTTP header terminator");
+        };
+        &response[index + 4..]
+    }
+
+    fn find_header_end(response: &[u8]) -> Option<usize> {
+        response.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn decode_chunked_body(bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut cursor = 0;
+
+        loop {
+            let line_end = bytes[cursor..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .map(|offset| cursor + offset)
+                .expect("chunk size line");
+            let size_text = std::str::from_utf8(&bytes[cursor..line_end]).expect("chunk size utf8");
+            let size = usize::from_str_radix(size_text.trim(), 16).expect("chunk size hex");
+            cursor = line_end + 2;
+            if size == 0 {
+                break;
+            }
+            output.extend_from_slice(&bytes[cursor..cursor + size]);
+            cursor += size + 2;
+        }
+
+        output
+    }
+
+    fn gunzip_to_string(bytes: &[u8]) -> String {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut output = String::new();
+        decoder.read_to_string(&mut output).unwrap();
+        output
+    }
+
+    #[test]
+    fn accept_encoding_parser_respects_gzip_quality() {
+        assert!(client_accepts_gzip(
+            "GET / HTTP/1.1\r\nAccept-Encoding: br, gzip;q=0.8\r\n\r\n"
+        ));
+        assert!(client_accepts_gzip(
+            "GET / HTTP/1.1\r\nAccept-Encoding: *;q=0.5\r\n\r\n"
+        ));
+        assert!(!client_accepts_gzip(
+            "GET / HTTP/1.1\r\nAccept-Encoding: gzip;q=0, *;q=1\r\n\r\n"
+        ));
+        assert!(!client_accepts_gzip(
+            "GET / HTTP/1.1\r\nAccept-Encoding: br, identity\r\n\r\n"
+        ));
     }
 
     #[test]
@@ -2534,6 +2774,126 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected non-strea
         assert!(response.contains("Production chunk"));
         assert!(!response.contains("/__ferrite/client.js"));
         assert!(response.ends_with("0\r\n\r\n"));
+    }
+
+    #[test]
+    fn production_adapter_compresses_html_when_gzip_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = production_project_for(&app);
+
+        let response = production_http_request(
+            project,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n",
+        );
+        let headers = response_headers(&response);
+        let body = gunzip_to_string(response_body(&response));
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(headers.contains("Content-Encoding: gzip"));
+        assert!(headers.contains("Vary: Accept-Encoding"));
+        assert!(headers.contains("Content-Length:"));
+        assert!(!headers.contains("Transfer-Encoding: chunked"));
+        assert!(body.contains("<h1>Home Page</h1>"));
+        assert!(!body.contains("/__ferrite/client.js"));
+    }
+
+    #[test]
+    fn production_adapter_keeps_html_uncompressed_without_gzip_support() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = production_project_for(&app);
+
+        let response = production_http_request(
+            project,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, identity\r\n\r\n",
+        );
+        let headers = response_headers(&response);
+        let body = String::from_utf8_lossy(response_body(&response));
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(!headers.contains("Content-Encoding: gzip"));
+        assert!(!headers.contains("Vary: Accept-Encoding"));
+        assert!(headers.contains("Content-Length:"));
+        assert!(!headers.contains("Transfer-Encoding: chunked"));
+        assert!(body.contains("<h1>Home Page</h1>"));
+    }
+
+    #[test]
+    fn production_adapter_compresses_server_payload_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = production_project_for(&app);
+
+        let response = production_http_request(
+            project,
+            b"GET /?__ferrite_payload=server HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip;q=1\r\n\r\n",
+        );
+        let headers = response_headers(&response);
+        let body = gunzip_to_string(response_body(&response));
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.contains(&format!("Content-Type: {SERVER_PAYLOAD_CONTENT_TYPE}")));
+        assert!(headers.contains("Content-Encoding: gzip"));
+        assert!(headers.contains("Vary: Accept-Encoding"));
+        assert!(headers.contains("Content-Length:"));
+        assert!(!headers.contains("Transfer-Encoding: chunked"));
+        assert!(body.contains(r#""ferrite":"server-payload""#));
+        assert!(body.contains("Home Page"));
+    }
+
+    #[test]
+    fn production_adapter_compresses_server_payload_frame_streams() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = production_project_for(&app);
+        make_script(
+            &temp.path().join("render-page.mjs"),
+            r#"
+const mode = process.argv[2];
+if (mode === "--server-payload") {
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-payload",
+    version: 1,
+    shell: [2, "main", {}, [
+      [2, "h1", {}, [[0, "Compressed shell"]]],
+      [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[0, "Loading"]]]
+    ]],
+    clientReferences: [],
+    chunks: [{ id: "s0", root: [2, "strong", {}, [[0, "Compressed chunk"]]], clientReferences: [] }]
+  }));
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected" }));
+"#,
+        );
+
+        let response = production_http_request(
+            project,
+            b"GET /?__ferrite_payload=stream HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip, br\r\n\r\n",
+        );
+        let headers = response_headers(&response);
+        let compressed_body = decode_chunked_body(response_body(&response));
+        let body = gunzip_to_string(&compressed_body);
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert!(headers.contains(&format!(
+            "Content-Type: {SERVER_PAYLOAD_STREAM_CONTENT_TYPE}"
+        )));
+        assert!(headers.contains("Content-Encoding: gzip"));
+        assert!(headers.contains("Vary: Accept-Encoding"));
+        assert!(headers.contains("Transfer-Encoding: chunked"));
+        assert!(!headers.contains("Content-Length:"));
+        assert!(body.contains(r#""ferrite":"server-payload-frame""#));
+        assert!(body.contains(r#""kind":"shell""#));
+        assert!(body.contains(r#""kind":"chunk""#));
+        assert!(body.contains("Compressed shell"));
+        assert!(body.contains("Compressed chunk"));
     }
 
     #[test]
