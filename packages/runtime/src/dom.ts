@@ -107,6 +107,7 @@ export type ServerPayloadNavigationOptions = FetchServerPayloadOptions & {
   eventRoot?: ParentNode;
   routeRootId?: string | null;
   reconcileHead?: boolean;
+  prefetch?: boolean;
   fallback?: (url: URL) => void;
   onError?: (error: unknown, url: URL) => void;
 };
@@ -117,6 +118,7 @@ export type ServerPayloadNavigateOptions = {
 };
 
 export type ServerPayloadNavigator = {
+  prefetch(input: string | URL): Promise<ServerPayloadPacket | null>;
   navigate(input: string | URL, options?: ServerPayloadNavigateOptions): Promise<ServerPayloadPacket | null>;
   destroy(): void;
 };
@@ -247,6 +249,7 @@ export function createServerPayloadNavigator(
     fetch: options.fetch,
     requestInit: options.requestInit,
   };
+  const prefetchedPayloads = new Map<string, ServerPayloadPacket | Promise<ServerPayloadPacket>>();
   let destroyed = false;
 
   seedNavigationHistory(navigationWindow);
@@ -259,6 +262,44 @@ export function createServerPayloadNavigator(
     headPlan?.apply();
   };
 
+  const prefetch = async (input: string | URL): Promise<ServerPayloadPacket | null> => {
+    const url = navigationUrl(input, navigationWindow);
+    if (!isSameOriginNavigation(url, navigationWindow)) {
+      return null;
+    }
+
+    const key = navigationCacheKey(url);
+    const existing = prefetchedPayloads.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const request = fetchServerPayload(url, fetchOptions).then(
+      (packet) => {
+        if (!destroyed) {
+          prefetchedPayloads.set(key, packet);
+        }
+        return packet;
+      },
+      (error) => {
+        prefetchedPayloads.delete(key);
+        throw error;
+      },
+    );
+    prefetchedPayloads.set(key, request);
+    return request;
+  };
+
+  const loadNavigationPacket = async (url: URL): Promise<ServerPayloadPacket> => {
+    const key = navigationCacheKey(url);
+    const prefetched = prefetchedPayloads.get(key);
+    if (prefetched) {
+      prefetchedPayloads.delete(key);
+      return prefetched;
+    }
+    return fetchServerPayload(url, fetchOptions);
+  };
+
   const navigate = async (
     input: string | URL,
     navigateOptions: ServerPayloadNavigateOptions = {},
@@ -269,7 +310,7 @@ export function createServerPayloadNavigator(
     }
 
     try {
-      const packet = await fetchServerPayload(url, fetchOptions);
+      const packet = await loadNavigationPacket(url);
       applyNavigationPacket(packet);
       updateNavigationHistory(navigationWindow, url, navigateOptions.replace === true);
       return packet;
@@ -295,7 +336,7 @@ export function createServerPayloadNavigator(
 
   const restore = async (url: URL): Promise<void> => {
     try {
-      const packet = await fetchServerPayload(url, fetchOptions);
+      const packet = await loadNavigationPacket(url);
       if (destroyed) {
         return;
       }
@@ -318,14 +359,33 @@ export function createServerPayloadNavigator(
     void restore(url);
   };
 
+  const handlePrefetchIntent = (event: Event) => {
+    const url = navigationIntentUrl(event, navigationWindow);
+    if (!url) {
+      return;
+    }
+
+    void prefetch(url).catch(() => undefined);
+  };
+
   eventRoot.addEventListener("click", handleClick);
+  if (options.prefetch === true) {
+    eventRoot.addEventListener("pointerover", handlePrefetchIntent);
+    eventRoot.addEventListener("focusin", handlePrefetchIntent);
+  }
   navigationWindow.addEventListener("popstate", handlePopState);
 
   return {
+    prefetch,
     navigate,
     destroy() {
       destroyed = true;
+      prefetchedPayloads.clear();
       eventRoot.removeEventListener("click", handleClick);
+      if (options.prefetch === true) {
+        eventRoot.removeEventListener("pointerover", handlePrefetchIntent);
+        eventRoot.removeEventListener("focusin", handlePrefetchIntent);
+      }
       navigationWindow.removeEventListener("popstate", handlePopState);
     },
   };
@@ -741,7 +801,19 @@ function navigationClickUrl(event: Event, navigationWindow: Window): URL | null 
     return null;
   }
 
-  const anchor = closestAnchor(mouseEvent.target);
+  return navigationAnchorUrl(mouseEvent.target, navigationWindow);
+}
+
+function navigationIntentUrl(event: Event, navigationWindow: Window): URL | null {
+  if (event.defaultPrevented) {
+    return null;
+  }
+
+  return navigationAnchorUrl(event.target, navigationWindow);
+}
+
+function navigationAnchorUrl(target: EventTarget | null, navigationWindow: Window): URL | null {
+  const anchor = closestAnchor(target);
   if (!anchor) {
     return null;
   }
@@ -750,8 +822,8 @@ function navigationClickUrl(event: Event, navigationWindow: Window): URL | null 
     return null;
   }
 
-  const target = anchor.getAttribute("target");
-  if (target && target.toLowerCase() !== "_self") {
+  const anchorTarget = anchor.getAttribute("target");
+  if (anchorTarget && anchorTarget.toLowerCase() !== "_self") {
     return null;
   }
 
@@ -766,6 +838,10 @@ function navigationClickUrl(event: Event, navigationWindow: Window): URL | null 
   }
 
   return url;
+}
+
+function navigationCacheKey(url: URL): string {
+  return url.href;
 }
 
 function isMouseNavigationEvent(event: Event): event is MouseEvent {

@@ -992,6 +992,223 @@ test("server payload navigator intercepts same-origin link clicks", async () => 
   navigator.destroy();
 });
 
+test("server payload navigator prefetches and consumes payloads for navigation", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const requests = [];
+  const payload = navigationDocumentPayload("/posts/prefetched", "Prefetched route", "Prefetched title");
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async (input) => {
+      requests.push(input);
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => payload,
+      };
+    },
+  });
+
+  const prefetched = await navigator.prefetch("/posts/prefetched");
+
+  assert.equal(prefetched, payload);
+  assert.deepEqual(requests, ["https://example.com/posts/prefetched?__ferrite_payload=server"]);
+  assert.equal(container.innerHTML, '<div id="ferrite-root" data-route="/posts/old">Old</div>');
+
+  const applied = await navigator.navigate("/posts/prefetched");
+
+  assert.equal(applied, payload);
+  assert.deepEqual(requests, ["https://example.com/posts/prefetched?__ferrite_payload=server"]);
+  assert.equal(window.location.href, "https://example.com/posts/prefetched");
+  assert.equal(window.document.title, "Prefetched title");
+  assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/prefetched");
+  assert.equal(container.textContent, "Prefetched route");
+
+  navigator.destroy();
+});
+
+test("server payload navigator prefetches safe links on focus intent", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const link = window.document.createElement("a");
+  link.href = "/posts/focused";
+  link.textContent = "Focused";
+  window.document.body.append(link);
+  const requests = [];
+  const payload = navigationDocumentPayload("/posts/focused", "Focused route", "Focused title");
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    prefetch: true,
+    fetch: async (input) => {
+      requests.push(input);
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => payload,
+      };
+    },
+  });
+
+  link.dispatchEvent(new window.Event("focusin", { bubbles: true }));
+  await flushScheduledWork();
+
+  assert.deepEqual(requests, ["https://example.com/posts/focused?__ferrite_payload=server"]);
+  assert.equal(container.textContent, "Old");
+
+  const event = new window.MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+  link.dispatchEvent(event);
+  await flushScheduledWork();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.deepEqual(requests, ["https://example.com/posts/focused?__ferrite_payload=server"]);
+  assert.equal(window.location.href, "https://example.com/posts/focused");
+  assert.equal(window.document.title, "Focused title");
+  assert.equal(container.textContent, "Focused route");
+
+  navigator.destroy();
+});
+
+test("server payload navigator evicts failed prefetches without mutating DOM", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  let attempts = 0;
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          ok: false,
+          status: 502,
+          statusText: "Bad Gateway",
+          json: async () => ({ error: "bad gateway" }),
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => navigationDocumentPayload("/posts/retry", "Retry route", "Retry title"),
+      };
+    },
+  });
+
+  await assert.rejects(() => navigator.prefetch("/posts/retry"), /failed with 502 Bad Gateway/);
+
+  assert.equal(attempts, 1);
+  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(container.innerHTML, '<div id="ferrite-root" data-route="/posts/old">Old</div>');
+
+  await navigator.navigate("/posts/retry");
+
+  assert.equal(attempts, 2);
+  assert.equal(window.location.href, "https://example.com/posts/retry");
+  assert.equal(window.document.title, "Retry title");
+  assert.equal(container.textContent, "Retry route");
+
+  navigator.destroy();
+});
+
+test("server payload navigator evicts malformed prefetches without mutating DOM", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  let attempts = 0;
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            ferrite: "not-server-payload",
+            version: 1,
+            shell: [0, ""],
+            clientReferences: [],
+            chunks: [],
+          }),
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => navigationDocumentPayload("/posts/valid", "Valid route", "Valid title"),
+      };
+    },
+  });
+
+  await assert.rejects(() => navigator.prefetch("/posts/valid"), /ferrite marker "server-payload"/);
+
+  assert.equal(attempts, 1);
+  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(container.innerHTML, '<div id="ferrite-root" data-route="/posts/old">Old</div>');
+
+  await navigator.navigate("/posts/valid");
+
+  assert.equal(attempts, 2);
+  assert.equal(window.location.href, "https://example.com/posts/valid");
+  assert.equal(window.document.title, "Valid title");
+  assert.equal(container.textContent, "Valid route");
+
+  navigator.destroy();
+});
+
+test("server payload navigator does not prefetch bypassed links", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("main", null, "Old"), container);
+  let fetchCalls = 0;
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    prefetch: true,
+    fetch: async () => {
+      fetchCalls += 1;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => navigationDocumentPayload("/ignored", "Ignored", "Ignored"),
+      };
+    },
+  });
+  const cases = [
+    { href: "https://other.example/posts/next" },
+    { href: "/download", download: "" },
+    { href: "/target", target: "_blank" },
+    { href: "#section" },
+  ];
+
+  for (const entry of cases) {
+    const link = window.document.createElement("a");
+    link.href = entry.href;
+    if ("download" in entry) {
+      link.setAttribute("download", entry.download);
+    }
+    if (entry.target) {
+      link.target = entry.target;
+    }
+    window.document.body.append(link);
+
+    link.dispatchEvent(new window.MouseEvent("pointerover", { bubbles: true }));
+    link.dispatchEvent(new window.Event("focusin", { bubbles: true }));
+  }
+
+  const external = await navigator.prefetch("https://other.example/posts/next");
+  await flushScheduledWork();
+
+  assert.equal(external, null);
+  assert.equal(fetchCalls, 0);
+  assert.equal(container.textContent, "Old");
+
+  navigator.destroy();
+});
+
 test("server payload navigator falls back after failed click payload requests", async () => {
   const { window, container } = createContainer("https://example.com/posts/old");
   const root = mount(createElement("main", { "data-route": "/posts/old" }, "Old"), container);
