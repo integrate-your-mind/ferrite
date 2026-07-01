@@ -10,14 +10,18 @@ use ferrite_client_bundler::{ClientBundle, ClientBundleError, ClientBundler};
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
 };
+use ferrite_protocol::{SERVER_PAYLOAD_STREAM_FRAME_MARKER, SERVER_PAYLOAD_STREAM_FRAME_VERSION};
 use ferrite_router::{Route, find_document_file, scan_app_dir, write_route_types};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 const SERVER_PAYLOAD_CONTENT_TYPE: &str =
     "application/vnd.ferrite.server-payload+json; charset=utf-8";
+const SERVER_PAYLOAD_STREAM_CONTENT_TYPE: &str =
+    "application/vnd.ferrite.server-payload-stream+jsonl; charset=utf-8";
 const SERVER_PAYLOAD_QUERY_NAME: &str = "__ferrite_payload";
 const SERVER_PAYLOAD_QUERY_VALUE: &str = "server";
+const SERVER_PAYLOAD_STREAM_QUERY_VALUE: &str = "stream";
 
 #[derive(Debug)]
 pub enum DevServerError {
@@ -244,9 +248,20 @@ impl DevProject {
                 RouteResponseMode::Html => {
                     self.route_stream_response(path, &match_result, &renderer, &conventions)
                 }
-                RouteResponseMode::ServerPayload => {
-                    self.route_server_payload_response(path, &match_result, &renderer, &conventions)
-                }
+                RouteResponseMode::ServerPayloadJson => self.route_server_payload_response(
+                    path,
+                    &match_result,
+                    &renderer,
+                    &conventions,
+                    ServerPayloadResponseKind::Json,
+                ),
+                RouteResponseMode::ServerPayloadStream => self.route_server_payload_response(
+                    path,
+                    &match_result,
+                    &renderer,
+                    &conventions,
+                    ServerPayloadResponseKind::Stream,
+                ),
             }
         } else {
             DevResponse::not_found(render_not_found(self.build_id, path, &snapshot.routes))
@@ -392,6 +407,7 @@ impl DevProject {
         match_result: &RouteMatch,
         renderer: &PageRenderer,
         conventions: &RouteConventions,
+        response_kind: ServerPayloadResponseKind,
     ) -> DevResponse {
         match find_document_file(&self.config.app_dir) {
             Some(document_file) => match renderer.collect_metadata(
@@ -430,7 +446,7 @@ impl DevProject {
                                 },
                                 conventions,
                             ) {
-                            Ok(payload) => DevResponse::server_payload_json(payload),
+                            Ok(payload) => server_payload_response(payload, response_kind),
                             Err(error) => DevResponse::internal_error(render_render_error(
                                 self.build_id,
                                 path,
@@ -459,7 +475,7 @@ impl DevProject {
                 &match_result.params,
                 conventions,
             ) {
-                Ok(payload) => DevResponse::server_payload_json(payload),
+                Ok(payload) => server_payload_response(payload, response_kind),
                 Err(error) => DevResponse::internal_error(render_render_error(
                     self.build_id,
                     path,
@@ -560,12 +576,21 @@ impl ProductionProject {
                     snapshot.document_file.as_deref(),
                     &conventions,
                 ),
-                RouteResponseMode::ServerPayload => self.route_server_payload_response(
+                RouteResponseMode::ServerPayloadJson => self.route_server_payload_response(
                     path,
                     &match_result,
                     &renderer,
                     snapshot.document_file.as_deref(),
                     &conventions,
+                    ServerPayloadResponseKind::Json,
+                ),
+                RouteResponseMode::ServerPayloadStream => self.route_server_payload_response(
+                    path,
+                    &match_result,
+                    &renderer,
+                    snapshot.document_file.as_deref(),
+                    &conventions,
+                    ServerPayloadResponseKind::Stream,
                 ),
             }
             .with_cache_control("no-store")
@@ -706,6 +731,7 @@ impl ProductionProject {
         renderer: &PageRenderer,
         document_file: Option<&Path>,
         conventions: &RouteConventions,
+        response_kind: ServerPayloadResponseKind,
     ) -> DevResponse {
         match document_file {
             Some(document_file) => {
@@ -745,7 +771,7 @@ impl ProductionProject {
                                     },
                                     conventions,
                                 ) {
-                                Ok(payload) => DevResponse::server_payload_json(payload),
+                                Ok(payload) => server_payload_response(payload, response_kind),
                                 Err(error) => DevResponse::internal_error(
                                     render_production_render_error(path, match_result, &error),
                                 ),
@@ -768,7 +794,7 @@ impl ProductionProject {
                 &match_result.params,
                 conventions,
             ) {
-                Ok(payload) => DevResponse::server_payload_json(payload),
+                Ok(payload) => server_payload_response(payload, response_kind),
                 Err(error) => DevResponse::internal_error(render_production_render_error(
                     path,
                     match_result,
@@ -840,6 +866,31 @@ impl DevResponse {
 
     pub fn server_payload_json(body: String) -> Self {
         Self::ok(SERVER_PAYLOAD_CONTENT_TYPE, body)
+    }
+
+    pub fn server_payload_stream(shell: String, chunks: Vec<String>) -> Self {
+        let shell_bytes = shell.into_bytes();
+        let chunk_bytes = chunks
+            .into_iter()
+            .map(String::into_bytes)
+            .collect::<Vec<_>>();
+        let mut body = shell_bytes.clone();
+        for chunk in &chunk_bytes {
+            body.extend_from_slice(chunk);
+        }
+
+        Self {
+            status: 200,
+            reason: "OK",
+            content_type: SERVER_PAYLOAD_STREAM_CONTENT_TYPE,
+            body,
+            stream: Some(DevStreamBody {
+                shell: shell_bytes,
+                chunks: chunk_bytes,
+            }),
+            cache_control: None,
+            route_pattern_header: None,
+        }
     }
 
     pub fn not_found(body: String) -> Self {
@@ -926,7 +977,14 @@ struct ProductionRouteSnapshot {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum RouteResponseMode {
     Html,
-    ServerPayload,
+    ServerPayloadJson,
+    ServerPayloadStream,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ServerPayloadResponseKind {
+    Json,
+    Stream,
 }
 
 #[derive(Debug, Serialize)]
@@ -986,6 +1044,71 @@ fn render_script_tags(scripts: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn server_payload_response(payload: String, kind: ServerPayloadResponseKind) -> DevResponse {
+    match kind {
+        ServerPayloadResponseKind::Json => DevResponse::server_payload_json(payload),
+        ServerPayloadResponseKind::Stream => match server_payload_stream_frames(&payload) {
+            Ok((shell, chunks)) => DevResponse::server_payload_stream(shell, chunks),
+            Err(error) => DevResponse::internal_error(format!(
+                "<!doctype html><title>Ferrite Payload Error</title><pre>{}</pre>",
+                escape_html(&error.to_string())
+            )),
+        },
+    }
+}
+
+fn server_payload_stream_frames(payload: &str) -> Result<(String, Vec<String>)> {
+    let mut value: Value = serde_json::from_str(payload)?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        DevServerError::Json(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server payload must be a JSON object",
+        )))
+    })?;
+
+    let shell = object.remove("shell").ok_or_else(|| {
+        DevServerError::Json(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server payload stream requires shell",
+        )))
+    })?;
+    let client_references = object
+        .remove("clientReferences")
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let chunks = object
+        .remove("chunks")
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let chunks = chunks.as_array().ok_or_else(|| {
+        DevServerError::Json(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server payload chunks must be an array",
+        )))
+    })?;
+
+    let shell_frame = json!({
+        "ferrite": SERVER_PAYLOAD_STREAM_FRAME_MARKER,
+        "version": SERVER_PAYLOAD_STREAM_FRAME_VERSION,
+        "kind": "shell",
+        "shell": shell,
+        "clientReferences": client_references,
+    });
+    let shell_frame = format!("{}\n", serde_json::to_string(&shell_frame)?);
+    let chunk_frames = chunks
+        .iter()
+        .map(|chunk| {
+            let frame = json!({
+                "ferrite": SERVER_PAYLOAD_STREAM_FRAME_MARKER,
+                "version": SERVER_PAYLOAD_STREAM_FRAME_VERSION,
+                "kind": "chunk",
+                "chunk": chunk,
+            });
+            serde_json::to_string(&frame).map(|line| format!("{line}\n"))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok((shell_frame, chunk_frames))
 }
 
 pub fn serve<A: ToSocketAddrs>(addr: A, mut project: DevProject) -> Result<()> {
@@ -1157,12 +1280,19 @@ fn route_response_mode(raw_path: &str) -> std::result::Result<RouteResponseMode,
         if name != SERVER_PAYLOAD_QUERY_NAME {
             continue;
         }
-        if value != SERVER_PAYLOAD_QUERY_VALUE {
-            return Err(format!(
-                "unsupported {SERVER_PAYLOAD_QUERY_NAME} value `{value}`; expected `{SERVER_PAYLOAD_QUERY_VALUE}`"
-            ));
+        match value {
+            SERVER_PAYLOAD_QUERY_VALUE => {
+                mode = RouteResponseMode::ServerPayloadJson;
+            }
+            SERVER_PAYLOAD_STREAM_QUERY_VALUE => {
+                mode = RouteResponseMode::ServerPayloadStream;
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported {SERVER_PAYLOAD_QUERY_NAME} value `{value}`; expected `{SERVER_PAYLOAD_QUERY_VALUE}` or `{SERVER_PAYLOAD_STREAM_QUERY_VALUE}`"
+                ));
+            }
         }
-        mode = RouteResponseMode::ServerPayload;
     }
 
     Ok(mode)
@@ -1958,6 +2088,55 @@ process.stdout.write(JSON.stringify({
     }
 
     #[test]
+    fn dev_adapter_returns_server_payload_stream_for_route_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Post() {}",
+        );
+        let mut project = project_for(&app);
+
+        let response = project
+            .handle_get("/posts/abc?__ferrite_payload=stream")
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, SERVER_PAYLOAD_STREAM_CONTENT_TYPE);
+        assert!(response.stream.is_some());
+        let body = response.body_text();
+        assert!(body.contains(r#""ferrite":"server-payload-frame""#));
+        assert!(body.contains(r#""kind":"shell""#));
+        assert!(body.contains("Post abc"));
+        assert!(!body.contains("<!doctype html>"));
+    }
+
+    #[test]
+    fn dev_adapter_returns_document_server_payload_stream_for_custom_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("document.tsx"),
+            "export default function Document() {}",
+        );
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+
+        let response = project.handle_get("/?__ferrite_payload=stream").unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, SERVER_PAYLOAD_STREAM_CONTENT_TYPE);
+        let body = response.body_text();
+        assert!(body.contains(r#""ferrite":"server-payload-frame""#));
+        assert!(body.contains(r#""kind":"shell""#));
+        assert!(body.contains(r#""data-document":"dev-test""#));
+        assert!(body.contains("ferrite-dev-root"));
+        assert!(body.contains("Home Page"));
+        assert!(!body.contains("<!doctype html>"));
+    }
+
+    #[test]
     fn production_adapter_returns_server_payload_for_route_query() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -1978,6 +2157,33 @@ process.stdout.write(JSON.stringify({
         assert_eq!(response.route_pattern_header.as_deref(), Some("/posts/:id"));
         let body = response.body_text();
         assert!(body.contains(r#""ferrite":"server-payload""#));
+        assert!(body.contains("Post abc"));
+        assert!(!body.contains("/__ferrite/client.js"));
+    }
+
+    #[test]
+    fn production_adapter_returns_server_payload_stream_for_route_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Post() {}",
+        );
+        let mut project = production_project_for(&app);
+
+        let response = project
+            .handle_get("/posts/abc?__ferrite_payload=stream")
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, SERVER_PAYLOAD_STREAM_CONTENT_TYPE);
+        assert!(response.stream.is_some());
+        assert_eq!(response.cache_control, Some("no-store"));
+        assert_eq!(response.route_pattern_header.as_deref(), Some("/posts/:id"));
+        let body = response.body_text();
+        assert!(body.contains(r#""ferrite":"server-payload-frame""#));
+        assert!(body.contains(r#""kind":"shell""#));
         assert!(body.contains("Post abc"));
         assert!(!body.contains("/__ferrite/client.js"));
     }
@@ -2074,6 +2280,61 @@ process.stdout.write("{}");
         assert!(response.contains("Content-Length:"));
         assert!(!response.contains("Transfer-Encoding: chunked"));
         assert!(response.contains(r#""ferrite":"server-payload""#));
+    }
+
+    #[test]
+    fn serves_server_payload_stream_query_over_real_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = project_for(&app);
+        make_script(
+            &temp.path().join("render-page.mjs"),
+            r#"
+const mode = process.argv[2];
+if (mode === "--server-payload") {
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-payload",
+    version: 1,
+    shell: [2, "main", {}, [
+      [2, "h1", {}, [[0, "Stream shell"]]],
+      [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[0, "Loading"]]]
+    ]],
+    clientReferences: [],
+    chunks: [{ id: "s0", root: [2, "strong", {}, [[0, "Stream chunk"]]], clientReferences: [] }]
+  }));
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected" }));
+"#,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut project = project;
+            serve_listener_once(listener, &mut project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(b"GET /?__ferrite_payload=stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(&format!(
+            "Content-Type: {SERVER_PAYLOAD_STREAM_CONTENT_TYPE}"
+        )));
+        assert!(response.contains("Transfer-Encoding: chunked"));
+        assert!(!response.contains("Content-Length:"));
+        assert!(response.contains(r#""ferrite":"server-payload-frame""#));
+        assert!(response.contains(r#""kind":"shell""#));
+        assert!(response.contains(r#""kind":"chunk""#));
+        assert!(response.contains("Stream shell"));
+        assert!(response.contains("Stream chunk"));
     }
 
     #[test]

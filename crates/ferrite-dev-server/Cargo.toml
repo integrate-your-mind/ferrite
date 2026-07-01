@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 ferrite-client-bundler = { path = "../ferrite-client-bundler" }
 ferrite-page-renderer = { path = "../ferrite-page-renderer" }
+ferrite-protocol = { path = "../ferrite-protocol" }
 ferrite-router = { path = "../ferrite-router" }
 serde = { workspace = true }
 serde_json = { workspace = true }

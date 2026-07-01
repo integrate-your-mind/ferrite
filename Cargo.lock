@@ -175,6 +175,7 @@ version = "0.1.0"
 dependencies = [
  "ferrite-client-bundler",
  "ferrite-page-renderer",
+ "ferrite-protocol",
  "ferrite-router",
  "serde",
  "serde_json",
