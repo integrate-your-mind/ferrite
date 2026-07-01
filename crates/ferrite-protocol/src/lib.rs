@@ -7,8 +7,10 @@ use serde_json::Value;
 pub const RENDER_PACKET_MARKER: &str = "render-packet";
 pub const RENDER_STREAM_MARKER: &str = "render-stream";
 pub const CLIENT_REFERENCE_MARKER: &str = "client-reference";
+pub const SERVER_PAYLOAD_MARKER: &str = "server-payload";
 pub const RENDER_PACKET_VERSION: u64 = 1;
 pub const CLIENT_REFERENCE_VERSION: u64 = 1;
+pub const SERVER_PAYLOAD_VERSION: u64 = 1;
 pub const COMPACT_TEXT_OPCODE: u8 = 0;
 pub const COMPACT_FRAGMENT_OPCODE: u8 = 1;
 pub const COMPACT_ELEMENT_OPCODE: u8 = 2;
@@ -41,6 +43,17 @@ pub fn typescript_protocol_source() -> String {
     writeln!(
         out,
         "export const CLIENT_REFERENCE_VERSION = {CLIENT_REFERENCE_VERSION} as const;"
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_PAYLOAD_MARKER = {} as const;",
+        serde_json::to_string(SERVER_PAYLOAD_MARKER).expect("string serialization cannot fail")
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_PAYLOAD_VERSION = {SERVER_PAYLOAD_VERSION} as const;"
     )
     .expect("writing to a string cannot fail");
     out.push('\n');
@@ -119,6 +132,20 @@ export type ClientReferencePayload = {
   props: Record<string, ClientReferenceSerializableValue>;
 };
 
+export type ServerPayloadChunk = {
+  id: string;
+  root: CompactNode;
+  clientReferences: ClientReferencePayload[];
+};
+
+export type ServerPayloadPacket = {
+  ferrite: typeof SERVER_PAYLOAD_MARKER;
+  version: typeof SERVER_PAYLOAD_VERSION;
+  shell: CompactNode;
+  clientReferences: ClientReferencePayload[];
+  chunks: ServerPayloadChunk[];
+};
+
 export function parseClientReferenceId(id: string): { module: string; exportName: string } {
   if (typeof id !== "string" || id.length === 0) {
     throw new TypeError("Ferrite client reference requires a non-empty id.");
@@ -186,6 +213,58 @@ export function validateClientReferencePayload(payload: unknown): ClientReferenc
   }
 
   return candidate as ClientReferencePayload;
+}
+
+export function validateServerPayloadPacket(payload: unknown): ServerPayloadPacket {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("Ferrite server payload must be an object.");
+  }
+
+  const candidate = payload as Partial<ServerPayloadPacket>;
+  if (candidate.ferrite !== SERVER_PAYLOAD_MARKER) {
+    throw new TypeError(`expected ferrite marker "${SERVER_PAYLOAD_MARKER}"`);
+  }
+
+  if (candidate.version !== SERVER_PAYLOAD_VERSION) {
+    throw new TypeError(`unsupported server payload version ${String(candidate.version)}; expected ${SERVER_PAYLOAD_VERSION}`);
+  }
+
+  if (!Array.isArray(candidate.clientReferences)) {
+    throw new TypeError("Ferrite server payload clientReferences must be an array.");
+  }
+
+  if (!Array.isArray(candidate.chunks)) {
+    throw new TypeError("Ferrite server payload chunks must be an array.");
+  }
+
+  candidate.clientReferences = candidate.clientReferences.map(validateClientReferencePayload);
+  candidate.chunks = candidate.chunks.map((chunk, index) => validateServerPayloadChunk(chunk, index));
+
+  return candidate as ServerPayloadPacket;
+}
+
+function validateServerPayloadChunk(chunk: unknown, index: number): ServerPayloadChunk {
+  if (chunk === null || typeof chunk !== "object" || Array.isArray(chunk)) {
+    throw new TypeError(`Ferrite server payload chunk ${index} must be an object.`);
+  }
+
+  const candidate = chunk as Partial<ServerPayloadChunk>;
+  if (typeof candidate.id !== "string" || candidate.id.length === 0) {
+    throw new TypeError(`Ferrite server payload chunk ${index} requires a non-empty id.`);
+  }
+  validateStreamChunkId(candidate.id);
+
+  if (!Array.isArray(candidate.clientReferences)) {
+    throw new TypeError(`Ferrite server payload chunk ${index} clientReferences must be an array.`);
+  }
+  candidate.clientReferences = candidate.clientReferences.map(validateClientReferencePayload);
+  return candidate as ServerPayloadChunk;
+}
+
+function validateStreamChunkId(id: string): void {
+  if (!/^[A-Za-z0-9_:-]+$/.test(id)) {
+    throw new TypeError(`invalid stream chunk id "${id}"`);
+  }
 }
 
 export function validateClientReferenceParts(id: string, module: string, exportName: string): void {
@@ -322,6 +401,27 @@ pub struct ClientReferencePayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerPayloadPacket {
+    pub ferrite: String,
+    pub version: u64,
+    pub shell: CompactNode,
+    #[serde(default)]
+    pub client_references: Vec<ClientReferencePayload>,
+    #[serde(default)]
+    pub chunks: Vec<ServerPayloadChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerPayloadChunk {
+    pub id: String,
+    pub root: CompactNode,
+    #[serde(default)]
+    pub client_references: Vec<ClientReferencePayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompactNode {
     Text((u8, String)),
@@ -359,6 +459,7 @@ pub fn looks_like_ferrite_payload(value: &Value) -> bool {
             || object.contains_key("chunks")
             || object.contains_key("module")
             || object.contains_key("exportName")
+            || object.contains_key("clientReferences")
     })
 }
 
@@ -428,6 +529,34 @@ pub fn validate_client_reference_payload(payload: &ClientReferencePayload) -> Re
 
     for (key, value) in &payload.props {
         validate_client_reference_value(value, &format!("props.{key}"))?;
+    }
+
+    Ok(())
+}
+
+pub fn validate_server_payload_packet(packet: &ServerPayloadPacket) -> Result<()> {
+    if packet.ferrite != SERVER_PAYLOAD_MARKER {
+        return Err(ProtocolError::new(format!(
+            "expected ferrite marker \"{SERVER_PAYLOAD_MARKER}\""
+        )));
+    }
+
+    if packet.version != SERVER_PAYLOAD_VERSION {
+        return Err(ProtocolError::new(format!(
+            "unsupported server payload version {}; expected {SERVER_PAYLOAD_VERSION}",
+            packet.version
+        )));
+    }
+
+    for reference in &packet.client_references {
+        validate_client_reference_payload(reference)?;
+    }
+
+    for chunk in &packet.chunks {
+        validate_chunk_id(&chunk.id)?;
+        for reference in &chunk.client_references {
+            validate_client_reference_payload(reference)?;
+        }
     }
 
     Ok(())
@@ -643,6 +772,67 @@ mod tests {
             .unwrap_err()
             .message(),
             "invalid client reference export \"bad-name\""
+        );
+    }
+
+    #[test]
+    fn validates_server_payload_packets() {
+        let reference = ClientReferencePayload {
+            ferrite: CLIENT_REFERENCE_MARKER.to_owned(),
+            version: CLIENT_REFERENCE_VERSION,
+            id: "app/Button.tsx#default".to_owned(),
+            module: "app/Button.tsx".to_owned(),
+            export_name: "default".to_owned(),
+            props: BTreeMap::from([("id".to_owned(), Value::String("alpha".to_owned()))]),
+        };
+        let packet = ServerPayloadPacket {
+            ferrite: SERVER_PAYLOAD_MARKER.to_owned(),
+            version: SERVER_PAYLOAD_VERSION,
+            shell: CompactNode::Text((0, "shell".to_owned())),
+            client_references: vec![reference.clone()],
+            chunks: vec![ServerPayloadChunk {
+                id: "s0".to_owned(),
+                root: CompactNode::Text((0, "chunk".to_owned())),
+                client_references: vec![reference],
+            }],
+        };
+
+        assert!(validate_server_payload_packet(&packet).is_ok());
+
+        let mut wrong_marker = packet.clone();
+        wrong_marker.ferrite = "other".to_owned();
+        assert_eq!(
+            validate_server_payload_packet(&wrong_marker)
+                .unwrap_err()
+                .message(),
+            "expected ferrite marker \"server-payload\""
+        );
+
+        let mut wrong_version = packet.clone();
+        wrong_version.version = 99;
+        assert_eq!(
+            validate_server_payload_packet(&wrong_version)
+                .unwrap_err()
+                .message(),
+            "unsupported server payload version 99; expected 1"
+        );
+
+        let mut bad_chunk = packet.clone();
+        bad_chunk.chunks[0].id = "bad id".to_owned();
+        assert_eq!(
+            validate_server_payload_packet(&bad_chunk)
+                .unwrap_err()
+                .message(),
+            "invalid stream chunk id \"bad id\""
+        );
+
+        let mut bad_reference = packet.clone();
+        bad_reference.client_references[0].id = "app/Button.tsx#Other".to_owned();
+        assert_eq!(
+            validate_server_payload_packet(&bad_reference)
+                .unwrap_err()
+                .message(),
+            "client reference id must equal \"app/Button.tsx#default\""
         );
     }
 

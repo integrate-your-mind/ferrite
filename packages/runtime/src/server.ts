@@ -18,12 +18,19 @@ import {
   type RenderStreamPacket,
   type ErrorBoundaryProps,
   type SerializableNode,
+  type ServerPayloadPacket,
   type StateUpdater,
   type SuspenseProps,
   type TransitionStartFunction,
 } from "./index.js";
-import { createClientReferencePayload, parseClientReferenceId } from "./protocol.js";
-import type { ClientReferenceSerializableValue } from "./protocol.js";
+import {
+  SERVER_PAYLOAD_MARKER,
+  SERVER_PAYLOAD_VERSION,
+  createClientReferencePayload,
+  parseClientReferenceId,
+  validateClientReferencePayload,
+} from "./protocol.js";
+import type { ClientReferencePayload, ClientReferenceSerializableValue } from "./protocol.js";
 
 export type PageModule<Props extends Record<string, unknown> = Record<string, unknown>> = {
   default: (props: Props) => Child | Promise<Child>;
@@ -197,6 +204,16 @@ export async function renderPageModuleToStreamPacket(
   return renderServerChildToStreamPacket(rendered);
 }
 
+export async function renderPageModuleToServerPayload(
+  module: PageModule,
+  props: Record<string, unknown> = {},
+  layouts: LayoutModule[] = [],
+  conventions: RouteConventionModules = {},
+): Promise<ServerPayloadPacket> {
+  const rendered = await renderPageChild(module, props, layouts, conventions, { stream: true });
+  return renderServerChildToServerPayload(rendered);
+}
+
 export async function renderDocumentModule(
   pageModule: PageModule,
   props: Record<string, unknown>,
@@ -299,6 +316,52 @@ export async function renderDocumentModuleToStreamPacket(
   }
 
   return renderStreamPacketFromShell(documentShell, context);
+}
+
+export async function renderDocumentModuleToServerPayload(
+  pageModule: PageModule,
+  props: Record<string, unknown>,
+  layouts: LayoutModule[],
+  documentModule: DocumentModule,
+  options: DocumentRenderOptions,
+  conventions: RouteConventionModules = {},
+): Promise<ServerPayloadPacket> {
+  if (typeof documentModule.default !== "function") {
+    throw new TypeError("Ferrite document module must export a default component function.");
+  }
+
+  const page = await renderPageChild(pageModule, props, layouts, conventions, { stream: true });
+  const context = createServerRenderContext(true);
+  const metadata = normalizeMetadata(options.metadata, "document options");
+  const rootProps: Record<string, unknown> = {
+    id: options.rootId,
+    "data-route": options.routePath,
+  };
+  if (options.routePattern) {
+    rootProps["data-route-pattern"] = options.routePattern;
+  }
+  if (options.buildId !== undefined) {
+    rootProps["data-ferrite-build-id"] = options.buildId;
+  }
+
+  const children = createServerElement("div", rootProps, page);
+  const head = createDocumentHead(metadata, options);
+  const rendered = await withHookDispatcher(serverHookDispatcher, () =>
+    documentModule.default({
+      children,
+      head,
+      routePath: options.routePath,
+      routePattern: options.routePattern,
+      buildId: options.buildId,
+      metadata,
+    }),
+  );
+  const documentShell = await resolveRenderedNode(renderServerChildMaybe(rendered, context));
+  if (!documentShell || documentShell.kind !== "element" || documentShell.tag !== "html") {
+    throw new TypeError("Ferrite document module must render an <html> element.");
+  }
+
+  return renderServerPayloadFromShell(documentShell, context);
 }
 
 export async function collectStaticParams(module: PageModule): Promise<StaticParamsResult> {
@@ -450,6 +513,12 @@ async function renderServerChildToStreamPacket(child: Child): Promise<RenderStre
   return renderStreamPacketFromShell(shell, context);
 }
 
+async function renderServerChildToServerPayload(child: Child): Promise<ServerPayloadPacket> {
+  const context = createServerRenderContext(true);
+  const shell = (await resolveRenderedNode(renderServerChildMaybe(child, context))) ?? emptyFragment();
+  return renderServerPayloadFromShell(shell, context);
+}
+
 async function renderStreamPacketFromShell(
   shell: SerializableNode,
   context: ServerRenderContext,
@@ -467,6 +536,30 @@ async function renderStreamPacketFromShell(
     ferrite: "render-stream",
     version: 1,
     shell: toCompactRoot(shell),
+    chunks,
+  };
+}
+
+async function renderServerPayloadFromShell(
+  shell: SerializableNode,
+  context: ServerRenderContext,
+): Promise<ServerPayloadPacket> {
+  const chunks: ServerPayloadPacket["chunks"] = [];
+  for (let index = 0; index < context.chunks.length; index += 1) {
+    const chunk = context.chunks[index];
+    const rootNode = await chunk.promise;
+    chunks.push({
+      id: chunk.id,
+      root: toCompactRoot(rootNode),
+      clientReferences: collectClientReferencePayloads(rootNode),
+    });
+  }
+
+  return {
+    ferrite: SERVER_PAYLOAD_MARKER,
+    version: SERVER_PAYLOAD_VERSION,
+    shell: toCompactRoot(shell),
+    clientReferences: collectClientReferencePayloads(shell),
     chunks,
   };
 }
@@ -647,6 +740,38 @@ function emptyFragment(): SerializableNode {
 
 function toCompactRoot(node: SerializableNode): CompactNode {
   return serializableNodeToRenderPacket(node).root;
+}
+
+function collectClientReferencePayloads(node: SerializableNode): ClientReferencePayload[] {
+  const references: ClientReferencePayload[] = [];
+  collectClientReferencePayloadsInto(node, references);
+  return references;
+}
+
+function collectClientReferencePayloadsInto(node: SerializableNode, references: ClientReferencePayload[]): void {
+  if (node.kind === "text") {
+    return;
+  }
+
+  if (node.kind === "fragment") {
+    node.children.forEach((child) => collectClientReferencePayloadsInto(child, references));
+    return;
+  }
+
+  const rawPayload = node.props["data-ferrite-client-payload"];
+  if (typeof rawPayload === "string") {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawPayload);
+    } catch (error) {
+      throw new TypeError(
+        `Ferrite client reference payload must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    references.push(validateClientReferencePayload(parsed));
+  }
+
+  node.children.forEach((child) => collectClientReferencePayloadsInto(child, references));
 }
 
 function serializeServerProps(props: Record<string, unknown>): Record<string, string | number | boolean> {

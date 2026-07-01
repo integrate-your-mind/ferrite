@@ -164,6 +164,54 @@ impl PageRenderer {
         Ok(ferrite_ssr::render_stream_json_to_parts(&json)?)
     }
 
+    pub fn render_page_to_server_payload_parts(
+        &self,
+        page_file: &Path,
+        layouts: &[PathBuf],
+        params: &[(String, Value)],
+    ) -> Result<ferrite_ssr::RenderStreamParts> {
+        self.render_page_to_server_payload_parts_with_conventions(
+            page_file,
+            layouts,
+            params,
+            &RouteConventions::default(),
+        )
+    }
+
+    pub fn render_page_to_server_payload_parts_with_conventions(
+        &self,
+        page_file: &Path,
+        layouts: &[PathBuf],
+        params: &[(String, Value)],
+        conventions: &RouteConventions,
+    ) -> Result<ferrite_ssr::RenderStreamParts> {
+        let props = PageProps {
+            params: params.iter().cloned().collect(),
+        };
+        let props_json = serde_json::to_string(&props)?;
+        let layouts_json = serde_json::to_string(layouts)?;
+        let conventions_json = serde_json::to_string(conventions)?;
+        let output = Command::new("node")
+            .arg(&self.script)
+            .arg("--server-payload")
+            .arg(page_file)
+            .arg(props_json)
+            .arg(layouts_json)
+            .arg(conventions_json)
+            .current_dir(&self.project)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(PageRenderError::NodeFailed {
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let json = String::from_utf8_lossy(&output.stdout);
+        Ok(ferrite_ssr::render_server_payload_json_to_parts(&json)?)
+    }
+
     pub fn generate_static_params(&self, page_file: &Path) -> Result<StaticParamsResult> {
         let output = Command::new("node")
             .arg(&self.script)
@@ -325,6 +373,65 @@ impl PageRenderer {
 
         let json = String::from_utf8_lossy(&output.stdout);
         let mut parts = ferrite_ssr::render_stream_json_to_parts(&json)?;
+        parts.shell = format!("<!doctype html>\n{}", parts.shell);
+        Ok(parts)
+    }
+
+    pub fn render_document_to_server_payload_parts(
+        &self,
+        page_file: &Path,
+        layouts: &[PathBuf],
+        document_file: &Path,
+        params: &[(String, Value)],
+        options: &DocumentRenderOptions,
+    ) -> Result<ferrite_ssr::RenderStreamParts> {
+        self.render_document_to_server_payload_parts_with_conventions(
+            page_file,
+            layouts,
+            document_file,
+            params,
+            options,
+            &RouteConventions::default(),
+        )
+    }
+
+    pub fn render_document_to_server_payload_parts_with_conventions(
+        &self,
+        page_file: &Path,
+        layouts: &[PathBuf],
+        document_file: &Path,
+        params: &[(String, Value)],
+        options: &DocumentRenderOptions,
+        conventions: &RouteConventions,
+    ) -> Result<ferrite_ssr::RenderStreamParts> {
+        let props = PageProps {
+            params: params.iter().cloned().collect(),
+        };
+        let props_json = serde_json::to_string(&props)?;
+        let layouts_json = serde_json::to_string(layouts)?;
+        let options_json = serde_json::to_string(options)?;
+        let conventions_json = serde_json::to_string(conventions)?;
+        let output = Command::new("node")
+            .arg(&self.script)
+            .arg("--document-server-payload")
+            .arg(page_file)
+            .arg(props_json)
+            .arg(layouts_json)
+            .arg(document_file)
+            .arg(options_json)
+            .arg(conventions_json)
+            .current_dir(&self.project)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(PageRenderError::NodeFailed {
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let json = String::from_utf8_lossy(&output.stdout);
+        let mut parts = ferrite_ssr::render_server_payload_json_to_parts(&json)?;
         parts.shell = format!("<!doctype html>\n{}", parts.shell);
         Ok(parts)
     }
@@ -528,6 +635,45 @@ process.stdout.write(JSON.stringify({
                 .html
                 .contains("<strong>Post stream</strong>")
         );
+    }
+
+    #[test]
+    fn renders_page_server_payload_to_parts() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(
+            &script,
+            r#"
+const props = JSON.parse(process.argv[4]);
+process.stdout.write(JSON.stringify({
+  ferrite: "server-payload",
+  version: 1,
+  shell: [2, "span", { "data-ferrite-client-reference": "app/Button.tsx#default" }, [[0, `Like ${props.params.id}: 0`]]],
+  clientReferences: [{
+    ferrite: "client-reference",
+    version: 1,
+    id: "app/Button.tsx#default",
+    module: "app/Button.tsx",
+    exportName: "default",
+    props: { id: props.params.id }
+  }],
+  chunks: []
+}));
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script);
+
+        let parts = renderer
+            .render_page_to_server_payload_parts(&page, &[], &[("id".to_owned(), json!("payload"))])
+            .unwrap();
+
+        assert_eq!(
+            parts.shell,
+            "<span data-ferrite-client-reference=\"app/Button.tsx#default\">Like payload: 0</span>"
+        );
+        assert!(parts.chunks.is_empty());
     }
 
     #[test]
@@ -915,6 +1061,57 @@ process.stdout.write(JSON.stringify({
         assert!(parts.shell.contains("guide/intro"));
         assert_eq!(parts.chunks.len(), 1);
         assert!(parts.chunks[0].html.contains("<strong>Docs</strong>"));
+    }
+
+    #[test]
+    fn renders_document_server_payload_to_parts() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(
+            &script,
+            r#"
+const options = JSON.parse(process.argv[7]);
+process.stdout.write(JSON.stringify({
+  ferrite: "server-payload",
+  version: 1,
+  shell: [
+    2,
+    "html",
+    {},
+    [[2, "body", {}, [[2, "div", { id: options.rootId }, [[0, "Document payload"]]]]]]
+  ],
+  clientReferences: [],
+  chunks: []
+}));
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        let document = temp.path().join("document.tsx");
+        fs::write(&page, "").unwrap();
+        fs::write(&document, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script);
+
+        let parts = renderer
+            .render_document_to_server_payload_parts(
+                &page,
+                &[],
+                &document,
+                &[],
+                &DocumentRenderOptions {
+                    root_id: "ferrite-root".to_owned(),
+                    route_path: "/".to_owned(),
+                    route_pattern: None,
+                    build_id: None,
+                    metadata: PageMetadata::default(),
+                    styles: vec![],
+                    scripts: vec![],
+                    default_title: "Ferrite".to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert!(parts.shell.starts_with("<!doctype html>\n<html"));
+        assert!(parts.shell.contains("Document payload"));
     }
 
     #[test]

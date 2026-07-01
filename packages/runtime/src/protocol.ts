@@ -3,6 +3,8 @@ export const RENDER_STREAM_MARKER = "render-stream" as const;
 export const RENDER_PACKET_VERSION = 1 as const;
 export const CLIENT_REFERENCE_MARKER = "client-reference" as const;
 export const CLIENT_REFERENCE_VERSION = 1 as const;
+export const SERVER_PAYLOAD_MARKER = "server-payload" as const;
+export const SERVER_PAYLOAD_VERSION = 1 as const;
 
 export const COMPACT_TEXT_OPCODE = 0 as const;
 export const COMPACT_FRAGMENT_OPCODE = 1 as const;
@@ -64,6 +66,20 @@ export type ClientReferencePayload = {
   module: string;
   exportName: string;
   props: Record<string, ClientReferenceSerializableValue>;
+};
+
+export type ServerPayloadChunk = {
+  id: string;
+  root: CompactNode;
+  clientReferences: ClientReferencePayload[];
+};
+
+export type ServerPayloadPacket = {
+  ferrite: typeof SERVER_PAYLOAD_MARKER;
+  version: typeof SERVER_PAYLOAD_VERSION;
+  shell: CompactNode;
+  clientReferences: ClientReferencePayload[];
+  chunks: ServerPayloadChunk[];
 };
 
 export function parseClientReferenceId(id: string): { module: string; exportName: string } {
@@ -133,6 +149,58 @@ export function validateClientReferencePayload(payload: unknown): ClientReferenc
   }
 
   return candidate as ClientReferencePayload;
+}
+
+export function validateServerPayloadPacket(payload: unknown): ServerPayloadPacket {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("Ferrite server payload must be an object.");
+  }
+
+  const candidate = payload as Partial<ServerPayloadPacket>;
+  if (candidate.ferrite !== SERVER_PAYLOAD_MARKER) {
+    throw new TypeError(`expected ferrite marker "${SERVER_PAYLOAD_MARKER}"`);
+  }
+
+  if (candidate.version !== SERVER_PAYLOAD_VERSION) {
+    throw new TypeError(`unsupported server payload version ${String(candidate.version)}; expected ${SERVER_PAYLOAD_VERSION}`);
+  }
+
+  if (!Array.isArray(candidate.clientReferences)) {
+    throw new TypeError("Ferrite server payload clientReferences must be an array.");
+  }
+
+  if (!Array.isArray(candidate.chunks)) {
+    throw new TypeError("Ferrite server payload chunks must be an array.");
+  }
+
+  candidate.clientReferences = candidate.clientReferences.map(validateClientReferencePayload);
+  candidate.chunks = candidate.chunks.map((chunk, index) => validateServerPayloadChunk(chunk, index));
+
+  return candidate as ServerPayloadPacket;
+}
+
+function validateServerPayloadChunk(chunk: unknown, index: number): ServerPayloadChunk {
+  if (chunk === null || typeof chunk !== "object" || Array.isArray(chunk)) {
+    throw new TypeError(`Ferrite server payload chunk ${index} must be an object.`);
+  }
+
+  const candidate = chunk as Partial<ServerPayloadChunk>;
+  if (typeof candidate.id !== "string" || candidate.id.length === 0) {
+    throw new TypeError(`Ferrite server payload chunk ${index} requires a non-empty id.`);
+  }
+  validateStreamChunkId(candidate.id);
+
+  if (!Array.isArray(candidate.clientReferences)) {
+    throw new TypeError(`Ferrite server payload chunk ${index} clientReferences must be an array.`);
+  }
+  candidate.clientReferences = candidate.clientReferences.map(validateClientReferencePayload);
+  return candidate as ServerPayloadChunk;
+}
+
+function validateStreamChunkId(id: string): void {
+  if (!/^[A-Za-z0-9_:-]+$/.test(id)) {
+    throw new TypeError(`invalid stream chunk id "${id}"`);
+  }
 }
 
 export function validateClientReferenceParts(id: string, module: string, exportName: string): void {

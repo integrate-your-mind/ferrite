@@ -8,17 +8,25 @@ import { build } from "esbuild";
 const CLIENT_ORIGINAL_SUFFIX = "?ferrite-client-original";
 
 const args = process.argv.slice(2);
-const knownModes = new Set(["--static-params", "--metadata", "--stream", "--document", "--document-stream"]);
+const knownModes = new Set([
+  "--static-params",
+  "--metadata",
+  "--stream",
+  "--server-payload",
+  "--document",
+  "--document-stream",
+  "--document-server-payload",
+]);
 const mode = knownModes.has(args[0]) ? args.shift() : "render";
 const [pageFile, propsJson = "{}", layoutsJson = "[]", fourthArg, fifthArg = "{}", sixthArg = "{}"] = args;
-const documentMode = mode === "--document" || mode === "--document-stream";
+const documentMode = mode === "--document" || mode === "--document-stream" || mode === "--document-server-payload";
 const documentFile = documentMode ? fourthArg : undefined;
 const documentOptionsJson = documentMode ? fifthArg : "{}";
 const conventionsJson = documentMode ? sixthArg : (fourthArg ?? "{}");
 
 if (!pageFile) {
   console.error(
-    "usage: render-page [--static-params|--metadata|--stream|--document|--document-stream] <page-file> [props-json] [layouts-json] [document-file] [document-options-json]",
+    "usage: render-page [--static-params|--metadata|--stream|--server-payload|--document|--document-stream|--document-server-payload] <page-file> [props-json] [layouts-json] [document-file] [document-options-json]",
   );
   process.exit(2);
 }
@@ -164,6 +172,14 @@ try {
       entryModule.conventionModules,
     );
     process.stdout.write(`${JSON.stringify(stream)}\n`);
+  } else if (mode === "--server-payload") {
+    const payload = await server.renderPageModuleToServerPayload(
+      entryModule.pageModule,
+      props,
+      entryModule.layoutModules,
+      entryModule.conventionModules,
+    );
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
   } else if (mode === "--document") {
     const document = await server.renderDocumentModuleToPacket(
       entryModule.pageModule,
@@ -184,6 +200,16 @@ try {
       entryModule.conventionModules,
     );
     process.stdout.write(`${JSON.stringify(stream)}\n`);
+  } else if (mode === "--document-server-payload") {
+    const payload = await server.renderDocumentModuleToServerPayload(
+      entryModule.pageModule,
+      props,
+      entryModule.layoutModules,
+      entryModule.documentModule,
+      documentOptions,
+      entryModule.conventionModules,
+    );
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
   } else {
     const serializable = await server.renderPageModuleToPacket(
       entryModule.pageModule,

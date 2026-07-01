@@ -34,9 +34,16 @@ async function linkRuntimePackage(projectRoot) {
 }
 
 async function renderPage(projectRoot, pageFile, props = {}) {
+  return renderPageMode(projectRoot, "render", pageFile, props);
+}
+
+async function renderPageMode(projectRoot, mode, pageFile, props = {}) {
+  const args = mode === "render"
+    ? [renderPageScript, pageFile, JSON.stringify(props), "[]"]
+    : [renderPageScript, mode, pageFile, JSON.stringify(props), "[]"];
   const { stdout } = await execFileAsync(
     "node",
-    [renderPageScript, pageFile, JSON.stringify(props), "[]"],
+    args,
     {
       cwd: projectRoot,
       maxBuffer: 1024 * 1024,
@@ -149,5 +156,80 @@ test("render-page does not proxy a route entry with use client", async () => {
         ],
       ],
     });
+  });
+});
+
+test("render-page emits server payloads with imported client references", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
+    const clientFile = join(projectRoot, "app/posts/[id]/PostActions.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `import PostActions from "./PostActions";`,
+        "",
+        `export default function Page({ params }) {`,
+        `  return <article data-route="/posts/:id"><PostActions id={params.id} /></article>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      clientFile,
+      [
+        `"use client";`,
+        "",
+        `export default function PostActions({ id }) {`,
+        `  return <button type="button" data-client-island="post-actions">Like {id}: 0</button>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
+    const payload = await renderPageMode(projectRoot, "--server-payload", pageFile, { params: { id: "alpha" } });
+
+    assert.equal(payload.ferrite, "server-payload");
+    assert.equal(payload.version, 1);
+    assert.deepEqual(payload.clientReferences, [
+      {
+        ferrite: "client-reference",
+        version: 1,
+        id: "app/posts/[id]/PostActions.tsx#default",
+        module: "app/posts/[id]/PostActions.tsx",
+        exportName: "default",
+        props: { id: "alpha" },
+      },
+    ]);
+    assert.deepEqual(payload.chunks, []);
+    assert.deepEqual(payload.shell, [
+      2,
+      "article",
+      { "data-route": "/posts/:id" },
+      [
+        [
+          2,
+          "span",
+          {
+            "data-ferrite-client-reference": "app/posts/[id]/PostActions.tsx#default",
+            "data-ferrite-client-props": '{"id":"alpha"}',
+            "data-ferrite-client-payload":
+              '{"ferrite":"client-reference","version":1,"id":"app/posts/[id]/PostActions.tsx#default","module":"app/posts/[id]/PostActions.tsx","exportName":"default","props":{"id":"alpha"}}',
+          },
+          [
+            [
+              2,
+              "button",
+              { type: "button", "data-client-island": "post-actions" },
+              [
+                [0, "Like "],
+                [0, "alpha"],
+                [0, ": 0"],
+              ],
+            ],
+          ],
+        ],
+      ],
+    ]);
   });
 });

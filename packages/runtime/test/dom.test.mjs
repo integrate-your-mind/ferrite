@@ -21,6 +21,7 @@ import {
   useRef,
   useState,
   useTransition,
+  validateServerPayloadPacket,
 } from "../dist/index.js";
 import { hydrate, hydrateClientReference, mount } from "../dist/dom.js";
 import {
@@ -32,6 +33,7 @@ import {
   renderDocumentModuleToStreamPacket,
   renderPageModule,
   renderPageModuleToPacket,
+  renderPageModuleToServerPayload,
   renderPageModuleToStreamPacket,
 } from "../dist/server.js";
 
@@ -658,6 +660,95 @@ test("createClientReference renders duplicate references with separate serialize
   assert.deepEqual(
     rendered.children.map((child) => child.children[0].children[0].value),
     ["Post alpha", "Post beta"],
+  );
+});
+
+test("renderPageModuleToServerPayload emits shell client references", async () => {
+  function IslandButton({ id }) {
+    return createElement("button", { type: "button" }, `Like ${id}: 0`);
+  }
+
+  const PostActions = createClientReference({
+    id: "app/posts/[id]/PostActions.tsx#default",
+    render: IslandButton,
+  });
+
+  function Page() {
+    return createElement("article", null, createElement(PostActions, { id: "alpha" }));
+  }
+
+  const payload = await renderPageModuleToServerPayload({ default: Page });
+  const validated = validateServerPayloadPacket(payload);
+
+  assert.equal(validated.ferrite, "server-payload");
+  assert.equal(validated.version, 1);
+  assert.deepEqual(validated.clientReferences, [
+    {
+      ferrite: "client-reference",
+      version: 1,
+      id: "app/posts/[id]/PostActions.tsx#default",
+      module: "app/posts/[id]/PostActions.tsx",
+      exportName: "default",
+      props: { id: "alpha" },
+    },
+  ]);
+  assert.deepEqual(validated.chunks, []);
+  assert.deepEqual(validated.shell[0], 2);
+});
+
+test("renderPageModuleToServerPayload attaches client references to streamed chunks", async () => {
+  function IslandButton({ id }) {
+    return createElement("button", { type: "button" }, `Like ${id}: 0`);
+  }
+
+  const PostActions = createClientReference({
+    id: "app/posts/[id]/PostActions.tsx#default",
+    render: IslandButton,
+  });
+
+  async function AsyncPanel() {
+    return createElement(PostActions, { id: "chunk" });
+  }
+
+  function Page() {
+    return createElement(
+      Suspense,
+      { fallback: createElement("span", null, "Loading") },
+      createElement(AsyncPanel, null),
+    );
+  }
+
+  const payload = validateServerPayloadPacket(await renderPageModuleToServerPayload({ default: Page }));
+
+  assert.deepEqual(payload.clientReferences, []);
+  assert.equal(payload.chunks.length, 1);
+  assert.equal(payload.chunks[0].id, "s0");
+  assert.deepEqual(payload.chunks[0].clientReferences, [
+    {
+      ferrite: "client-reference",
+      version: 1,
+      id: "app/posts/[id]/PostActions.tsx#default",
+      module: "app/posts/[id]/PostActions.tsx",
+      exportName: "default",
+      props: { id: "chunk" },
+    },
+  ]);
+});
+
+test("renderPageModuleToServerPayload rejects malformed embedded client payloads", async () => {
+  function Page() {
+    return createElement(
+      "span",
+      {
+        "data-ferrite-client-payload": "not-json",
+      },
+      "Bad",
+    );
+  }
+
+  await assert.rejects(
+    () => renderPageModuleToServerPayload({ default: Page }),
+    /client reference payload must be valid JSON/,
   );
 });
 

@@ -16,10 +16,13 @@ export {
   RENDER_PACKET_MARKER,
   RENDER_PACKET_VERSION,
   RENDER_STREAM_MARKER,
+  SERVER_PAYLOAD_MARKER,
+  SERVER_PAYLOAD_VERSION,
   createClientReferencePayload,
   parseClientReferenceId,
   validateClientReferenceParts,
   validateClientReferencePayload,
+  validateServerPayloadPacket,
 } from "./protocol.js";
 export type {
   ClientReferencePayload,
@@ -28,6 +31,8 @@ export type {
   RenderPacket,
   RenderStreamChunk,
   RenderStreamPacket,
+  ServerPayloadChunk,
+  ServerPayloadPacket,
   SerializableNode,
   SerializableProp,
 } from "./protocol.js";

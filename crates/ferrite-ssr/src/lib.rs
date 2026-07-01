@@ -5,8 +5,9 @@ use ferrite_core::{AttributeValue, Node, element, fragment, render_to_html, text
 pub use ferrite_protocol::{
     COMPACT_ELEMENT_OPCODE, COMPACT_FRAGMENT_OPCODE, COMPACT_TEXT_OPCODE, CompactNode,
     RENDER_PACKET_MARKER, RENDER_PACKET_VERSION, RENDER_STREAM_MARKER, RenderPacket,
-    RenderStreamChunk, RenderStreamPacket, SerializableProp, ferrite_marker,
-    looks_like_ferrite_payload, validate_chunk_id, validate_packet, validate_stream_packet,
+    RenderStreamChunk, RenderStreamPacket, SERVER_PAYLOAD_MARKER, SerializableProp,
+    ServerPayloadPacket, ferrite_marker, looks_like_ferrite_payload, validate_chunk_id,
+    validate_packet, validate_server_payload_packet, validate_stream_packet,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -104,6 +105,10 @@ pub fn render_json_to_html(input: &str) -> Result<String> {
                 let packet: RenderStreamPacket = serde_json::from_value(value)?;
                 Ok(render_stream_packet_to_parts(&packet)?.to_html())
             }
+            SERVER_PAYLOAD_MARKER => {
+                let packet: ServerPayloadPacket = serde_json::from_value(value)?;
+                Ok(render_server_payload_packet_to_parts(&packet)?.to_html())
+            }
             _ => Err(SsrError::InvalidRenderPacket(format!(
                 "unsupported ferrite marker \"{marker}\""
             ))),
@@ -112,7 +117,7 @@ pub fn render_json_to_html(input: &str) -> Result<String> {
 
     if looks_like_ferrite_payload(&value) {
         return Err(SsrError::InvalidRenderPacket(format!(
-            "expected ferrite marker \"{RENDER_PACKET_MARKER}\" or \"{RENDER_STREAM_MARKER}\""
+            "expected ferrite marker \"{RENDER_PACKET_MARKER}\", \"{RENDER_STREAM_MARKER}\", or \"{SERVER_PAYLOAD_MARKER}\""
         )));
     }
 
@@ -144,6 +149,19 @@ pub fn render_stream_json_to_parts(input: &str) -> Result<RenderStreamParts> {
     render_stream_packet_to_parts(&packet)
 }
 
+pub fn render_server_payload_json_to_parts(input: &str) -> Result<RenderStreamParts> {
+    let value: Value = serde_json::from_str(input)?;
+    let marker = ferrite_marker(&value)?;
+    if marker != Some(SERVER_PAYLOAD_MARKER) {
+        return Err(SsrError::InvalidRenderPacket(format!(
+            "expected ferrite marker \"{SERVER_PAYLOAD_MARKER}\""
+        )));
+    }
+
+    let packet: ServerPayloadPacket = serde_json::from_value(value)?;
+    render_server_payload_packet_to_parts(&packet)
+}
+
 pub fn render_stream_packet_to_parts(packet: &RenderStreamPacket) -> Result<RenderStreamParts> {
     validate_stream_packet(packet)?;
     let shell = render_to_html(&compact_to_core_node(&packet.shell)?)?;
@@ -151,6 +169,24 @@ pub fn render_stream_packet_to_parts(packet: &RenderStreamPacket) -> Result<Rend
 
     for chunk in &packet.chunks {
         validate_chunk_id(&chunk.id)?;
+        let html = render_to_html(&compact_to_core_node(&chunk.root)?)?;
+        chunks.push(RenderedStreamChunk {
+            id: chunk.id.clone(),
+            html: render_stream_chunk_html(&chunk.id, &html),
+        });
+    }
+
+    Ok(RenderStreamParts { shell, chunks })
+}
+
+pub fn render_server_payload_packet_to_parts(
+    packet: &ServerPayloadPacket,
+) -> Result<RenderStreamParts> {
+    validate_server_payload_packet(packet)?;
+    let shell = render_to_html(&compact_to_core_node(&packet.shell)?)?;
+    let mut chunks = Vec::with_capacity(packet.chunks.len());
+
+    for chunk in &packet.chunks {
         let html = render_to_html(&compact_to_core_node(&chunk.root)?)?;
         chunks.push(RenderedStreamChunk {
             id: chunk.id.clone(),
@@ -377,6 +413,50 @@ mod tests {
     }
 
     #[test]
+    fn renders_server_payload_to_concatenated_html() {
+        let input = r#"
+        {
+          "ferrite": "server-payload",
+          "version": 1,
+          "shell": [
+            2,
+            "span",
+            {
+              "data-ferrite-client-reference": "app/Button.tsx#default",
+              "data-ferrite-client-payload": "{\"ferrite\":\"client-reference\",\"version\":1,\"id\":\"app/Button.tsx#default\",\"module\":\"app/Button.tsx\",\"exportName\":\"default\",\"props\":{\"id\":\"alpha\"}}"
+            },
+            [[0, "Like alpha: 0"]]
+          ],
+          "clientReferences": [
+            {
+              "ferrite": "client-reference",
+              "version": 1,
+              "id": "app/Button.tsx#default",
+              "module": "app/Button.tsx",
+              "exportName": "default",
+              "props": { "id": "alpha" }
+            }
+          ],
+          "chunks": [
+            {
+              "id": "s0",
+              "root": [2, "strong", {}, [[0, "Loaded"]] ],
+              "clientReferences": []
+            }
+          ]
+        }
+        "#;
+
+        let html = render_json_to_html(input).unwrap();
+
+        assert!(html.starts_with("<span data-ferrite-client-payload="));
+        assert!(html.contains("data-ferrite-client-reference=\"app/Button.tsx#default\""));
+        assert!(html.contains(
+            "<template data-ferrite-stream-chunk=\"s0\"><strong>Loaded</strong></template>"
+        ));
+    }
+
+    #[test]
     fn rejects_invalid_stream_chunk_ids() {
         let input = r#"
         {
@@ -394,6 +474,35 @@ mod tests {
             error,
             SsrError::InvalidRenderPacket(message)
                 if message.contains("invalid stream chunk id")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_server_payload_client_references() {
+        let input = r#"
+        {
+          "ferrite": "server-payload",
+          "version": 1,
+          "shell": [0, "Loading"],
+          "clientReferences": [
+            {
+              "ferrite": "client-reference",
+              "version": 1,
+              "id": "app/Button.tsx#Other",
+              "module": "app/Button.tsx",
+              "exportName": "default",
+              "props": {}
+            }
+          ],
+          "chunks": []
+        }
+        "#;
+        let error = render_json_to_html(input).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SsrError::InvalidRenderPacket(message)
+                if message.contains("client reference id must equal")
         ));
     }
 
