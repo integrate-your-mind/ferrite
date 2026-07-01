@@ -14,6 +14,11 @@ use ferrite_router::{Route, find_document_file, scan_app_dir, write_route_types}
 use serde::Serialize;
 use serde_json::{Value, json};
 
+const SERVER_PAYLOAD_CONTENT_TYPE: &str =
+    "application/vnd.ferrite.server-payload+json; charset=utf-8";
+const SERVER_PAYLOAD_QUERY_NAME: &str = "__ferrite_payload";
+const SERVER_PAYLOAD_QUERY_VALUE: &str = "server";
+
 #[derive(Debug)]
 pub enum DevServerError {
     Router(ferrite_router::RouterError),
@@ -173,7 +178,10 @@ impl DevProject {
             _ if path.starts_with(&self.config.client_public_path) => {
                 Ok(self.static_asset_response(path))
             }
-            _ => Ok(self.route_response(path)),
+            _ => match route_response_mode(raw_path) {
+                Ok(mode) => Ok(self.route_response(path, mode)),
+                Err(message) => Ok(DevResponse::bad_request(message)),
+            },
         }
     }
 
@@ -220,7 +228,7 @@ impl DevProject {
         Ok(DevResponse::ok("application/json; charset=utf-8", body))
     }
 
-    fn route_response(&self, path: &str) -> DevResponse {
+    fn route_response(&self, path: &str, mode: RouteResponseMode) -> DevResponse {
         let snapshot = self
             .snapshot
             .as_ref()
@@ -232,7 +240,14 @@ impl DevProject {
                 self.config.page_renderer.clone(),
             );
             let conventions = route_conventions(&match_result.route);
-            self.route_stream_response(path, &match_result, &renderer, &conventions)
+            match mode {
+                RouteResponseMode::Html => {
+                    self.route_stream_response(path, &match_result, &renderer, &conventions)
+                }
+                RouteResponseMode::ServerPayload => {
+                    self.route_server_payload_response(path, &match_result, &renderer, &conventions)
+                }
+            }
         } else {
             DevResponse::not_found(render_not_found(self.build_id, path, &snapshot.routes))
         }
@@ -371,6 +386,90 @@ impl DevProject {
         }
     }
 
+    fn route_server_payload_response(
+        &self,
+        path: &str,
+        match_result: &RouteMatch,
+        renderer: &PageRenderer,
+        conventions: &RouteConventions,
+    ) -> DevResponse {
+        match find_document_file(&self.config.app_dir) {
+            Some(document_file) => match renderer.collect_metadata(
+                &match_result.route.file,
+                &match_result.route.layouts,
+                &match_result.params,
+            ) {
+                Ok(metadata) => {
+                    let bundler = ClientBundler::new(
+                        self.config.project.clone(),
+                        self.config.client_bundler.clone(),
+                    );
+                    match bundler.bundle_route(
+                        &match_result.route.file,
+                        &match_result.route.layouts,
+                        &match_result.route.path,
+                        &match_result.params,
+                        &self.config.client_out_dir,
+                        &self.config.client_public_path,
+                    ) {
+                        Ok(client_bundle) => match renderer
+                            .render_document_to_server_payload_json_with_conventions(
+                                &match_result.route.file,
+                                &match_result.route.layouts,
+                                &document_file,
+                                &match_result.params,
+                                &DocumentRenderOptions {
+                                    root_id: "ferrite-dev-root".to_owned(),
+                                    route_path: path.to_owned(),
+                                    route_pattern: Some(match_result.route.path.clone()),
+                                    build_id: Some(self.build_id),
+                                    metadata: metadata.clone(),
+                                    styles: client_bundle_styles(&client_bundle),
+                                    scripts: dev_document_scripts(&client_bundle),
+                                    default_title: "Ferrite Dev".to_owned(),
+                                },
+                                conventions,
+                            ) {
+                            Ok(payload) => DevResponse::server_payload_json(payload),
+                            Err(error) => DevResponse::internal_error(render_render_error(
+                                self.build_id,
+                                path,
+                                match_result,
+                                &error,
+                            )),
+                        },
+                        Err(error) => DevResponse::internal_error(render_bundle_error(
+                            self.build_id,
+                            path,
+                            match_result,
+                            &error,
+                        )),
+                    }
+                }
+                Err(error) => DevResponse::internal_error(render_render_error(
+                    self.build_id,
+                    path,
+                    match_result,
+                    &error,
+                )),
+            },
+            None => match renderer.render_page_to_server_payload_json_with_conventions(
+                &match_result.route.file,
+                &match_result.route.layouts,
+                &match_result.params,
+                conventions,
+            ) {
+                Ok(payload) => DevResponse::server_payload_json(payload),
+                Err(error) => DevResponse::internal_error(render_render_error(
+                    self.build_id,
+                    path,
+                    match_result,
+                    &error,
+                )),
+            },
+        }
+    }
+
     fn static_asset_response(&self, path: &str) -> DevResponse {
         static_asset_response(
             path,
@@ -420,7 +519,10 @@ impl ProductionProject {
             .with_cache_control("public, max-age=0, must-revalidate"));
         }
 
-        Ok(self.route_response(path))
+        match route_response_mode(raw_path) {
+            Ok(mode) => Ok(self.route_response(path, mode)),
+            Err(message) => Ok(DevResponse::bad_request(message)),
+        }
     }
 
     fn ensure_ready(&mut self) -> Result<()> {
@@ -438,7 +540,7 @@ impl ProductionProject {
         Ok(())
     }
 
-    fn route_response(&self, path: &str) -> DevResponse {
+    fn route_response(&self, path: &str, mode: RouteResponseMode) -> DevResponse {
         let snapshot = self
             .snapshot
             .as_ref()
@@ -450,13 +552,22 @@ impl ProductionProject {
                 self.config.page_renderer.clone(),
             );
             let conventions = route_conventions(&match_result.route);
-            self.route_stream_response(
-                path,
-                &match_result,
-                &renderer,
-                snapshot.document_file.as_deref(),
-                &conventions,
-            )
+            match mode {
+                RouteResponseMode::Html => self.route_stream_response(
+                    path,
+                    &match_result,
+                    &renderer,
+                    snapshot.document_file.as_deref(),
+                    &conventions,
+                ),
+                RouteResponseMode::ServerPayload => self.route_server_payload_response(
+                    path,
+                    &match_result,
+                    &renderer,
+                    snapshot.document_file.as_deref(),
+                    &conventions,
+                ),
+            }
             .with_cache_control("no-store")
             .with_route_pattern(match_result.route.path)
         } else {
@@ -587,6 +698,85 @@ impl ProductionProject {
             },
         }
     }
+
+    fn route_server_payload_response(
+        &self,
+        path: &str,
+        match_result: &RouteMatch,
+        renderer: &PageRenderer,
+        document_file: Option<&Path>,
+        conventions: &RouteConventions,
+    ) -> DevResponse {
+        match document_file {
+            Some(document_file) => {
+                match renderer.collect_metadata(
+                    &match_result.route.file,
+                    &match_result.route.layouts,
+                    &match_result.params,
+                ) {
+                    Ok(metadata) => {
+                        let bundler = ClientBundler::new(
+                            self.config.project.clone(),
+                            self.config.client_bundler.clone(),
+                        );
+                        match bundler.bundle_route(
+                            &match_result.route.file,
+                            &match_result.route.layouts,
+                            &match_result.route.path,
+                            &match_result.params,
+                            &self.config.client_out_dir,
+                            &self.config.client_public_path,
+                        ) {
+                            Ok(client_bundle) => match renderer
+                                .render_document_to_server_payload_json_with_conventions(
+                                    &match_result.route.file,
+                                    &match_result.route.layouts,
+                                    document_file,
+                                    &match_result.params,
+                                    &DocumentRenderOptions {
+                                        root_id: "ferrite-root".to_owned(),
+                                        route_path: path.to_owned(),
+                                        route_pattern: Some(match_result.route.path.clone()),
+                                        build_id: None,
+                                        metadata: metadata.clone(),
+                                        styles: client_bundle_styles(&client_bundle),
+                                        scripts: client_bundle_scripts(&client_bundle),
+                                        default_title: "Ferrite".to_owned(),
+                                    },
+                                    conventions,
+                                ) {
+                                Ok(payload) => DevResponse::server_payload_json(payload),
+                                Err(error) => DevResponse::internal_error(
+                                    render_production_render_error(path, match_result, &error),
+                                ),
+                            },
+                            Err(error) => DevResponse::internal_error(
+                                render_production_bundle_error(path, match_result, &error),
+                            ),
+                        }
+                    }
+                    Err(error) => DevResponse::internal_error(render_production_render_error(
+                        path,
+                        match_result,
+                        &error,
+                    )),
+                }
+            }
+            None => match renderer.render_page_to_server_payload_json_with_conventions(
+                &match_result.route.file,
+                &match_result.route.layouts,
+                &match_result.params,
+                conventions,
+            ) {
+                Ok(payload) => DevResponse::server_payload_json(payload),
+                Err(error) => DevResponse::internal_error(render_production_render_error(
+                    path,
+                    match_result,
+                    &error,
+                )),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -646,6 +836,10 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
         }
+    }
+
+    pub fn server_payload_json(body: String) -> Self {
+        Self::ok(SERVER_PAYLOAD_CONTENT_TYPE, body)
     }
 
     pub fn not_found(body: String) -> Self {
@@ -727,6 +921,12 @@ struct RouteSnapshot {
 struct ProductionRouteSnapshot {
     routes: Vec<Route>,
     document_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum RouteResponseMode {
+    Html,
+    ServerPayload,
 }
 
 #[derive(Debug, Serialize)]
@@ -942,6 +1142,30 @@ fn parse_request_line(request: &str) -> Option<(&str, &str)> {
 
 fn strip_query(path: &str) -> &str {
     path.split_once('?').map_or(path, |(path, _query)| path)
+}
+
+fn route_response_mode(raw_path: &str) -> std::result::Result<RouteResponseMode, String> {
+    let Some((_, query)) = raw_path.split_once('?') else {
+        return Ok(RouteResponseMode::Html);
+    };
+
+    let mut mode = RouteResponseMode::Html;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (name, value) = pair
+            .split_once('=')
+            .map_or((pair, ""), |(name, value)| (name, value));
+        if name != SERVER_PAYLOAD_QUERY_NAME {
+            continue;
+        }
+        if value != SERVER_PAYLOAD_QUERY_VALUE {
+            return Err(format!(
+                "unsupported {SERVER_PAYLOAD_QUERY_NAME} value `{value}`; expected `{SERVER_PAYLOAD_QUERY_VALUE}`"
+            ));
+        }
+        mode = RouteResponseMode::ServerPayload;
+    }
+
+    Ok(mode)
 }
 
 fn match_route(path: &str, routes: &[Route]) -> Option<RouteMatch> {
@@ -1471,10 +1695,13 @@ mod tests {
 const mode = process.argv[2];
 const metadataMode = mode === "--metadata";
 const streamMode = mode === "--stream";
+const serverPayloadMode = mode === "--server-payload";
 const documentMode = mode === "--document";
 const documentStreamMode = mode === "--document-stream";
-const page = metadataMode || streamMode || documentMode || documentStreamMode ? process.argv[3] : process.argv[2];
-const props = JSON.parse(metadataMode || streamMode || documentMode || documentStreamMode ? process.argv[4] : process.argv[3]);
+const documentServerPayloadMode = mode === "--document-server-payload";
+const explicitMode = metadataMode || streamMode || serverPayloadMode || documentMode || documentStreamMode || documentServerPayloadMode;
+const page = explicitMode ? process.argv[3] : process.argv[2];
+const props = JSON.parse(explicitMode ? process.argv[4] : process.argv[3]);
 const slug = Array.isArray(props.params.slug) ? props.params.slug.join("/") : "index";
 const title = page.includes("[id]") ? `Post ${props.params.id}` : page.includes("docs") ? `Docs ${slug}` : "Home Page";
 if (metadataMode) {
@@ -1500,6 +1727,16 @@ if (streamMode) {
     ferrite: "render-stream",
     version: 1,
     shell: [2, "main", { "data-rendered": title }, [[2, "h1", {}, [[0, title]]]]],
+    chunks: []
+  }));
+  process.exit(0);
+}
+if (serverPayloadMode) {
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-payload",
+    version: 1,
+    shell: [2, "main", { "data-rendered": title }, [[2, "h1", {}, [[0, title]]]]],
+    clientReferences: [],
     chunks: []
   }));
   process.exit(0);
@@ -1541,6 +1778,20 @@ if (documentStreamMode) {
       [2, "head", {}, [[2, "title", {}, [[0, options.metadata.title || options.defaultTitle]]]]],
       [2, "body", {}, [[2, "div", { id: options.rootId, "data-route": options.routePath, "data-route-pattern": options.routePattern, "data-ferrite-build-id": options.buildId }, [[2, "h1", {}, [[0, title]]]]]]]
     ]],
+    chunks: []
+  }));
+  process.exit(0);
+}
+if (documentServerPayloadMode) {
+  const options = JSON.parse(process.argv[7]);
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-payload",
+    version: 1,
+    shell: [2, "html", { "data-document": "dev-test" }, [
+      [2, "head", {}, [[2, "title", {}, [[0, options.metadata.title || options.defaultTitle]]]]],
+      [2, "body", {}, [[2, "div", { id: options.rootId, "data-route": options.routePath, "data-route-pattern": options.routePattern, "data-ferrite-build-id": options.buildId }, [[2, "h1", {}, [[0, title]]]]]]]
+    ]],
+    clientReferences: [],
     chunks: []
   }));
   process.exit(0);
@@ -1657,6 +1908,172 @@ process.stdout.write(JSON.stringify({
         let routes = project.handle_get("/__ferrite/routes").unwrap();
         assert_eq!(routes.status, 200);
         assert!(routes.body_text().contains("\"/posts/:id\""));
+    }
+
+    #[test]
+    fn dev_adapter_returns_server_payload_for_route_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Post() {}",
+        );
+        let mut project = project_for(&app);
+
+        let response = project
+            .handle_get("/posts/abc?__ferrite_payload=server")
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, SERVER_PAYLOAD_CONTENT_TYPE);
+        assert_eq!(response.stream, None);
+        let body = response.body_text();
+        assert!(body.contains(r#""ferrite":"server-payload""#));
+        assert!(body.contains("Post abc"));
+        assert!(!body.contains("<!doctype html>"));
+    }
+
+    #[test]
+    fn dev_adapter_returns_document_server_payload_for_custom_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("document.tsx"),
+            "export default function Document() {}",
+        );
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+
+        let response = project.handle_get("/?__ferrite_payload=server").unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, SERVER_PAYLOAD_CONTENT_TYPE);
+        let body = response.body_text();
+        assert!(body.contains(r#""ferrite":"server-payload""#));
+        assert!(body.contains(r#""data-document":"dev-test""#));
+        assert!(body.contains("ferrite-dev-root"));
+        assert!(body.contains("Home Page"));
+        assert!(!body.contains("<!doctype html>"));
+    }
+
+    #[test]
+    fn production_adapter_returns_server_payload_for_route_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Post() {}",
+        );
+        let mut project = production_project_for(&app);
+
+        let response = project
+            .handle_get("/posts/abc?__ferrite_payload=server")
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, SERVER_PAYLOAD_CONTENT_TYPE);
+        assert_eq!(response.cache_control, Some("no-store"));
+        assert_eq!(response.route_pattern_header.as_deref(), Some("/posts/:id"));
+        let body = response.body_text();
+        assert!(body.contains(r#""ferrite":"server-payload""#));
+        assert!(body.contains("Post abc"));
+        assert!(!body.contains("/__ferrite/client.js"));
+    }
+
+    #[test]
+    fn server_payload_query_reports_missing_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+
+        let response = project
+            .handle_get("/missing?__ferrite_payload=server")
+            .unwrap();
+
+        assert_eq!(response.status, 404);
+        assert!(response.body_text().contains("No Ferrite route matched"));
+    }
+
+    #[test]
+    fn server_payload_query_rejects_unsupported_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+
+        let response = project.handle_get("/?__ferrite_payload=flight").unwrap();
+
+        assert_eq!(response.status, 400);
+        assert!(
+            response
+                .body_text()
+                .contains("unsupported __ferrite_payload")
+        );
+    }
+
+    #[test]
+    fn server_payload_query_reports_render_failures_as_500() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = temp.path().to_path_buf();
+        let renderer = project.join("render-page.mjs");
+        make_script(
+            &renderer,
+            r#"
+if (process.argv[2] === "--server-payload") {
+  console.error("payload exploded");
+  process.exit(1);
+}
+process.stdout.write("{}");
+"#,
+        );
+        let mut project = DevProject::new(DevServerConfig::new(
+            project.clone(),
+            app,
+            project.join(".ferrite/types/routes.d.ts"),
+            renderer,
+            project.join("build-client.mjs"),
+            project.join(".ferrite/dev/static"),
+            "/_ferrite/static".to_owned(),
+        ));
+
+        let response = project.handle_get("/?__ferrite_payload=server").unwrap();
+
+        assert_eq!(response.status, 500);
+        assert!(response.body_text().contains("payload exploded"));
+    }
+
+    #[test]
+    fn serves_server_payload_query_over_real_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = project_for(&app);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut project = project;
+            serve_listener_once(listener, &mut project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(b"GET /?__ferrite_payload=server HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(&format!("Content-Type: {SERVER_PAYLOAD_CONTENT_TYPE}")));
+        assert!(response.contains("Content-Length:"));
+        assert!(!response.contains("Transfer-Encoding: chunked"));
+        assert!(response.contains(r#""ferrite":"server-payload""#));
     }
 
     #[test]
