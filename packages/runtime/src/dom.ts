@@ -25,7 +25,16 @@ import {
   type TransitionStartFunction,
   type VNode,
 } from "./index.js";
-import { parseClientReferenceId, validateClientReferenceParts, validateClientReferencePayload } from "./protocol.js";
+import {
+  COMPACT_ELEMENT_OPCODE,
+  COMPACT_FRAGMENT_OPCODE,
+  COMPACT_TEXT_OPCODE,
+  parseClientReferenceId,
+  validateClientReferenceParts,
+  validateClientReferencePayload,
+  validateServerPayloadPacket,
+} from "./protocol.js";
+import type { CompactNode, ServerPayloadChunk, ServerPayloadPacket } from "./protocol.js";
 
 type HookState = unknown[];
 type EffectPhase = "layout" | "passive";
@@ -84,6 +93,13 @@ export type ClientReferenceRegistration = {
   component: Component<Record<string, unknown>>;
 };
 
+export type ServerPayloadFetch = (input: string, init?: RequestInit) => Promise<Response>;
+
+export type FetchServerPayloadOptions = {
+  fetch?: ServerPayloadFetch;
+  requestInit?: RequestInit;
+};
+
 export function mount(child: Child, container: Element): RootHandle {
   if (!container.ownerDocument) {
     throw new TypeError("Ferrite mount requires a container attached to a document.");
@@ -100,6 +116,88 @@ export function mount(child: Child, container: Element): RootHandle {
       root.unmount();
     },
   };
+}
+
+export function serverPayloadRequestUrl(input: string | URL): string {
+  if (input instanceof URL) {
+    const url = new URL(input.href);
+    url.searchParams.set("__ferrite_payload", "server");
+    return url.toString();
+  }
+
+  if (typeof input !== "string" || input.length === 0) {
+    throw new TypeError("Ferrite server payload request URL requires a non-empty string or URL.");
+  }
+
+  const hashIndex = input.indexOf("#");
+  const withoutHash = hashIndex === -1 ? input : input.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : input.slice(hashIndex);
+  const queryIndex = withoutHash.indexOf("?");
+  const path = queryIndex === -1 ? withoutHash : withoutHash.slice(0, queryIndex);
+  const query = queryIndex === -1 ? "" : withoutHash.slice(queryIndex + 1);
+  const params = query
+    .split("&")
+    .filter((pair) => pair.length > 0)
+    .filter((pair) => pair.split("=", 1)[0] !== "__ferrite_payload");
+  params.push("__ferrite_payload=server");
+  return `${path}?${params.join("&")}${hash}`;
+}
+
+export async function fetchServerPayload(
+  input: string | URL,
+  options: FetchServerPayloadOptions = {},
+): Promise<ServerPayloadPacket> {
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new TypeError("Ferrite server payload fetch requires a fetch implementation.");
+  }
+
+  const response = await fetchImpl(serverPayloadRequestUrl(input), options.requestInit);
+  if (!response.ok) {
+    throw new Error(
+      `Ferrite server payload request failed with ${response.status} ${response.statusText || "Unknown Status"}.`,
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw new TypeError(
+      `Ferrite server payload response must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  return validateServerPayloadPacket(payload);
+}
+
+export function compactNodeToChild(node: CompactNode): Child {
+  return compactNodeToChildWithChunks(node, new Map(), new Set(), "root");
+}
+
+export function serverPayloadToChild(payload: unknown): Child {
+  const packet = validateServerPayloadPacket(payload);
+  return validatedServerPayloadToChild(packet);
+}
+
+export function applyServerPayload(root: RootHandle, payload: unknown): ServerPayloadPacket {
+  if (!root || typeof root.update !== "function") {
+    throw new TypeError("Ferrite server payload application requires a root handle.");
+  }
+
+  const packet = validateServerPayloadPacket(payload);
+  const child = validatedServerPayloadToChild(packet);
+  root.update(child);
+  return packet;
+}
+
+export async function fetchAndApplyServerPayload(
+  root: RootHandle,
+  input: string | URL,
+  options: FetchServerPayloadOptions = {},
+): Promise<ServerPayloadPacket> {
+  const packet = await fetchServerPayload(input, options);
+  return applyServerPayload(root, packet);
 }
 
 export function hydrateClientReference(
@@ -220,6 +318,95 @@ function isElement(value: ParentNode): value is Element {
     typeof (value as Element).hasAttribute === "function" &&
     typeof (value as Element).setAttribute === "function"
   );
+}
+
+function validatedServerPayloadToChild(packet: ServerPayloadPacket): Child {
+  const chunks = new Map<string, ServerPayloadChunk>();
+  for (const chunk of packet.chunks) {
+    if (chunks.has(chunk.id)) {
+      throw new TypeError(`Ferrite server payload contains duplicate chunk id "${chunk.id}".`);
+    }
+    chunks.set(chunk.id, chunk);
+  }
+
+  const usedChunks = new Set<string>();
+  const child = compactNodeToChildWithChunks(packet.shell, chunks, usedChunks, "shell");
+  for (const chunk of chunks.keys()) {
+    if (!usedChunks.has(chunk)) {
+      throw new TypeError(`Ferrite server payload chunk "${chunk}" has no matching suspense boundary.`);
+    }
+  }
+  return child;
+}
+
+function compactNodeToChildWithChunks(
+  node: unknown,
+  chunks: Map<string, ServerPayloadChunk>,
+  usedChunks: Set<string>,
+  path: string,
+): Child {
+  if (!Array.isArray(node) || node.length === 0) {
+    throw new TypeError(`Ferrite compact node at ${path} must be a non-empty array.`);
+  }
+
+  const opcode = node[0];
+  if (opcode === COMPACT_TEXT_OPCODE) {
+    if (node.length !== 2 || typeof node[1] !== "string") {
+      throw new TypeError(`Ferrite compact text node at ${path} is malformed.`);
+    }
+    return node[1];
+  }
+
+  if (opcode === COMPACT_FRAGMENT_OPCODE) {
+    if (node.length !== 2 || !Array.isArray(node[1])) {
+      throw new TypeError(`Ferrite compact fragment node at ${path} is malformed.`);
+    }
+    return node[1].map((child, index) => compactNodeToChildWithChunks(child, chunks, usedChunks, `${path}.${index}`));
+  }
+
+  if (opcode === COMPACT_ELEMENT_OPCODE) {
+    if (node.length !== 4 || typeof node[1] !== "string" || !Array.isArray(node[3])) {
+      throw new TypeError(`Ferrite compact element node at ${path} is malformed.`);
+    }
+
+    const props = compactProps(node[2], path);
+    const boundary = props["data-ferrite-suspense-boundary"];
+    if (typeof boundary === "string") {
+      const chunk = chunks.get(boundary);
+      if (chunk) {
+        usedChunks.add(boundary);
+        return compactNodeToChildWithChunks(chunk.root, chunks, usedChunks, `${path}.chunk(${boundary})`);
+      }
+    }
+
+    const children = node[3].map((child, index) =>
+      compactNodeToChildWithChunks(child, chunks, usedChunks, `${path}.children.${index}`),
+    );
+    return createElement(node[1], props, children);
+  }
+
+  throw new TypeError(`Ferrite compact node at ${path} has unsupported opcode ${String(opcode)}.`);
+}
+
+function compactProps(value: unknown, path: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`Ferrite compact element props at ${path} must be an object.`);
+  }
+
+  const props: Record<string, unknown> = {};
+  for (const [name, prop] of Object.entries(value)) {
+    if (name === "children" || name === "key" || name.startsWith("on")) {
+      throw new TypeError(`Ferrite server payload prop "${name}" at ${path} cannot be applied to the DOM.`);
+    }
+
+    if (typeof prop !== "string" && typeof prop !== "number" && typeof prop !== "boolean") {
+      throw new TypeError(`Ferrite compact element prop "${name}" at ${path} must be a string, number, or boolean.`);
+    }
+
+    props[name] = prop;
+  }
+
+  return props;
 }
 
 class DomRoot {

@@ -23,7 +23,14 @@ import {
   useTransition,
   validateServerPayloadPacket,
 } from "../dist/index.js";
-import { hydrate, hydrateClientReference, mount } from "../dist/dom.js";
+import {
+  applyServerPayload,
+  fetchAndApplyServerPayload,
+  hydrate,
+  hydrateClientReference,
+  mount,
+  serverPayloadRequestUrl,
+} from "../dist/dom.js";
 import {
   collectPageMetadata,
   collectStaticParams,
@@ -750,6 +757,123 @@ test("renderPageModuleToServerPayload rejects malformed embedded client payloads
     () => renderPageModuleToServerPayload({ default: Page }),
     /client reference payload must be valid JSON/,
   );
+});
+
+test("serverPayloadRequestUrl adds and replaces the payload query flag", () => {
+  assert.equal(serverPayloadRequestUrl("/posts/abc"), "/posts/abc?__ferrite_payload=server");
+  assert.equal(
+    serverPayloadRequestUrl("/posts/abc?tab=comments#section"),
+    "/posts/abc?tab=comments&__ferrite_payload=server#section",
+  );
+  assert.equal(
+    serverPayloadRequestUrl("/posts/abc?__ferrite_payload=flight&tab=comments"),
+    "/posts/abc?tab=comments&__ferrite_payload=server",
+  );
+
+  const url = new URL("https://example.com/posts/abc?tab=comments");
+  assert.equal(serverPayloadRequestUrl(url), "https://example.com/posts/abc?tab=comments&__ferrite_payload=server");
+});
+
+test("fetchAndApplyServerPayload updates a mounted root from shell and chunks", async () => {
+  const { container } = createContainer();
+  const root = mount(createElement("main", { "data-route": "/posts/old" }, createElement("h1", null, "Old")), container);
+  let requested;
+  const payload = {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [
+      2,
+      "main",
+      { "data-route": "/posts/alpha" },
+      [
+        [2, "h1", {}, [[0, "Post alpha"]]],
+        [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[2, "span", {}, [[0, "Loading"]]]]],
+      ],
+    ],
+    clientReferences: [],
+    chunks: [{ id: "s0", root: [2, "strong", { "data-loaded": true }, [[0, "Loaded chunk"]]], clientReferences: [] }],
+  };
+
+  const applied = await fetchAndApplyServerPayload(root, "/posts/alpha?tab=old", {
+    fetch: async (input) => {
+      requested = input;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => payload,
+      };
+    },
+  });
+
+  assert.equal(requested, "/posts/alpha?tab=old&__ferrite_payload=server");
+  assert.equal(applied, payload);
+  assert.equal(container.querySelector("main")?.getAttribute("data-route"), "/posts/alpha");
+  assert.equal(container.querySelector("h1")?.textContent, "Post alpha");
+  assert.equal(container.querySelector("strong")?.textContent, "Loaded chunk");
+  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "");
+  assert.equal(container.textContent, "Post alphaLoaded chunk");
+});
+
+test("applyServerPayload rejects malformed compact nodes without changing DOM", () => {
+  const { container } = createContainer();
+  const root = mount(createElement("p", null, "Stable"), container);
+  const before = container.innerHTML;
+
+  assert.throws(
+    () =>
+      applyServerPayload(root, {
+        ferrite: "server-payload",
+        version: 1,
+        shell: [9],
+        clientReferences: [],
+        chunks: [],
+      }),
+    /unsupported opcode 9/,
+  );
+
+  assert.equal(container.innerHTML, before);
+});
+
+test("applyServerPayload rejects chunks without matching suspense boundaries", () => {
+  const { container } = createContainer();
+  const root = mount(createElement("p", null, "Stable"), container);
+  const before = container.innerHTML;
+
+  assert.throws(
+    () =>
+      applyServerPayload(root, {
+        ferrite: "server-payload",
+        version: 1,
+        shell: [2, "main", {}, [[0, "No boundary"]]],
+        clientReferences: [],
+        chunks: [{ id: "s0", root: [2, "strong", {}, [[0, "Loaded"]]], clientReferences: [] }],
+      }),
+    /chunk "s0" has no matching suspense boundary/,
+  );
+
+  assert.equal(container.innerHTML, before);
+});
+
+test("fetchAndApplyServerPayload rejects failed responses without changing DOM", async () => {
+  const { container } = createContainer();
+  const root = mount(createElement("p", null, "Stable"), container);
+  const before = container.innerHTML;
+
+  await assert.rejects(
+    () =>
+      fetchAndApplyServerPayload(root, "/missing", {
+        fetch: async () => ({
+          ok: false,
+          status: 404,
+          statusText: "Not Found",
+          json: async () => ({ error: "missing" }),
+        }),
+      }),
+    /failed with 404 Not Found/,
+  );
+
+  assert.equal(container.innerHTML, before);
 });
 
 test("server render serializes ErrorBoundary fallback for child render errors", async () => {
