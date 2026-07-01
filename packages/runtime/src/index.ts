@@ -8,14 +8,22 @@ import {
 import type { CompactNode, RenderPacket, SerializableNode, SerializableProp } from "./protocol.js";
 
 export {
+  CLIENT_REFERENCE_MARKER,
+  CLIENT_REFERENCE_VERSION,
   COMPACT_ELEMENT_OPCODE,
   COMPACT_FRAGMENT_OPCODE,
   COMPACT_TEXT_OPCODE,
   RENDER_PACKET_MARKER,
   RENDER_PACKET_VERSION,
   RENDER_STREAM_MARKER,
+  createClientReferencePayload,
+  parseClientReferenceId,
+  validateClientReferenceParts,
+  validateClientReferencePayload,
 } from "./protocol.js";
 export type {
+  ClientReferencePayload,
+  ClientReferenceSerializableValue,
   CompactNode,
   RenderPacket,
   RenderStreamChunk,

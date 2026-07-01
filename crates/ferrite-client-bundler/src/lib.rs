@@ -10,6 +10,7 @@ use serde_json::Value;
 pub enum ClientBundleError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    Protocol(ferrite_protocol::ProtocolError),
     NodeFailed { status: Option<i32>, stderr: String },
 }
 
@@ -18,6 +19,7 @@ impl fmt::Display for ClientBundleError {
         match self {
             ClientBundleError::Io(error) => write!(f, "{error}"),
             ClientBundleError::Json(error) => write!(f, "{error}"),
+            ClientBundleError::Protocol(error) => write!(f, "{error}"),
             ClientBundleError::NodeFailed { status, stderr } => match status {
                 Some(status) => {
                     write!(f, "client bundler failed with exit code {status}: {stderr}")
@@ -39,6 +41,12 @@ impl From<std::io::Error> for ClientBundleError {
 impl From<serde_json::Error> for ClientBundleError {
     fn from(error: serde_json::Error) -> Self {
         ClientBundleError::Json(error)
+    }
+}
+
+impl From<ferrite_protocol::ProtocolError> for ClientBundleError {
+    fn from(error: ferrite_protocol::ProtocolError) -> Self {
+        ClientBundleError::Protocol(error)
     }
 }
 
@@ -87,7 +95,9 @@ impl ClientBundler {
             });
         }
 
-        Ok(serde_json::from_slice(&output.stdout)?)
+        let bundle: ClientBundle = serde_json::from_slice(&output.stdout)?;
+        bundle.validate()?;
+        Ok(bundle)
     }
 }
 
@@ -122,6 +132,20 @@ pub struct ClientReference {
     pub sourcemaps: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assets: Vec<PathBuf>,
+}
+
+impl ClientBundle {
+    pub fn validate(&self) -> Result<()> {
+        for reference in &self.client_references {
+            ferrite_protocol::validate_client_reference_parts(
+                &reference.id,
+                &reference.module,
+                &reference.export_name,
+            )?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -197,6 +221,44 @@ process.stdout.write(JSON.stringify({
                 sourcemaps: Vec::new(),
                 assets: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_client_reference_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        make_script(
+            &script,
+            r#"
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  clientReferences: [{ id: "app/Counter.tsx#Other", module: "app/Counter.tsx", exportName: "default" }]
+}));
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let bundler = ClientBundler::new(temp.path().to_path_buf(), script);
+
+        let error = bundler
+            .bundle_route(
+                &page,
+                &[],
+                "/",
+                &[],
+                &temp.path().join("out"),
+                "/_ferrite/static",
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "client reference id must equal \"app/Counter.tsx#default\""
         );
     }
 

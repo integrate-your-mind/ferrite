@@ -43,7 +43,9 @@ function createContainer() {
 }
 
 async function flushScheduledWork() {
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  for (let turn = 0; turn < 5; turn += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
 }
 
 function errorMessage(error) {
@@ -584,6 +586,8 @@ test("createClientReference renders a marked island with server fallback HTML", 
         props: {
           "data-ferrite-client-reference": "app/posts/[id]/PostActions.tsx#default",
           "data-ferrite-client-props": '{"id":"alpha"}',
+          "data-ferrite-client-payload":
+            '{"ferrite":"client-reference","version":1,"id":"app/posts/[id]/PostActions.tsx#default","module":"app/posts/[id]/PostActions.tsx","exportName":"default","props":{"id":"alpha"}}',
         },
         children: [
           {
@@ -596,6 +600,17 @@ test("createClientReference renders a marked island with server fallback HTML", 
       },
     ],
   });
+});
+
+test("createClientReference rejects malformed client reference ids", () => {
+  assert.throws(
+    () =>
+      createClientReference({
+        id: "app/Action.tsx",
+        render: () => createElement("button", { type: "button" }, "Action"),
+      }),
+    /client reference id must be formatted as module#exportName/,
+  );
 });
 
 test("createClientReference rejects non JSON-serializable props", async () => {
@@ -635,6 +650,10 @@ test("createClientReference renders duplicate references with separate serialize
   assert.deepEqual(
     rendered.children.map((child) => child.props["data-ferrite-client-props"]),
     ['{"id":"alpha"}', '{"id":"beta"}'],
+  );
+  assert.deepEqual(
+    rendered.children.map((child) => JSON.parse(child.props["data-ferrite-client-payload"]).props),
+    [{ id: "alpha" }, { id: "beta" }],
   );
   assert.deepEqual(
     rendered.children.map((child) => child.children[0].children[0].value),
@@ -1613,8 +1632,19 @@ test("hydrate attaches event handlers without replacing matching DOM", () => {
 test("hydrateClientReference hydrates matching marked islands", () => {
   const { window, container } = createContainer();
   container.innerHTML =
-    '<span data-ferrite-client-reference="app/Button.tsx#default" data-ferrite-client-props="{&quot;id&quot;:&quot;alpha&quot;}"><button type="button">Like alpha: 0</button></span>';
+    '<span data-ferrite-client-reference="app/Button.tsx#default" data-ferrite-client-props="{&quot;id&quot;:&quot;legacy&quot;}"><button type="button">Like payload: 0</button></span>';
   const island = container.querySelector("[data-ferrite-client-reference]");
+  island?.setAttribute(
+    "data-ferrite-client-payload",
+    JSON.stringify({
+      ferrite: "client-reference",
+      version: 1,
+      id: "app/Button.tsx#default",
+      module: "app/Button.tsx",
+      exportName: "default",
+      props: { id: "payload" },
+    }),
+  );
   const serverButton = container.querySelector("button");
 
   function IslandButton({ id }) {
@@ -1625,6 +1655,8 @@ test("hydrateClientReference hydrates matching marked islands", () => {
   const handles = hydrateClientReference(
     {
       id: "app/Button.tsx#default",
+      module: "app/Button.tsx",
+      exportName: "default",
       component: IslandButton,
     },
     container,
@@ -1636,7 +1668,7 @@ test("hydrateClientReference hydrates matching marked islands", () => {
 
   serverButton?.dispatchEvent(new window.Event("click", { bubbles: true }));
 
-  assert.equal(container.querySelector("button")?.textContent, "Like alpha: 1");
+  assert.equal(container.querySelector("button")?.textContent, "Like payload: 1");
 });
 
 test("hydrateClientReference returns no handles when no marker matches", () => {
@@ -1670,6 +1702,37 @@ test("hydrateClientReference rejects malformed serialized props", () => {
         container,
       ),
     /client reference props must be valid JSON/,
+  );
+  assert.equal(container.querySelector("[data-ferrite-client-hydrated]"), null);
+});
+
+test("hydrateClientReference rejects mismatched versioned payload ids", () => {
+  const { container } = createContainer();
+  container.innerHTML =
+    '<span data-ferrite-client-reference="app/Button.tsx#default"><button>Bad</button></span>';
+  const island = container.querySelector("[data-ferrite-client-reference]");
+  island?.setAttribute(
+    "data-ferrite-client-payload",
+    JSON.stringify({
+      ferrite: "client-reference",
+      version: 1,
+      id: "app/Other.tsx#default",
+      module: "app/Other.tsx",
+      exportName: "default",
+      props: {},
+    }),
+  );
+
+  assert.throws(
+    () =>
+      hydrateClientReference(
+        {
+          id: "app/Button.tsx#default",
+          component: () => createElement("button", null, "Bad"),
+        },
+        container,
+      ),
+    /payload id "app\/Other.tsx#default" does not match marker "app\/Button.tsx#default"/,
   );
   assert.equal(container.querySelector("[data-ferrite-client-hydrated]"), null);
 });

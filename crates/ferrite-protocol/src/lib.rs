@@ -6,7 +6,9 @@ use serde_json::Value;
 
 pub const RENDER_PACKET_MARKER: &str = "render-packet";
 pub const RENDER_STREAM_MARKER: &str = "render-stream";
+pub const CLIENT_REFERENCE_MARKER: &str = "client-reference";
 pub const RENDER_PACKET_VERSION: u64 = 1;
+pub const CLIENT_REFERENCE_VERSION: u64 = 1;
 pub const COMPACT_TEXT_OPCODE: u8 = 0;
 pub const COMPACT_FRAGMENT_OPCODE: u8 = 1;
 pub const COMPACT_ELEMENT_OPCODE: u8 = 2;
@@ -30,6 +32,17 @@ pub fn typescript_protocol_source() -> String {
         "export const RENDER_PACKET_VERSION = {RENDER_PACKET_VERSION} as const;"
     )
     .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const CLIENT_REFERENCE_MARKER = {} as const;",
+        serde_json::to_string(CLIENT_REFERENCE_MARKER).expect("string serialization cannot fail")
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const CLIENT_REFERENCE_VERSION = {CLIENT_REFERENCE_VERSION} as const;"
+    )
+    .expect("writing to a string cannot fail");
     out.push('\n');
     writeln!(
         out,
@@ -47,8 +60,16 @@ pub fn typescript_protocol_source() -> String {
     )
     .expect("writing to a string cannot fail");
     out.push_str(
-        r#"
+        r##"
 export type SerializableProp = string | number | boolean;
+
+export type ClientReferenceSerializableValue =
+  | string
+  | number
+  | boolean
+  | null
+  | ClientReferenceSerializableValue[]
+  | { [key: string]: ClientReferenceSerializableValue };
 
 export type SerializableNode =
   | {
@@ -88,7 +109,143 @@ export type RenderStreamPacket = {
   shell: CompactNode;
   chunks: RenderStreamChunk[];
 };
-"#,
+
+export type ClientReferencePayload = {
+  ferrite: typeof CLIENT_REFERENCE_MARKER;
+  version: typeof CLIENT_REFERENCE_VERSION;
+  id: string;
+  module: string;
+  exportName: string;
+  props: Record<string, ClientReferenceSerializableValue>;
+};
+
+export function parseClientReferenceId(id: string): { module: string; exportName: string } {
+  if (typeof id !== "string" || id.length === 0) {
+    throw new TypeError("Ferrite client reference requires a non-empty id.");
+  }
+
+  const separator = id.indexOf("#");
+  if (separator === -1 || separator !== id.lastIndexOf("#")) {
+    throw new TypeError("Ferrite client reference id must be formatted as module#exportName.");
+  }
+
+  const module = id.slice(0, separator);
+  const exportName = id.slice(separator + 1);
+  validateClientReferenceParts(id, module, exportName);
+  return { module, exportName };
+}
+
+export function createClientReferencePayload(input: {
+  id: string;
+  props?: Record<string, ClientReferenceSerializableValue>;
+}): ClientReferencePayload {
+  const { module, exportName } = parseClientReferenceId(input.id);
+  return {
+    ferrite: CLIENT_REFERENCE_MARKER,
+    version: CLIENT_REFERENCE_VERSION,
+    id: input.id,
+    module,
+    exportName,
+    props: input.props ?? {},
+  };
+}
+
+export function validateClientReferencePayload(payload: unknown): ClientReferencePayload {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("Ferrite client reference payload must be an object.");
+  }
+
+  const candidate = payload as Partial<ClientReferencePayload>;
+  if (candidate.ferrite !== CLIENT_REFERENCE_MARKER) {
+    throw new TypeError(`expected ferrite marker "${CLIENT_REFERENCE_MARKER}"`);
+  }
+
+  if (candidate.version !== CLIENT_REFERENCE_VERSION) {
+    throw new TypeError(`unsupported client reference version ${String(candidate.version)}; expected ${CLIENT_REFERENCE_VERSION}`);
+  }
+
+  if (
+    typeof candidate.id !== "string" ||
+    typeof candidate.module !== "string" ||
+    typeof candidate.exportName !== "string"
+  ) {
+    throw new TypeError("Ferrite client reference payload requires string id, module, and exportName.");
+  }
+
+  validateClientReferenceParts(candidate.id, candidate.module, candidate.exportName);
+
+  if (candidate.props === undefined) {
+    candidate.props = {};
+  }
+  if (candidate.props === null || typeof candidate.props !== "object" || Array.isArray(candidate.props)) {
+    throw new TypeError("Ferrite client reference payload props must be a JSON object.");
+  }
+
+  for (const [key, value] of Object.entries(candidate.props)) {
+    validateClientReferenceSerializableValue(value, `props.${key}`);
+  }
+
+  return candidate as ClientReferencePayload;
+}
+
+export function validateClientReferenceParts(id: string, module: string, exportName: string): void {
+  validateClientReferenceModule(module);
+  validateClientReferenceExportName(exportName);
+  const expectedId = `${module}#${exportName}`;
+  if (id !== expectedId) {
+    throw new TypeError(`client reference id must equal "${expectedId}"`);
+  }
+}
+
+function validateClientReferenceModule(module: string): void {
+  if (typeof module !== "string" || module.length === 0) {
+    throw new TypeError("client reference module must be non-empty.");
+  }
+  if (module.startsWith("/") || module.includes("\\") || module.includes("#")) {
+    throw new TypeError(`invalid client reference module "${module}"`);
+  }
+
+  const segments = module.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    throw new TypeError(`invalid client reference module "${module}"`);
+  }
+}
+
+function validateClientReferenceExportName(exportName: string): void {
+  if (exportName === "default" || exportName === "*") {
+    return;
+  }
+  if (!/^[A-Za-z_$][\w$]*$/.test(exportName)) {
+    throw new TypeError(`invalid client reference export "${exportName}"`);
+  }
+}
+
+function validateClientReferenceSerializableValue(
+  value: ClientReferenceSerializableValue,
+  path: string,
+): void {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return;
+  }
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) {
+      return;
+    }
+    throw new TypeError(`Ferrite client reference ${path} must be JSON-serializable.`);
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => validateClientReferenceSerializableValue(item, `${path}[${index}]`));
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      validateClientReferenceSerializableValue(child, `${path}.${key}`);
+    }
+    return;
+  }
+  throw new TypeError(`Ferrite client reference ${path} must be JSON-serializable.`);
+}
+"##,
     );
     out
 }
@@ -128,6 +285,8 @@ pub enum SerializableProp {
     Number(f64),
 }
 
+pub type ClientReferenceProps = BTreeMap<String, Value>;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderPacket {
     pub ferrite: String,
@@ -148,6 +307,18 @@ pub struct RenderStreamPacket {
 pub struct RenderStreamChunk {
     pub id: String,
     pub root: CompactNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientReferencePayload {
+    pub ferrite: String,
+    pub version: u64,
+    pub id: String,
+    pub module: String,
+    pub export_name: String,
+    #[serde(default)]
+    pub props: ClientReferenceProps,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -186,6 +357,8 @@ pub fn looks_like_ferrite_payload(value: &Value) -> bool {
             || object.contains_key("root")
             || object.contains_key("shell")
             || object.contains_key("chunks")
+            || object.contains_key("module")
+            || object.contains_key("exportName")
     })
 }
 
@@ -235,6 +408,101 @@ pub fn validate_chunk_id(id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn validate_client_reference_payload(payload: &ClientReferencePayload) -> Result<()> {
+    if payload.ferrite != CLIENT_REFERENCE_MARKER {
+        return Err(ProtocolError::new(format!(
+            "expected ferrite marker \"{CLIENT_REFERENCE_MARKER}\""
+        )));
+    }
+
+    if payload.version != CLIENT_REFERENCE_VERSION {
+        return Err(ProtocolError::new(format!(
+            "unsupported client reference version {}; expected {CLIENT_REFERENCE_VERSION}",
+            payload.version
+        )));
+    }
+
+    validate_client_reference_parts(&payload.id, &payload.module, &payload.export_name)?;
+
+    for (key, value) in &payload.props {
+        validate_client_reference_value(value, &format!("props.{key}"))?;
+    }
+
+    Ok(())
+}
+
+pub fn validate_client_reference_parts(id: &str, module: &str, export_name: &str) -> Result<()> {
+    validate_client_reference_module(module)?;
+    validate_client_reference_export_name(export_name)?;
+
+    let expected_id = format!("{module}#{export_name}");
+    if id != expected_id {
+        return Err(ProtocolError::new(format!(
+            "client reference id must equal \"{expected_id}\""
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_client_reference_module(module: &str) -> Result<()> {
+    if module.is_empty() {
+        return Err(ProtocolError::new(
+            "client reference module must be non-empty.",
+        ));
+    }
+
+    if module.starts_with('/') || module.contains('\\') || module.contains('#') {
+        return Err(ProtocolError::new(format!(
+            "invalid client reference module \"{module}\""
+        )));
+    }
+
+    if module
+        .split('/')
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(ProtocolError::new(format!(
+            "invalid client reference module \"{module}\""
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_client_reference_export_name(export_name: &str) -> Result<()> {
+    if matches!(export_name, "default" | "*") {
+        return Ok(());
+    }
+
+    let mut chars = export_name.chars();
+    let Some(first) = chars.next() else {
+        return Err(ProtocolError::new("invalid client reference export \"\""));
+    };
+
+    if !(first.is_ascii_alphabetic() || matches!(first, '_' | '$'))
+        || !chars.all(|char| char.is_ascii_alphanumeric() || matches!(char, '_' | '$'))
+    {
+        return Err(ProtocolError::new(format!(
+            "invalid client reference export \"{export_name}\""
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_client_reference_value(value: &Value, path: &str) -> Result<()> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) | Value::Number(_) => Ok(()),
+        Value::Array(items) => items.iter().enumerate().try_for_each(|(index, item)| {
+            validate_client_reference_value(item, &format!("{path}[{index}]"))
+        }),
+        Value::Object(object) => object.iter().try_for_each(|(key, child)| {
+            validate_client_reference_value(child, &format!("{path}.{key}"))
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -303,6 +571,78 @@ mod tests {
         assert_eq!(
             ferrite_marker(&marker_error).unwrap_err().message(),
             "ferrite marker must be a string"
+        );
+    }
+
+    #[test]
+    fn validates_client_reference_payloads() {
+        let payload = ClientReferencePayload {
+            ferrite: CLIENT_REFERENCE_MARKER.to_owned(),
+            version: CLIENT_REFERENCE_VERSION,
+            id: "app/posts/[id]/PostActions.tsx#default".to_owned(),
+            module: "app/posts/[id]/PostActions.tsx".to_owned(),
+            export_name: "default".to_owned(),
+            props: BTreeMap::from([("id".to_owned(), Value::String("alpha".to_owned()))]),
+        };
+
+        assert!(validate_client_reference_payload(&payload).is_ok());
+        assert!(
+            validate_client_reference_parts(
+                "app/Button.tsx#ShareButton",
+                "app/Button.tsx",
+                "ShareButton"
+            )
+            .is_ok()
+        );
+        assert!(validate_client_reference_parts("app/Button.tsx#*", "app/Button.tsx", "*").is_ok());
+
+        let mut wrong_marker = payload.clone();
+        wrong_marker.ferrite = "other".to_owned();
+        assert_eq!(
+            validate_client_reference_payload(&wrong_marker)
+                .unwrap_err()
+                .message(),
+            "expected ferrite marker \"client-reference\""
+        );
+
+        let mut wrong_version = payload.clone();
+        wrong_version.version = 99;
+        assert_eq!(
+            validate_client_reference_payload(&wrong_version)
+                .unwrap_err()
+                .message(),
+            "unsupported client reference version 99; expected 1"
+        );
+
+        let mut id_mismatch = payload.clone();
+        id_mismatch.id = "app/posts/[id]/PostActions.tsx#Other".to_owned();
+        assert_eq!(
+            validate_client_reference_payload(&id_mismatch)
+                .unwrap_err()
+                .message(),
+            "client reference id must equal \"app/posts/[id]/PostActions.tsx#default\""
+        );
+
+        assert_eq!(
+            validate_client_reference_parts(
+                "/app/Button.tsx#default",
+                "/app/Button.tsx",
+                "default"
+            )
+            .unwrap_err()
+            .message(),
+            "invalid client reference module \"/app/Button.tsx\""
+        );
+
+        assert_eq!(
+            validate_client_reference_parts(
+                "app/Button.tsx#bad-name",
+                "app/Button.tsx",
+                "bad-name"
+            )
+            .unwrap_err()
+            .message(),
+            "invalid client reference export \"bad-name\""
         );
     }
 

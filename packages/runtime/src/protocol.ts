@@ -1,12 +1,22 @@
 export const RENDER_PACKET_MARKER = "render-packet" as const;
 export const RENDER_STREAM_MARKER = "render-stream" as const;
 export const RENDER_PACKET_VERSION = 1 as const;
+export const CLIENT_REFERENCE_MARKER = "client-reference" as const;
+export const CLIENT_REFERENCE_VERSION = 1 as const;
 
 export const COMPACT_TEXT_OPCODE = 0 as const;
 export const COMPACT_FRAGMENT_OPCODE = 1 as const;
 export const COMPACT_ELEMENT_OPCODE = 2 as const;
 
 export type SerializableProp = string | number | boolean;
+
+export type ClientReferenceSerializableValue =
+  | string
+  | number
+  | boolean
+  | null
+  | ClientReferenceSerializableValue[]
+  | { [key: string]: ClientReferenceSerializableValue };
 
 export type SerializableNode =
   | {
@@ -46,3 +56,139 @@ export type RenderStreamPacket = {
   shell: CompactNode;
   chunks: RenderStreamChunk[];
 };
+
+export type ClientReferencePayload = {
+  ferrite: typeof CLIENT_REFERENCE_MARKER;
+  version: typeof CLIENT_REFERENCE_VERSION;
+  id: string;
+  module: string;
+  exportName: string;
+  props: Record<string, ClientReferenceSerializableValue>;
+};
+
+export function parseClientReferenceId(id: string): { module: string; exportName: string } {
+  if (typeof id !== "string" || id.length === 0) {
+    throw new TypeError("Ferrite client reference requires a non-empty id.");
+  }
+
+  const separator = id.indexOf("#");
+  if (separator === -1 || separator !== id.lastIndexOf("#")) {
+    throw new TypeError("Ferrite client reference id must be formatted as module#exportName.");
+  }
+
+  const module = id.slice(0, separator);
+  const exportName = id.slice(separator + 1);
+  validateClientReferenceParts(id, module, exportName);
+  return { module, exportName };
+}
+
+export function createClientReferencePayload(input: {
+  id: string;
+  props?: Record<string, ClientReferenceSerializableValue>;
+}): ClientReferencePayload {
+  const { module, exportName } = parseClientReferenceId(input.id);
+  return {
+    ferrite: CLIENT_REFERENCE_MARKER,
+    version: CLIENT_REFERENCE_VERSION,
+    id: input.id,
+    module,
+    exportName,
+    props: input.props ?? {},
+  };
+}
+
+export function validateClientReferencePayload(payload: unknown): ClientReferencePayload {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("Ferrite client reference payload must be an object.");
+  }
+
+  const candidate = payload as Partial<ClientReferencePayload>;
+  if (candidate.ferrite !== CLIENT_REFERENCE_MARKER) {
+    throw new TypeError(`expected ferrite marker "${CLIENT_REFERENCE_MARKER}"`);
+  }
+
+  if (candidate.version !== CLIENT_REFERENCE_VERSION) {
+    throw new TypeError(`unsupported client reference version ${String(candidate.version)}; expected ${CLIENT_REFERENCE_VERSION}`);
+  }
+
+  if (
+    typeof candidate.id !== "string" ||
+    typeof candidate.module !== "string" ||
+    typeof candidate.exportName !== "string"
+  ) {
+    throw new TypeError("Ferrite client reference payload requires string id, module, and exportName.");
+  }
+
+  validateClientReferenceParts(candidate.id, candidate.module, candidate.exportName);
+
+  if (candidate.props === undefined) {
+    candidate.props = {};
+  }
+  if (candidate.props === null || typeof candidate.props !== "object" || Array.isArray(candidate.props)) {
+    throw new TypeError("Ferrite client reference payload props must be a JSON object.");
+  }
+
+  for (const [key, value] of Object.entries(candidate.props)) {
+    validateClientReferenceSerializableValue(value, `props.${key}`);
+  }
+
+  return candidate as ClientReferencePayload;
+}
+
+export function validateClientReferenceParts(id: string, module: string, exportName: string): void {
+  validateClientReferenceModule(module);
+  validateClientReferenceExportName(exportName);
+  const expectedId = `${module}#${exportName}`;
+  if (id !== expectedId) {
+    throw new TypeError(`client reference id must equal "${expectedId}"`);
+  }
+}
+
+function validateClientReferenceModule(module: string): void {
+  if (typeof module !== "string" || module.length === 0) {
+    throw new TypeError("client reference module must be non-empty.");
+  }
+  if (module.startsWith("/") || module.includes("\\") || module.includes("#")) {
+    throw new TypeError(`invalid client reference module "${module}"`);
+  }
+
+  const segments = module.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    throw new TypeError(`invalid client reference module "${module}"`);
+  }
+}
+
+function validateClientReferenceExportName(exportName: string): void {
+  if (exportName === "default" || exportName === "*") {
+    return;
+  }
+  if (!/^[A-Za-z_$][\w$]*$/.test(exportName)) {
+    throw new TypeError(`invalid client reference export "${exportName}"`);
+  }
+}
+
+function validateClientReferenceSerializableValue(
+  value: ClientReferenceSerializableValue,
+  path: string,
+): void {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return;
+  }
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) {
+      return;
+    }
+    throw new TypeError(`Ferrite client reference ${path} must be JSON-serializable.`);
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => validateClientReferenceSerializableValue(item, `${path}[${index}]`));
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      validateClientReferenceSerializableValue(child, `${path}.${key}`);
+    }
+    return;
+  }
+  throw new TypeError(`Ferrite client reference ${path} must be JSON-serializable.`);
+}

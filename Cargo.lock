@@ -156,6 +156,7 @@ dependencies = [
 name = "ferrite-client-bundler"
 version = "0.1.0"
 dependencies = [
+ "ferrite-protocol",
  "serde",
  "serde_json",
  "tempfile",

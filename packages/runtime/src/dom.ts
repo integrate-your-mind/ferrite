@@ -25,6 +25,7 @@ import {
   type TransitionStartFunction,
   type VNode,
 } from "./index.js";
+import { parseClientReferenceId, validateClientReferenceParts, validateClientReferencePayload } from "./protocol.js";
 
 type HookState = unknown[];
 type EffectPhase = "layout" | "passive";
@@ -78,6 +79,8 @@ export interface RootHandle {
 
 export type ClientReferenceRegistration = {
   id: string;
+  module?: string;
+  exportName?: string;
   component: Component<Record<string, unknown>>;
 };
 
@@ -103,9 +106,7 @@ export function hydrateClientReference(
   registration: ClientReferenceRegistration,
   root: ParentNode = globalThis.document,
 ): RootHandle[] {
-  if (!registration || typeof registration.id !== "string" || registration.id.length === 0) {
-    throw new TypeError("Ferrite client reference registration requires a non-empty id.");
-  }
+  normalizeClientReferenceRegistration(registration);
 
   if (typeof registration.component !== "function") {
     throw new TypeError("Ferrite client reference registration requires a component function.");
@@ -121,7 +122,7 @@ export function hydrateClientReference(
       continue;
     }
 
-    const props = clientReferenceProps(container);
+    const props = clientReferenceProps(container, registration.id);
     const handle = hydrate(createElement(registration.component, props), container);
     container.setAttribute("data-ferrite-client-hydrated", "true");
     handles.push(handle);
@@ -157,7 +158,41 @@ function clientReferenceContainers(root: ParentNode, id: string): Element[] {
   return containers.filter((container) => container.getAttribute("data-ferrite-client-reference") === id);
 }
 
-function clientReferenceProps(container: Element): Record<string, unknown> {
+function normalizeClientReferenceRegistration(registration: ClientReferenceRegistration): void {
+  if (!registration || typeof registration.id !== "string" || registration.id.length === 0) {
+    throw new TypeError("Ferrite client reference registration requires a non-empty id.");
+  }
+
+  parseClientReferenceId(registration.id);
+
+  if (registration.module !== undefined || registration.exportName !== undefined) {
+    if (typeof registration.module !== "string" || typeof registration.exportName !== "string") {
+      throw new TypeError("Ferrite client reference registration module and exportName must be strings.");
+    }
+    validateClientReferenceParts(registration.id, registration.module, registration.exportName);
+  }
+}
+
+function clientReferenceProps(container: Element, expectedId: string): Record<string, unknown> {
+  const rawPayload = container.getAttribute("data-ferrite-client-payload");
+  if (rawPayload !== null && rawPayload !== "") {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawPayload);
+    } catch (error) {
+      throw new TypeError(
+        `Ferrite client reference payload must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    const validated = validateClientReferencePayload(payload);
+    if (validated.id !== expectedId) {
+      throw new TypeError(`Ferrite client reference payload id "${validated.id}" does not match marker "${expectedId}".`);
+    }
+
+    return validated.props;
+  }
+
   const raw = container.getAttribute("data-ferrite-client-props");
   if (raw === null || raw === "") {
     return {};

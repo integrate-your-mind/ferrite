@@ -22,6 +22,8 @@ import {
   type SuspenseProps,
   type TransitionStartFunction,
 } from "./index.js";
+import { createClientReferencePayload, parseClientReferenceId } from "./protocol.js";
+import type { ClientReferenceSerializableValue } from "./protocol.js";
 
 export type PageModule<Props extends Record<string, unknown> = Record<string, unknown>> = {
   default: (props: Props) => Child | Promise<Child>;
@@ -113,14 +115,6 @@ export type DocumentRenderOptions = {
   defaultTitle?: string;
 };
 
-export type ClientReferenceSerializableValue =
-  | string
-  | number
-  | boolean
-  | null
-  | ClientReferenceSerializableValue[]
-  | { [key: string]: ClientReferenceSerializableValue };
-
 export type ClientReferenceSerializedProps = Record<string, ClientReferenceSerializableValue>;
 
 export type ClientReferenceOptions<Props extends Record<string, unknown> = Record<string, unknown>> = {
@@ -157,13 +151,17 @@ export function createClientReference<Props extends Record<string, unknown> = Re
     throw new TypeError("Ferrite client reference requires a render component function.");
   }
 
+  parseClientReferenceId(options.id);
+
   return function FerriteClientReference(props) {
     const serializedProps = serializeClientReferenceProps(props);
+    const payload = createClientReferencePayload({ id: options.id, props: serializedProps });
     return createServerElement(
       "span",
       {
         "data-ferrite-client-reference": options.id,
         "data-ferrite-client-props": JSON.stringify(serializedProps),
+        "data-ferrite-client-payload": JSON.stringify(payload),
       },
       createElement(options.render, props) as Child,
     );

@@ -92,6 +92,8 @@ test("render-page proxies nested use client imports into client reference marker
             {
               "data-ferrite-client-reference": "app/posts/[id]/PostActions.tsx#default",
               "data-ferrite-client-props": '{"id":"alpha"}',
+              "data-ferrite-client-payload":
+                '{"ferrite":"client-reference","version":1,"id":"app/posts/[id]/PostActions.tsx#default","module":"app/posts/[id]/PostActions.tsx","exportName":"default","props":{"id":"alpha"}}',
             },
             [
               [
