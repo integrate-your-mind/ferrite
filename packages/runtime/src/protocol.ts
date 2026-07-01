@@ -5,6 +5,8 @@ export const CLIENT_REFERENCE_MARKER = "client-reference" as const;
 export const CLIENT_REFERENCE_VERSION = 1 as const;
 export const SERVER_PAYLOAD_MARKER = "server-payload" as const;
 export const SERVER_PAYLOAD_VERSION = 1 as const;
+export const SERVER_PAYLOAD_STREAM_FRAME_MARKER = "server-payload-frame" as const;
+export const SERVER_PAYLOAD_STREAM_FRAME_VERSION = 1 as const;
 
 export const COMPACT_TEXT_OPCODE = 0 as const;
 export const COMPACT_FRAGMENT_OPCODE = 1 as const;
@@ -81,6 +83,23 @@ export type ServerPayloadPacket = {
   clientReferences: ClientReferencePayload[];
   chunks: ServerPayloadChunk[];
 };
+
+export type ServerPayloadStreamShellFrame = {
+  ferrite: typeof SERVER_PAYLOAD_STREAM_FRAME_MARKER;
+  version: typeof SERVER_PAYLOAD_STREAM_FRAME_VERSION;
+  kind: "shell";
+  shell: CompactNode;
+  clientReferences: ClientReferencePayload[];
+};
+
+export type ServerPayloadStreamChunkFrame = {
+  ferrite: typeof SERVER_PAYLOAD_STREAM_FRAME_MARKER;
+  version: typeof SERVER_PAYLOAD_STREAM_FRAME_VERSION;
+  kind: "chunk";
+  chunk: ServerPayloadChunk;
+};
+
+export type ServerPayloadStreamFrame = ServerPayloadStreamShellFrame | ServerPayloadStreamChunkFrame;
 
 export function parseClientReferenceId(id: string): { module: string; exportName: string } {
   if (typeof id !== "string" || id.length === 0) {
@@ -177,6 +196,51 @@ export function validateServerPayloadPacket(payload: unknown): ServerPayloadPack
   candidate.chunks = candidate.chunks.map((chunk, index) => validateServerPayloadChunk(chunk, index));
 
   return candidate as ServerPayloadPacket;
+}
+
+export function validateServerPayloadStreamFrame(frame: unknown): ServerPayloadStreamFrame {
+  if (frame === null || typeof frame !== "object" || Array.isArray(frame)) {
+    throw new TypeError("Ferrite server payload stream frame must be an object.");
+  }
+
+  const candidate = frame as Partial<ServerPayloadStreamFrame>;
+  if (candidate.ferrite !== SERVER_PAYLOAD_STREAM_FRAME_MARKER) {
+    throw new TypeError(`expected ferrite marker "${SERVER_PAYLOAD_STREAM_FRAME_MARKER}"`);
+  }
+
+  if (candidate.version !== SERVER_PAYLOAD_STREAM_FRAME_VERSION) {
+    throw new TypeError(`unsupported server payload stream frame version ${String(candidate.version)}; expected ${SERVER_PAYLOAD_STREAM_FRAME_VERSION}`);
+  }
+
+  if (candidate.kind === "shell") {
+    return validateServerPayloadStreamShellFrame(candidate as Partial<ServerPayloadStreamShellFrame>);
+  }
+  if (candidate.kind === "chunk") {
+    return validateServerPayloadStreamChunkFrame(candidate as Partial<ServerPayloadStreamChunkFrame>);
+  }
+
+  throw new TypeError(`unsupported server payload stream frame kind ${String(candidate.kind)}`);
+}
+
+function validateServerPayloadStreamShellFrame(
+  frame: Partial<ServerPayloadStreamShellFrame>,
+): ServerPayloadStreamShellFrame {
+  if (!Array.isArray(frame.shell)) {
+    throw new TypeError("Ferrite server payload stream shell frame requires a compact shell.");
+  }
+  if (!Array.isArray(frame.clientReferences)) {
+    throw new TypeError("Ferrite server payload stream shell frame clientReferences must be an array.");
+  }
+
+  frame.clientReferences = frame.clientReferences.map(validateClientReferencePayload);
+  return frame as ServerPayloadStreamShellFrame;
+}
+
+function validateServerPayloadStreamChunkFrame(
+  frame: Partial<ServerPayloadStreamChunkFrame>,
+): ServerPayloadStreamChunkFrame {
+  frame.chunk = validateServerPayloadChunk(frame.chunk, 0);
+  return frame as ServerPayloadStreamChunkFrame;
 }
 
 function validateServerPayloadChunk(chunk: unknown, index: number): ServerPayloadChunk {

@@ -27,6 +27,7 @@ import {
   applyServerPayload,
   createServerPayloadNavigator,
   fetchAndApplyServerPayload,
+  fetchAndApplyServerPayloadStream,
   hydrate,
   hydrateClientReference,
   mount,
@@ -77,6 +78,32 @@ function navigationDocumentPayload(route, text, title, headChildren = []) {
     ],
     clientReferences: [],
     chunks: [],
+  };
+}
+
+function serverPayloadStreamFrame(frame) {
+  return {
+    ferrite: "server-payload-frame",
+    version: 1,
+    ...frame,
+  };
+}
+
+function serverPayloadStreamResponse(frames) {
+  const encoder = new TextEncoder();
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    body: new ReadableStream({
+      start(controller) {
+        for (const frame of frames) {
+          const line = typeof frame === "string" ? frame : JSON.stringify(frame);
+          controller.enqueue(encoder.encode(`${line}\n`));
+        }
+        controller.close();
+      },
+    }),
   };
 }
 
@@ -893,6 +920,188 @@ test("fetchAndApplyServerPayload rejects failed responses without changing DOM",
   );
 
   assert.equal(container.innerHTML, before);
+});
+
+test("fetchAndApplyServerPayloadStream commits shell before deferred chunks", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  window.document.head.innerHTML = "<title>Old title</title>";
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const observed = [];
+  const frames = [
+    serverPayloadStreamFrame({
+      kind: "shell",
+      shell: [
+        2,
+        "html",
+        {},
+        [
+          [2, "head", {}, [[2, "title", {}, [[0, "Stream title"]]]]],
+          [
+            2,
+            "body",
+            {},
+            [
+              [
+                2,
+                "div",
+                { id: "ferrite-root", "data-route": "/posts/stream" },
+                [
+                  [2, "h1", {}, [[0, "Stream route"]]],
+                  [2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[0, "Loading chunk"]]],
+                ],
+              ],
+            ],
+          ],
+        ],
+      ],
+      clientReferences: [],
+    }),
+    serverPayloadStreamFrame({
+      kind: "chunk",
+      chunk: { id: "s0", root: [2, "strong", {}, [[0, "Loaded chunk"]]], clientReferences: [] },
+    }),
+  ];
+  let requested;
+
+  const packet = await fetchAndApplyServerPayloadStream(root, "/posts/stream", {
+    window,
+    fetch: async (input) => {
+      requested = input;
+      return serverPayloadStreamResponse(frames);
+    },
+    onShell: (shellPacket) => {
+      observed.push({
+        phase: "shell",
+        text: container.textContent,
+        title: window.document.title,
+        chunks: shellPacket.chunks.length,
+      });
+    },
+    onChunk: (chunk, chunkPacket) => {
+      observed.push({
+        phase: `chunk:${chunk.id}`,
+        text: container.textContent,
+        title: window.document.title,
+        chunks: chunkPacket.chunks.length,
+      });
+    },
+  });
+
+  assert.equal(requested, "/posts/stream?__ferrite_payload=server");
+  assert.equal(packet.ferrite, "server-payload");
+  assert.equal(packet.chunks.length, 1);
+  assert.deepEqual(observed, [
+    { phase: "shell", text: "Stream routeLoading chunk", title: "Stream title", chunks: 0 },
+    { phase: "chunk:s0", text: "Stream routeLoaded chunk", title: "Stream title", chunks: 1 },
+  ]);
+  assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/stream");
+  assert.equal(container.textContent, "Stream routeLoaded chunk");
+});
+
+test("fetchAndApplyServerPayloadStream rejects malformed shell frames without mutation", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  window.document.head.innerHTML = "<title>Old title</title>";
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const headBefore = window.document.head.innerHTML;
+  const bodyBefore = container.innerHTML;
+
+  await assert.rejects(
+    () =>
+      fetchAndApplyServerPayloadStream(root, "/posts/bad", {
+        window,
+        fetch: async () =>
+          serverPayloadStreamResponse([
+            serverPayloadStreamFrame({
+              kind: "shell",
+              shell: [
+                2,
+                "html",
+                {},
+                [
+                  [2, "head", {}, [[2, "meta", { name: "description", content: { nested: true } }, []]]],
+                  [2, "body", {}, [[2, "div", { id: "ferrite-root", "data-route": "/posts/bad" }, [[0, "Bad"]]]]],
+                ],
+              ],
+              clientReferences: [],
+            }),
+          ]),
+      }),
+    /prop "content".*must be a string, number, or boolean/,
+  );
+
+  assert.equal(window.document.head.innerHTML, headBefore);
+  assert.equal(container.innerHTML, bodyBefore);
+});
+
+test("fetchAndApplyServerPayloadStream rejects chunk frames before shell", async () => {
+  const { container } = createContainer();
+  const root = mount(createElement("p", null, "Stable"), container);
+  const before = container.innerHTML;
+
+  await assert.rejects(
+    () =>
+      fetchAndApplyServerPayloadStream(root, "/posts/chunk-first", {
+        fetch: async () =>
+          serverPayloadStreamResponse([
+            serverPayloadStreamFrame({
+              kind: "chunk",
+              chunk: { id: "s0", root: [2, "strong", {}, [[0, "Loaded"]]], clientReferences: [] },
+            }),
+          ]),
+      }),
+    /chunk frame arrived before a shell frame/,
+  );
+
+  assert.equal(container.innerHTML, before);
+});
+
+test("fetchAndApplyServerPayloadStream reports unmatched chunks after shell commit", async () => {
+  const { container } = createContainer();
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Old"), container);
+  const shellFrames = [
+    serverPayloadStreamFrame({
+      kind: "shell",
+      shell: [2, "div", { id: "ferrite-root", "data-route": "/posts/shell" }, [[0, "Shell committed"]]],
+      clientReferences: [],
+    }),
+    serverPayloadStreamFrame({
+      kind: "chunk",
+      chunk: { id: "missing", root: [2, "strong", {}, [[0, "Unexpected"]]], clientReferences: [] },
+    }),
+  ];
+  const shellSnapshots = [];
+
+  await assert.rejects(
+    () =>
+      fetchAndApplyServerPayloadStream(root, "/posts/shell", {
+        fetch: async () => serverPayloadStreamResponse(shellFrames),
+        onShell: () => shellSnapshots.push(container.innerHTML),
+      }),
+    /chunk "missing" has no matching suspense boundary/,
+  );
+
+  assert.deepEqual(shellSnapshots, ['<div id="ferrite-root" data-route="/posts/shell">Shell committed</div>']);
+  assert.equal(container.innerHTML, '<div id="ferrite-root" data-route="/posts/shell">Shell committed</div>');
+});
+
+test("fetchAndApplyServerPayloadStream reports invalid JSON after shell commit", async () => {
+  const { container } = createContainer();
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Old"), container);
+  const shellFrame = serverPayloadStreamFrame({
+    kind: "shell",
+    shell: [2, "div", { id: "ferrite-root", "data-route": "/posts/shell" }, [[0, "Shell committed"]]],
+    clientReferences: [],
+  });
+
+  await assert.rejects(
+    () =>
+      fetchAndApplyServerPayloadStream(root, "/posts/shell", {
+        fetch: async () => serverPayloadStreamResponse([shellFrame, "{not-json"]),
+      }),
+    /frame 2 must be valid JSON/,
+  );
+
+  assert.equal(container.innerHTML, '<div id="ferrite-root" data-route="/posts/shell">Shell committed</div>');
 });
 
 test("server payload navigator applies same-origin document payloads and updates history", async () => {

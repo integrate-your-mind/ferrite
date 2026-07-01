@@ -29,10 +29,13 @@ import {
   COMPACT_ELEMENT_OPCODE,
   COMPACT_FRAGMENT_OPCODE,
   COMPACT_TEXT_OPCODE,
+  SERVER_PAYLOAD_MARKER,
+  SERVER_PAYLOAD_VERSION,
   parseClientReferenceId,
   validateClientReferenceParts,
   validateClientReferencePayload,
   validateServerPayloadPacket,
+  validateServerPayloadStreamFrame,
 } from "./protocol.js";
 import type { CompactNode, ServerPayloadChunk, ServerPayloadPacket } from "./protocol.js";
 
@@ -100,6 +103,14 @@ export type ServerPayloadFetch = (input: string, init?: RequestInit) => Promise<
 export type FetchServerPayloadOptions = {
   fetch?: ServerPayloadFetch;
   requestInit?: RequestInit;
+};
+
+export type FetchServerPayloadStreamOptions = FetchServerPayloadOptions & {
+  window?: Window;
+  routeRootId?: string | null;
+  reconcileHead?: boolean;
+  onShell?: (packet: ServerPayloadPacket) => void;
+  onChunk?: (chunk: ServerPayloadChunk, packet: ServerPayloadPacket) => void;
 };
 
 export type ServerPayloadNavigationOptions = FetchServerPayloadOptions & {
@@ -221,6 +232,147 @@ export async function fetchAndApplyServerPayload(
 ): Promise<ServerPayloadPacket> {
   const packet = await fetchServerPayload(input, options);
   return applyServerPayload(root, packet);
+}
+
+export async function fetchAndApplyServerPayloadStream(
+  root: RootHandle,
+  input: string | URL,
+  options: FetchServerPayloadStreamOptions = {},
+): Promise<ServerPayloadPacket> {
+  if (!root || typeof root.update !== "function") {
+    throw new TypeError("Ferrite server payload stream application requires a root handle.");
+  }
+
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new TypeError("Ferrite server payload stream fetch requires a fetch implementation.");
+  }
+
+  const response = await fetchImpl(serverPayloadRequestUrl(input), options.requestInit);
+  if (!response.ok) {
+    throw new Error(
+      `Ferrite server payload stream request failed with ${response.status} ${response.statusText || "Unknown Status"}.`,
+    );
+  }
+
+  if (!response.body || typeof response.body.getReader !== "function") {
+    throw new TypeError("Ferrite server payload stream response requires a readable body.");
+  }
+
+  const navigationWindow = options.window ?? globalThis.window;
+  const document = navigationWindow?.document;
+  let shell: Omit<ServerPayloadPacket, "chunks"> | null = null;
+  const chunks: ServerPayloadChunk[] = [];
+  let frameCount = 0;
+  let latestPacket: ServerPayloadPacket | null = null;
+
+  for await (const rawFrame of readServerPayloadStreamFrames(response.body)) {
+    const frame = validateServerPayloadStreamFrame(rawFrame);
+    frameCount += 1;
+
+    if (frame.kind === "shell") {
+      if (shell) {
+        throw new TypeError("Ferrite server payload stream cannot contain more than one shell frame.");
+      }
+      if (frameCount !== 1) {
+        throw new TypeError("Ferrite server payload stream shell frame must be first.");
+      }
+
+      shell = {
+        ferrite: SERVER_PAYLOAD_MARKER,
+        version: SERVER_PAYLOAD_VERSION,
+        shell: frame.shell,
+        clientReferences: frame.clientReferences,
+      };
+      const packet = { ...shell, chunks: [] } satisfies ServerPayloadPacket;
+      applyStreamPayloadPacket(root, packet, options.routeRootId, document, options.reconcileHead);
+      latestPacket = packet;
+      options.onShell?.(packet);
+      continue;
+    }
+
+    if (!shell) {
+      throw new TypeError("Ferrite server payload stream chunk frame arrived before a shell frame.");
+    }
+
+    chunks.push(frame.chunk);
+    const packet = { ...shell, chunks: [...chunks] } satisfies ServerPayloadPacket;
+    applyStreamPayloadPacket(root, packet, options.routeRootId, undefined, false);
+    latestPacket = packet;
+    options.onChunk?.(frame.chunk, packet);
+  }
+
+  if (!latestPacket) {
+    throw new TypeError("Ferrite server payload stream ended before a shell frame.");
+  }
+
+  return latestPacket;
+}
+
+function applyStreamPayloadPacket(
+  root: RootHandle,
+  packet: ServerPayloadPacket,
+  routeRootId: string | null | undefined,
+  document: Document | undefined,
+  reconcileHead: boolean | undefined,
+): void {
+  const headPlan = document && reconcileHead !== false ? prepareHeadReconciliation(packet, document) : null;
+  const child = navigationPayloadToChild(packet, routeRootId);
+  root.update(child);
+  headPlan?.apply();
+}
+
+async function* readServerPayloadStreamFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<unknown> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let lineNumber = 0;
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.search(/\r?\n/);
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(buffer.charCodeAt(newlineIndex) === 13 ? newlineIndex + 2 : newlineIndex + 1);
+        lineNumber += 1;
+        const frame = parseServerPayloadStreamLine(line, lineNumber);
+        if (frame !== undefined) {
+          yield frame;
+        }
+        newlineIndex = buffer.search(/\r?\n/);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  buffer += decoder.decode();
+  if (buffer.trim().length > 0) {
+    lineNumber += 1;
+    yield parseServerPayloadStreamLine(buffer, lineNumber);
+  }
+}
+
+function parseServerPayloadStreamLine(line: string, lineNumber: number): unknown | undefined {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch (error) {
+    throw new TypeError(
+      `Ferrite server payload stream frame ${lineNumber} must be valid JSON: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 export function createServerPayloadNavigator(

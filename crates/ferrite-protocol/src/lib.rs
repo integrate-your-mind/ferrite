@@ -8,9 +8,11 @@ pub const RENDER_PACKET_MARKER: &str = "render-packet";
 pub const RENDER_STREAM_MARKER: &str = "render-stream";
 pub const CLIENT_REFERENCE_MARKER: &str = "client-reference";
 pub const SERVER_PAYLOAD_MARKER: &str = "server-payload";
+pub const SERVER_PAYLOAD_STREAM_FRAME_MARKER: &str = "server-payload-frame";
 pub const RENDER_PACKET_VERSION: u64 = 1;
 pub const CLIENT_REFERENCE_VERSION: u64 = 1;
 pub const SERVER_PAYLOAD_VERSION: u64 = 1;
+pub const SERVER_PAYLOAD_STREAM_FRAME_VERSION: u64 = 1;
 pub const COMPACT_TEXT_OPCODE: u8 = 0;
 pub const COMPACT_FRAGMENT_OPCODE: u8 = 1;
 pub const COMPACT_ELEMENT_OPCODE: u8 = 2;
@@ -54,6 +56,18 @@ pub fn typescript_protocol_source() -> String {
     writeln!(
         out,
         "export const SERVER_PAYLOAD_VERSION = {SERVER_PAYLOAD_VERSION} as const;"
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_PAYLOAD_STREAM_FRAME_MARKER = {} as const;",
+        serde_json::to_string(SERVER_PAYLOAD_STREAM_FRAME_MARKER)
+            .expect("string serialization cannot fail")
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_PAYLOAD_STREAM_FRAME_VERSION = {SERVER_PAYLOAD_STREAM_FRAME_VERSION} as const;"
     )
     .expect("writing to a string cannot fail");
     out.push('\n');
@@ -145,6 +159,23 @@ export type ServerPayloadPacket = {
   clientReferences: ClientReferencePayload[];
   chunks: ServerPayloadChunk[];
 };
+
+export type ServerPayloadStreamShellFrame = {
+  ferrite: typeof SERVER_PAYLOAD_STREAM_FRAME_MARKER;
+  version: typeof SERVER_PAYLOAD_STREAM_FRAME_VERSION;
+  kind: "shell";
+  shell: CompactNode;
+  clientReferences: ClientReferencePayload[];
+};
+
+export type ServerPayloadStreamChunkFrame = {
+  ferrite: typeof SERVER_PAYLOAD_STREAM_FRAME_MARKER;
+  version: typeof SERVER_PAYLOAD_STREAM_FRAME_VERSION;
+  kind: "chunk";
+  chunk: ServerPayloadChunk;
+};
+
+export type ServerPayloadStreamFrame = ServerPayloadStreamShellFrame | ServerPayloadStreamChunkFrame;
 
 export function parseClientReferenceId(id: string): { module: string; exportName: string } {
   if (typeof id !== "string" || id.length === 0) {
@@ -241,6 +272,51 @@ export function validateServerPayloadPacket(payload: unknown): ServerPayloadPack
   candidate.chunks = candidate.chunks.map((chunk, index) => validateServerPayloadChunk(chunk, index));
 
   return candidate as ServerPayloadPacket;
+}
+
+export function validateServerPayloadStreamFrame(frame: unknown): ServerPayloadStreamFrame {
+  if (frame === null || typeof frame !== "object" || Array.isArray(frame)) {
+    throw new TypeError("Ferrite server payload stream frame must be an object.");
+  }
+
+  const candidate = frame as Partial<ServerPayloadStreamFrame>;
+  if (candidate.ferrite !== SERVER_PAYLOAD_STREAM_FRAME_MARKER) {
+    throw new TypeError(`expected ferrite marker "${SERVER_PAYLOAD_STREAM_FRAME_MARKER}"`);
+  }
+
+  if (candidate.version !== SERVER_PAYLOAD_STREAM_FRAME_VERSION) {
+    throw new TypeError(`unsupported server payload stream frame version ${String(candidate.version)}; expected ${SERVER_PAYLOAD_STREAM_FRAME_VERSION}`);
+  }
+
+  if (candidate.kind === "shell") {
+    return validateServerPayloadStreamShellFrame(candidate as Partial<ServerPayloadStreamShellFrame>);
+  }
+  if (candidate.kind === "chunk") {
+    return validateServerPayloadStreamChunkFrame(candidate as Partial<ServerPayloadStreamChunkFrame>);
+  }
+
+  throw new TypeError(`unsupported server payload stream frame kind ${String(candidate.kind)}`);
+}
+
+function validateServerPayloadStreamShellFrame(
+  frame: Partial<ServerPayloadStreamShellFrame>,
+): ServerPayloadStreamShellFrame {
+  if (!Array.isArray(frame.shell)) {
+    throw new TypeError("Ferrite server payload stream shell frame requires a compact shell.");
+  }
+  if (!Array.isArray(frame.clientReferences)) {
+    throw new TypeError("Ferrite server payload stream shell frame clientReferences must be an array.");
+  }
+
+  frame.clientReferences = frame.clientReferences.map(validateClientReferencePayload);
+  return frame as ServerPayloadStreamShellFrame;
+}
+
+function validateServerPayloadStreamChunkFrame(
+  frame: Partial<ServerPayloadStreamChunkFrame>,
+): ServerPayloadStreamChunkFrame {
+  frame.chunk = validateServerPayloadChunk(frame.chunk, 0);
+  return frame as ServerPayloadStreamChunkFrame;
 }
 
 function validateServerPayloadChunk(chunk: unknown, index: number): ServerPayloadChunk {
@@ -422,6 +498,26 @@ pub struct ServerPayloadChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerPayloadStreamShellFrame {
+    pub ferrite: String,
+    pub version: u64,
+    pub kind: String,
+    pub shell: CompactNode,
+    #[serde(default)]
+    pub client_references: Vec<ClientReferencePayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerPayloadStreamChunkFrame {
+    pub ferrite: String,
+    pub version: u64,
+    pub kind: String,
+    pub chunk: ServerPayloadChunk,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompactNode {
     Text((u8, String)),
@@ -557,6 +653,68 @@ pub fn validate_server_payload_packet(packet: &ServerPayloadPacket) -> Result<()
         for reference in &chunk.client_references {
             validate_client_reference_payload(reference)?;
         }
+    }
+
+    Ok(())
+}
+
+pub fn validate_server_payload_stream_shell_frame(
+    frame: &ServerPayloadStreamShellFrame,
+) -> Result<()> {
+    validate_server_payload_stream_frame_header(
+        &frame.ferrite,
+        frame.version,
+        &frame.kind,
+        "shell",
+    )?;
+
+    for reference in &frame.client_references {
+        validate_client_reference_payload(reference)?;
+    }
+
+    Ok(())
+}
+
+pub fn validate_server_payload_stream_chunk_frame(
+    frame: &ServerPayloadStreamChunkFrame,
+) -> Result<()> {
+    validate_server_payload_stream_frame_header(
+        &frame.ferrite,
+        frame.version,
+        &frame.kind,
+        "chunk",
+    )?;
+    validate_chunk_id(&frame.chunk.id)?;
+    for reference in &frame.chunk.client_references {
+        validate_client_reference_payload(reference)?;
+    }
+
+    Ok(())
+}
+
+fn validate_server_payload_stream_frame_header(
+    ferrite: &str,
+    version: u64,
+    kind: &str,
+    expected_kind: &str,
+) -> Result<()> {
+    if ferrite != SERVER_PAYLOAD_STREAM_FRAME_MARKER {
+        return Err(ProtocolError::new(format!(
+            "expected ferrite marker \"{SERVER_PAYLOAD_STREAM_FRAME_MARKER}\""
+        )));
+    }
+
+    if version != SERVER_PAYLOAD_STREAM_FRAME_VERSION {
+        return Err(ProtocolError::new(format!(
+            "unsupported server payload stream frame version {}; expected {SERVER_PAYLOAD_STREAM_FRAME_VERSION}",
+            version
+        )));
+    }
+
+    if kind != expected_kind {
+        return Err(ProtocolError::new(format!(
+            "expected server payload stream frame kind \"{expected_kind}\""
+        )));
     }
 
     Ok(())
@@ -833,6 +991,74 @@ mod tests {
                 .unwrap_err()
                 .message(),
             "client reference id must equal \"app/Button.tsx#default\""
+        );
+    }
+
+    #[test]
+    fn validates_server_payload_stream_frames() {
+        let reference = ClientReferencePayload {
+            ferrite: CLIENT_REFERENCE_MARKER.to_owned(),
+            version: CLIENT_REFERENCE_VERSION,
+            id: "app/Button.tsx#default".to_owned(),
+            module: "app/Button.tsx".to_owned(),
+            export_name: "default".to_owned(),
+            props: BTreeMap::from([("id".to_owned(), Value::String("alpha".to_owned()))]),
+        };
+        let shell = ServerPayloadStreamShellFrame {
+            ferrite: SERVER_PAYLOAD_STREAM_FRAME_MARKER.to_owned(),
+            version: SERVER_PAYLOAD_STREAM_FRAME_VERSION,
+            kind: "shell".to_owned(),
+            shell: CompactNode::Text((0, "shell".to_owned())),
+            client_references: vec![reference.clone()],
+        };
+        let chunk = ServerPayloadStreamChunkFrame {
+            ferrite: SERVER_PAYLOAD_STREAM_FRAME_MARKER.to_owned(),
+            version: SERVER_PAYLOAD_STREAM_FRAME_VERSION,
+            kind: "chunk".to_owned(),
+            chunk: ServerPayloadChunk {
+                id: "s0".to_owned(),
+                root: CompactNode::Text((0, "chunk".to_owned())),
+                client_references: vec![reference],
+            },
+        };
+
+        assert!(validate_server_payload_stream_shell_frame(&shell).is_ok());
+        assert!(validate_server_payload_stream_chunk_frame(&chunk).is_ok());
+
+        let mut wrong_marker = shell.clone();
+        wrong_marker.ferrite = "server-payload".to_owned();
+        assert_eq!(
+            validate_server_payload_stream_shell_frame(&wrong_marker)
+                .unwrap_err()
+                .message(),
+            "expected ferrite marker \"server-payload-frame\""
+        );
+
+        let mut wrong_version = shell.clone();
+        wrong_version.version = 99;
+        assert_eq!(
+            validate_server_payload_stream_shell_frame(&wrong_version)
+                .unwrap_err()
+                .message(),
+            "unsupported server payload stream frame version 99; expected 1"
+        );
+
+        let mut wrong_kind = chunk.clone();
+        wrong_kind.kind = "shell".to_owned();
+        assert_eq!(
+            validate_server_payload_stream_chunk_frame(&wrong_kind)
+                .unwrap_err()
+                .message(),
+            "expected server payload stream frame kind \"chunk\""
+        );
+
+        let mut bad_chunk = chunk;
+        bad_chunk.chunk.id = "bad id".to_owned();
+        assert_eq!(
+            validate_server_payload_stream_chunk_frame(&bad_chunk)
+                .unwrap_err()
+                .message(),
+            "invalid stream chunk id \"bad id\""
         );
     }
 
