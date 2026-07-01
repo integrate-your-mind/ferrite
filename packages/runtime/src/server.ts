@@ -117,6 +117,7 @@ export type DocumentRenderOptions = {
   routePattern?: string;
   buildId?: number;
   metadata?: Metadata;
+  preloadScripts?: string[];
   styles?: string[];
   scripts?: string[];
   defaultTitle?: string;
@@ -486,6 +487,10 @@ function createDocumentHead(metadata: Metadata, options: DocumentRenderOptions):
   children.push(...createOpenGraphHead(metadata.openGraph));
   children.push(...createIconHead(metadata.icons));
   children.push(...createAlternateHead(metadata.alternates));
+
+  for (const href of options.preloadScripts ?? []) {
+    children.push(createServerElement("link", { rel: "modulepreload", href }));
+  }
 
   for (const href of options.styles ?? []) {
     children.push(createServerElement("link", { rel: "stylesheet", href }));

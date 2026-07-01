@@ -200,6 +200,7 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                             route_pattern: None,
                             build_id: None,
                             metadata: metadata.clone(),
+                            preload_scripts: client_bundle_scripts(&client_bundle),
                             styles: client_bundle_styles(&client_bundle),
                             scripts: client_bundle_scripts(&client_bundle),
                             default_title: "Ferrite".to_owned(),
@@ -465,6 +466,8 @@ fn render_static_document(
     metadata: &PageMetadata,
 ) -> String {
     let metadata_tags = render_metadata_head_tags(metadata, "Ferrite");
+    let scripts = client_bundle_scripts(client_bundle);
+    let preloads = render_modulepreload_tags(&scripts);
     let styles = client_bundle_styles(client_bundle)
         .into_iter()
         .map(|href| format!(r#"  <link rel="stylesheet" href="{}">"#, escape_html(&href)))
@@ -480,7 +483,7 @@ fn render_static_document(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-{metadata_tags}{styles}{scripts}
+{metadata_tags}{preloads}{styles}{scripts}
 </head>
 <body>
   <div id="ferrite-root" data-route="{route_path}">{page_html}</div>
@@ -489,8 +492,9 @@ fn render_static_document(
         route_path = escape_html(route_path),
         page_html = page_html,
         metadata_tags = metadata_tags,
+        preloads = preloads,
         styles = styles,
-        scripts = render_script_tags(&client_bundle_scripts(client_bundle)),
+        scripts = render_script_tags(&scripts),
     )
 }
 
@@ -523,6 +527,24 @@ fn render_script_tags(scripts: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_modulepreload_tags(scripts: &[String]) -> String {
+    let tags = scripts
+        .iter()
+        .map(|script| {
+            format!(
+                r#"  <link rel="modulepreload" href="{}">"#,
+                escape_html(script)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!("{tags}\n")
+    }
 }
 
 fn render_metadata_head_tags(metadata: &PageMetadata, default_title: &str) -> String {
@@ -815,6 +837,15 @@ process.stdout.write(JSON.stringify({
         assert!(html.contains("<h1>About Page</h1>"));
         assert!(html.contains(r#"<link rel="stylesheet" href="/_ferrite/static/"#));
         assert!(html.contains(r#"<script type="module" src="/_ferrite/static/"#));
+        let about_script = html
+            .split("src=\"")
+            .find_map(|part| part.strip_prefix("/_ferrite/static/"))
+            .and_then(|part| part.split('"').next())
+            .map(|path| format!("/_ferrite/static/{path}"))
+            .expect("about script");
+        assert!(html.contains(&format!(
+            r#"<link rel="modulepreload" href="{about_script}">"#
+        )));
         assert!(temp.path().join(".ferrite/types/routes.d.ts").is_file());
         assert_eq!(report.page_metadata.len(), 2);
         assert!(
@@ -971,6 +1002,7 @@ process.stdout.write(JSON.stringify({
                 .is_file()
         );
         let html = fs::read_to_string(config.out_dir.join("index.html")).unwrap();
+        assert!(html.contains(&format!(r#"<link rel="modulepreload" href="{script}">"#)));
         assert!(html.contains(&format!(r#"<link rel="stylesheet" href="{style}">"#)));
         assert!(html.contains(&format!(
             r#"<script type="module" src="{script}"></script>"#

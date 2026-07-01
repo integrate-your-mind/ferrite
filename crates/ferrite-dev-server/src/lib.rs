@@ -310,6 +310,7 @@ impl DevProject {
                                     route_pattern: Some(match_result.route.path.clone()),
                                     build_id: Some(self.build_id),
                                     metadata: metadata.clone(),
+                                    preload_scripts: Vec::new(),
                                     styles: client_bundle_styles(&client_bundle),
                                     scripts: dev_document_scripts(&client_bundle),
                                     default_title: "Ferrite Dev".to_owned(),
@@ -444,6 +445,7 @@ impl DevProject {
                                     route_pattern: Some(match_result.route.path.clone()),
                                     build_id: Some(self.build_id),
                                     metadata: metadata.clone(),
+                                    preload_scripts: Vec::new(),
                                     styles: client_bundle_styles(&client_bundle),
                                     scripts: dev_document_scripts(&client_bundle),
                                     default_title: "Ferrite Dev".to_owned(),
@@ -649,6 +651,7 @@ impl ProductionProject {
                                         route_pattern: Some(match_result.route.path.clone()),
                                         build_id: None,
                                         metadata: metadata.clone(),
+                                        preload_scripts: client_bundle_scripts(&client_bundle),
                                         styles: client_bundle_styles(&client_bundle),
                                         scripts: client_bundle_scripts(&client_bundle),
                                         default_title: "Ferrite".to_owned(),
@@ -775,6 +778,7 @@ impl ProductionProject {
                                         route_pattern: Some(match_result.route.path.clone()),
                                         build_id: None,
                                         metadata: metadata.clone(),
+                                        preload_scripts: client_bundle_scripts(&client_bundle),
                                         styles: client_bundle_styles(&client_bundle),
                                         scripts: client_bundle_scripts(&client_bundle),
                                         default_title: "Ferrite".to_owned(),
@@ -1075,6 +1079,24 @@ fn render_script_tags(scripts: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_modulepreload_tags(scripts: &[String]) -> String {
+    let tags = scripts
+        .iter()
+        .map(|script| {
+            format!(
+                r#"  <link rel="modulepreload" href="{}">"#,
+                escape_html(script)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!("{tags}\n")
+    }
 }
 
 fn server_payload_response(payload: String, kind: ServerPayloadResponseKind) -> DevResponse {
@@ -1698,6 +1720,8 @@ fn render_production_route_document(
     metadata: &PageMetadata,
 ) -> String {
     let metadata_tags = render_metadata_head_tags(metadata, "Ferrite");
+    let scripts = client_bundle_scripts(client_bundle);
+    let preloads = render_modulepreload_tags(&scripts);
     let styles = client_bundle_styles(client_bundle)
         .into_iter()
         .map(|href| format!(r#"  <link rel="stylesheet" href="{}">"#, escape_html(&href)))
@@ -1721,7 +1745,7 @@ fn render_production_route_document(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-{metadata_tags}{scripts}
+{metadata_tags}{preloads}{scripts}
 {styles}
 </head>
 <body>
@@ -1729,11 +1753,12 @@ fn render_production_route_document(
 </body>
 </html>"#,
         metadata_tags = metadata_tags,
+        preloads = preloads,
         path = escape_html(path),
         route_pattern = route_pattern,
         page_html = page_html,
         styles = styles,
-        scripts = render_script_tags(&client_bundle_scripts(client_bundle)),
+        scripts = render_script_tags(&scripts),
     )
 }
 
@@ -2794,6 +2819,7 @@ process.stdout.write(JSON.stringify({
             .map(|path| format!("/_ferrite/static/{path}"))
             .expect("client script");
         assert_fingerprinted_public_path(&script, ".js");
+        assert!(body.contains(&format!(r#"<link rel="modulepreload" href="{script}">"#)));
         assert!(!body.contains("/__ferrite/client.js"));
         assert!(!body.contains("data-ferrite-build-id"));
         assert!(!body.contains("ferrite-dev-root"));

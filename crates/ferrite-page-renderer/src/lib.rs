@@ -624,6 +624,8 @@ pub struct DocumentRenderOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_id: Option<u64>,
     pub metadata: PageMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_scripts: Vec<String>,
     pub styles: Vec<String>,
     pub scripts: Vec<String>,
     pub default_title: String,
@@ -1090,7 +1092,10 @@ process.stdout.write(JSON.stringify({
       kind: "element",
       tag: "head",
       props: {},
-      children: [{ kind: "element", tag: "title", props: {}, children: [{ kind: "text", value: options.metadata.title }] }]
+      children: [
+        { kind: "element", tag: "title", props: {}, children: [{ kind: "text", value: options.metadata.title }] },
+        ...options.preloadScripts.map((href) => ({ kind: "element", tag: "link", props: { rel: "modulepreload", href }, children: [] }))
+      ]
     },
     {
       kind: "element",
@@ -1129,6 +1134,7 @@ process.stdout.write(JSON.stringify({
                         description: None,
                         ..PageMetadata::default()
                     },
+                    preload_scripts: vec!["/route.js".to_owned()],
                     styles: vec![],
                     scripts: vec![],
                     default_title: "Ferrite".to_owned(),
@@ -1138,7 +1144,7 @@ process.stdout.write(JSON.stringify({
 
         assert_eq!(
             html,
-            "<!doctype html>\n<html data-route=\"/docs/guide/intro\"><head><title>Docs</title></head><body><div id=\"ferrite-root\">guide/intro</div></body></html>"
+            "<!doctype html>\n<html data-route=\"/docs/guide/intro\"><head><title>Docs</title><link href=\"/route.js\" rel=\"modulepreload\"></head><body><div id=\"ferrite-root\">guide/intro</div></body></html>"
         );
     }
 
@@ -1186,6 +1192,7 @@ process.stdout.write(JSON.stringify({
                         description: None,
                         ..PageMetadata::default()
                     },
+                    preload_scripts: vec![],
                     styles: vec![],
                     scripts: vec![],
                     default_title: "Ferrite".to_owned(),
@@ -1239,6 +1246,7 @@ process.stdout.write(JSON.stringify({
                     route_pattern: None,
                     build_id: None,
                     metadata: PageMetadata::default(),
+                    preload_scripts: vec![],
                     styles: vec![],
                     scripts: vec![],
                     default_title: "Ferrite".to_owned(),
@@ -1285,6 +1293,7 @@ process.stdout.write(JSON.stringify({
                     route_pattern: None,
                     build_id: None,
                     metadata: PageMetadata::default(),
+                    preload_scripts: vec![],
                     styles: vec![],
                     scripts: vec![],
                     default_title: "Ferrite".to_owned(),
@@ -1325,6 +1334,7 @@ process.exit(1);
                     route_pattern: None,
                     build_id: None,
                     metadata: PageMetadata::default(),
+                    preload_scripts: vec![],
                     styles: vec![],
                     scripts: vec![],
                     default_title: "Ferrite".to_owned(),
