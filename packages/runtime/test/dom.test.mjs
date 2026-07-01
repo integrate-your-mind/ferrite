@@ -1085,6 +1085,135 @@ test("server payload navigator bypasses links that should use normal browser nav
   navigator.destroy();
 });
 
+test("server payload navigator reconciles managed document head resources", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  window.document.head.innerHTML = `
+    <title>Old title</title>
+    <meta name="description" content="Old description">
+    <meta name="viewport" content="width=device-width">
+    <meta property="og:title" content="Old OG">
+    <link rel="stylesheet" href="/_ferrite/static/old.css">
+    <link rel="preconnect" href="https://cdn.example">
+    <script type="module" src="/_ferrite/static/old.js"></script>
+    <script src="https://analytics.example/app.js"></script>
+  `;
+  const root = mount(
+    createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, createElement("h1", null, "Old")),
+    container,
+  );
+  const payload = {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [
+      2,
+      "html",
+      { lang: "en" },
+      [
+        [
+          2,
+          "head",
+          {},
+          [
+            [2, "title", {}, [[0, "New title"]]],
+            [2, "meta", { name: "description", content: "New description" }, []],
+            [2, "meta", { property: "og:title", content: "New OG" }, []],
+            [2, "meta", { property: "og:image", content: "/first.png" }, []],
+            [2, "meta", { property: "og:image", content: "/second.png" }, []],
+            [2, "link", { rel: "stylesheet", href: "/_ferrite/static/new.css" }, []],
+            [2, "link", { rel: "icon", href: "/favicon-new.svg", type: "image/svg+xml" }, []],
+            [2, "script", { type: "module", src: "/_ferrite/static/new.js" }, []],
+          ],
+        ],
+        [
+          2,
+          "body",
+          {},
+          [[2, "div", { id: "ferrite-root", "data-route": "/posts/new" }, [[2, "h1", {}, [[0, "New"]]]]]],
+        ],
+      ],
+    ],
+    clientReferences: [],
+    chunks: [],
+  };
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => payload,
+    }),
+  });
+
+  await navigator.navigate("/posts/new");
+
+  assert.equal(window.document.title, "New title");
+  assert.equal(window.document.querySelector('meta[name="description"]')?.getAttribute("content"), "New description");
+  assert.equal(window.document.querySelector('meta[name="viewport"]')?.getAttribute("content"), "width=device-width");
+  assert.equal(window.document.querySelector('meta[property="og:title"]')?.getAttribute("content"), "New OG");
+  assert.deepEqual(
+    Array.from(window.document.querySelectorAll('meta[property="og:image"]')).map((node) =>
+      node.getAttribute("content"),
+    ),
+    ["/first.png", "/second.png"],
+  );
+  assert.equal(window.document.querySelector('link[rel="preconnect"]')?.getAttribute("href"), "https://cdn.example");
+  assert.equal(window.document.querySelector('script[src="https://analytics.example/app.js"]') !== null, true);
+  assert.equal(window.document.querySelector('link[href="/_ferrite/static/old.css"]'), null);
+  assert.equal(window.document.querySelector('script[src="/_ferrite/static/old.js"]'), null);
+  assert.equal(
+    window.document.querySelector('link[href="/_ferrite/static/new.css"]')?.getAttribute("data-ferrite-head"),
+    "managed",
+  );
+  assert.equal(
+    window.document.querySelector('script[src="/_ferrite/static/new.js"]')?.getAttribute("data-ferrite-head"),
+    "managed",
+  );
+  assert.equal(container.textContent, "New");
+
+  navigator.destroy();
+});
+
+test("server payload navigator rejects malformed document head payloads without mutation", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  window.document.head.innerHTML = '<title>Old title</title><meta name="viewport" content="width=device-width">';
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const headBefore = window.document.head.innerHTML;
+  const bodyBefore = container.innerHTML;
+  const payload = {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [
+      2,
+      "html",
+      {},
+      [
+        [2, "head", {}, [[2, "meta", { name: "description", content: { nested: true } }, []]]],
+        [2, "body", {}, [[2, "div", { id: "ferrite-root", "data-route": "/posts/bad" }, [[0, "Bad"]]]]],
+      ],
+    ],
+    clientReferences: [],
+    chunks: [],
+  };
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => payload,
+    }),
+  });
+
+  await assert.rejects(() => navigator.navigate("/posts/bad"), /prop "content".*must be a string, number, or boolean/);
+
+  assert.equal(window.document.head.innerHTML, headBefore);
+  assert.equal(container.innerHTML, bodyBefore);
+  assert.equal(window.location.href, "https://example.com/posts/old");
+
+  navigator.destroy();
+});
+
 test("server render serializes ErrorBoundary fallback for child render errors", async () => {
   function Broken() {
     throw new Error("server boom");

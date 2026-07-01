@@ -104,6 +104,7 @@ export type ServerPayloadNavigationOptions = FetchServerPayloadOptions & {
   window?: Window;
   eventRoot?: ParentNode;
   routeRootId?: string | null;
+  reconcileHead?: boolean;
   fallback?: (url: URL) => void;
   onError?: (error: unknown, url: URL) => void;
 };
@@ -256,7 +257,10 @@ export function createServerPayloadNavigator(
 
     try {
       const packet = await fetchServerPayload(url, fetchOptions);
+      const headPlan =
+        options.reconcileHead === false ? null : prepareHeadReconciliation(packet, navigationWindow.document);
       root.update(navigationPayloadToChild(packet, options.routeRootId));
+      headPlan?.apply();
       updateNavigationHistory(navigationWindow, url, navigateOptions.replace === true);
       return packet;
     } catch (error) {
@@ -437,6 +441,36 @@ function navigationPayloadToChild(packet: ServerPayloadPacket, routeRootId: stri
   return validatedServerPayloadToChild({ ...packet, shell });
 }
 
+type HeadReconciliationPlan = {
+  apply(): void;
+};
+
+function prepareHeadReconciliation(packet: ServerPayloadPacket, document: Document): HeadReconciliationPlan | null {
+  const head = navigationHead(packet.shell);
+  if (!head) {
+    return null;
+  }
+
+  const nextNodes = headChildrenToManagedNodes(head, document);
+  return {
+    apply() {
+      reconcileManagedHead(document, nextNodes);
+    },
+  };
+}
+
+function navigationHead(node: CompactNode): CompactNode | undefined {
+  if (!Array.isArray(node) || node[0] !== COMPACT_ELEMENT_OPCODE || node.length !== 4) {
+    return undefined;
+  }
+
+  if (typeof node[1] === "string" && node[1].toLowerCase() === "head") {
+    return node;
+  }
+
+  return node[3].find(navigationHead);
+}
+
 function navigationRouteRoot(node: CompactNode, routeRootId: string | undefined): CompactNode | undefined {
   if (!Array.isArray(node) || node[0] !== COMPACT_ELEMENT_OPCODE || node.length !== 4) {
     return undefined;
@@ -455,6 +489,192 @@ function navigationRouteRoot(node: CompactNode, routeRootId: string | undefined)
   }
 
   return node[3].find((child) => navigationRouteRoot(child, routeRootId));
+}
+
+function headChildrenToManagedNodes(head: CompactNode, document: Document): Element[] {
+  if (!Array.isArray(head) || head[0] !== COMPACT_ELEMENT_OPCODE || head.length !== 4 || !Array.isArray(head[3])) {
+    throw new TypeError("Ferrite navigation head payload is malformed.");
+  }
+
+  const nodes = head[3].flatMap((child, index) => compactHeadChildToElements(child, document, `head.${index}`));
+  for (const node of nodes) {
+    const key = managedHeadKey(node);
+    if (!key) {
+      throw new TypeError(`Ferrite navigation head node <${node.localName}> is not framework-manageable.`);
+    }
+    node.setAttribute("data-ferrite-head", "managed");
+  }
+  return nodes;
+}
+
+function compactHeadChildToElements(node: unknown, document: Document, path: string): Element[] {
+  if (!Array.isArray(node) || node.length === 0) {
+    throw new TypeError(`Ferrite compact head node at ${path} must be a non-empty array.`);
+  }
+
+  const opcode = node[0];
+  if (opcode === COMPACT_TEXT_OPCODE) {
+    if (node.length !== 2 || typeof node[1] !== "string") {
+      throw new TypeError(`Ferrite compact head text node at ${path} is malformed.`);
+    }
+    if (node[1].trim().length === 0) {
+      return [];
+    }
+    throw new TypeError(`Ferrite navigation head text at ${path} must be whitespace only.`);
+  }
+
+  if (opcode === COMPACT_FRAGMENT_OPCODE) {
+    if (node.length !== 2 || !Array.isArray(node[1])) {
+      throw new TypeError(`Ferrite compact head fragment node at ${path} is malformed.`);
+    }
+    return node[1].flatMap((child, index) => compactHeadChildToElements(child, document, `${path}.${index}`));
+  }
+
+  if (opcode !== COMPACT_ELEMENT_OPCODE) {
+    throw new TypeError(`Ferrite compact head node at ${path} has unsupported opcode ${String(opcode)}.`);
+  }
+
+  if (node.length !== 4 || typeof node[1] !== "string" || !Array.isArray(node[3])) {
+    throw new TypeError(`Ferrite compact head element node at ${path} is malformed.`);
+  }
+
+  const tag = node[1].toLowerCase();
+  if (!isManageableHeadTag(tag)) {
+    throw new TypeError(`Ferrite navigation head cannot manage <${node[1]}> nodes.`);
+  }
+
+  const element = document.createElement(tag);
+  applyCompactHeadProps(element, node[2], path);
+  for (const child of node[3]) {
+    appendCompactHeadChild(element, child, document, `${path}.children`);
+  }
+  return [element];
+}
+
+function appendCompactHeadChild(parent: Element, node: unknown, document: Document, path: string): void {
+  if (!Array.isArray(node) || node.length === 0) {
+    throw new TypeError(`Ferrite compact head child at ${path} must be a non-empty array.`);
+  }
+
+  const opcode = node[0];
+  if (opcode === COMPACT_TEXT_OPCODE) {
+    if (node.length !== 2 || typeof node[1] !== "string") {
+      throw new TypeError(`Ferrite compact head text child at ${path} is malformed.`);
+    }
+    parent.append(document.createTextNode(node[1]));
+    return;
+  }
+
+  if (opcode === COMPACT_FRAGMENT_OPCODE) {
+    if (node.length !== 2 || !Array.isArray(node[1])) {
+      throw new TypeError(`Ferrite compact head fragment child at ${path} is malformed.`);
+    }
+    node[1].forEach((child, index) => appendCompactHeadChild(parent, child, document, `${path}.${index}`));
+    return;
+  }
+
+  throw new TypeError(`Ferrite navigation head only allows text children inside managed head nodes.`);
+}
+
+function applyCompactHeadProps(element: Element, value: unknown, path: string): void {
+  const props = compactProps(value, path);
+  for (const [name, prop] of Object.entries(props)) {
+    const attribute = attributeNameFromProp(name);
+    if (prop === true) {
+      element.setAttribute(attribute, "");
+    } else if (prop !== false) {
+      element.setAttribute(attribute, String(prop));
+    }
+  }
+}
+
+function isManageableHeadTag(tag: string): boolean {
+  return tag === "title" || tag === "meta" || tag === "link" || tag === "script" || tag === "style";
+}
+
+function reconcileManagedHead(document: Document, nextNodes: Element[]): void {
+  const nextKeys = new Set(nextNodes.map((node) => managedHeadKey(node)).filter((key): key is string => Boolean(key)));
+  for (const child of Array.from(document.head.children)) {
+    const key = managedHeadKey(child);
+    if (
+      child.getAttribute("data-ferrite-head") === "managed" ||
+      (key !== undefined && (nextKeys.has(key) || isInitialFrameworkManagedHead(child)))
+    ) {
+      child.remove();
+    }
+  }
+
+  document.head.append(...nextNodes);
+}
+
+function managedHeadKey(element: Element): string | undefined {
+  const tag = element.localName.toLowerCase();
+  if (tag === "title") {
+    return "title";
+  }
+  if (tag === "meta") {
+    const charset = element.getAttribute("charset");
+    if (charset !== null) {
+      return "meta:charset";
+    }
+    const name = element.getAttribute("name");
+    if (name) {
+      return `meta:name:${name.toLowerCase()}`;
+    }
+    const property = element.getAttribute("property");
+    if (property) {
+      return `meta:property:${property.toLowerCase()}`;
+    }
+  }
+  if (tag === "link") {
+    const rel = element.getAttribute("rel");
+    if (!rel) {
+      return undefined;
+    }
+    const relKey = rel.toLowerCase();
+    const href = element.getAttribute("href") ?? "";
+    return `link:${relKey}:${href}`;
+  }
+  if (tag === "script") {
+    const src = element.getAttribute("src");
+    if (src) {
+      return `script:${src}`;
+    }
+  }
+  if (tag === "style") {
+    const id = element.getAttribute("id");
+    return id ? `style:${id}` : "style:inline";
+  }
+  return undefined;
+}
+
+function isInitialFrameworkManagedHead(element: Element): boolean {
+  const tag = element.localName.toLowerCase();
+  if (tag === "title") {
+    return true;
+  }
+  if (tag === "meta") {
+    return (
+      element.hasAttribute("charset") ||
+      element.getAttribute("name") === "description" ||
+      (element.getAttribute("property")?.startsWith("og:") ?? false)
+    );
+  }
+  if (tag === "link") {
+    const rel = element.getAttribute("rel")?.toLowerCase();
+    const href = element.getAttribute("href") ?? "";
+    return (
+      rel === "canonical" ||
+      rel === "alternate" ||
+      rel === "icon" ||
+      (rel === "stylesheet" && href.startsWith("/_ferrite/"))
+    );
+  }
+  if (tag === "script") {
+    const src = element.getAttribute("src") ?? "";
+    return src === "/__ferrite/client.js" || src.startsWith("/_ferrite/");
+  }
+  return false;
 }
 
 function navigationUrl(input: string | URL, navigationWindow: Window): URL {
