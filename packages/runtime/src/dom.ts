@@ -74,6 +74,8 @@ type PendingEffect = {
   deps?: EffectDependencyList;
 };
 
+const SERVER_PAYLOAD_HISTORY_STATE_KEY = "__ferriteServerPayloadNavigation";
+
 class RenderYield extends Error {
   constructor() {
     super("Ferrite render yielded to higher-priority work.");
@@ -245,6 +247,17 @@ export function createServerPayloadNavigator(
     fetch: options.fetch,
     requestInit: options.requestInit,
   };
+  let destroyed = false;
+
+  seedNavigationHistory(navigationWindow);
+
+  const applyNavigationPacket = (packet: ServerPayloadPacket): void => {
+    const headPlan =
+      options.reconcileHead === false ? null : prepareHeadReconciliation(packet, navigationWindow.document);
+    const child = navigationPayloadToChild(packet, options.routeRootId);
+    root.update(child);
+    headPlan?.apply();
+  };
 
   const navigate = async (
     input: string | URL,
@@ -257,10 +270,7 @@ export function createServerPayloadNavigator(
 
     try {
       const packet = await fetchServerPayload(url, fetchOptions);
-      const headPlan =
-        options.reconcileHead === false ? null : prepareHeadReconciliation(packet, navigationWindow.document);
-      root.update(navigationPayloadToChild(packet, options.routeRootId));
-      headPlan?.apply();
+      applyNavigationPacket(packet);
       updateNavigationHistory(navigationWindow, url, navigateOptions.replace === true);
       return packet;
     } catch (error) {
@@ -283,12 +293,40 @@ export function createServerPayloadNavigator(
     void navigate(url, { fallbackOnError: true });
   };
 
+  const restore = async (url: URL): Promise<void> => {
+    try {
+      const packet = await fetchServerPayload(url, fetchOptions);
+      if (destroyed) {
+        return;
+      }
+      applyNavigationPacket(packet);
+    } catch (error) {
+      if (destroyed) {
+        return;
+      }
+      options.onError?.(error, url);
+      fallback(url);
+    }
+  };
+
+  const handlePopState = (event: PopStateEvent) => {
+    const url = restoredNavigationUrl(event.state, navigationWindow);
+    if (!url) {
+      return;
+    }
+
+    void restore(url);
+  };
+
   eventRoot.addEventListener("click", handleClick);
+  navigationWindow.addEventListener("popstate", handlePopState);
 
   return {
     navigate,
     destroy() {
+      destroyed = true;
       eventRoot.removeEventListener("click", handleClick);
+      navigationWindow.removeEventListener("popstate", handlePopState);
     },
   };
 }
@@ -757,13 +795,77 @@ function isSameOriginNavigation(url: URL, navigationWindow: Window): boolean {
   return url.origin === navigationWindow.location.origin;
 }
 
-function updateNavigationHistory(navigationWindow: Window, url: URL, replace: boolean): void {
-  const next = `${url.pathname}${url.search}${url.hash}`;
-  if (replace) {
-    navigationWindow.history.replaceState(null, "", next);
-  } else {
-    navigationWindow.history.pushState(null, "", next);
+function seedNavigationHistory(navigationWindow: Window): void {
+  const url = new URL(navigationWindow.location.href);
+  const restored = restoredNavigationUrl(navigationWindow.history.state, navigationWindow);
+  if (restored?.href === url.href) {
+    return;
   }
+
+  navigationWindow.history.replaceState(
+    navigationHistoryState(url, navigationWindow.history.state),
+    "",
+    navigationLocationPath(url),
+  );
+}
+
+function updateNavigationHistory(navigationWindow: Window, url: URL, replace: boolean): void {
+  const next = navigationLocationPath(url);
+  const state = navigationHistoryState(url, replace ? navigationWindow.history.state : undefined);
+  if (replace) {
+    navigationWindow.history.replaceState(state, "", next);
+  } else {
+    navigationWindow.history.pushState(state, "", next);
+  }
+}
+
+function navigationLocationPath(url: URL): string {
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+function navigationHistoryState(url: URL, previousState?: unknown): Record<string, unknown> {
+  const state: Record<string, unknown> =
+    previousState !== null && typeof previousState === "object" && !Array.isArray(previousState)
+      ? { ...(previousState as Record<string, unknown>) }
+      : previousState === undefined
+        ? {}
+        : { state: previousState };
+
+  state[SERVER_PAYLOAD_HISTORY_STATE_KEY] = {
+    version: 1,
+    url: url.href,
+  };
+  return state;
+}
+
+function restoredNavigationUrl(state: unknown, navigationWindow: Window): URL | null {
+  if (state === null || typeof state !== "object" || Array.isArray(state)) {
+    return null;
+  }
+
+  const marker = (state as Record<string, unknown>)[SERVER_PAYLOAD_HISTORY_STATE_KEY];
+  if (marker === null || typeof marker !== "object" || Array.isArray(marker)) {
+    return null;
+  }
+
+  const version = (marker as Record<string, unknown>).version;
+  const rawUrl = (marker as Record<string, unknown>).url;
+  if (version !== 1 || typeof rawUrl !== "string" || rawUrl.length === 0) {
+    return null;
+  }
+
+  let url: URL;
+  try {
+    url = navigationUrl(rawUrl, navigationWindow);
+  } catch {
+    return null;
+  }
+
+  if (!isSameOriginNavigation(url, navigationWindow)) {
+    return null;
+  }
+
+  return url.href === navigationWindow.location.href ? url : null;
 }
 
 function compactNodeToChildWithChunks(

@@ -62,6 +62,24 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function navigationDocumentPayload(route, text, title, headChildren = []) {
+  return {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [
+      2,
+      "html",
+      {},
+      [
+        [2, "head", {}, [[2, "title", {}, [[0, title]]], ...headChildren]],
+        [2, "body", {}, [[2, "div", { id: "ferrite-root", "data-route": route }, [[2, "h1", {}, [[0, text]]]]]]],
+      ],
+    ],
+    clientReferences: [],
+    chunks: [],
+  };
+}
+
 test("mount renders function components and updates state from events", () => {
   const { window, container } = createContainer();
   let initializers = 0;
@@ -1210,6 +1228,212 @@ test("server payload navigator rejects malformed document head payloads without 
   assert.equal(window.document.head.innerHTML, headBefore);
   assert.equal(container.innerHTML, bodyBefore);
   assert.equal(window.location.href, "https://example.com/posts/old");
+
+  navigator.destroy();
+});
+
+test("server payload navigator restores back and forward entries from payload history", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  window.document.head.innerHTML = '<title>Old title</title><meta name="description" content="Old description">';
+  const root = mount(
+    createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, createElement("h1", null, "Old")),
+    container,
+  );
+  const requests = [];
+  const payloads = new Map([
+    [
+      "https://example.com/posts/old?__ferrite_payload=server",
+      navigationDocumentPayload("/posts/old", "Old restored", "Old restored title", [
+        [2, "meta", { name: "description", content: "Old restored description" }, []],
+      ]),
+    ],
+    [
+      "https://example.com/posts/new?__ferrite_payload=server",
+      navigationDocumentPayload("/posts/new", "New route", "New title", [
+        [2, "meta", { name: "description", content: "New description" }, []],
+      ]),
+    ],
+  ]);
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async (input) => {
+      requests.push(input);
+      const payload = payloads.get(input);
+      assert.ok(payload, `unexpected payload request ${input}`);
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => payload,
+      };
+    },
+  });
+
+  await navigator.navigate("/posts/new");
+  assert.equal(window.location.href, "https://example.com/posts/new");
+  assert.equal(window.document.title, "New title");
+  assert.equal(container.textContent, "New route");
+
+  window.history.back();
+  await flushScheduledWork();
+
+  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(window.document.title, "Old restored title");
+  assert.equal(window.document.querySelector('meta[name="description"]')?.getAttribute("content"), "Old restored description");
+  assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/old");
+  assert.equal(container.textContent, "Old restored");
+
+  window.history.forward();
+  await flushScheduledWork();
+
+  assert.equal(window.location.href, "https://example.com/posts/new");
+  assert.equal(window.document.title, "New title");
+  assert.equal(window.document.querySelector('meta[name="description"]')?.getAttribute("content"), "New description");
+  assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/new");
+  assert.equal(container.textContent, "New route");
+  assert.deepEqual(requests, [
+    "https://example.com/posts/new?__ferrite_payload=server",
+    "https://example.com/posts/old?__ferrite_payload=server",
+    "https://example.com/posts/new?__ferrite_payload=server",
+  ]);
+
+  navigator.destroy();
+});
+
+test("server payload navigator falls back when popstate payload requests fail", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const fallbackUrls = [];
+  const errors = [];
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async (input) => {
+      if (input === "https://example.com/posts/new?__ferrite_payload=server") {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => navigationDocumentPayload("/posts/new", "New route", "New title"),
+        };
+      }
+
+      return {
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
+        json: async () => ({ error: "unavailable" }),
+      };
+    },
+    fallback: (url) => fallbackUrls.push(url.href),
+    onError: (error) => errors.push(error),
+  });
+
+  await navigator.navigate("/posts/new");
+  const headBefore = window.document.head.innerHTML;
+  const bodyBefore = container.innerHTML;
+
+  window.history.back();
+  await flushScheduledWork();
+
+  assert.deepEqual(fallbackUrls, ["https://example.com/posts/old"]);
+  assert.equal(errors.length, 1);
+  assert.match(errorMessage(errors[0]), /failed with 503 Service Unavailable/);
+  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(window.document.head.innerHTML, headBefore);
+  assert.equal(container.innerHTML, bodyBefore);
+
+  navigator.destroy();
+});
+
+test("server payload navigator rejects malformed popstate payloads without mutation", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const fallbackUrls = [];
+  const errors = [];
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async (input) => {
+      if (input === "https://example.com/posts/new?__ferrite_payload=server") {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () =>
+            navigationDocumentPayload("/posts/new", "New route", "New title", [
+              [2, "meta", { name: "description", content: "New description" }, []],
+            ]),
+        };
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({
+          ferrite: "server-payload",
+          version: 1,
+          shell: [
+            2,
+            "html",
+            {},
+            [
+              [2, "head", {}, [[2, "meta", { name: "description", content: { nested: true } }, []]]],
+              [2, "body", {}, [[2, "div", { id: "ferrite-root", "data-route": "/posts/old" }, [[0, "Bad"]]]]],
+            ],
+          ],
+          clientReferences: [],
+          chunks: [],
+        }),
+      };
+    },
+    fallback: (url) => fallbackUrls.push(url.href),
+    onError: (error) => errors.push(error),
+  });
+
+  await navigator.navigate("/posts/new");
+  const headBefore = window.document.head.innerHTML;
+  const bodyBefore = container.innerHTML;
+
+  window.history.back();
+  await flushScheduledWork();
+
+  assert.deepEqual(fallbackUrls, ["https://example.com/posts/old"]);
+  assert.equal(errors.length, 1);
+  assert.match(errorMessage(errors[0]), /prop "content".*must be a string, number, or boolean/);
+  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(window.document.head.innerHTML, headBefore);
+  assert.equal(container.innerHTML, bodyBefore);
+
+  navigator.destroy();
+});
+
+test("server payload navigator ignores popstate entries without Ferrite history state", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  let fetchCalls = 0;
+  const fallbackUrls = [];
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => {
+      fetchCalls += 1;
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => navigationDocumentPayload("/external", "External", "External"),
+      };
+    },
+    fallback: (url) => fallbackUrls.push(url.href),
+  });
+
+  window.history.pushState({ external: true }, "", "/external");
+  window.dispatchEvent(new window.PopStateEvent("popstate", { state: { external: true } }));
+  await flushScheduledWork();
+
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(fallbackUrls, []);
+  assert.equal(window.location.href, "https://example.com/external");
+  assert.equal(container.innerHTML, '<div id="ferrite-root" data-route="/posts/old">Old</div>');
 
   navigator.destroy();
 });
