@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   createReleaseManifest,
   validateManifestMetadata,
   validatePackFiles,
+  verifyNpmPackages,
 } from "./verify-npm-packages.mjs";
 
 test("release package set stays explicit", () => {
@@ -130,11 +131,64 @@ test("pack file validation accepts required files and rejects forbidden files", 
   );
 });
 
-test("default verifier mode can write a local report directory", async () => {
+test("verifier validates packages and writes the inspected report", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-npm-report-"));
+  const buildCalls = [];
+  const packCalls = [];
   try {
-    await mkdir(join(root, "dist", "npm-packages"), { recursive: true });
-    await writeFile(join(root, "dist", "npm-packages", "report.json"), "{}\n");
+    const results = await verifyNpmPackages({
+      releasePackages: [
+        {
+          name: "@ferrite/protocol",
+          directory: "packages/protocol",
+          build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+          requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+          forbiddenFiles: ["src/index.ts", "test"],
+        },
+      ],
+      nativePackageNames: [],
+      packageManifests: new Map([
+        [
+          "@ferrite/protocol",
+          {
+            name: "@ferrite/protocol",
+            version: "0.1.0",
+            private: true,
+            description: "Ferrite protocol package.",
+            license: "UNLICENSED",
+            keywords: ["ferrite"],
+            files: ["dist"],
+            exports: { ".": "./dist/index.js" },
+            publishConfig: { access: "public" },
+          },
+        ],
+      ]),
+      reportDir: join(root, "reports"),
+      runCommand: async (command, args, options) => {
+        buildCalls.push({ command, args, cwd: options.cwd });
+        return "";
+      },
+      packDryRun: async (packageDir) => {
+        packCalls.push(packageDir);
+        return ["package/dist/index.js", "package/dist/index.d.ts"];
+      },
+    });
+
+    const report = JSON.parse(await readFile(join(root, "reports", "npm-package-report.json"), "utf8"));
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].name, "@ferrite/protocol");
+    assert.equal(results[0].releaseManifest.private, undefined);
+    assert.deepEqual(buildCalls, [
+      {
+        command: "pnpm",
+        args: ["--filter", "@ferrite/protocol", "build"],
+        cwd: process.cwd(),
+      },
+    ]);
+    assert.equal(packCalls.length, 1);
+    assert.equal(packCalls[0].endsWith("packages/protocol"), true);
+    assert.deepEqual(report, results);
   } finally {
     await rm(root, { force: true, recursive: true });
   }

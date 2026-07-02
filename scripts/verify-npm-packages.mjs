@@ -137,23 +137,31 @@ export async function verifyNpmPackages({
   publishManifestMode = false,
   repositoryUrl,
   writeReports = true,
+  releasePackages = RELEASE_PACKAGES,
+  nativePackageNames = SUPPORTED_NATIVE_PREBUILD_TARGETS.map((target) => target.packageName),
+  packageManifests,
+  workspaceRoot: packageWorkspaceRoot = workspaceRoot,
+  reportDir: packageReportDir = reportDir,
+  runCommand = run,
+  packDryRun = npmPackDryRun,
 } = {}) {
-  const nativePackageNames = SUPPORTED_NATIVE_PREBUILD_TARGETS.map((target) => target.packageName);
   const packageVersions = new Map();
   const manifests = new Map();
   const results = [];
 
-  for (const config of RELEASE_PACKAGES) {
-    const sourceManifest = await readJson(join(workspaceRoot, config.directory, "package.json"));
+  for (const config of releasePackages) {
+    const sourceManifest =
+      packageManifests?.get(config.name) ??
+      (await readJson(join(packageWorkspaceRoot, config.directory, "package.json")));
     manifests.set(config.name, sourceManifest);
     packageVersions.set(config.name, sourceManifest.version);
   }
 
   assertAlignedVersions(packageVersions);
 
-  for (const config of RELEASE_PACKAGES) {
-    await run(config.build[0], config.build[1], { cwd: workspaceRoot });
-    const packageDir = join(workspaceRoot, config.directory);
+  for (const config of releasePackages) {
+    await runCommand(config.build[0], config.build[1], { cwd: packageWorkspaceRoot });
+    const packageDir = join(packageWorkspaceRoot, config.directory);
     const sourceManifest = manifests.get(config.name);
     const releaseManifest = createReleaseManifest(sourceManifest, {
       packageVersions,
@@ -166,7 +174,7 @@ export async function verifyNpmPackages({
       releaseManifest,
       publishManifestMode,
     });
-    const packFiles = await npmPackDryRun(packageDir);
+    const packFiles = await packDryRun(packageDir);
     validatePackFiles({
       packageName: config.name,
       files: packFiles,
@@ -183,9 +191,9 @@ export async function verifyNpmPackages({
   }
 
   if (writeReports) {
-    await rm(reportDir, { force: true, recursive: true });
-    await mkdir(reportDir, { recursive: true });
-    await writeFile(join(reportDir, "npm-package-report.json"), `${JSON.stringify(results, null, 2)}\n`);
+    await rm(packageReportDir, { force: true, recursive: true });
+    await mkdir(packageReportDir, { recursive: true });
+    await writeFile(join(packageReportDir, "npm-package-report.json"), `${JSON.stringify(results, null, 2)}\n`);
   }
 
   return results;

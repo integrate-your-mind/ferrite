@@ -93,7 +93,7 @@ Evidence used:
 
 - [x] A simple empty-test scan did not find empty `test(..., () => {})` bodies.
 - [x] A simple constant-assertion scan found only a few `assert.ok(...)` calls; the sampled uses check live stream controllers, payload lookups, or packet-size relationships.
-- [ ] `scripts/verify-npm-packages.test.mjs` has one weak test: `default verifier mode can write a local report directory` only proves temp directory writes, not the verifier's real report path or report contents.
+- [x] Replaced the weak `scripts/verify-npm-packages.test.mjs` report-directory test with a real `verifyNpmPackages()` report test that exercises package validation, build and pack hooks, and `npm-package-report.json` output.
 - [ ] `packages/node/test/binding-resolution.test.mjs` uses fake `require` and fake `readFileSync` helpers. These are acceptable unit tests for resolver branching, but they do not prove a package manager installed optional native packages correctly.
 - [ ] Runtime DOM coverage uses `happy-dom`. It is useful for deterministic unit and integration behavior, but it is not a real browser-engine proof for hydration, navigation, form submission, focus, pointer, or history behavior.
 - [ ] Several proof docs rely on `--once`, temp fixtures, or local generated packages. These are valid milestone checks, but they are not deployment proof.
