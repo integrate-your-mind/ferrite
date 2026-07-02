@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
@@ -18,7 +18,9 @@ use ferrite_client_bundler::{
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
 };
-use ferrite_protocol::{SERVER_PAYLOAD_STREAM_FRAME_MARKER, SERVER_PAYLOAD_STREAM_FRAME_VERSION};
+use ferrite_protocol::{
+    SERVER_PAYLOAD_STREAM_FRAME_MARKER, SERVER_PAYLOAD_STREAM_FRAME_VERSION, ServerActionFormValue,
+};
 use ferrite_router::{Route, find_document_file, scan_app_dir, write_route_types};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -32,11 +34,13 @@ const SERVER_PAYLOAD_STREAM_CONTENT_TYPE: &str =
 const SERVER_PAYLOAD_QUERY_NAME: &str = "__ferrite_payload";
 const SERVER_PAYLOAD_QUERY_VALUE: &str = "server";
 const SERVER_PAYLOAD_STREAM_QUERY_VALUE: &str = "stream";
+const SERVER_ACTION_PATH: &str = "/_ferrite/action";
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
+const DEFAULT_DEV_MAX_REQUEST_BYTES: usize = DEFAULT_PRODUCTION_MAX_REQUEST_BYTES;
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -1503,13 +1507,16 @@ pub fn serve_production_listener_once(
 }
 
 fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()> {
-    let mut buffer = [0_u8; 8192];
-    let bytes = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..bytes]);
-    let response = match parse_request_line(&request) {
-        Some(("GET", path)) => project.handle_get(path)?,
-        Some((_method, _path)) => DevResponse::method_not_allowed(),
-        None => DevResponse::bad_request("invalid HTTP request line"),
+    let request = match read_http_request(stream, DEFAULT_DEV_MAX_REQUEST_BYTES)? {
+        RequestReadResult::Request(request) => request,
+        RequestReadResult::Response(response) => {
+            write_response(stream, &response)?;
+            return Ok(());
+        }
+    };
+    let response = match request.method.as_str() {
+        "GET" => project.handle_get(&request.path)?,
+        _ => DevResponse::method_not_allowed(),
     };
 
     write_response(stream, &response)?;
@@ -1561,20 +1568,35 @@ where
         }
     };
     let write_options = ResponseWriteOptions {
-        gzip: client_accepts_gzip(&request),
+        gzip: request.accepts_gzip(),
     };
-    let response = match parse_request_line(&request) {
-        Some(("GET", path)) => handle_get(path)?,
-        Some((_method, _path)) => DevResponse::method_not_allowed(),
-        None => DevResponse::bad_request("invalid HTTP request line"),
+    let response = match request.method.as_str() {
+        "GET" => handle_get(&request.path)?,
+        _ => DevResponse::method_not_allowed(),
     };
 
     write_response_with_options(stream, &response, write_options)?;
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedHttpRequest {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl ParsedHttpRequest {
+    fn accepts_gzip(&self) -> bool {
+        self.headers
+            .get("accept-encoding")
+            .is_some_and(|value| accept_encoding_value_allows_gzip(value))
+    }
+}
+
 enum RequestReadResult {
-    Request(String),
+    Request(ParsedHttpRequest),
     Response(DevResponse),
 }
 
@@ -1586,14 +1608,26 @@ fn read_http_request(
     let mut buffer = [0_u8; 1024];
     loop {
         match stream.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => {
+                let Some(header_end) = find_http_header_end(&request) else {
+                    return Ok(RequestReadResult::Response(DevResponse::bad_request(
+                        "incomplete HTTP request headers",
+                    )));
+                };
+                return finish_read_http_request(stream, request, header_end, max_request_bytes);
+            }
             Ok(bytes) => {
                 request.extend_from_slice(&buffer[..bytes]);
                 if request.len() > max_request_bytes {
                     return Ok(RequestReadResult::Response(DevResponse::payload_too_large()));
                 }
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
+                if let Some(header_end) = find_http_header_end(&request) {
+                    return finish_read_http_request(
+                        stream,
+                        request,
+                        header_end,
+                        max_request_bytes,
+                    );
                 }
             }
             Err(error)
@@ -1607,10 +1641,140 @@ fn read_http_request(
             Err(error) => return Err(error.into()),
         }
     }
+}
 
-    Ok(RequestReadResult::Request(
-        String::from_utf8_lossy(&request).into_owned(),
-    ))
+fn finish_read_http_request(
+    stream: &mut TcpStream,
+    mut request: Vec<u8>,
+    header_end: usize,
+    max_request_bytes: usize,
+) -> Result<RequestReadResult> {
+    let header_bytes = header_end + 4;
+    let mut parsed = match parse_http_request_head(&request[..header_end]) {
+        Ok(parsed) => parsed,
+        Err(response) => return Ok(RequestReadResult::Response(*response)),
+    };
+
+    if !should_read_request_body(&parsed) {
+        return Ok(RequestReadResult::Request(parsed));
+    }
+
+    let content_length = match action_content_length(&parsed, header_bytes, max_request_bytes) {
+        Ok(content_length) => content_length,
+        Err(response) => return Ok(RequestReadResult::Response(*response)),
+    };
+    let expected_len = header_bytes + content_length;
+    let mut buffer = [0_u8; 1024];
+    while request.len() < expected_len {
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                return Ok(RequestReadResult::Response(DevResponse::bad_request(
+                    "incomplete server action request body",
+                )));
+            }
+            Ok(bytes) => {
+                request.extend_from_slice(&buffer[..bytes]);
+                if request.len() > max_request_bytes {
+                    return Ok(RequestReadResult::Response(DevResponse::payload_too_large()));
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(RequestReadResult::Response(DevResponse::request_timeout()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    parsed.body = request[header_bytes..expected_len].to_vec();
+
+    Ok(RequestReadResult::Request(parsed))
+}
+
+fn parse_http_request_head(
+    head: &[u8],
+) -> std::result::Result<ParsedHttpRequest, Box<DevResponse>> {
+    let request = std::str::from_utf8(head).map_err(|_| {
+        Box::new(DevResponse::bad_request(
+            "HTTP request headers must be UTF-8",
+        ))
+    })?;
+    let Some((method, path)) = parse_request_line(request) else {
+        return Err(Box::new(DevResponse::bad_request(
+            "invalid HTTP request line",
+        )));
+    };
+    let mut headers = BTreeMap::new();
+    for line in request.lines().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(Box::new(DevResponse::bad_request(
+                "invalid HTTP request header",
+            )));
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err(Box::new(DevResponse::bad_request(
+                "invalid HTTP request header",
+            )));
+        }
+        headers.insert(name, value.trim().to_owned());
+    }
+
+    Ok(ParsedHttpRequest {
+        method: method.to_owned(),
+        path: path.to_owned(),
+        headers,
+        body: Vec::new(),
+    })
+}
+
+fn find_http_header_end(request: &[u8]) -> Option<usize> {
+    request.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn should_read_request_body(request: &ParsedHttpRequest) -> bool {
+    request.method == "POST" && strip_query(&request.path) == SERVER_ACTION_PATH
+}
+
+fn action_content_length(
+    request: &ParsedHttpRequest,
+    header_bytes: usize,
+    max_request_bytes: usize,
+) -> std::result::Result<usize, Box<DevResponse>> {
+    if request
+        .headers
+        .get("transfer-encoding")
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(Box::new(DevResponse::bad_request(
+            "Transfer-Encoding is not supported for server action POST",
+        )));
+    }
+
+    let Some(value) = request.headers.get("content-length") else {
+        return Err(Box::new(DevResponse::bad_request(
+            "Content-Length is required for server action POST",
+        )));
+    };
+    let content_length = value.parse::<usize>().map_err(|_| {
+        Box::new(DevResponse::bad_request(
+            "Content-Length must be a non-negative integer",
+        ))
+    })?;
+    let total = header_bytes
+        .checked_add(content_length)
+        .unwrap_or(max_request_bytes.saturating_add(1));
+    if total > max_request_bytes {
+        return Err(Box::new(DevResponse::payload_too_large()));
+    }
+
+    Ok(content_length)
 }
 
 fn write_response(stream: &mut TcpStream, response: &DevResponse) -> Result<()> {
@@ -1756,6 +1920,7 @@ fn write_gzip_stream_part(
     Ok(())
 }
 
+#[cfg(test)]
 fn client_accepts_gzip(request: &str) -> bool {
     request
         .lines()
@@ -1848,6 +2013,227 @@ fn parse_request_line(request: &str) -> Option<(&str, &str)> {
 
 fn strip_query(path: &str) -> &str {
     path.split_once('?').map_or(path, |(path, _query)| path)
+}
+
+#[allow(dead_code)]
+type FormParseResult<T> = std::result::Result<T, String>;
+
+#[allow(dead_code)]
+fn parse_urlencoded_form(body: &[u8]) -> FormParseResult<BTreeMap<String, ServerActionFormValue>> {
+    let mut fields = BTreeMap::new();
+    for pair in body.split(|byte| *byte == b'&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = pair
+            .iter()
+            .position(|byte| *byte == b'=')
+            .map_or((pair, &[][..]), |index| {
+                (&pair[..index], &pair[index + 1..])
+            });
+        let name = decode_urlencoded_component(name)?;
+        if name.is_empty() {
+            return Err("server action form field name must be non-empty".to_owned());
+        }
+        let value = decode_urlencoded_component(value)?;
+        insert_form_value(&mut fields, name, value);
+    }
+    Ok(fields)
+}
+
+#[allow(dead_code)]
+fn parse_multipart_form(
+    content_type: &str,
+    body: &[u8],
+) -> FormParseResult<BTreeMap<String, ServerActionFormValue>> {
+    let boundary = multipart_boundary(content_type)?;
+    let body = std::str::from_utf8(body)
+        .map_err(|_| "multipart server action forms must be UTF-8 text".to_owned())?;
+    let delimiter = format!("--{boundary}");
+    let mut fields = BTreeMap::new();
+    let mut saw_boundary = false;
+
+    for raw_part in body.split(&delimiter).skip(1) {
+        saw_boundary = true;
+        if raw_part.starts_with("--") {
+            break;
+        }
+        let part = raw_part.strip_prefix("\r\n").unwrap_or(raw_part);
+        let part = part.strip_suffix("\r\n").unwrap_or(part);
+        if part.is_empty() {
+            continue;
+        }
+        let Some((headers, value)) = part.split_once("\r\n\r\n") else {
+            return Err("multipart server action part is missing headers".to_owned());
+        };
+        let headers = parse_multipart_headers(headers)?;
+        let disposition = headers.get("content-disposition").ok_or_else(|| {
+            "multipart server action part is missing Content-Disposition".to_owned()
+        })?;
+        if !multipart_disposition_is_form_data(disposition) {
+            return Err("multipart server action part must use form-data disposition".to_owned());
+        }
+        if multipart_disposition_has_file(disposition) {
+            return Err("multipart server action file parts are not supported".to_owned());
+        }
+        let name = multipart_disposition_param(disposition, "name")
+            .ok_or_else(|| "multipart server action part is missing a name".to_owned())?;
+        if name.is_empty() {
+            return Err("server action form field name must be non-empty".to_owned());
+        }
+        insert_form_value(&mut fields, name, value.to_owned());
+    }
+
+    if !saw_boundary {
+        return Err("multipart server action body did not contain the boundary".to_owned());
+    }
+
+    Ok(fields)
+}
+
+#[allow(dead_code)]
+fn decode_urlencoded_component(bytes: &[u8]) -> FormParseResult<String> {
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err("malformed percent escape in urlencoded form".to_owned());
+                }
+                let high = hex_value(bytes[index + 1])
+                    .ok_or_else(|| "malformed percent escape in urlencoded form".to_owned())?;
+                let low = hex_value(bytes[index + 2])
+                    .ok_or_else(|| "malformed percent escape in urlencoded form".to_owned())?;
+                output.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(output)
+        .map_err(|_| "urlencoded server action forms must be UTF-8 text".to_owned())
+}
+
+#[allow(dead_code)]
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn insert_form_value(
+    fields: &mut BTreeMap<String, ServerActionFormValue>,
+    name: String,
+    value: String,
+) {
+    use std::collections::btree_map::Entry;
+
+    match fields.entry(name) {
+        Entry::Vacant(entry) => {
+            entry.insert(ServerActionFormValue::String(value));
+        }
+        Entry::Occupied(mut entry) => {
+            let slot = entry.get_mut();
+            match slot {
+                ServerActionFormValue::String(first) => {
+                    let first = std::mem::take(first);
+                    *slot = ServerActionFormValue::List(vec![first, value]);
+                }
+                ServerActionFormValue::List(values) => values.push(value),
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn multipart_boundary(content_type: &str) -> FormParseResult<String> {
+    for parameter in content_type.split(';').skip(1) {
+        let Some((name, value)) = parameter.trim().split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            continue;
+        }
+        let value = strip_optional_quotes(value.trim());
+        if value.is_empty() || value.contains(['\r', '\n']) {
+            return Err("multipart boundary must be non-empty".to_owned());
+        }
+        return Ok(value.to_owned());
+    }
+
+    Err("multipart server action form is missing a boundary".to_owned())
+}
+
+#[allow(dead_code)]
+fn parse_multipart_headers(headers: &str) -> FormParseResult<BTreeMap<String, String>> {
+    let mut parsed = BTreeMap::new();
+    for line in headers.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err("multipart server action part contains an invalid header".to_owned());
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err("multipart server action part contains an invalid header".to_owned());
+        }
+        parsed.insert(name, value.trim().to_owned());
+    }
+    Ok(parsed)
+}
+
+#[allow(dead_code)]
+fn multipart_disposition_is_form_data(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("form-data"))
+}
+
+#[allow(dead_code)]
+fn multipart_disposition_has_file(value: &str) -> bool {
+    value.split(';').skip(1).any(|parameter| {
+        parameter
+            .trim()
+            .split_once('=')
+            .is_some_and(|(name, _value)| {
+                let name = name.trim();
+                name.eq_ignore_ascii_case("filename") || name.eq_ignore_ascii_case("filename*")
+            })
+    })
+}
+
+#[allow(dead_code)]
+fn multipart_disposition_param(value: &str, expected_name: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case(expected_name) {
+            return None;
+        }
+        Some(strip_optional_quotes(value.trim()).to_owned())
+    })
+}
+
+#[allow(dead_code)]
+fn strip_optional_quotes(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
 }
 
 fn route_response_mode(raw_path: &str) -> std::result::Result<RouteResponseMode, String> {
@@ -2471,6 +2857,7 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_protocol::ServerActionFormValue;
     use flate2::read::GzDecoder;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -2766,6 +3153,20 @@ process.stdout.write(JSON.stringify({
         response
     }
 
+    fn read_request_from_client(request: &[u8], max_request_bytes: usize) -> RequestReadResult {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request = request.to_vec();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(&request).unwrap();
+        });
+        let (mut stream, _addr) = listener.accept().unwrap();
+        let result = read_http_request(&mut stream, max_request_bytes).unwrap();
+        client.join().unwrap();
+        result
+    }
+
     fn wait_for_path(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !path.exists() {
@@ -2776,6 +3177,117 @@ process.stdout.write(JSON.stringify({
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn urlencoded_action_form_collects_duplicate_values() {
+        let form = parse_urlencoded_form(b"title=Hello+Rust&tag=rust&tag=tsx&empty=").unwrap();
+
+        assert_eq!(
+            form.get("title"),
+            Some(&ServerActionFormValue::String("Hello Rust".to_owned()))
+        );
+        assert_eq!(
+            form.get("tag"),
+            Some(&ServerActionFormValue::List(vec![
+                "rust".to_owned(),
+                "tsx".to_owned()
+            ]))
+        );
+        assert_eq!(
+            form.get("empty"),
+            Some(&ServerActionFormValue::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn urlencoded_action_form_rejects_malformed_percent_escape() {
+        let error = parse_urlencoded_form(b"title=%GG").unwrap_err();
+
+        assert!(error.contains("percent escape"), "{error}");
+    }
+
+    #[test]
+    fn multipart_action_form_accepts_text_fields_and_rejects_file_parts() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello multipart\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\nrust\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\ntsx\r\n--FerriteBoundary--\r\n";
+        let form = parse_multipart_form(content_type, body).unwrap();
+
+        assert_eq!(
+            form.get("title"),
+            Some(&ServerActionFormValue::String("Hello multipart".to_owned()))
+        );
+        assert_eq!(
+            form.get("tag"),
+            Some(&ServerActionFormValue::List(vec![
+                "rust".to_owned(),
+                "tsx".to_owned()
+            ]))
+        );
+
+        let file_body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"asset\"; filename=\"avatar.png\"\r\nContent-Type: image/png\r\n\r\nnot-text\r\n--FerriteBoundary--\r\n";
+        let error = parse_multipart_form(content_type, file_body).unwrap_err();
+        assert!(error.contains("file parts"), "{error}");
+    }
+
+    #[test]
+    fn action_post_reader_preserves_body() {
+        let result = read_request_from_client(
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 16\r\n\r\ntitle=Hello+Rust",
+            1024,
+        );
+
+        let RequestReadResult::Request(request) = result else {
+            panic!("expected parsed request");
+        };
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/_ferrite/action");
+        assert_eq!(
+            request.headers.get("content-type"),
+            Some(&"application/x-www-form-urlencoded".to_owned())
+        );
+        assert_eq!(request.body, b"title=Hello+Rust");
+    }
+
+    #[test]
+    fn action_post_reader_rejects_missing_content_length() {
+        let result = read_request_from_client(
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\n\r\ntitle=Hello",
+            1024,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected HTTP error response");
+        };
+        assert_eq!(response.status, 400);
+        assert!(response.body_text().contains("Content-Length"));
+    }
+
+    #[test]
+    fn action_post_reader_rejects_oversized_body() {
+        let result = read_request_from_client(
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 128\r\n\r\nshort",
+            64,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected HTTP error response");
+        };
+        assert_eq!(response.status, 413);
+    }
+
+    #[test]
+    fn action_post_reader_rejects_transfer_encoding() {
+        let result = read_request_from_client(
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            1024,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected HTTP error response");
+        };
+        assert_eq!(response.status, 400);
+        assert!(response.body_text().contains("Transfer-Encoding"));
     }
 
     #[test]

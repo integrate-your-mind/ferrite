@@ -395,7 +395,7 @@ pub fn invoke_server_action(
 
 Build `PageProps` exactly like render methods, call `render-page.mjs --server-action`, parse stdout as `ServerActionResponse`, and call `ferrite_protocol::validate_server_action_response()` before returning.
 
-- [ ] **Step 3: Add HTTP request parsing tests first**
+- [x] **Step 3: Add HTTP request parsing tests first**
 
 In `crates/ferrite-dev-server/src/lib.rs`, add tests for a small parser layer:
 
@@ -406,7 +406,7 @@ In `crates/ferrite-dev-server/src/lib.rs`, add tests for a small parser layer:
 - Unsupported transfer encoding is rejected for action POST.
 - Multipart text fields parse, and multipart file parts are rejected.
 
-- [ ] **Step 4: Extend request reading safely**
+- [x] **Step 4: Extend request reading safely**
 
 Replace the string-only request result with a request object:
 
@@ -421,7 +421,7 @@ struct ParsedHttpRequest {
 
 Update dev and production adapters to parse the request line once, route `GET` requests exactly as before, and only read/require a body for `POST /_ferrite/action`. Keep the total header plus body size under `max_request_bytes` in production. For dev socket tests, use a bounded read path rather than the current single 8192-byte header read for action POSTs.
 
-- [ ] **Step 5: Implement form parsers**
+- [x] **Step 5: Implement form parsers**
 
 Add dependency-free parsers in `ferrite-dev-server`:
 
