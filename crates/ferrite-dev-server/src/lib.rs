@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ferrite_client_bundler::{
     ClientBundle, ClientBundleError, ClientBundler, fingerprint_client_bundle,
@@ -30,6 +30,8 @@ const SERVER_PAYLOAD_QUERY_VALUE: &str = "server";
 const SERVER_PAYLOAD_STREAM_QUERY_VALUE: &str = "stream";
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
+const DEFAULT_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
@@ -111,6 +113,42 @@ impl DevServerConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionRequestEvent {
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub route_pattern: Option<String>,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone)]
+pub struct ProductionRequestObserver {
+    observe: Arc<dyn Fn(ProductionRequestEvent) + Send + Sync>,
+}
+
+impl ProductionRequestObserver {
+    pub fn new<F>(observe: F) -> Self
+    where
+        F: Fn(ProductionRequestEvent) + Send + Sync + 'static,
+    {
+        Self {
+            observe: Arc::new(observe),
+        }
+    }
+
+    fn observe(&self, event: ProductionRequestEvent) {
+        (self.observe)(event);
+    }
+}
+
+impl fmt::Debug for ProductionRequestObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProductionRequestObserver")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductionServerConfig {
     pub project: PathBuf,
@@ -121,8 +159,10 @@ pub struct ProductionServerConfig {
     pub client_out_dir: PathBuf,
     pub client_public_path: String,
     pub request_read_timeout: Duration,
+    pub render_timeout: Duration,
     pub max_request_bytes: usize,
     pub max_in_flight_requests: usize,
+    pub request_observer: Option<ProductionRequestObserver>,
 }
 
 impl ProductionServerConfig {
@@ -144,8 +184,10 @@ impl ProductionServerConfig {
             client_out_dir,
             client_public_path,
             request_read_timeout: DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT,
+            render_timeout: DEFAULT_PRODUCTION_RENDER_TIMEOUT,
             max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
             max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
+            request_observer: None,
         }
     }
 
@@ -161,6 +203,19 @@ impl ProductionServerConfig {
 
     pub fn with_max_in_flight_requests(mut self, requests: usize) -> Self {
         self.max_in_flight_requests = requests.max(1);
+        self
+    }
+
+    pub fn with_render_timeout(mut self, timeout: Duration) -> Self {
+        self.render_timeout = timeout.max(MIN_PRODUCTION_RENDER_TIMEOUT);
+        self
+    }
+
+    pub fn with_request_observer<F>(mut self, observer: F) -> Self
+    where
+        F: Fn(ProductionRequestEvent) + Send + Sync + 'static,
+    {
+        self.request_observer = Some(ProductionRequestObserver::new(observer));
         self
     }
 }
@@ -556,6 +611,13 @@ impl ProductionProject {
             return Err(DevServerError::InvalidRequestPath(raw_path.to_owned()));
         }
 
+        let started = Instant::now();
+        let response = self.handle_get_inner(raw_path)?;
+        self.observe_request("GET", raw_path, &response, started.elapsed());
+        Ok(response)
+    }
+
+    fn handle_get_inner(&mut self, raw_path: &str) -> Result<DevResponse> {
         self.ensure_ready()?;
         let path = strip_query(raw_path);
 
@@ -571,6 +633,24 @@ impl ProductionProject {
         match route_response_mode(raw_path) {
             Ok(mode) => Ok(self.route_response(path, mode)),
             Err(message) => Ok(DevResponse::bad_request(message)),
+        }
+    }
+
+    fn observe_request(
+        &self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        response: &DevResponse,
+        elapsed: Duration,
+    ) {
+        if let Some(observer) = &self.config.request_observer {
+            observer.observe(ProductionRequestEvent {
+                method: method.into(),
+                path: path.into(),
+                status: response.status,
+                route_pattern: response.route_pattern_header.clone(),
+                elapsed,
+            });
         }
     }
 
@@ -602,7 +682,8 @@ impl ProductionProject {
             let renderer = PageRenderer::new(
                 self.config.project.clone(),
                 self.config.page_renderer.clone(),
-            );
+            )
+            .with_command_timeout(self.config.render_timeout);
             let conventions = route_conventions(&match_result.route);
             match mode {
                 RouteResponseMode::Html => self.route_stream_response(
@@ -690,20 +771,16 @@ impl ProductionProject {
                                     parts.chunks.into_iter().map(|chunk| chunk.html).collect(),
                                 )
                                 .with_modulepreload_links(client_bundle_scripts(&client_bundle)),
-                                Err(error) => DevResponse::internal_error(
-                                    render_production_render_error(path, match_result, &error),
-                                ),
+                                Err(error) => {
+                                    production_render_error_response(path, match_result, &error)
+                                }
                             },
                             Err(error) => DevResponse::internal_error(
                                 render_production_bundle_error(path, match_result, &error),
                             ),
                         }
                     }
-                    Err(error) => DevResponse::internal_error(render_production_render_error(
-                        path,
-                        match_result,
-                        &error,
-                    )),
+                    Err(error) => production_render_error_response(path, match_result, &error),
                 }
             }
             None => match renderer.render_page_to_stream_parts_with_conventions(
@@ -750,17 +827,9 @@ impl ProductionProject {
                             ),
                         }
                     }
-                    Err(error) => DevResponse::internal_error(render_production_render_error(
-                        path,
-                        match_result,
-                        &error,
-                    )),
+                    Err(error) => production_render_error_response(path, match_result, &error),
                 },
-                Err(error) => DevResponse::internal_error(render_production_render_error(
-                    path,
-                    match_result,
-                    &error,
-                )),
+                Err(error) => production_render_error_response(path, match_result, &error),
             },
         }
     }
@@ -815,20 +884,16 @@ impl ProductionProject {
                                     conventions,
                                 ) {
                                 Ok(payload) => server_payload_response(payload, response_kind),
-                                Err(error) => DevResponse::internal_error(
-                                    render_production_render_error(path, match_result, &error),
-                                ),
+                                Err(error) => {
+                                    production_render_error_response(path, match_result, &error)
+                                }
                             },
                             Err(error) => DevResponse::internal_error(
                                 render_production_bundle_error(path, match_result, &error),
                             ),
                         }
                     }
-                    Err(error) => DevResponse::internal_error(render_production_render_error(
-                        path,
-                        match_result,
-                        &error,
-                    )),
+                    Err(error) => production_render_error_response(path, match_result, &error),
                 }
             }
             None => match renderer.render_page_to_server_payload_json_with_conventions(
@@ -838,11 +903,7 @@ impl ProductionProject {
                 conventions,
             ) {
                 Ok(payload) => server_payload_response(payload, response_kind),
-                Err(error) => DevResponse::internal_error(render_production_render_error(
-                    path,
-                    match_result,
-                    &error,
-                )),
+                Err(error) => production_render_error_response(path, match_result, &error),
             },
         }
     }
@@ -998,6 +1059,19 @@ impl DevResponse {
             reason: "Payload Too Large",
             content_type: "text/plain; charset=utf-8",
             body: b"Payload Too Large\n".to_vec(),
+            stream: None,
+            cache_control: None,
+            route_pattern_header: None,
+            link_headers: Vec::new(),
+        }
+    }
+
+    pub fn gateway_timeout(body: String) -> Self {
+        Self {
+            status: 504,
+            reason: "Gateway Timeout",
+            content_type: "text/html; charset=utf-8",
+            body: body.into_bytes(),
             stream: None,
             cache_control: None,
             route_pattern_header: None,
@@ -2120,23 +2194,49 @@ fn push_meta_property(tags: &mut Vec<String>, property: &str, content: Option<&s
     }
 }
 
+fn production_render_error_response(
+    path: &str,
+    match_result: &RouteMatch,
+    error: &PageRenderError,
+) -> DevResponse {
+    match error {
+        PageRenderError::TimedOut { .. } => DevResponse::gateway_timeout(
+            render_production_render_error(504, path, match_result, error),
+        ),
+        _ => DevResponse::internal_error(render_production_render_error(
+            500,
+            path,
+            match_result,
+            error,
+        )),
+    }
+}
+
 fn render_production_render_error(
+    status: u16,
     path: &str,
     match_result: &RouteMatch,
     error: &PageRenderError,
 ) -> String {
+    let title = if status == 504 {
+        "Ferrite - Render Timeout"
+    } else {
+        "Ferrite - Render Error"
+    };
     format!(
         r#"<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Ferrite - Render Error</title></head>
+<head><meta charset="utf-8"><title>{title}</title></head>
 <body>
   <main id="ferrite-root" data-route="{path}" data-route-pattern="{pattern}">
-    <h1>500</h1>
+    <h1>{status}</h1>
     <p>Ferrite could not render <code>{pattern}</code>.</p>
     <pre>{error}</pre>
   </main>
 </body>
 </html>"#,
+        title = title,
+        status = status,
         path = escape_html(path),
         pattern = escape_html(&match_result.route.path),
         error = escape_html(&error.to_string()),
@@ -2601,6 +2701,10 @@ process.stdout.write(JSON.stringify({
             DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT
         );
         assert_eq!(
+            project.config.render_timeout,
+            DEFAULT_PRODUCTION_RENDER_TIMEOUT
+        );
+        assert_eq!(
             project.config.max_request_bytes,
             DEFAULT_PRODUCTION_MAX_REQUEST_BYTES
         );
@@ -2619,6 +2723,7 @@ process.stdout.write(JSON.stringify({
             production_project_for(&app)
                 .config
                 .with_request_read_timeout(Duration::ZERO)
+                .with_render_timeout(Duration::ZERO)
                 .with_max_request_bytes(0)
                 .with_max_in_flight_requests(0),
         );
@@ -2627,8 +2732,77 @@ process.stdout.write(JSON.stringify({
             project.config.request_read_timeout,
             MIN_PRODUCTION_REQUEST_READ_TIMEOUT
         );
+        assert_eq!(project.config.render_timeout, MIN_PRODUCTION_RENDER_TIMEOUT);
         assert_eq!(project.config.max_request_bytes, 1);
         assert_eq!(project.config.max_in_flight_requests, 1);
+    }
+
+    #[test]
+    fn production_observer_records_route_responses() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Post() {}",
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
+        let mut project =
+            ProductionProject::new(production_project_for(&app).config.with_request_observer(
+                move |event| {
+                    observed_events.lock().unwrap().push(event);
+                },
+            ));
+
+        let response = project.handle_get("/posts/abc").unwrap();
+
+        assert_eq!(response.status, 200);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, "GET");
+        assert_eq!(events[0].path, "/posts/abc");
+        assert_eq!(events[0].status, 200);
+        assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
+        assert!(events[0].elapsed > Duration::ZERO);
+    }
+
+    #[test]
+    fn production_render_timeout_returns_gateway_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = temp.path().to_path_buf();
+        let renderer = project.join("render-page.mjs");
+        make_script(
+            &renderer,
+            r#"
+setInterval(() => {}, 1000);
+"#,
+        );
+        let mut project = ProductionProject::new(
+            ProductionServerConfig::new(
+                project.clone(),
+                app,
+                project.join(".ferrite/types/routes.d.ts"),
+                renderer,
+                project.join("build-client.mjs"),
+                project.join(".ferrite/server/static"),
+                "/_ferrite/static".to_owned(),
+            )
+            .with_render_timeout(Duration::from_millis(20)),
+        );
+
+        let response = project.handle_get("/").unwrap();
+
+        assert_eq!(response.status, 504);
+        assert_eq!(response.reason, "Gateway Timeout");
+        assert_eq!(response.cache_control, Some("no-store"));
+        assert_eq!(response.route_pattern_header.as_deref(), Some("/"));
+        let body = response.body_text();
+        assert!(body.contains("<h1>504</h1>"));
+        assert!(body.contains("page renderer timed out"));
+        assert!(body.contains(r#"id="ferrite-root""#));
     }
 
     #[test]

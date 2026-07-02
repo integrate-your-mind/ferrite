@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use ferrite_builder::{BuildConfig, BuildReport};
@@ -225,6 +226,13 @@ struct ServeArgs {
         help = "Client bundler script path, relative to the current directory unless absolute"
     )]
     client_bundler: PathBuf,
+
+    #[arg(
+        long,
+        default_value_t = 30_000,
+        help = "Maximum milliseconds allowed for each production page renderer subprocess"
+    )]
+    render_timeout_ms: u64,
 }
 
 #[derive(Debug, Args)]
@@ -495,15 +503,19 @@ fn run_cli(cli: Cli) -> Result<()> {
             let client_out = resolve_project_path(&project, &args.client_out);
             let page_renderer = normalize_current_path(&args.page_renderer)?;
             let client_bundler = normalize_current_path(&args.client_bundler)?;
-            let mut production_project = ProductionProject::new(ProductionServerConfig::new(
-                project.clone(),
-                app_dir.clone(),
-                types_out.clone(),
-                page_renderer.clone(),
-                client_bundler.clone(),
-                client_out.clone(),
-                args.client_public_path.clone(),
-            ));
+            let mut production_project = ProductionProject::new(
+                ProductionServerConfig::new(
+                    project.clone(),
+                    app_dir.clone(),
+                    types_out.clone(),
+                    page_renderer.clone(),
+                    client_bundler.clone(),
+                    client_out.clone(),
+                    args.client_public_path.clone(),
+                )
+                .with_render_timeout(Duration::from_millis(args.render_timeout_ms)),
+            );
+            let render_timeout_ms = duration_millis_u64(production_project.config().render_timeout);
 
             if args.once {
                 let response = production_project.handle_get(&args.request_path)?;
@@ -516,6 +528,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         client_public_path: args.client_public_path,
                         page_renderer,
                         client_bundler,
+                        render_timeout_ms,
                         response: response.into(),
                     })?;
                 } else {
@@ -532,6 +545,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         client_public_path: &args.client_public_path,
                         page_renderer: &page_renderer,
                         client_bundler: &client_bundler,
+                        render_timeout_ms,
                         url: format!("http://{addr}"),
                     })?;
                 } else {
@@ -637,6 +651,10 @@ fn print_build_report(report: &BuildReport) {
     println!("manifest: {}", report.manifest_file.display());
 }
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn run_typescript_check(project: &Path) -> Result<()> {
     let tsconfig = project.join("tsconfig.json");
     if !tsconfig.is_file() {
@@ -728,6 +746,7 @@ struct ServeOnceOutput {
     client_public_path: String,
     page_renderer: PathBuf,
     client_bundler: PathBuf,
+    render_timeout_ms: u64,
     response: DevResponseOutput,
 }
 
@@ -740,6 +759,7 @@ struct ServeStartedOutput<'a> {
     client_public_path: &'a str,
     page_renderer: &'a Path,
     client_bundler: &'a Path,
+    render_timeout_ms: u64,
     url: String,
 }
 
@@ -791,5 +811,16 @@ mod tests {
 
         assert!(matches!(error, CliError::MissingTsConfig(_)));
         assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn serve_accepts_render_timeout_ms() {
+        let cli = Cli::try_parse_from(["ferrite", "serve", "--render-timeout-ms", "250", "--once"])
+            .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.render_timeout_ms, 250);
     }
 }

@@ -1,10 +1,16 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+const MIN_RENDER_COMMAND_TIMEOUT: Duration = Duration::from_millis(1);
+const RENDER_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug)]
 pub enum PageRenderError {
@@ -12,6 +18,7 @@ pub enum PageRenderError {
     Json(serde_json::Error),
     Ssr(ferrite_ssr::SsrError),
     NodeFailed { status: Option<i32>, stderr: String },
+    TimedOut { timeout: Duration },
 }
 
 impl fmt::Display for PageRenderError {
@@ -24,6 +31,13 @@ impl fmt::Display for PageRenderError {
                 Some(status) => write!(f, "page renderer failed with exit code {status}: {stderr}"),
                 None => write!(f, "page renderer was terminated: {stderr}"),
             },
+            PageRenderError::TimedOut { timeout } => {
+                write!(
+                    f,
+                    "page renderer timed out after {} ms",
+                    timeout.as_millis()
+                )
+            }
         }
     }
 }
@@ -62,11 +76,26 @@ pub struct RouteConventions {
 pub struct PageRenderer {
     project: PathBuf,
     script: PathBuf,
+    command_timeout: Option<Duration>,
 }
 
 impl PageRenderer {
     pub fn new(project: PathBuf, script: PathBuf) -> Self {
-        Self { project, script }
+        Self {
+            project,
+            script,
+            command_timeout: None,
+        }
+    }
+
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = Some(timeout.max(MIN_RENDER_COMMAND_TIMEOUT));
+        self
+    }
+
+    pub fn without_command_timeout(mut self) -> Self {
+        self.command_timeout = None;
+        self
     }
 
     pub fn render_page_to_html(
@@ -96,14 +125,13 @@ impl PageRenderer {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
         let conventions_json = serde_json::to_string(conventions)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
-            .arg(conventions_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -143,15 +171,14 @@ impl PageRenderer {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
         let conventions_json = serde_json::to_string(conventions)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg("--stream")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
-            .arg(conventions_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -191,15 +218,14 @@ impl PageRenderer {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
         let conventions_json = serde_json::to_string(conventions)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg("--server-payload")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
-            .arg(conventions_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -239,15 +265,14 @@ impl PageRenderer {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
         let conventions_json = serde_json::to_string(conventions)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg("--server-payload")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
-            .arg(conventions_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -262,12 +287,9 @@ impl PageRenderer {
     }
 
     pub fn generate_static_params(&self, page_file: &Path) -> Result<StaticParamsResult> {
-        let output = Command::new("node")
-            .arg(&self.script)
-            .arg("--static-params")
-            .arg(page_file)
-            .current_dir(&self.project)
-            .output()?;
+        let mut command = self.node_command();
+        command.arg("--static-params").arg(page_file);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -290,14 +312,13 @@ impl PageRenderer {
         };
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg("--metadata")
             .arg(page_file)
             .arg(props_json)
-            .arg(layouts_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(layouts_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -343,17 +364,16 @@ impl PageRenderer {
         let layouts_json = serde_json::to_string(layouts)?;
         let options_json = serde_json::to_string(options)?;
         let conventions_json = serde_json::to_string(conventions)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg("--document")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
             .arg(document_file)
             .arg(options_json)
-            .arg(conventions_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -401,17 +421,16 @@ impl PageRenderer {
         let layouts_json = serde_json::to_string(layouts)?;
         let options_json = serde_json::to_string(options)?;
         let conventions_json = serde_json::to_string(conventions)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg("--document-stream")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
             .arg(document_file)
             .arg(options_json)
-            .arg(conventions_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -460,17 +479,16 @@ impl PageRenderer {
         let layouts_json = serde_json::to_string(layouts)?;
         let options_json = serde_json::to_string(options)?;
         let conventions_json = serde_json::to_string(conventions)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg("--document-server-payload")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
             .arg(document_file)
             .arg(options_json)
-            .arg(conventions_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -519,17 +537,16 @@ impl PageRenderer {
         let layouts_json = serde_json::to_string(layouts)?;
         let options_json = serde_json::to_string(options)?;
         let conventions_json = serde_json::to_string(conventions)?;
-        let output = Command::new("node")
-            .arg(&self.script)
+        let mut command = self.node_command();
+        command
             .arg("--document-server-payload")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
             .arg(document_file)
             .arg(options_json)
-            .arg(conventions_json)
-            .current_dir(&self.project)
-            .output()?;
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(PageRenderError::NodeFailed {
@@ -541,6 +558,73 @@ impl PageRenderer {
         let json = String::from_utf8_lossy(&output.stdout).into_owned();
         ferrite_ssr::render_server_payload_json_to_parts(&json)?;
         Ok(json)
+    }
+
+    fn node_command(&self) -> Command {
+        let mut command = Command::new("node");
+        command.arg(&self.script).current_dir(&self.project);
+        command
+    }
+
+    fn run_command(&self, mut command: Command) -> Result<RendererOutput> {
+        match self.command_timeout {
+            Some(timeout) => run_command_with_timeout(command, timeout),
+            None => {
+                let output = command.output()?;
+                Ok(RendererOutput {
+                    status: output.status,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RendererOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<RendererOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().expect("renderer stdout was piped");
+    let mut stderr = child.stderr.take().expect("renderer stderr was piped");
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(RendererOutput {
+                status,
+                stdout: stdout_reader
+                    .join()
+                    .expect("renderer stdout reader panicked")?,
+                stderr: stderr_reader
+                    .join()
+                    .expect("renderer stderr reader panicked")?,
+            });
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(PageRenderError::TimedOut { timeout });
+        }
+
+        thread::sleep(RENDER_TIMEOUT_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
     }
 }
 
@@ -875,6 +959,31 @@ process.exit(1);
             error,
             PageRenderError::NodeFailed { stderr, .. } if stderr == "page exploded"
         ));
+    }
+
+    #[test]
+    fn times_out_hanging_node_renders() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(
+            &script,
+            r#"
+setInterval(() => {}, 1000);
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let timeout = Duration::from_millis(20);
+        let renderer =
+            PageRenderer::new(temp.path().to_path_buf(), script).with_command_timeout(timeout);
+        let started = Instant::now();
+
+        let error = renderer.render_page_to_html(&page, &[], &[]).unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(error, PageRenderError::TimedOut { timeout: actual } if actual == timeout)
+        );
     }
 
     #[test]
