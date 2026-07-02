@@ -171,7 +171,7 @@ git commit -m "feat(protocol): add server action contract"
 - Modify: `packages/runtime/src/index.ts`
 - Create: `packages/runtime/test/server-actions.test.mjs`
 
-- [ ] **Step 1: Add failing runtime tests**
+- [x] **Step 1: Add failing runtime tests**
 
 Create `packages/runtime/test/server-actions.test.mjs` with tests for:
 
@@ -181,7 +181,7 @@ Create `packages/runtime/test/server-actions.test.mjs` with tests for:
 - Duplicate action IDs in one route render throw before HTML/payload output is returned.
 - Existing primitive prop serialization still works for non-action forms.
 
-- [ ] **Step 2: Add public server action types**
+- [x] **Step 2: Add public server action types**
 
 Add server-only types:
 
@@ -207,7 +207,7 @@ export type ServerActionReference<Output = unknown> = {
 
 Keep the unique symbol local to `server.ts`. Export a type guard only if render-page needs it from the same module.
 
-- [ ] **Step 3: Implement `createServerAction()`**
+- [x] **Step 3: Implement `createServerAction()`**
 
 Validate explicit IDs with the generated protocol helper. Return a frozen reference object:
 
@@ -230,7 +230,7 @@ export function createServerAction<Output>(
 
 If no render context exists and no `routePattern` is provided, throw with a message that server actions must be created while rendering a Ferrite route or include an explicit route pattern.
 
-- [ ] **Step 4: Add action render context**
+- [x] **Step 4: Add action render context**
 
 Extend `ServerRenderContext` with:
 
@@ -247,9 +247,9 @@ Add helpers:
 - `collectServerActionRegistry(context)`
 - `invokeRegisteredServerAction(request)`
 
-Use a stack so nested rendering and async promise resolution do not leak actions between requests. Preserve the existing `withHookDispatcher()` behavior.
+Use async-local render context so overlapping async renders do not leak actions between requests. Preserve the existing `withHookDispatcher()` behavior.
 
-- [ ] **Step 5: Serialize form actions only**
+- [x] **Step 5: Serialize form actions only**
 
 Before `serializeServerProps(child.props)`, detect action references:
 
@@ -269,7 +269,7 @@ The serializer should:
 - Preserve user children and primitive form attributes.
 - Reject conflicting Ferrite hidden field names provided by user code.
 
-- [ ] **Step 6: Run focused runtime tests**
+- [x] **Step 6: Run focused runtime tests**
 
 Run:
 
@@ -281,10 +281,10 @@ pnpm --filter @ferrite/runtime typecheck
 
 Expected: all runtime tests pass, including existing server-payload/client-reference coverage.
 
-- [ ] **Step 7: Commit runtime references**
+- [x] **Step 7: Commit runtime references**
 
 ```bash
-git add packages/runtime/src/server.ts packages/runtime/src/index.ts packages/runtime/test/server-actions.test.mjs
+git add packages/runtime/src/server.ts packages/runtime/src/index.ts packages/runtime/test/server-actions.test.mjs packages/runtime/package.json packages/runtime/tsconfig.json pnpm-lock.yaml
 git diff --cached --check
 git commit -m "feat(runtime): serialize server action forms"
 ```

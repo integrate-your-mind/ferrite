@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import {
   ErrorBoundary,
   Fragment,
@@ -27,6 +29,7 @@ import {
   SERVER_PAYLOAD_MARKER,
   SERVER_PAYLOAD_VERSION,
   createClientReferencePayload,
+  createServerActionReferencePayload,
   parseClientReferenceId,
   validateClientReferencePayload,
 } from "./protocol.js";
@@ -130,6 +133,31 @@ export type ClientReferenceOptions<Props extends Record<string, unknown> = Recor
   render: Component<Props>;
 };
 
+const SERVER_ACTION_REFERENCE_SYMBOL = Symbol.for("ferrite.server-action-reference");
+
+export type ServerActionInput = {
+  form: Record<string, string | string[]>;
+  routePath: string;
+};
+
+export type ServerActionOptions<Output = unknown> = {
+  id: string;
+  routePattern?: string;
+  run(input: ServerActionInput): Output | Promise<Output>;
+};
+
+export type ServerActionReference<Output = unknown> = {
+  readonly $$typeof: typeof SERVER_ACTION_REFERENCE_SYMBOL;
+  readonly id: string;
+  readonly routePattern: string;
+  readonly run: (input: ServerActionInput) => Output | Promise<Output>;
+};
+
+export type ServerRenderOptions = {
+  routePath?: string;
+  routePattern?: string;
+};
+
 export type StaticParamsResult = {
   has_generate_static_params: boolean;
   params: Array<Record<string, string | string[]>>;
@@ -139,6 +167,7 @@ type ServerRenderContext = {
   stream: boolean;
   nextSuspenseId: number;
   chunks: PendingStreamChunk[];
+  actionContext?: ServerActionRenderContext;
 };
 
 type PendingStreamChunk = {
@@ -146,7 +175,19 @@ type PendingStreamChunk = {
   promise: Promise<SerializableNode>;
 };
 
+type ServerActionRenderContext = {
+  routePath?: string;
+  routePattern?: string;
+  actions: Map<string, ServerActionReference>;
+};
+
 type MaybePromise<T> = T | Promise<T>;
+
+const SERVER_ACTION_URL = "/_ferrite/action";
+const SERVER_ACTION_ID_FIELD = "__ferrite_action";
+const SERVER_ACTION_ROUTE_FIELD = "__ferrite_route";
+const RESERVED_SERVER_ACTION_FIELDS = new Set([SERVER_ACTION_ID_FIELD, SERVER_ACTION_ROUTE_FIELD]);
+const serverActionContextStorage = new AsyncLocalStorage<ServerActionRenderContext>();
 
 export function createClientReference<Props extends Record<string, unknown> = Record<string, unknown>>(
   options: ClientReferenceOptions<Props>,
@@ -176,14 +217,50 @@ export function createClientReference<Props extends Record<string, unknown> = Re
   };
 }
 
+export function createServerAction<Output = unknown>(
+  options: ServerActionOptions<Output>,
+): ServerActionReference<Output> {
+  if (!options || typeof options.id !== "string" || options.id.length === 0) {
+    throw new TypeError("Ferrite server action requires a non-empty id.");
+  }
+
+  if (typeof options.run !== "function") {
+    throw new TypeError("Ferrite server action requires a run function.");
+  }
+
+  const routePattern = options.routePattern ?? currentServerActionRoutePattern();
+  if (typeof routePattern !== "string" || routePattern.length === 0) {
+    throw new TypeError(
+      "Ferrite server action requires a routePattern when no Ferrite route render context is active.",
+    );
+  }
+
+  createServerActionReferencePayload({
+    id: options.id,
+    routePattern,
+    url: SERVER_ACTION_URL,
+    bound: {},
+  });
+
+  return Object.freeze({
+    $$typeof: SERVER_ACTION_REFERENCE_SYMBOL,
+    id: options.id,
+    routePattern,
+    run: options.run,
+  });
+}
+
 export async function renderPageModule(
   module: PageModule,
   props: Record<string, unknown> = {},
   layouts: LayoutModule[] = [],
   conventions: RouteConventionModules = {},
+  renderOptions: ServerRenderOptions = {},
 ): Promise<SerializableNode> {
-  const rendered = await renderPageChild(module, props, layouts, conventions);
-  return (await renderServerChildFinal(rendered)) ?? emptyFragment();
+  return withServerActionRenderContext(renderOptions, async () => {
+    const rendered = await renderPageChild(module, props, layouts, conventions);
+    return (await renderServerChildFinal(rendered)) ?? emptyFragment();
+  });
 }
 
 export async function renderPageModuleToPacket(
@@ -191,8 +268,9 @@ export async function renderPageModuleToPacket(
   props: Record<string, unknown> = {},
   layouts: LayoutModule[] = [],
   conventions: RouteConventionModules = {},
+  renderOptions: ServerRenderOptions = {},
 ): Promise<RenderPacket> {
-  return serializableNodeToRenderPacket(await renderPageModule(module, props, layouts, conventions));
+  return serializableNodeToRenderPacket(await renderPageModule(module, props, layouts, conventions, renderOptions));
 }
 
 export async function renderPageModuleToStreamPacket(
@@ -200,9 +278,12 @@ export async function renderPageModuleToStreamPacket(
   props: Record<string, unknown> = {},
   layouts: LayoutModule[] = [],
   conventions: RouteConventionModules = {},
+  renderOptions: ServerRenderOptions = {},
 ): Promise<RenderStreamPacket> {
-  const rendered = await renderPageChild(module, props, layouts, conventions, { stream: true });
-  return renderServerChildToStreamPacket(rendered);
+  return withServerActionRenderContext(renderOptions, async () => {
+    const rendered = await renderPageChild(module, props, layouts, conventions, { stream: true });
+    return renderServerChildToStreamPacket(rendered);
+  });
 }
 
 export async function renderPageModuleToServerPayload(
@@ -210,9 +291,12 @@ export async function renderPageModuleToServerPayload(
   props: Record<string, unknown> = {},
   layouts: LayoutModule[] = [],
   conventions: RouteConventionModules = {},
+  renderOptions: ServerRenderOptions = {},
 ): Promise<ServerPayloadPacket> {
-  const rendered = await renderPageChild(module, props, layouts, conventions, { stream: true });
-  return renderServerChildToServerPayload(rendered);
+  return withServerActionRenderContext(renderOptions, async () => {
+    const rendered = await renderPageChild(module, props, layouts, conventions, { stream: true });
+    return renderServerChildToServerPayload(rendered);
+  });
 }
 
 export async function renderDocumentModule(
@@ -227,37 +311,39 @@ export async function renderDocumentModule(
     throw new TypeError("Ferrite document module must export a default component function.");
   }
 
-  const page = await renderPageChild(pageModule, props, layouts, conventions);
-  const metadata = normalizeMetadata(options.metadata, "document options");
-  const rootProps: Record<string, unknown> = {
-    id: options.rootId,
-    "data-route": options.routePath,
-  };
-  if (options.routePattern) {
-    rootProps["data-route-pattern"] = options.routePattern;
-  }
-  if (options.buildId !== undefined) {
-    rootProps["data-ferrite-build-id"] = options.buildId;
-  }
+  return withServerActionRenderContext(documentRenderOptionsToServerRenderOptions(options), async () => {
+    const page = await renderPageChild(pageModule, props, layouts, conventions);
+    const metadata = normalizeMetadata(options.metadata, "document options");
+    const rootProps: Record<string, unknown> = {
+      id: options.rootId,
+      "data-route": options.routePath,
+    };
+    if (options.routePattern) {
+      rootProps["data-route-pattern"] = options.routePattern;
+    }
+    if (options.buildId !== undefined) {
+      rootProps["data-ferrite-build-id"] = options.buildId;
+    }
 
-  const children = createServerElement("div", rootProps, page);
-  const head = createDocumentHead(metadata, options);
-  const rendered = await withHookDispatcher(serverHookDispatcher, () =>
-    documentModule.default({
-      children,
-      head,
-      routePath: options.routePath,
-      routePattern: options.routePattern,
-      buildId: options.buildId,
-      metadata,
-    }),
-  );
-  const serializable = await renderServerChildFinal(rendered);
-  if (!serializable || serializable.kind !== "element" || serializable.tag !== "html") {
-    throw new TypeError("Ferrite document module must render an <html> element.");
-  }
+    const children = createServerElement("div", rootProps, page);
+    const head = createDocumentHead(metadata, options);
+    const rendered = await withHookDispatcher(serverHookDispatcher, () =>
+      documentModule.default({
+        children,
+        head,
+        routePath: options.routePath,
+        routePattern: options.routePattern,
+        buildId: options.buildId,
+        metadata,
+      }),
+    );
+    const serializable = await renderServerChildFinal(rendered);
+    if (!serializable || serializable.kind !== "element" || serializable.tag !== "html") {
+      throw new TypeError("Ferrite document module must render an <html> element.");
+    }
 
-  return serializable;
+    return serializable;
+  });
 }
 
 export async function renderDocumentModuleToPacket(
@@ -285,38 +371,40 @@ export async function renderDocumentModuleToStreamPacket(
     throw new TypeError("Ferrite document module must export a default component function.");
   }
 
-  const page = await renderPageChild(pageModule, props, layouts, conventions, { stream: true });
-  const context = createServerRenderContext(true);
-  const metadata = normalizeMetadata(options.metadata, "document options");
-  const rootProps: Record<string, unknown> = {
-    id: options.rootId,
-    "data-route": options.routePath,
-  };
-  if (options.routePattern) {
-    rootProps["data-route-pattern"] = options.routePattern;
-  }
-  if (options.buildId !== undefined) {
-    rootProps["data-ferrite-build-id"] = options.buildId;
-  }
+  return withServerActionRenderContext(documentRenderOptionsToServerRenderOptions(options), async () => {
+    const page = await renderPageChild(pageModule, props, layouts, conventions, { stream: true });
+    const context = createServerRenderContext(true);
+    const metadata = normalizeMetadata(options.metadata, "document options");
+    const rootProps: Record<string, unknown> = {
+      id: options.rootId,
+      "data-route": options.routePath,
+    };
+    if (options.routePattern) {
+      rootProps["data-route-pattern"] = options.routePattern;
+    }
+    if (options.buildId !== undefined) {
+      rootProps["data-ferrite-build-id"] = options.buildId;
+    }
 
-  const children = createServerElement("div", rootProps, page);
-  const head = createDocumentHead(metadata, options);
-  const rendered = await withHookDispatcher(serverHookDispatcher, () =>
-    documentModule.default({
-      children,
-      head,
-      routePath: options.routePath,
-      routePattern: options.routePattern,
-      buildId: options.buildId,
-      metadata,
-    }),
-  );
-  const documentShell = await resolveRenderedNode(renderServerChildMaybe(rendered, context));
-  if (!documentShell || documentShell.kind !== "element" || documentShell.tag !== "html") {
-    throw new TypeError("Ferrite document module must render an <html> element.");
-  }
+    const children = createServerElement("div", rootProps, page);
+    const head = createDocumentHead(metadata, options);
+    const rendered = await withHookDispatcher(serverHookDispatcher, () =>
+      documentModule.default({
+        children,
+        head,
+        routePath: options.routePath,
+        routePattern: options.routePattern,
+        buildId: options.buildId,
+        metadata,
+      }),
+    );
+    const documentShell = await resolveRenderedNode(renderServerChildMaybe(rendered, context));
+    if (!documentShell || documentShell.kind !== "element" || documentShell.tag !== "html") {
+      throw new TypeError("Ferrite document module must render an <html> element.");
+    }
 
-  return renderStreamPacketFromShell(documentShell, context);
+    return renderStreamPacketFromShell(documentShell, context);
+  });
 }
 
 export async function renderDocumentModuleToServerPayload(
@@ -331,38 +419,40 @@ export async function renderDocumentModuleToServerPayload(
     throw new TypeError("Ferrite document module must export a default component function.");
   }
 
-  const page = await renderPageChild(pageModule, props, layouts, conventions, { stream: true });
-  const context = createServerRenderContext(true);
-  const metadata = normalizeMetadata(options.metadata, "document options");
-  const rootProps: Record<string, unknown> = {
-    id: options.rootId,
-    "data-route": options.routePath,
-  };
-  if (options.routePattern) {
-    rootProps["data-route-pattern"] = options.routePattern;
-  }
-  if (options.buildId !== undefined) {
-    rootProps["data-ferrite-build-id"] = options.buildId;
-  }
+  return withServerActionRenderContext(documentRenderOptionsToServerRenderOptions(options), async () => {
+    const page = await renderPageChild(pageModule, props, layouts, conventions, { stream: true });
+    const context = createServerRenderContext(true);
+    const metadata = normalizeMetadata(options.metadata, "document options");
+    const rootProps: Record<string, unknown> = {
+      id: options.rootId,
+      "data-route": options.routePath,
+    };
+    if (options.routePattern) {
+      rootProps["data-route-pattern"] = options.routePattern;
+    }
+    if (options.buildId !== undefined) {
+      rootProps["data-ferrite-build-id"] = options.buildId;
+    }
 
-  const children = createServerElement("div", rootProps, page);
-  const head = createDocumentHead(metadata, options);
-  const rendered = await withHookDispatcher(serverHookDispatcher, () =>
-    documentModule.default({
-      children,
-      head,
-      routePath: options.routePath,
-      routePattern: options.routePattern,
-      buildId: options.buildId,
-      metadata,
-    }),
-  );
-  const documentShell = await resolveRenderedNode(renderServerChildMaybe(rendered, context));
-  if (!documentShell || documentShell.kind !== "element" || documentShell.tag !== "html") {
-    throw new TypeError("Ferrite document module must render an <html> element.");
-  }
+    const children = createServerElement("div", rootProps, page);
+    const head = createDocumentHead(metadata, options);
+    const rendered = await withHookDispatcher(serverHookDispatcher, () =>
+      documentModule.default({
+        children,
+        head,
+        routePath: options.routePath,
+        routePattern: options.routePattern,
+        buildId: options.buildId,
+        metadata,
+      }),
+    );
+    const documentShell = await resolveRenderedNode(renderServerChildMaybe(rendered, context));
+    if (!documentShell || documentShell.kind !== "element" || documentShell.tag !== "html") {
+      throw new TypeError("Ferrite document module must render an <html> element.");
+    }
 
-  return renderServerPayloadFromShell(documentShell, context);
+    return renderServerPayloadFromShell(documentShell, context);
+  });
 }
 
 export async function collectStaticParams(module: PageModule): Promise<StaticParamsResult> {
@@ -574,6 +664,31 @@ function createServerRenderContext(stream: boolean): ServerRenderContext {
     stream,
     nextSuspenseId: 0,
     chunks: [],
+    actionContext: currentServerActionContext(),
+  };
+}
+
+function withServerActionRenderContext<T>(options: ServerRenderOptions, render: () => T): T {
+  const context: ServerActionRenderContext = {
+    routePath: options.routePath,
+    routePattern: options.routePattern,
+    actions: new Map(),
+  };
+  return serverActionContextStorage.run(context, render);
+}
+
+function currentServerActionContext(): ServerActionRenderContext | undefined {
+  return serverActionContextStorage.getStore();
+}
+
+function currentServerActionRoutePattern(): string | undefined {
+  return currentServerActionContext()?.routePattern;
+}
+
+function documentRenderOptionsToServerRenderOptions(options: DocumentRenderOptions): ServerRenderOptions {
+  return {
+    routePath: options.routePath,
+    routePattern: options.routePattern,
   };
 }
 
@@ -637,6 +752,11 @@ function renderServerChildMaybe(
     throw new TypeError("Cannot serialize unsupported Ferrite element type.");
   }
 
+  if (child.type === "form" && isServerActionReference(child.props.action)) {
+    return renderServerActionFormMaybe(child.props, context);
+  }
+
+  assertNoServerActionProps(child.type, child.props);
   const children = renderServerChildrenMaybe(child.props.children, context);
   if (isPromiseLike(children)) {
     return children.then((resolvedChildren) => ({
@@ -777,6 +897,134 @@ function collectClientReferencePayloadsInto(node: SerializableNode, references: 
   }
 
   node.children.forEach((child) => collectClientReferencePayloadsInto(child, references));
+}
+
+function renderServerActionFormMaybe(
+  props: Record<string, unknown>,
+  context: ServerRenderContext,
+): MaybePromise<SerializableNode> {
+  const action = props.action;
+  if (!isServerActionReference(action)) {
+    throw new TypeError("Ferrite server action forms require a server action reference.");
+  }
+
+  const actionContext = context.actionContext;
+  if (!actionContext?.routePath) {
+    throw new TypeError("Ferrite server action forms require a routePath render option.");
+  }
+
+  if (actionContext.routePattern && action.routePattern !== actionContext.routePattern) {
+    throw new TypeError(
+      `Ferrite server action routePattern "${action.routePattern}" does not match current route pattern "${actionContext.routePattern}".`,
+    );
+  }
+
+  const method = props.method;
+  if (method !== undefined && method !== null && method !== false) {
+    if (typeof method !== "string" || method.toLowerCase() !== "post") {
+      throw new TypeError('Ferrite server action forms must use method="post".');
+    }
+  }
+
+  assertNoServerActionProps("form", props);
+  registerServerActionReference(actionContext, action);
+
+  const serializedProps = serializeServerActionFormProps(props);
+  const renderedChildren = renderServerChildrenMaybe(props.children as Child, context);
+  if (isPromiseLike(renderedChildren)) {
+    return renderedChildren.then((children) =>
+      createSerializedServerActionForm(serializedProps, action.id, actionContext.routePath as string, children),
+    );
+  }
+
+  return createSerializedServerActionForm(serializedProps, action.id, actionContext.routePath, renderedChildren);
+}
+
+function createSerializedServerActionForm(
+  props: Record<string, string | number | boolean>,
+  actionId: string,
+  routePath: string,
+  children: SerializableNode[],
+): SerializableNode {
+  assertNoReservedServerActionFields(children);
+  return {
+    kind: "element",
+    tag: "form",
+    props,
+    children: [
+      createHiddenServerActionInput(SERVER_ACTION_ID_FIELD, actionId),
+      createHiddenServerActionInput(SERVER_ACTION_ROUTE_FIELD, routePath),
+      ...children,
+    ],
+  };
+}
+
+function createHiddenServerActionInput(name: string, value: string): SerializableNode {
+  return {
+    kind: "element",
+    tag: "input",
+    props: { type: "hidden", name, value },
+    children: [],
+  };
+}
+
+function serializeServerActionFormProps(props: Record<string, unknown>): Record<string, string | number | boolean> {
+  const { action: _action, children: _children, key: _key, method: _method, ...rest } = props;
+  return serializeServerProps({
+    ...rest,
+    action: SERVER_ACTION_URL,
+    method: "post",
+  });
+}
+
+function registerServerActionReference(
+  context: ServerActionRenderContext,
+  action: ServerActionReference,
+): void {
+  const existing = context.actions.get(action.id);
+  if (existing && existing !== action) {
+    throw new TypeError(`Ferrite duplicate Ferrite server action id "${action.id}" in one render.`);
+  }
+
+  context.actions.set(action.id, action);
+}
+
+function assertNoServerActionProps(tag: string, props: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(props)) {
+    if (key === "children" || (tag === "form" && key === "action")) {
+      continue;
+    }
+
+    if (isServerActionReference(value)) {
+      throw new TypeError("Ferrite server actions can only be used as <form action>.");
+    }
+  }
+}
+
+function assertNoReservedServerActionFields(nodes: SerializableNode[]): void {
+  for (const node of nodes) {
+    if (node.kind !== "element") {
+      continue;
+    }
+
+    if (
+      node.tag === "input" &&
+      typeof node.props.name === "string" &&
+      RESERVED_SERVER_ACTION_FIELDS.has(node.props.name)
+    ) {
+      throw new TypeError(
+        `Ferrite reserved Ferrite server action field "${node.props.name}" cannot be rendered by user code.`,
+      );
+    }
+
+    assertNoReservedServerActionFields(node.children);
+  }
+}
+
+function isServerActionReference(value: unknown): value is ServerActionReference {
+  return Boolean(
+    value && typeof value === "object" && (value as { $$typeof?: symbol }).$$typeof === SERVER_ACTION_REFERENCE_SYMBOL,
+  );
 }
 
 function serializeServerProps(props: Record<string, unknown>): Record<string, string | number | boolean> {
