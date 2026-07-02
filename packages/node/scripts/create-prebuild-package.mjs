@@ -28,6 +28,12 @@ const checksum = createHash("sha256").update(bindingBytes).digest("hex");
 const manifest = {
   name: packageName,
   version: nodePackage.version,
+  description: `Ferrite native Node.js binding for ${platform}/${arch}.`,
+  license: nodePackage.license,
+  keywords: nodePackage.keywords,
+  publishConfig: {
+    access: "public",
+  },
   os: [platform],
   cpu: [arch],
   files: ["ferrite-node.node", checksumFile],

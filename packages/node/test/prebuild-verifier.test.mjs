@@ -80,6 +80,23 @@ test("rejects missing expected aggregate packages", async () => {
   });
 });
 
+test("rejects native packages without public publish metadata", async () => {
+  await withPackageFixture(async (dir) => {
+    await writePrebuildPackage(dir, {
+      packageName: "@ferrite/node-darwin-arm64",
+      os: "darwin",
+      cpu: "arm64",
+      binding: Buffer.from("native binding"),
+      publishConfig: {},
+    });
+
+    await assert.rejects(
+      () => verifyPrebuildPackageDirs([dir]),
+      /publishConfig\.access must be public/,
+    );
+  });
+});
+
 async function withPackageFixture(callback) {
   const dir = await mkdtemp(join(tmpdir(), "ferrite-prebuild-"));
   try {
@@ -89,7 +106,17 @@ async function withPackageFixture(callback) {
   }
 }
 
-async function writePrebuildPackage(dir, { packageName, os, cpu, binding, sha256 }) {
+async function writePrebuildPackage(
+  dir,
+  {
+    packageName,
+    os,
+    cpu,
+    binding,
+    sha256,
+    publishConfig = { access: "public" },
+  },
+) {
   const digest = sha256 ?? createHash("sha256").update(binding).digest("hex");
   await writeFile(join(dir, "ferrite-node.node"), binding);
   await writeFile(
@@ -110,6 +137,10 @@ async function writePrebuildPackage(dir, { packageName, os, cpu, binding, sha256
       {
         name: packageName,
         version: "0.1.0",
+        description: `Ferrite native Node.js binding for ${os}/${cpu}.`,
+        license: "UNLICENSED",
+        keywords: ["ferrite", "node-api", "native", "ssr", "rust"],
+        publishConfig,
         os: [os],
         cpu: [cpu],
         files: ["ferrite-node.node", "ferrite-node.sha256.json"],

@@ -71,6 +71,16 @@ async function assertPackageManifest(root, manifest, target) {
   if (manifest.version !== (await nodePackageVersion())) {
     throw new Error(`${root}: package version must match @ferrite/node.`);
   }
+  if (typeof manifest.description !== "string" || manifest.description.trim() === "") {
+    throw new Error(`${root}: package description is required.`);
+  }
+  if (manifest.license !== "UNLICENSED") {
+    throw new Error(`${root}: package license must match @ferrite/node.`);
+  }
+  assertArrayIncludes(root, manifest.keywords, "ferrite", "keywords");
+  if (manifest.publishConfig?.access !== "public") {
+    throw new Error(`${root}: package publishConfig.access must be public.`);
+  }
   assertArrayIncludes(root, manifest.files, bindingFile, "files");
   assertArrayIncludes(root, manifest.files, checksumFile, "files");
   if (!manifest.exports || typeof manifest.exports !== "object" || Array.isArray(manifest.exports)) {
