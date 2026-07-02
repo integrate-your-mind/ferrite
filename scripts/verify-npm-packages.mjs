@@ -162,11 +162,13 @@ export async function verifyNpmPackages({
   reportDir: packageReportDir = reportDir,
   runCommand = run,
   packPackage,
+  installPackageSet = installPackedPackageSet,
 } = {}) {
   const packageVerifier = packPackage ?? npmPackPackage;
   const packageVersions = new Map();
   const manifests = new Map();
   const results = [];
+  const installablePackages = [];
   const stageRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-stage-"));
 
   try {
@@ -226,7 +228,13 @@ export async function verifyNpmPackages({
         result.packedManifest = packResult.packedManifest;
       }
       results.push(result);
+      installablePackages.push({
+        ...result,
+        tarballPath: packResult.tarballPath,
+      });
     }
+
+    await installPackageSet(installablePackages, { runCommand });
 
     if (writeReports) {
       await rm(packageReportDir, { force: true, recursive: true });
@@ -329,6 +337,7 @@ function normalizePackResult(packageName, packResult) {
   return {
     files: packResult.files,
     packedManifest: packResult.packedManifest,
+    tarballPath: packResult.tarballPath,
   };
 }
 
@@ -349,15 +358,98 @@ async function npmPackPackage(packageDir) {
   if (typeof entry.filename !== "string" || entry.filename.trim() === "") {
     throw new Error(`${packageDir}: npm pack output did not include a tarball filename.`);
   }
-  const packedManifest = await readTarballPackageManifest(join(tarballDir, entry.filename));
+  const tarballPath = join(tarballDir, entry.filename);
+  const packedManifest = await readTarballPackageManifest(tarballPath);
   return {
     files: entry.files.map((file) => file.path),
     packedManifest,
+    tarballPath,
   };
 }
 
 async function readJson(path) {
   return JSON.parse(await readFile(path, "utf8"));
+}
+
+export async function installPackedPackageSet(packages, { runCommand = run } = {}) {
+  assertInstallablePackages(packages);
+  const installRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-install-"));
+  try {
+    await writeFile(
+      join(installRoot, "package.json"),
+      `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`,
+    );
+    await runCommand(
+      "npm",
+      [
+        "install",
+        "--ignore-scripts",
+        "--omit=optional",
+        "--package-lock=false",
+        "--no-audit",
+        "--fund=false",
+        "--offline",
+        ...packages.map((pkg) => pkg.tarballPath),
+      ],
+      { cwd: installRoot, capture: true },
+    );
+    await runCommand("node", ["--input-type=module", "--eval", installSmokeScript(packages)], {
+      cwd: installRoot,
+      capture: true,
+    });
+  } finally {
+    await rm(installRoot, { force: true, recursive: true });
+  }
+}
+
+function assertInstallablePackages(packages) {
+  if (!Array.isArray(packages) || packages.length === 0) {
+    throw new Error("npm install smoke requires at least one package tarball.");
+  }
+  for (const pkg of packages) {
+    if (!pkg || typeof pkg !== "object" || typeof pkg.name !== "string" || pkg.name.trim() === "") {
+      throw new Error("npm install smoke package entries require a package name.");
+    }
+    if (typeof pkg.tarballPath !== "string" || pkg.tarballPath.trim() === "") {
+      throw new Error(`${pkg.name}: npm install smoke requires a local tarball path.`);
+    }
+  }
+}
+
+function installSmokeScript(packages) {
+  return `
+import { readFile } from "node:fs/promises";
+
+const packageNames = new Set(${JSON.stringify(packages.map((pkg) => pkg.name))});
+
+if (packageNames.has("@ferrite/protocol")) {
+  const protocol = await import("@ferrite/protocol");
+  if (typeof protocol.validateServerPayloadPacket !== "function") {
+    throw new TypeError("@ferrite/protocol did not expose validateServerPayloadPacket.");
+  }
+}
+
+if (packageNames.has("@ferrite/protocol-wasm")) {
+  const wasm = await import("@ferrite/protocol-wasm");
+  if (typeof wasm.instantiateFerriteProtocolWasm !== "function") {
+    throw new TypeError("@ferrite/protocol-wasm did not expose instantiateFerriteProtocolWasm.");
+  }
+}
+
+if (packageNames.has("@ferrite/runtime")) {
+  const runtime = await import("@ferrite/runtime");
+  if (typeof runtime.createElement !== "function") {
+    throw new TypeError("@ferrite/runtime did not expose createElement.");
+  }
+}
+
+if (packageNames.has("@ferrite/node")) {
+  const manifest = JSON.parse(await readFile("node_modules/@ferrite/node/package.json", "utf8"));
+  if (manifest.name !== "@ferrite/node") {
+    throw new TypeError("@ferrite/node was not installed from the local tarball set.");
+  }
+}
+`;
 }
 
 async function readTarballPackageManifest(tarballPath) {

@@ -1,12 +1,12 @@
 # npm Publishing Prep Implementation Plan
 
-Status note, July 2, 2026: this plan records the original milestone 061 dry-run implementation. Milestone 063 superseded the npm verifier behavior: `scripts/verify-npm-packages.mjs` now stages release-shaped package copies, runs real `npm pack --json`, inspects packed `package/package.json`, and records both release and packed manifests. Dry-run snippets below are historical plan details, not the current verifier contract.
+Status note, July 2, 2026: this plan records the original milestone 061 dry-run implementation. Milestone 063 superseded the npm verifier behavior by staging release-shaped package copies, running real `npm pack --json`, inspecting packed `package/package.json`, and recording both release and packed manifests. Milestone 064 added clean offline install smoke for the generated tarballs. Dry-run snippets below are historical plan details, not the current verifier contract.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prepare Ferrite's JavaScript-facing packages for npm publication dry-runs without publishing packages or inventing unavailable GitHub/npm remote state.
 
-**Architecture:** Keep source packages private while adding release metadata that is knowable locally. The current verifier builds packages, stages release-shaped package copies, runs real `npm pack --json`, checks packed file lists, validates packed manifests from the tarball, and fails closed for missing remote-only metadata when publish mode is requested. The read-only GitHub Actions workflow remains non-publishing and remote proof remains unavailable in this checkout.
+**Architecture:** Keep source packages private while adding release metadata that is knowable locally. The current verifier builds packages, stages release-shaped package copies, runs real `npm pack --json`, checks packed file lists, validates packed manifests from the tarball, clean-installs the generated tarballs together offline, and fails closed for missing remote-only metadata when publish mode is requested. The read-only GitHub Actions workflow remains non-publishing and remote proof remains unavailable in this checkout.
 
 **Tech Stack:** Node.js ESM scripts and `node:test`, pnpm workspace package scripts, npm CLI pack dry-runs, GitHub Actions, Rust/Cargo build gates, TypeScript package builds.
 
@@ -35,10 +35,10 @@ The current checkout has no configured Git remote and no confirmed npm publisher
 
 The verifier has two modes:
 
-- Default local mode: proves source package metadata, staged package file lists, workspace dependency rewriting in packed tarball manifests, native optional dependency expectations in those packed manifests, and `npm pack --json` output without requiring a remote URL.
+- Default local mode: proves source package metadata, staged package file lists, workspace dependency rewriting in packed tarball manifests, native optional dependency expectations in those packed manifests, `npm pack --json` output, and clean offline install of the generated local tarballs without requiring a remote URL.
 - Publish-manifest mode: enabled by `--publish-manifest --repository-url <https-url>`. This mode validates that release-shaped manifests contain `repository`, `homepage`, `bugs`, no `private: true`, no `workspace:*`, public access, and native optional dependencies. It fails if the URL is missing.
 
-The dry-run workflow uses default local mode because the repository URL is not configured in this checkout. The proof document must list publish-manifest mode, real npm publication, trusted publishing, registry credentials, remote CI execution, and actual tarballs with rewritten publish manifests as not proven until those states exist.
+The read-only workflow uses default local mode because the repository URL is not configured in this checkout. The proof document must list publish-manifest mode, real npm publication, trusted publishing, registry credentials, and remote CI execution as not proven until those states exist.
 
 ## Task 1: Add Release Verifier Tests
 

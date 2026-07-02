@@ -212,6 +212,7 @@ test("verifier validates packages and writes the inspected report", async () => 
         packCalls.push(packageDir);
         return ["package/dist/index.js", "package/dist/index.d.ts"];
       },
+      installPackageSet: async () => {},
     });
 
     const report = JSON.parse(await readFile(join(root, "reports", "npm-package-report.json"), "utf8"));
@@ -318,6 +319,7 @@ test("verifier packs a staged release manifest instead of the source manifest", 
           packedManifest: manifest,
         };
       },
+      installPackageSet: async () => {},
     });
 
     const runtimeSourceManifest = JSON.parse(await readFile(join(root, "packages", "runtime", "package.json"), "utf8"));
@@ -328,6 +330,101 @@ test("verifier packs a staged release manifest instead of the source manifest", 
     assert.deepEqual(results[1].packedManifest.dependencies, {
       "@ferrite/protocol": "0.1.0",
     });
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("verifier installs all generated local tarballs together in a clean project", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-install-"));
+  try {
+    await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
+    await mkdir(join(root, "packages", "runtime", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
+    await writeFile(join(root, "packages", "runtime", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "runtime", "dist", "index.d.ts"), "export {};\n");
+    await writeFile(
+      join(root, "packages", "protocol", "package.json"),
+      `${JSON.stringify(
+        {
+          name: "@ferrite/protocol",
+          version: "0.1.0",
+          private: true,
+          description: "Ferrite protocol package.",
+          license: "UNLICENSED",
+          keywords: ["ferrite"],
+          files: ["dist"],
+          exports: { ".": "./dist/index.js" },
+          publishConfig: { access: "public" },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await writeFile(
+      join(root, "packages", "runtime", "package.json"),
+      `${JSON.stringify(
+        {
+          name: "@ferrite/runtime",
+          version: "0.1.0",
+          private: true,
+          description: "Ferrite runtime package.",
+          license: "UNLICENSED",
+          keywords: ["ferrite"],
+          files: ["dist"],
+          exports: { ".": "./dist/index.js" },
+          dependencies: {
+            "@ferrite/protocol": "workspace:*",
+          },
+          publishConfig: { access: "public" },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const installCalls = [];
+    await verifyNpmPackages({
+      releasePackages: [
+        {
+          name: "@ferrite/protocol",
+          directory: "packages/protocol",
+          build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+          requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+          forbiddenFiles: ["src/index.ts", "test"],
+        },
+        {
+          name: "@ferrite/runtime",
+          directory: "packages/runtime",
+          build: ["pnpm", ["--filter", "@ferrite/runtime", "build"]],
+          requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+          forbiddenFiles: ["src/index.ts", "test"],
+        },
+      ],
+      nativePackageNames: [],
+      workspaceRoot: root,
+      reportDir: join(root, "reports"),
+      runCommand: async () => "",
+      packPackage: async (packageDir) => {
+        const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
+        return {
+          files: ["package/dist/index.js", "package/dist/index.d.ts", "package/package.json"],
+          packedManifest: manifest,
+          tarballPath: join(root, `${manifest.name.replace("@ferrite/", "")}.tgz`),
+        };
+      },
+      installPackageSet: async (packages) => {
+        installCalls.push(packages.map(({ name, tarballPath }) => ({ name, tarballPath })));
+      },
+    });
+
+    assert.deepEqual(installCalls, [
+      [
+        { name: "@ferrite/protocol", tarballPath: join(root, "protocol.tgz") },
+        { name: "@ferrite/runtime", tarballPath: join(root, "runtime.tgz") },
+      ],
+    ]);
   } finally {
     await rm(root, { force: true, recursive: true });
   }

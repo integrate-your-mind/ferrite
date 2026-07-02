@@ -8,6 +8,7 @@
 - Added tarball manifest inspection for `package/package.json`.
 - Added validation that packed manifests omit `private`, omit `workspace:*`, match release package names and versions, and preserve rewritten release dependency fields.
 - Updated the npm package report to include both `releaseManifest` and `packedManifest`.
+- Follow-up milestone 064 extended this verifier to clean-install the generated tarballs together in an offline temp project.
 
 ## Normal Path Proof
 
@@ -34,6 +35,6 @@
 
 ## Not Proven
 
-- Clean-project installation from the generated local tarballs.
+- At the time of milestone 063, clean-project installation from the generated local tarballs was not proven; milestone 064 now proves local clean offline install smoke.
 - npm publication, trusted publishing, provenance, or registry credentials.
 - Remote CI, because this checkout has no configured Git remote.

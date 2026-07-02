@@ -1,6 +1,6 @@
 # npm Publishing Prep Design
 
-Status note, July 2, 2026: this design captured the original milestone 061 dry-run verifier. Milestone 063 superseded the npm verifier behavior: `scripts/verify-npm-packages.mjs` now stages release-shaped package copies, runs real `npm pack --json`, inspects packed `package/package.json`, and records both release and packed manifests. Clean-project tarball installation, remote CI, and npm publication remain unproven.
+Status note, July 2, 2026: this design captured the original milestone 061 dry-run verifier. Milestone 063 superseded the npm verifier behavior by staging release-shaped package copies, running real `npm pack --json`, inspecting packed `package/package.json`, and recording both release and packed manifests. Milestone 064 added clean offline install smoke for the generated tarballs. Remote CI and npm publication remain unproven.
 
 ## Purpose
 
@@ -56,7 +56,7 @@ Each publishable source package should have:
 - precise `files`
 - exports with type entries where applicable
 
-`@ferrite/protocol`, `@ferrite/protocol-wasm`, and `@ferrite/runtime` can carry normal workspace dependencies during development. The current local verifier stages release-shaped package copies, runs real `npm pack --json`, inspects the packed `package/package.json`, and records both release and packed manifests in `dist/npm-packages/npm-package-report.json`. Packed manifests must not contain `private: true` or `workspace:*`.
+`@ferrite/protocol`, `@ferrite/protocol-wasm`, and `@ferrite/runtime` can carry normal workspace dependencies during development. The current local verifier stages release-shaped package copies, runs real `npm pack --json`, inspects the packed `package/package.json`, installs the generated tarballs together in a clean offline temp project, and records both release and packed manifests in `dist/npm-packages/npm-package-report.json`. Packed manifests must not contain `private: true` or `workspace:*`.
 
 `@ferrite/node` needs special handling for platform packages. Adding optional dependencies for unpublished native packages directly to the source manifest can cause local installs to resolve packages that do not exist yet. The safer first slice is:
 
@@ -164,7 +164,7 @@ Remote proof after a GitHub remote exists:
 - Successful `npm-publish-dry-run.yml`.
 - Artifact containing pack inspection reports.
 - Existing native prebuild dry-run passing for every supported runner.
-- A clean-project install from staged tarballs whose package manifests no longer contain source-only `private` or `workspace:*` fields.
+- A clean-project install from staged tarballs whose package manifests no longer contain source-only `private` or `workspace:*` fields. This is now locally proven; remote CI still needs to run it.
 
 ## Documentation Updates
 
