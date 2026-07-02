@@ -2,6 +2,17 @@
   "name": "@ferrite/protocol",
   "version": "0.1.0",
   "private": true,
+  "description": "Browser-safe Ferrite protocol markers, builders, and validators generated from the Rust protocol crate.",
+  "license": "UNLICENSED",
+  "keywords": [
+    "ferrite",
+    "protocol",
+    "ssr",
+    "typescript"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": {

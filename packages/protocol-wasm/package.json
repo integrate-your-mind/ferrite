@@ -2,6 +2,17 @@
   "name": "@ferrite/protocol-wasm",
   "version": "0.1.0",
   "private": true,
+  "description": "Rust-backed WASM validation for Ferrite server payload protocol packets.",
+  "license": "UNLICENSED",
+  "keywords": [
+    "ferrite",
+    "wasm",
+    "protocol",
+    "ssr"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": {

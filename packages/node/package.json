@@ -2,6 +2,18 @@
   "name": "@ferrite/node",
   "version": "0.1.0",
   "private": true,
+  "description": "Native Node.js bindings for Ferrite Rust server-side rendering.",
+  "license": "UNLICENSED",
+  "keywords": [
+    "ferrite",
+    "node-api",
+    "native",
+    "ssr",
+    "rust"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": {
@@ -11,7 +23,6 @@
   },
   "files": [
     "binding.js",
-    "dist",
     "index.d.ts",
     "index.js"
   ],
