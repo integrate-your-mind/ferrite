@@ -147,7 +147,7 @@ Keep validators fail-closed and side-effect-free. Do not depend on DOM APIs or `
 Run:
 
 ```bash
-cargo run -p ferrite-cli -- generate-protocol
+cargo run --quiet -p ferrite-protocol --bin ferrite-protocol-codegen > packages/protocol/src/index.ts
 cargo test -p ferrite-protocol
 pnpm --filter @ferrite/protocol build
 pnpm --filter @ferrite/protocol test

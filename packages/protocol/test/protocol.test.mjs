@@ -4,13 +4,28 @@ import test from "node:test";
 import {
   CLIENT_REFERENCE_MARKER,
   CLIENT_REFERENCE_VERSION,
+  SERVER_ACTION_REFERENCE_MARKER,
+  SERVER_ACTION_REFERENCE_VERSION,
+  SERVER_ACTION_REQUEST_MARKER,
+  SERVER_ACTION_REQUEST_VERSION,
+  SERVER_ACTION_RESPONSE_MARKER,
+  SERVER_ACTION_RESPONSE_VERSION,
   SERVER_PAYLOAD_MARKER,
   SERVER_PAYLOAD_STREAM_FRAME_MARKER,
   SERVER_PAYLOAD_STREAM_FRAME_VERSION,
   SERVER_PAYLOAD_VERSION,
   createClientReferencePayload,
+  createServerActionErrorResponse,
+  createServerActionOkResponse,
+  createServerActionPayloadResponse,
+  createServerActionRedirectResponse,
+  createServerActionReferencePayload,
+  createServerActionRequest,
   parseClientReferenceId,
   validateClientReferencePayload,
+  validateServerActionReferencePayload,
+  validateServerActionRequest,
+  validateServerActionResponse,
   validateServerPayloadPacket,
   validateServerPayloadStreamFrame,
 } from "../dist/index.js";
@@ -107,5 +122,123 @@ test("rejects malformed server payload chunks", () => {
       chunk: { id: "", root: [0, "chunk"], clientReferences: [] },
     }),
     /requires a non-empty id/,
+  );
+});
+
+test("creates and validates server action protocol values", () => {
+  const reference = createServerActionReferencePayload({
+    id: "app/posts/[id]/page.tsx#createPost",
+    routePattern: "/posts/[id]",
+    bound: { postId: "abc" },
+  });
+  assert.deepEqual(reference, {
+    ferrite: SERVER_ACTION_REFERENCE_MARKER,
+    version: SERVER_ACTION_REFERENCE_VERSION,
+    id: "app/posts/[id]/page.tsx#createPost",
+    routePattern: "/posts/[id]",
+    url: "/_ferrite/action",
+    bound: { postId: "abc" },
+  });
+  assert.equal(validateServerActionReferencePayload(reference), reference);
+
+  const request = createServerActionRequest({
+    id: reference.id,
+    routePath: "/posts/abc",
+    form: {
+      title: "Hello",
+      tag: ["rust", "tsx"],
+    },
+  });
+  assert.deepEqual(request, {
+    ferrite: SERVER_ACTION_REQUEST_MARKER,
+    version: SERVER_ACTION_REQUEST_VERSION,
+    id: reference.id,
+    routePath: "/posts/abc",
+    form: {
+      title: "Hello",
+      tag: ["rust", "tsx"],
+    },
+  });
+  assert.equal(validateServerActionRequest(request), request);
+
+  assert.deepEqual(createServerActionOkResponse({ data: { saved: true } }), {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "ok",
+    data: { saved: true },
+  });
+  assert.deepEqual(createServerActionRedirectResponse({ location: "/posts/abc?draft=1#saved" }), {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "redirect",
+    location: "/posts/abc?draft=1#saved",
+  });
+  assert.deepEqual(createServerActionErrorResponse({ message: "Could not save post." }), {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "error",
+    message: "Could not save post.",
+  });
+
+  const payloadResponse = createServerActionPayloadResponse({
+    payload: {
+      ferrite: SERVER_PAYLOAD_MARKER,
+      version: SERVER_PAYLOAD_VERSION,
+      shell: [0, "updated"],
+      clientReferences: [],
+      chunks: [],
+    },
+  });
+  assert.equal(validateServerActionResponse(payloadResponse), payloadResponse);
+});
+
+test("rejects malformed server action protocol values", () => {
+  assert.throws(
+    () =>
+      validateServerActionReferencePayload({
+        ferrite: SERVER_ACTION_REFERENCE_MARKER,
+        version: SERVER_ACTION_REFERENCE_VERSION,
+        id: "",
+        routePattern: "/posts/[id]",
+        url: "/_ferrite/action",
+        bound: {},
+      }),
+    /server action id must be non-empty/,
+  );
+
+  assert.throws(
+    () =>
+      validateServerActionRequest({
+        ferrite: SERVER_ACTION_REQUEST_MARKER,
+        version: SERVER_ACTION_REQUEST_VERSION,
+        id: "app/posts/[id]/page.tsx#createPost",
+        routePath: "posts/abc",
+        form: {},
+      }),
+    /route path must start/,
+  );
+
+  assert.throws(
+    () =>
+      validateServerActionRequest({
+        ferrite: SERVER_ACTION_REQUEST_MARKER,
+        version: SERVER_ACTION_REQUEST_VERSION,
+        id: "app/posts/[id]/page.tsx#createPost",
+        routePath: "/posts/abc",
+        form: { title: ["ok", 1] },
+      }),
+    /must be a string or string array/,
+  );
+
+  assert.throws(
+    () =>
+      validateServerActionResponse({
+        ferrite: SERVER_ACTION_RESPONSE_MARKER,
+        version: SERVER_ACTION_RESPONSE_VERSION,
+        status: "ok",
+        data: { saved: true },
+        location: "/posts/abc",
+      }),
+    /unsupported field "location"/,
   );
 });

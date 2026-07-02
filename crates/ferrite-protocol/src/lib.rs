@@ -9,10 +9,16 @@ pub const RENDER_STREAM_MARKER: &str = "render-stream";
 pub const CLIENT_REFERENCE_MARKER: &str = "client-reference";
 pub const SERVER_PAYLOAD_MARKER: &str = "server-payload";
 pub const SERVER_PAYLOAD_STREAM_FRAME_MARKER: &str = "server-payload-frame";
+pub const SERVER_ACTION_REFERENCE_MARKER: &str = "server-action-reference";
+pub const SERVER_ACTION_REQUEST_MARKER: &str = "server-action-request";
+pub const SERVER_ACTION_RESPONSE_MARKER: &str = "server-action-response";
 pub const RENDER_PACKET_VERSION: u64 = 1;
 pub const CLIENT_REFERENCE_VERSION: u64 = 1;
 pub const SERVER_PAYLOAD_VERSION: u64 = 1;
 pub const SERVER_PAYLOAD_STREAM_FRAME_VERSION: u64 = 1;
+pub const SERVER_ACTION_REFERENCE_VERSION: u64 = 1;
+pub const SERVER_ACTION_REQUEST_VERSION: u64 = 1;
+pub const SERVER_ACTION_RESPONSE_VERSION: u64 = 1;
 pub const COMPACT_TEXT_OPCODE: u8 = 0;
 pub const COMPACT_FRAGMENT_OPCODE: u8 = 1;
 pub const COMPACT_ELEMENT_OPCODE: u8 = 2;
@@ -68,6 +74,42 @@ pub fn typescript_protocol_source() -> String {
     writeln!(
         out,
         "export const SERVER_PAYLOAD_STREAM_FRAME_VERSION = {SERVER_PAYLOAD_STREAM_FRAME_VERSION} as const;"
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_ACTION_REFERENCE_MARKER = {} as const;",
+        serde_json::to_string(SERVER_ACTION_REFERENCE_MARKER)
+            .expect("string serialization cannot fail")
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_ACTION_REFERENCE_VERSION = {SERVER_ACTION_REFERENCE_VERSION} as const;"
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_ACTION_REQUEST_MARKER = {} as const;",
+        serde_json::to_string(SERVER_ACTION_REQUEST_MARKER)
+            .expect("string serialization cannot fail")
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_ACTION_REQUEST_VERSION = {SERVER_ACTION_REQUEST_VERSION} as const;"
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_ACTION_RESPONSE_MARKER = {} as const;",
+        serde_json::to_string(SERVER_ACTION_RESPONSE_MARKER)
+            .expect("string serialization cannot fail")
+    )
+    .expect("writing to a string cannot fail");
+    writeln!(
+        out,
+        "export const SERVER_ACTION_RESPONSE_VERSION = {SERVER_ACTION_RESPONSE_VERSION} as const;"
     )
     .expect("writing to a string cannot fail");
     out.push('\n');
@@ -177,6 +219,59 @@ export type ServerPayloadStreamChunkFrame = {
 
 export type ServerPayloadStreamFrame = ServerPayloadStreamShellFrame | ServerPayloadStreamChunkFrame;
 
+export type ServerActionFormValue = string | string[];
+
+export type ServerActionReferencePayload = {
+  ferrite: typeof SERVER_ACTION_REFERENCE_MARKER;
+  version: typeof SERVER_ACTION_REFERENCE_VERSION;
+  id: string;
+  routePattern: string;
+  url: string;
+  bound: Record<string, ClientReferenceSerializableValue>;
+};
+
+export type ServerActionRequest = {
+  ferrite: typeof SERVER_ACTION_REQUEST_MARKER;
+  version: typeof SERVER_ACTION_REQUEST_VERSION;
+  id: string;
+  routePath: string;
+  form: Record<string, ServerActionFormValue>;
+};
+
+export type ServerActionOkResponse = {
+  ferrite: typeof SERVER_ACTION_RESPONSE_MARKER;
+  version: typeof SERVER_ACTION_RESPONSE_VERSION;
+  status: "ok";
+  data: ClientReferenceSerializableValue;
+};
+
+export type ServerActionRedirectResponse = {
+  ferrite: typeof SERVER_ACTION_RESPONSE_MARKER;
+  version: typeof SERVER_ACTION_RESPONSE_VERSION;
+  status: "redirect";
+  location: string;
+};
+
+export type ServerActionErrorResponse = {
+  ferrite: typeof SERVER_ACTION_RESPONSE_MARKER;
+  version: typeof SERVER_ACTION_RESPONSE_VERSION;
+  status: "error";
+  message: string;
+};
+
+export type ServerActionPayloadResponse = {
+  ferrite: typeof SERVER_ACTION_RESPONSE_MARKER;
+  version: typeof SERVER_ACTION_RESPONSE_VERSION;
+  status: "payload";
+  payload: ServerPayloadPacket;
+};
+
+export type ServerActionResponse =
+  | ServerActionOkResponse
+  | ServerActionRedirectResponse
+  | ServerActionErrorResponse
+  | ServerActionPayloadResponse;
+
 export function parseClientReferenceId(id: string): { module: string; exportName: string } {
   if (typeof id !== "string" || id.length === 0) {
     throw new TypeError("Ferrite client reference requires a non-empty id.");
@@ -206,6 +301,80 @@ export function createClientReferencePayload(input: {
     exportName,
     props: input.props ?? {},
   };
+}
+
+export function createServerActionReferencePayload(input: {
+  id: string;
+  routePattern: string;
+  url?: string;
+  bound?: Record<string, ClientReferenceSerializableValue>;
+}): ServerActionReferencePayload {
+  const payload: ServerActionReferencePayload = {
+    ferrite: SERVER_ACTION_REFERENCE_MARKER,
+    version: SERVER_ACTION_REFERENCE_VERSION,
+    id: input.id,
+    routePattern: input.routePattern,
+    url: input.url ?? "/_ferrite/action",
+    bound: input.bound ?? {},
+  };
+  return validateServerActionReferencePayload(payload);
+}
+
+export function createServerActionRequest(input: {
+  id: string;
+  routePath: string;
+  form?: Record<string, ServerActionFormValue>;
+}): ServerActionRequest {
+  const request: ServerActionRequest = {
+    ferrite: SERVER_ACTION_REQUEST_MARKER,
+    version: SERVER_ACTION_REQUEST_VERSION,
+    id: input.id,
+    routePath: input.routePath,
+    form: input.form ?? {},
+  };
+  return validateServerActionRequest(request);
+}
+
+export function createServerActionOkResponse(input: {
+  data?: ClientReferenceSerializableValue;
+} = {}): ServerActionOkResponse {
+  const response: ServerActionOkResponse = {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "ok",
+    data: input.data ?? null,
+  };
+  return validateServerActionResponse(response) as ServerActionOkResponse;
+}
+
+export function createServerActionRedirectResponse(input: { location: string }): ServerActionRedirectResponse {
+  const response: ServerActionRedirectResponse = {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "redirect",
+    location: input.location,
+  };
+  return validateServerActionResponse(response) as ServerActionRedirectResponse;
+}
+
+export function createServerActionErrorResponse(input: { message: string }): ServerActionErrorResponse {
+  const response: ServerActionErrorResponse = {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "error",
+    message: input.message,
+  };
+  return validateServerActionResponse(response) as ServerActionErrorResponse;
+}
+
+export function createServerActionPayloadResponse(input: { payload: ServerPayloadPacket }): ServerActionPayloadResponse {
+  const response: ServerActionPayloadResponse = {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "payload",
+    payload: input.payload,
+  };
+  return validateServerActionResponse(response) as ServerActionPayloadResponse;
 }
 
 export function validateClientReferencePayload(payload: unknown): ClientReferencePayload {
@@ -244,6 +413,141 @@ export function validateClientReferencePayload(payload: unknown): ClientReferenc
   }
 
   return candidate as ClientReferencePayload;
+}
+
+export function validateServerActionReferencePayload(payload: unknown): ServerActionReferencePayload {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypeError("Ferrite server action reference payload must be an object.");
+  }
+
+  const candidate = payload as Partial<ServerActionReferencePayload>;
+  if (candidate.ferrite !== SERVER_ACTION_REFERENCE_MARKER) {
+    throw new TypeError(`expected ferrite marker "${SERVER_ACTION_REFERENCE_MARKER}"`);
+  }
+
+  if (candidate.version !== SERVER_ACTION_REFERENCE_VERSION) {
+    throw new TypeError(`unsupported server action reference version ${String(candidate.version)}; expected ${SERVER_ACTION_REFERENCE_VERSION}`);
+  }
+
+  if (typeof candidate.id !== "string") {
+    throw new TypeError("Ferrite server action reference payload requires a string id.");
+  }
+  validateServerActionId(candidate.id);
+
+  if (typeof candidate.routePattern !== "string") {
+    throw new TypeError("Ferrite server action reference payload requires a string routePattern.");
+  }
+  validateServerActionRoutePath(candidate.routePattern);
+
+  if (typeof candidate.url !== "string") {
+    throw new TypeError("Ferrite server action reference payload requires a string url.");
+  }
+  validateServerActionUrl(candidate.url);
+
+  if (candidate.bound === undefined) {
+    candidate.bound = {};
+  }
+  if (candidate.bound === null || typeof candidate.bound !== "object" || Array.isArray(candidate.bound)) {
+    throw new TypeError("Ferrite server action reference payload bound values must be a JSON object.");
+  }
+  for (const [key, value] of Object.entries(candidate.bound)) {
+    if (key.length === 0) {
+      throw new TypeError("server action bound argument name must be non-empty.");
+    }
+    validateClientReferenceSerializableValue(value, `bound.${key}`);
+  }
+
+  return candidate as ServerActionReferencePayload;
+}
+
+export function validateServerActionRequest(request: unknown): ServerActionRequest {
+  if (request === null || typeof request !== "object" || Array.isArray(request)) {
+    throw new TypeError("Ferrite server action request must be an object.");
+  }
+
+  const candidate = request as Partial<ServerActionRequest>;
+  if (candidate.ferrite !== SERVER_ACTION_REQUEST_MARKER) {
+    throw new TypeError(`expected ferrite marker "${SERVER_ACTION_REQUEST_MARKER}"`);
+  }
+
+  if (candidate.version !== SERVER_ACTION_REQUEST_VERSION) {
+    throw new TypeError(`unsupported server action request version ${String(candidate.version)}; expected ${SERVER_ACTION_REQUEST_VERSION}`);
+  }
+
+  if (typeof candidate.id !== "string") {
+    throw new TypeError("Ferrite server action request requires a string id.");
+  }
+  validateServerActionId(candidate.id);
+
+  if (typeof candidate.routePath !== "string") {
+    throw new TypeError("Ferrite server action request requires a string routePath.");
+  }
+  validateServerActionRoutePath(candidate.routePath);
+
+  if (candidate.form === undefined) {
+    candidate.form = {};
+  }
+  if (candidate.form === null || typeof candidate.form !== "object" || Array.isArray(candidate.form)) {
+    throw new TypeError("Ferrite server action request form must be a JSON object.");
+  }
+  for (const [key, value] of Object.entries(candidate.form)) {
+    validateServerActionFormField(key, value);
+  }
+
+  return candidate as ServerActionRequest;
+}
+
+export function validateServerActionResponse(response: unknown): ServerActionResponse {
+  if (response === null || typeof response !== "object" || Array.isArray(response)) {
+    throw new TypeError("Ferrite server action response must be an object.");
+  }
+
+  const candidate = response as Partial<ServerActionResponse>;
+  if (candidate.ferrite !== SERVER_ACTION_RESPONSE_MARKER) {
+    throw new TypeError(`expected ferrite marker "${SERVER_ACTION_RESPONSE_MARKER}"`);
+  }
+
+  if (candidate.version !== SERVER_ACTION_RESPONSE_VERSION) {
+    throw new TypeError(`unsupported server action response version ${String(candidate.version)}; expected ${SERVER_ACTION_RESPONSE_VERSION}`);
+  }
+
+  if (candidate.status === "ok") {
+    assertOnlyServerActionResponseFields(candidate, ["ferrite", "version", "status", "data"], "ok");
+    validateClientReferenceSerializableValue((candidate as Partial<ServerActionOkResponse>).data ?? null, "data");
+    if ((candidate as Partial<ServerActionOkResponse>).data === undefined) {
+      (candidate as Partial<ServerActionOkResponse>).data = null;
+    }
+    return candidate as ServerActionOkResponse;
+  }
+
+    if (candidate.status === "redirect") {
+    assertOnlyServerActionResponseFields(candidate, ["ferrite", "version", "status", "location"], "redirect");
+    const location = (candidate as Partial<ServerActionRedirectResponse>).location;
+    if (typeof location !== "string" || location.length === 0) {
+      throw new TypeError("server action redirect location must be non-empty.");
+    }
+    validateServerActionUrl(location);
+    return candidate as ServerActionRedirectResponse;
+  }
+
+  if (candidate.status === "error") {
+    assertOnlyServerActionResponseFields(candidate, ["ferrite", "version", "status", "message"], "error");
+    const message = (candidate as Partial<ServerActionErrorResponse>).message;
+    if (typeof message !== "string" || message.length === 0) {
+      throw new TypeError("server action error message must be non-empty.");
+    }
+    return candidate as ServerActionErrorResponse;
+  }
+
+  if (candidate.status === "payload") {
+    assertOnlyServerActionResponseFields(candidate, ["ferrite", "version", "status", "payload"], "payload");
+    (candidate as Partial<ServerActionPayloadResponse>).payload = validateServerPayloadPacket(
+      (candidate as Partial<ServerActionPayloadResponse>).payload,
+    );
+    return candidate as ServerActionPayloadResponse;
+  }
+
+  throw new TypeError(`unsupported server action response status ${String(candidate.status)}`);
 }
 
 export function validateServerPayloadPacket(payload: unknown): ServerPayloadPacket {
@@ -340,6 +644,71 @@ function validateServerPayloadChunk(chunk: unknown, index: number): ServerPayloa
 function validateStreamChunkId(id: string): void {
   if (!/^[A-Za-z0-9_:-]+$/.test(id)) {
     throw new TypeError(`invalid stream chunk id "${id}"`);
+  }
+}
+
+function validateServerActionId(id: string): void {
+  if (typeof id !== "string" || id.length === 0) {
+    throw new TypeError("server action id must be non-empty.");
+  }
+
+  const separator = id.indexOf("#");
+  if (separator === -1 || separator !== id.lastIndexOf("#")) {
+    throw new TypeError("server action id must be formatted as module#exportName.");
+  }
+
+  const module = id.slice(0, separator);
+  const exportName = id.slice(separator + 1);
+  validateClientReferenceModule(module);
+  validateClientReferenceExportName(exportName);
+}
+
+function validateServerActionRoutePath(path: string): void {
+  if (!path.startsWith("/")) {
+    throw new TypeError("server action route path must start with `/`.");
+  }
+  if (path.includes("\\") || path.includes("?") || /[\u0000-\u001F\u007F]/.test(path)) {
+    throw new TypeError(`invalid server action route path "${path}"`);
+  }
+
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    throw new TypeError(`invalid server action route path "${path}"`);
+  }
+}
+
+function validateServerActionUrl(url: string): void {
+  if (!url.startsWith("/")) {
+    throw new TypeError("server action url must start with `/`.");
+  }
+  if (url.includes("\\") || /[\u0000-\u001F\u007F]/.test(url)) {
+    throw new TypeError(`invalid server action url "${url}"`);
+  }
+}
+
+function validateServerActionFormField(name: string, value: unknown): void {
+  if (name.length === 0) {
+    throw new TypeError("server action form field name must be non-empty.");
+  }
+  if (typeof value === "string") {
+    return;
+  }
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+    return;
+  }
+  throw new TypeError(`server action form field "${name}" must be a string or string array.`);
+}
+
+function assertOnlyServerActionResponseFields(
+  candidate: object,
+  allowedFields: string[],
+  status: string,
+): void {
+  const allowed = new Set(allowedFields);
+  for (const key of Object.keys(candidate)) {
+    if (!allowed.has(key)) {
+      throw new TypeError(`Ferrite server action ${status} response has unsupported field "${key}".`);
+    }
   }
 }
 
@@ -519,6 +888,58 @@ pub struct ServerPayloadStreamChunkFrame {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
+pub enum ServerActionFormValue {
+    String(String),
+    List(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerActionReferencePayload {
+    pub ferrite: String,
+    pub version: u64,
+    pub id: String,
+    pub route_pattern: String,
+    pub url: String,
+    #[serde(default)]
+    pub bound: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerActionRequest {
+    pub ferrite: String,
+    pub version: u64,
+    pub id: String,
+    pub route_path: String,
+    #[serde(default)]
+    pub form: BTreeMap<String, ServerActionFormValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerActionResponse {
+    pub ferrite: String,
+    pub version: u64,
+    #[serde(flatten)]
+    pub outcome: ServerActionResponseOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", deny_unknown_fields)]
+pub enum ServerActionResponseOutcome {
+    #[serde(rename = "ok")]
+    Ok { data: Value },
+    #[serde(rename = "redirect")]
+    Redirect { location: String },
+    #[serde(rename = "error")]
+    Error { message: String },
+    #[serde(rename = "payload")]
+    Payload { payload: ServerPayloadPacket },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum CompactNode {
     Text((u8, String)),
     Fragment((u8, Vec<CompactNode>)),
@@ -692,6 +1113,101 @@ pub fn validate_server_payload_stream_chunk_frame(
     Ok(())
 }
 
+pub fn validate_server_action_reference_payload(
+    payload: &ServerActionReferencePayload,
+) -> Result<()> {
+    if payload.ferrite != SERVER_ACTION_REFERENCE_MARKER {
+        return Err(ProtocolError::new(format!(
+            "expected ferrite marker \"{SERVER_ACTION_REFERENCE_MARKER}\""
+        )));
+    }
+
+    if payload.version != SERVER_ACTION_REFERENCE_VERSION {
+        return Err(ProtocolError::new(format!(
+            "unsupported server action reference version {}; expected {SERVER_ACTION_REFERENCE_VERSION}",
+            payload.version
+        )));
+    }
+
+    validate_server_action_id(&payload.id)?;
+    validate_server_action_route_path(&payload.route_pattern)?;
+    validate_server_action_url(&payload.url)?;
+    for (key, value) in &payload.bound {
+        if key.is_empty() {
+            return Err(ProtocolError::new(
+                "server action bound argument name must be non-empty.",
+            ));
+        }
+        validate_client_reference_value(value, &format!("bound.{key}"))?;
+    }
+
+    Ok(())
+}
+
+pub fn validate_server_action_request(request: &ServerActionRequest) -> Result<()> {
+    if request.ferrite != SERVER_ACTION_REQUEST_MARKER {
+        return Err(ProtocolError::new(format!(
+            "expected ferrite marker \"{SERVER_ACTION_REQUEST_MARKER}\""
+        )));
+    }
+
+    if request.version != SERVER_ACTION_REQUEST_VERSION {
+        return Err(ProtocolError::new(format!(
+            "unsupported server action request version {}; expected {SERVER_ACTION_REQUEST_VERSION}",
+            request.version
+        )));
+    }
+
+    validate_server_action_id(&request.id)?;
+    validate_server_action_route_path(&request.route_path)?;
+    for (key, value) in &request.form {
+        validate_server_action_form_field(key, value)?;
+    }
+
+    Ok(())
+}
+
+pub fn validate_server_action_response(response: &ServerActionResponse) -> Result<()> {
+    if response.ferrite != SERVER_ACTION_RESPONSE_MARKER {
+        return Err(ProtocolError::new(format!(
+            "expected ferrite marker \"{SERVER_ACTION_RESPONSE_MARKER}\""
+        )));
+    }
+
+    if response.version != SERVER_ACTION_RESPONSE_VERSION {
+        return Err(ProtocolError::new(format!(
+            "unsupported server action response version {}; expected {SERVER_ACTION_RESPONSE_VERSION}",
+            response.version
+        )));
+    }
+
+    match &response.outcome {
+        ServerActionResponseOutcome::Ok { data } => {
+            validate_client_reference_value(data, "data")?;
+        }
+        ServerActionResponseOutcome::Redirect { location } => {
+            if location.is_empty() {
+                return Err(ProtocolError::new(
+                    "server action redirect location must be non-empty.",
+                ));
+            }
+            validate_server_action_url(location)?;
+        }
+        ServerActionResponseOutcome::Error { message } => {
+            if message.is_empty() {
+                return Err(ProtocolError::new(
+                    "server action error message must be non-empty.",
+                ));
+            }
+        }
+        ServerActionResponseOutcome::Payload { payload } => {
+            validate_server_payload_packet(payload)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_server_payload_stream_frame_header(
     ferrite: &str,
     version: u64,
@@ -718,6 +1234,79 @@ fn validate_server_payload_stream_frame_header(
     }
 
     Ok(())
+}
+
+fn validate_server_action_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(ProtocolError::new("server action id must be non-empty."));
+    }
+
+    let Some(separator) = id.find('#') else {
+        return Err(ProtocolError::new(
+            "server action id must be formatted as module#exportName.",
+        ));
+    };
+    if separator != id.rfind('#').expect("separator found above") {
+        return Err(ProtocolError::new(
+            "server action id must be formatted as module#exportName.",
+        ));
+    }
+
+    let module = &id[..separator];
+    let export_name = &id[separator + 1..];
+    validate_client_reference_module(module)?;
+    validate_client_reference_export_name(export_name)?;
+
+    Ok(())
+}
+
+fn validate_server_action_route_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        return Err(ProtocolError::new(
+            "server action route path must start with `/`.",
+        ));
+    }
+
+    if path.contains('\\') || path.contains('?') || path.chars().any(char::is_control) {
+        return Err(ProtocolError::new(format!(
+            "invalid server action route path \"{path}\""
+        )));
+    }
+
+    if path.split('/').any(|segment| matches!(segment, "." | "..")) {
+        return Err(ProtocolError::new(format!(
+            "invalid server action route path \"{path}\""
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_server_action_url(url: &str) -> Result<()> {
+    if !url.starts_with('/') {
+        return Err(ProtocolError::new("server action url must start with `/`."));
+    }
+
+    if url.contains('\\') || url.chars().any(char::is_control) {
+        return Err(ProtocolError::new(format!(
+            "invalid server action url \"{url}\""
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_server_action_form_field(name: &str, value: &ServerActionFormValue) -> Result<()> {
+    if name.is_empty() {
+        return Err(ProtocolError::new(
+            "server action form field name must be non-empty.",
+        ));
+    }
+
+    match value {
+        ServerActionFormValue::String(_) => Ok(()),
+        ServerActionFormValue::List(_) => Ok(()),
+    }
 }
 
 pub fn validate_client_reference_parts(id: &str, module: &str, export_name: &str) -> Result<()> {
@@ -1060,6 +1649,213 @@ mod tests {
                 .message(),
             "invalid stream chunk id \"bad id\""
         );
+    }
+
+    #[test]
+    fn validates_server_action_reference_payloads() {
+        let payload = ServerActionReferencePayload {
+            ferrite: SERVER_ACTION_REFERENCE_MARKER.to_owned(),
+            version: SERVER_ACTION_REFERENCE_VERSION,
+            id: "app/posts/[id]/page.tsx#createPost".to_owned(),
+            route_pattern: "/posts/[id]".to_owned(),
+            url: "/_ferrite/action".to_owned(),
+            bound: BTreeMap::from([("postId".to_owned(), Value::String("abc".to_owned()))]),
+        };
+
+        assert!(validate_server_action_reference_payload(&payload).is_ok());
+
+        let mut wrong_marker = payload.clone();
+        wrong_marker.ferrite = "server-action".to_owned();
+        assert_eq!(
+            validate_server_action_reference_payload(&wrong_marker)
+                .unwrap_err()
+                .message(),
+            "expected ferrite marker \"server-action-reference\""
+        );
+
+        let mut wrong_version = payload.clone();
+        wrong_version.version = 99;
+        assert_eq!(
+            validate_server_action_reference_payload(&wrong_version)
+                .unwrap_err()
+                .message(),
+            "unsupported server action reference version 99; expected 1"
+        );
+
+        let mut empty_id = payload.clone();
+        empty_id.id.clear();
+        assert_eq!(
+            validate_server_action_reference_payload(&empty_id)
+                .unwrap_err()
+                .message(),
+            "server action id must be non-empty."
+        );
+
+        let mut unsafe_route = payload.clone();
+        unsafe_route.route_pattern = "../posts/[id]".to_owned();
+        assert_eq!(
+            validate_server_action_reference_payload(&unsafe_route)
+                .unwrap_err()
+                .message(),
+            "server action route path must start with `/`."
+        );
+
+        let malformed_bound: Value = serde_json::json!({
+            "ferrite": SERVER_ACTION_REFERENCE_MARKER,
+            "version": SERVER_ACTION_REFERENCE_VERSION,
+            "id": "app/posts/[id]/page.tsx#createPost",
+            "routePattern": "/posts/[id]",
+            "url": "/_ferrite/action",
+            "bound": ["not", "an", "object"]
+        });
+        assert!(serde_json::from_value::<ServerActionReferencePayload>(malformed_bound).is_err());
+    }
+
+    #[test]
+    fn validates_server_action_requests() {
+        let request = ServerActionRequest {
+            ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
+            version: SERVER_ACTION_REQUEST_VERSION,
+            id: "app/posts/[id]/page.tsx#createPost".to_owned(),
+            route_path: "/posts/abc".to_owned(),
+            form: BTreeMap::from([
+                (
+                    "title".to_owned(),
+                    ServerActionFormValue::String("Hello".to_owned()),
+                ),
+                (
+                    "tag".to_owned(),
+                    ServerActionFormValue::List(vec!["rust".to_owned(), "tsx".to_owned()]),
+                ),
+            ]),
+        };
+
+        assert!(validate_server_action_request(&request).is_ok());
+
+        let mut wrong_marker = request.clone();
+        wrong_marker.ferrite = "server-action".to_owned();
+        assert_eq!(
+            validate_server_action_request(&wrong_marker)
+                .unwrap_err()
+                .message(),
+            "expected ferrite marker \"server-action-request\""
+        );
+
+        let mut wrong_version = request.clone();
+        wrong_version.version = 99;
+        assert_eq!(
+            validate_server_action_request(&wrong_version)
+                .unwrap_err()
+                .message(),
+            "unsupported server action request version 99; expected 1"
+        );
+
+        let mut unsafe_route = request.clone();
+        unsafe_route.route_path = "posts/abc".to_owned();
+        assert_eq!(
+            validate_server_action_request(&unsafe_route)
+                .unwrap_err()
+                .message(),
+            "server action route path must start with `/`."
+        );
+
+        let mut empty_field_name = request.clone();
+        empty_field_name.form.insert(
+            String::new(),
+            ServerActionFormValue::String("bad".to_owned()),
+        );
+        assert_eq!(
+            validate_server_action_request(&empty_field_name)
+                .unwrap_err()
+                .message(),
+            "server action form field name must be non-empty."
+        );
+    }
+
+    #[test]
+    fn validates_server_action_responses() {
+        let ok = ServerActionResponse {
+            ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),
+            version: SERVER_ACTION_RESPONSE_VERSION,
+            outcome: ServerActionResponseOutcome::Ok {
+                data: serde_json::json!({ "saved": true }),
+            },
+        };
+        assert!(validate_server_action_response(&ok).is_ok());
+
+        let redirect = ServerActionResponse {
+            ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),
+            version: SERVER_ACTION_RESPONSE_VERSION,
+            outcome: ServerActionResponseOutcome::Redirect {
+                location: "/posts/abc?draft=1#saved".to_owned(),
+            },
+        };
+        assert!(validate_server_action_response(&redirect).is_ok());
+
+        let error = ServerActionResponse {
+            ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),
+            version: SERVER_ACTION_RESPONSE_VERSION,
+            outcome: ServerActionResponseOutcome::Error {
+                message: "Could not save post.".to_owned(),
+            },
+        };
+        assert!(validate_server_action_response(&error).is_ok());
+
+        let payload = ServerActionResponse {
+            ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),
+            version: SERVER_ACTION_RESPONSE_VERSION,
+            outcome: ServerActionResponseOutcome::Payload {
+                payload: ServerPayloadPacket {
+                    ferrite: SERVER_PAYLOAD_MARKER.to_owned(),
+                    version: SERVER_PAYLOAD_VERSION,
+                    shell: CompactNode::Text((0, "updated".to_owned())),
+                    client_references: Vec::new(),
+                    chunks: Vec::new(),
+                },
+            },
+        };
+        assert!(validate_server_action_response(&payload).is_ok());
+
+        let mut wrong_marker = ok.clone();
+        wrong_marker.ferrite = "server-action".to_owned();
+        assert_eq!(
+            validate_server_action_response(&wrong_marker)
+                .unwrap_err()
+                .message(),
+            "expected ferrite marker \"server-action-response\""
+        );
+
+        let mut wrong_version = ok.clone();
+        wrong_version.version = 99;
+        assert_eq!(
+            validate_server_action_response(&wrong_version)
+                .unwrap_err()
+                .message(),
+            "unsupported server action response version 99; expected 1"
+        );
+
+        let empty_redirect = ServerActionResponse {
+            ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),
+            version: SERVER_ACTION_RESPONSE_VERSION,
+            outcome: ServerActionResponseOutcome::Redirect {
+                location: String::new(),
+            },
+        };
+        assert_eq!(
+            validate_server_action_response(&empty_redirect)
+                .unwrap_err()
+                .message(),
+            "server action redirect location must be non-empty."
+        );
+
+        let ambiguous: Value = serde_json::json!({
+            "ferrite": SERVER_ACTION_RESPONSE_MARKER,
+            "version": SERVER_ACTION_RESPONSE_VERSION,
+            "status": "ok",
+            "data": { "saved": true },
+            "location": "/posts/abc"
+        });
+        assert!(serde_json::from_value::<ServerActionResponse>(ambiguous).is_err());
     }
 
     #[test]
