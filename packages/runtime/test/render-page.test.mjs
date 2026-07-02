@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { platform } from "node:process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import { createServerActionRequest, validateServerActionResponse } from "../dist/index.js";
 
 const execFileAsync = promisify(execFile);
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -50,6 +52,18 @@ async function renderPageMode(projectRoot, mode, pageFile, props = {}) {
     },
   );
   return JSON.parse(stdout);
+}
+
+async function renderPageAction(projectRoot, pageFile, request, props = {}) {
+  const { stdout } = await execFileAsync(
+    "node",
+    [renderPageScript, "--server-action", pageFile, JSON.stringify(props), "[]", "{}", JSON.stringify(request)],
+    {
+      cwd: projectRoot,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  return validateServerActionResponse(JSON.parse(stdout));
 }
 
 test("render-page proxies nested use client imports into client reference markers", async () => {
@@ -119,6 +133,139 @@ test("render-page proxies nested use client imports into client reference marker
         ],
       ],
     });
+  });
+});
+
+test("render-page invokes a registered server action", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `import { createServerAction } from "@ferrite/runtime/server";`,
+        "",
+        `export default function Page() {`,
+        `  const savePost = createServerAction({`,
+        `    id: "app/posts/[id]/page.tsx#savePost",`,
+        `    routePattern: "/posts/[id]",`,
+        `    async run({ form, routePath }) {`,
+        `      return { title: form.title, tags: form.tag, routePath };`,
+        `    },`,
+        `  });`,
+        `  return <form action={savePost}><input name="title" /></form>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
+    const response = await renderPageAction(
+      projectRoot,
+      pageFile,
+      createServerActionRequest({
+        id: "app/posts/[id]/page.tsx#savePost",
+        routePath: "/posts/alpha",
+        form: { title: "Hello", tag: ["rust", "tsx"] },
+      }),
+    );
+
+    assert.deepEqual(response, {
+      ferrite: "server-action-response",
+      version: 1,
+      status: "ok",
+      data: {
+        title: "Hello",
+        tags: ["rust", "tsx"],
+        routePath: "/posts/alpha",
+      },
+    });
+  });
+});
+
+test("render-page rejects unknown server action ids without invoking actions", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
+    const sideEffectFile = join(projectRoot, "side-effect.txt");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `import { writeFile } from "node:fs/promises";`,
+        `import { createServerAction } from "@ferrite/runtime/server";`,
+        "",
+        `export default function Page() {`,
+        `  const savePost = createServerAction({`,
+        `    id: "app/posts/[id]/page.tsx#savePost",`,
+        `    routePattern: "/posts/[id]",`,
+        `    async run() {`,
+        `      await writeFile(${JSON.stringify(sideEffectFile)}, "ran");`,
+        `      return { ok: true };`,
+        `    },`,
+        `  });`,
+        `  return <form action={savePost}><button type="submit">Save</button></form>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
+    await assert.rejects(
+      () =>
+        renderPageAction(
+          projectRoot,
+          pageFile,
+          createServerActionRequest({
+            id: "app/posts/[id]/page.tsx#missing",
+            routePath: "/posts/alpha",
+          }),
+        ),
+      (error) => {
+        assert.match(error.stderr, /was not registered during route render/);
+        return true;
+      },
+    );
+    await assert.rejects(() => readFile(sideEffectFile, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("render-page returns sanitized error responses for thrown server actions", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `import { createServerAction } from "@ferrite/runtime/server";`,
+        "",
+        `export default function Page() {`,
+        `  const savePost = createServerAction({`,
+        `    id: "app/posts/[id]/page.tsx#savePost",`,
+        `    routePattern: "/posts/[id]",`,
+        `    async run() {`,
+        `      throw new Error("Action exploded");`,
+        `    },`,
+        `  });`,
+        `  return <form action={savePost}><button type="submit">Save</button></form>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
+    const response = await renderPageAction(
+      projectRoot,
+      pageFile,
+      createServerActionRequest({
+        id: "app/posts/[id]/page.tsx#savePost",
+        routePath: "/posts/alpha",
+      }),
+    );
+
+    assert.deepEqual(response, {
+      ferrite: "server-action-response",
+      version: 1,
+      status: "error",
+      message: "Action exploded",
+    });
+    assert.equal(JSON.stringify(response).includes("at "), false);
   });
 });
 

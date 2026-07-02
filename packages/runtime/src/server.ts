@@ -29,11 +29,19 @@ import {
   SERVER_PAYLOAD_MARKER,
   SERVER_PAYLOAD_VERSION,
   createClientReferencePayload,
+  createServerActionErrorResponse,
+  createServerActionOkResponse,
   createServerActionReferencePayload,
   parseClientReferenceId,
+  validateServerActionRequest,
   validateClientReferencePayload,
 } from "./protocol.js";
-import type { ClientReferencePayload, ClientReferenceSerializableValue } from "./protocol.js";
+import type {
+  ClientReferencePayload,
+  ClientReferenceSerializableValue,
+  ServerActionRequest,
+  ServerActionResponse,
+} from "./protocol.js";
 
 export type PageModule<Props extends Record<string, unknown> = Record<string, unknown>> = {
   default: (props: Props) => Child | Promise<Child>;
@@ -155,6 +163,10 @@ export type ServerActionReference<Output = unknown> = {
 
 export type ServerRenderOptions = {
   routePath?: string;
+  routePattern?: string;
+};
+
+export type ServerActionInvokeOptions = {
   routePattern?: string;
 };
 
@@ -297,6 +309,46 @@ export async function renderPageModuleToServerPayload(
     const rendered = await renderPageChild(module, props, layouts, conventions, { stream: true });
     return renderServerChildToServerPayload(rendered);
   });
+}
+
+export async function invokeServerActionFromPageModule(
+  module: PageModule,
+  props: Record<string, unknown> = {},
+  layouts: LayoutModule[] = [],
+  conventions: RouteConventionModules = {},
+  request: ServerActionRequest,
+  options: ServerActionInvokeOptions = {},
+): Promise<ServerActionResponse> {
+  const validatedRequest = validateServerActionRequest(request);
+  return withServerActionRenderContext(
+    {
+      routePath: validatedRequest.routePath,
+      routePattern: options.routePattern ?? validatedRequest.routePath,
+    },
+    async () => {
+      const rendered = await renderPageChild(module, props, layouts, conventions);
+      await renderServerChildFinal(rendered);
+
+      const action = currentServerActionContext()?.actions.get(validatedRequest.id);
+      if (!action) {
+        throw new TypeError(`Ferrite server action "${validatedRequest.id}" was not registered during route render.`);
+      }
+
+      try {
+        const result = await action.run({
+          form: validatedRequest.form,
+          routePath: validatedRequest.routePath,
+        });
+        return createServerActionOkResponse({
+          data: result === undefined ? null : serializeClientReferenceValue(result, "server action result"),
+        });
+      } catch (error) {
+        return createServerActionErrorResponse({
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+  );
 }
 
 export async function renderDocumentModule(

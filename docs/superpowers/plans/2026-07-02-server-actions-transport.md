@@ -296,7 +296,7 @@ git commit -m "feat(runtime): serialize server action forms"
 - Modify: `packages/runtime/src/server.ts`
 - Modify: `packages/runtime/test/render-page.test.mjs`
 
-- [ ] **Step 1: Add failing render-page tests**
+- [x] **Step 1: Add failing render-page tests**
 
 In `packages/runtime/test/render-page.test.mjs`, add temporary app fixtures that:
 
@@ -306,7 +306,7 @@ In `packages/runtime/test/render-page.test.mjs`, add temporary app fixtures that
 - Assert unknown action IDs fail with a non-zero exit and no user action side effect.
 - Assert thrown user action errors return a validated `status: "error"` response without stack traces.
 
-- [ ] **Step 2: Add `--server-action` mode**
+- [x] **Step 2: Add `--server-action` mode**
 
 Extend `knownModes`:
 
@@ -322,7 +322,7 @@ render-page --server-action <page-file> <props-json> <layouts-json> <conventions
 
 Do not add document action mode in this task unless a test proves it is needed. Action execution should render the page and layouts, collect route-scoped actions, then invoke the requested action.
 
-- [ ] **Step 3: Add server invocation helper**
+- [x] **Step 3: Add server invocation helper**
 
 In `server.ts`, export:
 
@@ -345,7 +345,7 @@ Implementation requirements:
 - Return `createServerActionOkResponse({ data })` for JSON-serializable results.
 - Return `createServerActionErrorResponse({ message })` for user action exceptions.
 
-- [ ] **Step 4: Prove render-page behavior**
+- [x] **Step 4: Prove render-page behavior**
 
 Run:
 
@@ -356,7 +356,7 @@ pnpm --filter @ferrite/runtime test
 
 Expected: action invocation tests pass and existing render modes still pass.
 
-- [ ] **Step 5: Commit render-page invocation**
+- [x] **Step 5: Commit render-page invocation**
 
 ```bash
 git add packages/runtime/bin/render-page.mjs packages/runtime/src/server.ts packages/runtime/test/render-page.test.mjs

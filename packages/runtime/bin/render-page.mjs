@@ -16,17 +16,20 @@ const knownModes = new Set([
   "--document",
   "--document-stream",
   "--document-server-payload",
+  "--server-action",
 ]);
 const mode = knownModes.has(args[0]) ? args.shift() : "render";
 const [pageFile, propsJson = "{}", layoutsJson = "[]", fourthArg, fifthArg = "{}", sixthArg = "{}"] = args;
 const documentMode = mode === "--document" || mode === "--document-stream" || mode === "--document-server-payload";
+const serverActionMode = mode === "--server-action";
 const documentFile = documentMode ? fourthArg : undefined;
 const documentOptionsJson = documentMode ? fifthArg : "{}";
+const actionRequestJson = serverActionMode ? fifthArg : "{}";
 const conventionsJson = documentMode ? sixthArg : (fourthArg ?? "{}");
 
 if (!pageFile) {
   console.error(
-    "usage: render-page [--static-params|--metadata|--stream|--server-payload|--document|--document-stream|--document-server-payload] <page-file> [props-json] [layouts-json] [document-file] [document-options-json]",
+    "usage: render-page [--static-params|--metadata|--stream|--server-payload|--document|--document-stream|--document-server-payload|--server-action] <page-file> [props-json] [layouts-json] [document-file|conventions-json] [document-options-json|action-request-json]",
   );
   process.exit(2);
 }
@@ -65,6 +68,16 @@ if (documentMode) {
     documentOptions = JSON.parse(documentOptionsJson);
   } catch (error) {
     console.error(`invalid document options JSON: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(2);
+  }
+}
+
+let actionRequest = {};
+if (serverActionMode) {
+  try {
+    actionRequest = JSON.parse(actionRequestJson);
+  } catch (error) {
+    console.error(`invalid server action request JSON: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(2);
   }
 }
@@ -180,6 +193,16 @@ try {
       entryModule.conventionModules,
     );
     process.stdout.write(`${JSON.stringify(payload)}\n`);
+  } else if (mode === "--server-action") {
+    const response = await server.invokeServerActionFromPageModule(
+      entryModule.pageModule,
+      props,
+      entryModule.layoutModules,
+      entryModule.conventionModules,
+      actionRequest,
+      { routePattern: routePatternFromPageFile(pageFile, projectRoot) },
+    );
+    process.stdout.write(`${JSON.stringify(response)}\n`);
   } else if (mode === "--document") {
     const document = await server.renderDocumentModuleToPacket(
       entryModule.pageModule,
@@ -360,6 +383,21 @@ function isProjectSource(file, projectRoot) {
     !isAbsolute(projectRelative) &&
     !projectRelative.split(sep).includes("node_modules")
   );
+}
+
+function routePatternFromPageFile(pageFile, projectRoot) {
+  const parts = relative(projectRoot, resolve(pageFile)).split(sep);
+  const appIndex = parts.lastIndexOf("app");
+  if (appIndex === -1 || appIndex >= parts.length - 1) {
+    return undefined;
+  }
+
+  const routeSegments = parts.slice(appIndex + 1, -1).filter((segment) => !isRouteGroupSegment(segment));
+  return routeSegments.length === 0 ? "/" : `/${routeSegments.join("/")}`;
+}
+
+function isRouteGroupSegment(segment) {
+  return segment.startsWith("(") && segment.endsWith(")");
 }
 
 function loaderForPath(path) {
