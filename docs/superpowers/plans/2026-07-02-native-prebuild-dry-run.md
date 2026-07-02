@@ -626,7 +626,7 @@ jobs:
         run: pnpm --filter @ferrite/node prebuild:package
 
       - name: Verify native prebuild package
-        run: pnpm --filter @ferrite/node prebuild:verify -- --expect "${{ matrix.package }}"
+        run: pnpm --filter @ferrite/node prebuild:verify --expect "${{ matrix.package }}"
 
       - name: Upload native prebuild package
         uses: actions/upload-artifact@v4
