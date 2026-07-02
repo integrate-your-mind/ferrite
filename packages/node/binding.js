@@ -1,4 +1,5 @@
-import { existsSync as defaultExistsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync as defaultExistsSync, readFileSync as defaultReadFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import {
@@ -11,6 +12,8 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const packageRoot = dirname(fileURLToPath(import.meta.url));
+const PREBUILD_CHECKSUM_FILE = "ferrite-node.sha256.json";
+export const NATIVE_CHECKSUM_ALGORITHM = "sha256";
 
 const PREBUILD_PACKAGES = new Map([
   ["darwin:arm64", "@ferrite/node-darwin-arm64"],
@@ -55,6 +58,7 @@ export function nativeBindingCandidates({
       kind: "prebuild",
       packageName,
       path: resolvePrebuildBinding(requireFunction, packageName),
+      checksumPath: resolvePrebuildFile(requireFunction, packageName, PREBUILD_CHECKSUM_FILE),
       required: false,
     });
   }
@@ -68,6 +72,7 @@ export function resolveNativeBindingPath(options = {}) {
 
   for (const candidate of candidates) {
     if (candidate.path && existsSync(candidate.path)) {
+      verifyNativeBindingCandidate(candidate, options);
       return candidate.path;
     }
   }
@@ -97,10 +102,79 @@ export function resolveNativeBindingPath(options = {}) {
   );
 }
 
+export function verifyNativePrebuildChecksum({
+  bindingPath,
+  checksumPath,
+  packageName = "Ferrite native prebuild",
+  readFileSync = defaultReadFileSync,
+} = {}) {
+  if (!bindingPath) {
+    throw new Error(`${packageName} checksum verification requires a native binding path.`);
+  }
+  if (!checksumPath) {
+    throw new Error(`${packageName} must include ${PREBUILD_CHECKSUM_FILE}.`);
+  }
+
+  const manifest = parseChecksumManifest(readFileSync(checksumPath, "utf8"), packageName);
+  const actual = createHash(NATIVE_CHECKSUM_ALGORITHM).update(readFileSync(bindingPath)).digest("hex");
+  if (actual !== manifest.sha256) {
+    throw new Error(
+      `${packageName} checksum mismatch for ferrite-node.node: expected ${manifest.sha256}, got ${actual}.`,
+    );
+  }
+
+  return actual;
+}
+
 function resolvePrebuildBinding(requireFunction, packageName) {
+  return resolvePrebuildFile(requireFunction, packageName, "ferrite-node.node");
+}
+
+function resolvePrebuildFile(requireFunction, packageName, fileName) {
   try {
-    return requireFunction.resolve(`${packageName}/ferrite-node.node`);
+    return requireFunction.resolve(`${packageName}/${fileName}`);
   } catch {
     return null;
   }
+}
+
+function verifyNativeBindingCandidate(candidate, options) {
+  if (candidate.kind !== "prebuild") {
+    return;
+  }
+
+  verifyNativePrebuildChecksum({
+    bindingPath: candidate.path,
+    checksumPath: candidate.checksumPath,
+    packageName: candidate.packageName,
+    readFileSync: options.readFileSync ?? defaultReadFileSync,
+  });
+}
+
+function parseChecksumManifest(source, packageName) {
+  let manifest;
+  try {
+    manifest = JSON.parse(source);
+  } catch (error) {
+    throw new Error(
+      `${packageName} has an invalid ${PREBUILD_CHECKSUM_FILE}: ${error instanceof Error ? error.message : String(error)}.`,
+    );
+  }
+
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error(`${packageName} ${PREBUILD_CHECKSUM_FILE} must be a JSON object.`);
+  }
+  if (manifest.file !== "ferrite-node.node") {
+    throw new Error(`${packageName} ${PREBUILD_CHECKSUM_FILE} must describe ferrite-node.node.`);
+  }
+  if (manifest.algorithm !== NATIVE_CHECKSUM_ALGORITHM) {
+    throw new Error(
+      `${packageName} ${PREBUILD_CHECKSUM_FILE} uses unsupported algorithm ${String(manifest.algorithm)}.`,
+    );
+  }
+  if (typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(manifest.sha256)) {
+    throw new Error(`${packageName} ${PREBUILD_CHECKSUM_FILE} must include a hex sha256 digest.`);
+  }
+
+  return manifest;
 }
