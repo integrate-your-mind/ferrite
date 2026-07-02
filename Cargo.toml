@@ -8,6 +8,7 @@ members = [
   "crates/ferrite-page-renderer",
   "crates/ferrite-node",
   "crates/ferrite-protocol",
+  "crates/ferrite-protocol-wasm",
   "crates/ferrite-router",
   "crates/ferrite-ssr",
 ]

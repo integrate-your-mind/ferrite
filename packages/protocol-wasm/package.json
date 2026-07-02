@@ -1,0 +1,28 @@
+{
+  "name": "@ferrite/protocol-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./ferrite_protocol_wasm.wasm": "./dist/ferrite_protocol_wasm.wasm"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@ferrite/protocol": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/build-wasm.mjs",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "test": "pnpm build && node --test test/*.test.mjs",
+    "typecheck": "pnpm --filter @ferrite/protocol build && tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

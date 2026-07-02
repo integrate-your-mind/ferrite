@@ -224,6 +224,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-protocol-wasm"
+version = "0.1.0"
+dependencies = [
+ "ferrite-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "ferrite-router"
 version = "0.1.0"
 dependencies = [
