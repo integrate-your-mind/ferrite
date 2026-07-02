@@ -209,6 +209,7 @@ dependencies = [
 name = "ferrite-page-renderer"
 version = "0.1.0"
 dependencies = [
+ "ferrite-protocol",
  "ferrite-ssr",
  "serde",
  "serde_json",

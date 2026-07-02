@@ -370,7 +370,7 @@ git commit -m "feat(runtime): invoke server actions from render page"
 - Modify: `crates/ferrite-page-renderer/src/lib.rs`
 - Modify: `crates/ferrite-dev-server/src/lib.rs`
 
-- [ ] **Step 1: Add failing `ferrite-page-renderer` tests**
+- [x] **Step 1: Add failing `ferrite-page-renderer` tests**
 
 Add tests that write a temporary page with one server action and verify:
 
@@ -378,7 +378,7 @@ Add tests that write a temporary page with one server action and verify:
 - Unknown action IDs return `NodeFailed` or a typed action error without invoking user code.
 - Action exceptions return a validated error response.
 
-- [ ] **Step 2: Implement `PageRenderer::invoke_server_action()`**
+- [x] **Step 2: Implement `PageRenderer::invoke_server_action()`**
 
 Add typed Rust wrappers:
 

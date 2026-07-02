@@ -6,10 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ferrite-protocol = { path = "../ferrite-protocol" }
 ferrite-ssr = { path = "../ferrite-ssr" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-

@@ -6,6 +6,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ferrite_protocol::{ServerActionRequest, ServerActionResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,6 +17,7 @@ const RENDER_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 pub enum PageRenderError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    Protocol(ferrite_protocol::ProtocolError),
     Ssr(ferrite_ssr::SsrError),
     NodeFailed { status: Option<i32>, stderr: String },
     TimedOut { timeout: Duration },
@@ -26,6 +28,7 @@ impl fmt::Display for PageRenderError {
         match self {
             PageRenderError::Io(error) => write!(f, "{error}"),
             PageRenderError::Json(error) => write!(f, "{error}"),
+            PageRenderError::Protocol(error) => write!(f, "{error}"),
             PageRenderError::Ssr(error) => write!(f, "{error}"),
             PageRenderError::NodeFailed { status, stderr } => match status {
                 Some(status) => write!(f, "page renderer failed with exit code {status}: {stderr}"),
@@ -53,6 +56,12 @@ impl From<std::io::Error> for PageRenderError {
 impl From<serde_json::Error> for PageRenderError {
     fn from(error: serde_json::Error) -> Self {
         PageRenderError::Json(error)
+    }
+}
+
+impl From<ferrite_protocol::ProtocolError> for PageRenderError {
+    fn from(error: ferrite_protocol::ProtocolError) -> Self {
+        PageRenderError::Protocol(error)
     }
 }
 
@@ -284,6 +293,44 @@ impl PageRenderer {
         let json = String::from_utf8_lossy(&output.stdout).into_owned();
         ferrite_ssr::render_server_payload_json_to_parts(&json)?;
         Ok(json)
+    }
+
+    pub fn invoke_server_action(
+        &self,
+        page_file: &Path,
+        layouts: &[PathBuf],
+        params: &[(String, Value)],
+        conventions: &RouteConventions,
+        request: &ServerActionRequest,
+    ) -> Result<ServerActionResponse> {
+        ferrite_protocol::validate_server_action_request(request)?;
+        let props = PageProps {
+            params: params.iter().cloned().collect(),
+        };
+        let props_json = serde_json::to_string(&props)?;
+        let layouts_json = serde_json::to_string(layouts)?;
+        let conventions_json = serde_json::to_string(conventions)?;
+        let request_json = serde_json::to_string(request)?;
+        let mut command = self.node_command();
+        command
+            .arg("--server-action")
+            .arg(page_file)
+            .arg(props_json)
+            .arg(layouts_json)
+            .arg(conventions_json)
+            .arg(request_json);
+        let output = self.run_command(command)?;
+
+        if !output.status.success() {
+            return Err(PageRenderError::NodeFailed {
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let response: ServerActionResponse = serde_json::from_slice(&output.stdout)?;
+        ferrite_protocol::validate_server_action_response(&response)?;
+        Ok(response)
     }
 
     pub fn generate_static_params(&self, page_file: &Path) -> Result<StaticParamsResult> {
@@ -723,6 +770,10 @@ struct PageProps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_protocol::{
+        SERVER_ACTION_REQUEST_MARKER, SERVER_ACTION_REQUEST_VERSION, ServerActionFormValue,
+        ServerActionRequest, ServerActionResponseOutcome,
+    };
     use serde_json::json;
     use std::fs;
 
@@ -896,6 +947,176 @@ process.stdout.write(JSON.stringify({
 
         assert!(payload.contains(r#""ferrite":"server-payload""#));
         assert!(payload.contains("Payload raw"));
+    }
+
+    #[test]
+    fn invokes_server_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(
+            &script,
+            r#"
+const props = JSON.parse(process.argv[4]);
+const layouts = JSON.parse(process.argv[5]);
+const conventions = JSON.parse(process.argv[6]);
+const request = JSON.parse(process.argv[7]);
+process.stdout.write(JSON.stringify({
+  ferrite: "server-action-response",
+  version: 1,
+  status: "ok",
+  data: {
+    id: request.id,
+    routePath: request.routePath,
+    title: request.form.title,
+    paramsId: props.params.id,
+    layoutCount: layouts.length,
+    hasLoading: conventions.loading.endsWith("loading.tsx")
+  }
+}));
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        let layout = temp.path().join("layout.tsx");
+        let loading = temp.path().join("loading.tsx");
+        fs::write(&page, "").unwrap();
+        fs::write(&layout, "").unwrap();
+        fs::write(&loading, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script);
+        let request = ServerActionRequest {
+            ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
+            version: SERVER_ACTION_REQUEST_VERSION,
+            id: "app/posts/[id]/page.tsx#savePost".to_owned(),
+            route_path: "/posts/abc".to_owned(),
+            form: BTreeMap::from([(
+                "title".to_owned(),
+                ServerActionFormValue::String("Hello".to_owned()),
+            )]),
+        };
+
+        let response = renderer
+            .invoke_server_action(
+                &page,
+                &[layout],
+                &[("id".to_owned(), json!("abc"))],
+                &RouteConventions {
+                    loading: Some(loading),
+                    error: None,
+                },
+                &request,
+            )
+            .unwrap();
+
+        assert_eq!(
+            response.outcome,
+            ServerActionResponseOutcome::Ok {
+                data: json!({
+                    "id": "app/posts/[id]/page.tsx#savePost",
+                    "routePath": "/posts/abc",
+                    "title": "Hello",
+                    "paramsId": "abc",
+                    "layoutCount": 1,
+                    "hasLoading": true
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn reports_unknown_server_action_ids_without_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        let side_effect = temp.path().join("side-effect.txt");
+        make_script(
+            &script,
+            &format!(
+                r##"
+const request = JSON.parse(process.argv[7]);
+if (request.id.includes("#missing")) {{
+  console.error(`Ferrite server action "${{request.id}}" was not registered during route render.`);
+  process.exit(1);
+}}
+await import("node:fs/promises").then((fs) => fs.writeFile({}, "ran"));
+process.stdout.write(JSON.stringify({{
+  ferrite: "server-action-response",
+  version: 1,
+  status: "ok",
+  data: null
+}}));
+"##,
+                serde_json::to_string(&side_effect).unwrap()
+            ),
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script);
+        let request = ServerActionRequest {
+            ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
+            version: SERVER_ACTION_REQUEST_VERSION,
+            id: "app/posts/[id]/page.tsx#missing".to_owned(),
+            route_path: "/posts/abc".to_owned(),
+            form: BTreeMap::new(),
+        };
+
+        let error = renderer
+            .invoke_server_action(
+                &page,
+                &[],
+                &[("id".to_owned(), json!("abc"))],
+                &RouteConventions::default(),
+                &request,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PageRenderError::NodeFailed { stderr, .. }
+                if stderr.contains("was not registered during route render")
+        ));
+        assert!(!side_effect.exists());
+    }
+
+    #[test]
+    fn returns_server_action_error_responses() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(
+            &script,
+            r#"
+process.stdout.write(JSON.stringify({
+  ferrite: "server-action-response",
+  version: 1,
+  status: "error",
+  message: "Action exploded"
+}));
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script);
+        let request = ServerActionRequest {
+            ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
+            version: SERVER_ACTION_REQUEST_VERSION,
+            id: "app/posts/[id]/page.tsx#savePost".to_owned(),
+            route_path: "/posts/abc".to_owned(),
+            form: BTreeMap::new(),
+        };
+
+        let response = renderer
+            .invoke_server_action(
+                &page,
+                &[],
+                &[("id".to_owned(), json!("abc"))],
+                &RouteConventions::default(),
+                &request,
+            )
+            .unwrap();
+
+        assert_eq!(
+            response.outcome,
+            ServerActionResponseOutcome::Error {
+                message: "Action exploded".to_owned()
+            }
+        );
     }
 
     #[test]
