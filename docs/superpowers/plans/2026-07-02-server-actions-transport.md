@@ -483,7 +483,7 @@ git commit -m "feat(dev-server): handle server action posts"
 - Modify: `README.md`
 - Modify: `docs/architecture.md`
 
-- [ ] **Step 1: Add a progressive form example**
+- [x] **Step 1: Add a progressive form example**
 
 Add a small form to the existing posts page:
 
@@ -515,7 +515,7 @@ Render it as:
 
 Keep the example honest: no persistence claim, no authentication claim, and no optimistic client behavior.
 
-- [ ] **Step 2: Add proof document**
+- [x] **Step 2: Add proof document**
 
 `docs/milestone-062-proof.md` must include:
 
@@ -526,7 +526,7 @@ Keep the example honest: no persistence claim, no authentication claim, and no o
 - Odd path proof command and result.
 - What was not proven: remote CI, real PR, npm publication, Flight compatibility, static action manifest, upload streaming, auth helpers, and client event actions.
 
-- [ ] **Step 3: Update architecture and README**
+- [x] **Step 3: Update architecture and README**
 
 Document that Ferrite now has first form-based server-action transport only after Task 4 and Task 5 are proven. Do not imply:
 
@@ -536,7 +536,7 @@ Document that Ferrite now has first form-based server-action transport only afte
 - Cross-origin action calls.
 - File upload support.
 
-- [ ] **Step 4: Run example proof**
+- [x] **Step 4: Run example proof**
 
 Run:
 
@@ -547,7 +547,7 @@ pnpm dev:once
 
 Then send a real local HTTP POST to the dev server test path or add a deterministic `serve_listener_once` test proving the example form endpoint.
 
-- [ ] **Step 5: Commit docs and example**
+- [x] **Step 5: Commit docs and example**
 
 ```bash
 git add examples/basic/app/posts/[id]/page.tsx docs/milestone-062-plan.md docs/milestone-062-proof.md README.md docs/architecture.md
@@ -560,7 +560,7 @@ git commit -m "docs(actions): document server action transport"
 **Files:**
 - No planned edits unless verification finds a bug.
 
-- [ ] **Step 1: Run full local gate**
+- [x] **Step 1: Run full local gate**
 
 Run:
 
@@ -577,7 +577,7 @@ pnpm release:verify:npm
 
 Expected: all pass locally.
 
-- [ ] **Step 2: Check coverage validity**
+- [x] **Step 2: Check coverage validity**
 
 Review the new tests against the acceptance criteria:
 
@@ -595,7 +595,7 @@ Review the new tests against the acceptance criteria:
 
 Add tests before merging if any item is not physically proven.
 
-- [ ] **Step 3: Inspect git and remote state**
+- [x] **Step 3: Inspect git and remote state**
 
 Run:
 
@@ -607,7 +607,7 @@ git remote -v
 
 If a GitHub remote exists, push the branch and open a PR. If no remote exists, record the blocker in `docs/milestone-062-proof.md` and the final response.
 
-- [ ] **Step 4: Final implementation commit if needed**
+- [x] **Step 4: Final implementation commit if needed**
 
 Only commit verification fixes or proof doc updates:
 

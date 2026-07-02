@@ -543,10 +543,17 @@ process.stdout.write(JSON.stringify({
         fs::write(
             temp.path().join("app/posts/[id]/page.tsx"),
             r#"
+import { createServerAction } from "@ferrite/runtime/server";
 import PostActions, { ShareButton } from "./PostActions";
 import PostShell from "./PostShell";
 
 export default function Page() {
+  const savePost = createServerAction({
+    id: "app/posts/[id]/page.tsx#savePost",
+    async run() {
+      return null;
+    }
+  });
   return <PostShell><PostActions id="alpha" /><ShareButton id="alpha" /></PostShell>;
 }
 "#,

@@ -361,7 +361,7 @@ async function scanServerFileForClientReferences(file, projectRoot, visited, ref
 function parseRelativeImportRecords(source) {
   const records = [];
 
-  for (const match of source.matchAll(/\bimport\s+(type\s+)?([\s\S]*?)\s+from\s+["'](\.{1,2}\/[^"']+)["']/g)) {
+  for (const match of source.matchAll(/\bimport\s+(type\s+)?([\s\S]*?)\s+from\s+["']([^"']+)["']/g)) {
     if (match[1]) {
       continue;
     }
@@ -371,14 +371,14 @@ function parseRelativeImportRecords(source) {
     });
   }
 
-  for (const match of source.matchAll(/\bimport\s+["'](\.{1,2}\/[^"']+)["']/g)) {
+  for (const match of source.matchAll(/\bimport\s+["']([^"']+)["']/g)) {
     records.push({
       specifier: match[1],
       exportNames: [],
     });
   }
 
-  for (const match of source.matchAll(/\bexport\s+(type\s+)?\{([\s\S]*?)\}\s+from\s+["'](\.{1,2}\/[^"']+)["']/g)) {
+  for (const match of source.matchAll(/\bexport\s+(type\s+)?\{([\s\S]*?)\}\s+from\s+["']([^"']+)["']/g)) {
     if (match[1]) {
       continue;
     }
@@ -388,14 +388,14 @@ function parseRelativeImportRecords(source) {
     });
   }
 
-  for (const match of source.matchAll(/\bexport\s+\*\s+from\s+["'](\.{1,2}\/[^"']+)["']/g)) {
+  for (const match of source.matchAll(/\bexport\s+\*\s+from\s+["']([^"']+)["']/g)) {
     records.push({
       specifier: match[1],
       exportNames: ["*"],
     });
   }
 
-  return records.filter((record) => isSourceSpecifier(record.specifier));
+  return records.filter((record) => isRelativeSpecifier(record.specifier) && isSourceSpecifier(record.specifier));
 }
 
 function parseImportedExportNames(clause) {
@@ -440,6 +440,10 @@ function parseNamedExportNames(namedClause) {
 function isSourceSpecifier(specifier) {
   const extension = extname(specifier);
   return !extension || [".tsx", ".ts", ".jsx", ".js"].includes(extension);
+}
+
+function isRelativeSpecifier(specifier) {
+  return specifier.startsWith("./") || specifier.startsWith("../");
 }
 
 async function resolveSourceFile(path) {
