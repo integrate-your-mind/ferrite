@@ -4,7 +4,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, UNIX_EPOCH};
 
 use ferrite_client_bundler::{
     ClientBundle, ClientBundleError, ClientBundler, fingerprint_client_bundle,
@@ -26,6 +28,10 @@ const SERVER_PAYLOAD_STREAM_CONTENT_TYPE: &str =
 const SERVER_PAYLOAD_QUERY_NAME: &str = "__ferrite_payload";
 const SERVER_PAYLOAD_QUERY_VALUE: &str = "server";
 const SERVER_PAYLOAD_STREAM_QUERY_VALUE: &str = "stream";
+const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
+const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
+const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
 #[derive(Debug)]
 pub enum DevServerError {
@@ -114,6 +120,9 @@ pub struct ProductionServerConfig {
     pub client_bundler: PathBuf,
     pub client_out_dir: PathBuf,
     pub client_public_path: String,
+    pub request_read_timeout: Duration,
+    pub max_request_bytes: usize,
+    pub max_in_flight_requests: usize,
 }
 
 impl ProductionServerConfig {
@@ -134,7 +143,25 @@ impl ProductionServerConfig {
             client_bundler,
             client_out_dir,
             client_public_path,
+            request_read_timeout: DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT,
+            max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
+            max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
         }
+    }
+
+    pub fn with_request_read_timeout(mut self, timeout: Duration) -> Self {
+        self.request_read_timeout = timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT);
+        self
+    }
+
+    pub fn with_max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = bytes.max(1);
+        self
+    }
+
+    pub fn with_max_in_flight_requests(mut self, requests: usize) -> Self {
+        self.max_in_flight_requests = requests.max(1);
+        self
     }
 }
 
@@ -952,6 +979,32 @@ impl DevResponse {
         }
     }
 
+    pub fn request_timeout() -> Self {
+        Self {
+            status: 408,
+            reason: "Request Timeout",
+            content_type: "text/plain; charset=utf-8",
+            body: b"Request Timeout\n".to_vec(),
+            stream: None,
+            cache_control: None,
+            route_pattern_header: None,
+            link_headers: Vec::new(),
+        }
+    }
+
+    pub fn payload_too_large() -> Self {
+        Self {
+            status: 413,
+            reason: "Payload Too Large",
+            content_type: "text/plain; charset=utf-8",
+            body: b"Payload Too Large\n".to_vec(),
+            stream: None,
+            cache_control: None,
+            route_pattern_header: None,
+            link_headers: Vec::new(),
+        }
+    }
+
     pub fn internal_error(body: String) -> Self {
         Self {
             status: 500,
@@ -986,6 +1039,62 @@ impl DevResponse {
 
     pub fn body_text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProductionInFlightLimit {
+    max: usize,
+    state: Arc<(Mutex<usize>, Condvar)>,
+}
+
+impl ProductionInFlightLimit {
+    fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            state: Arc::new((Mutex::new(0), Condvar::new())),
+        }
+    }
+
+    fn acquire(&self) -> ProductionInFlightPermit {
+        let (lock, condition) = &*self.state;
+        let mut in_flight = lock.lock().expect("in-flight limiter mutex poisoned");
+        while *in_flight >= self.max {
+            in_flight = condition
+                .wait(in_flight)
+                .expect("in-flight limiter mutex poisoned");
+        }
+        *in_flight += 1;
+        ProductionInFlightPermit {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    #[cfg(test)]
+    fn try_acquire(&self) -> Option<ProductionInFlightPermit> {
+        let (lock, _condition) = &*self.state;
+        let mut in_flight = lock.lock().expect("in-flight limiter mutex poisoned");
+        if *in_flight >= self.max {
+            return None;
+        }
+        *in_flight += 1;
+        Some(ProductionInFlightPermit {
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ProductionInFlightPermit {
+    state: Arc<(Mutex<usize>, Condvar)>,
+}
+
+impl Drop for ProductionInFlightPermit {
+    fn drop(&mut self) {
+        let (lock, condition) = &*self.state;
+        let mut in_flight = lock.lock().expect("in-flight limiter mutex poisoned");
+        *in_flight = in_flight.saturating_sub(1);
+        condition.notify_one();
     }
 }
 
@@ -1194,7 +1303,8 @@ pub fn serve_production<A: ToSocketAddrs>(addr: A, mut project: ProductionProjec
     let mut addrs = addr.to_socket_addrs()?;
     let addr = addrs.next().ok_or(DevServerError::NoSocketAddress)?;
     let listener = TcpListener::bind(addr)?;
-    serve_production_listener(listener, &mut project)
+    project.ensure_ready()?;
+    serve_production_listener_concurrent(listener, project)
 }
 
 pub fn serve_listener(listener: TcpListener, project: &mut DevProject) -> Result<()> {
@@ -1223,6 +1333,24 @@ pub fn serve_production_listener(
     Ok(())
 }
 
+pub fn serve_production_listener_concurrent(
+    listener: TcpListener,
+    project: ProductionProject,
+) -> Result<()> {
+    let limit = ProductionInFlightLimit::new(project.config.max_in_flight_requests);
+    let project = Arc::new(Mutex::new(project));
+    loop {
+        let permit = limit.acquire();
+        let (stream, _addr) = listener.accept()?;
+        let project = Arc::clone(&project);
+        thread::spawn(move || {
+            let _permit = permit;
+            let mut stream = stream;
+            let _ = handle_production_stream_concurrent(&mut stream, &project);
+        });
+    }
+}
+
 pub fn serve_production_listener_once(
     listener: TcpListener,
     project: &mut ProductionProject,
@@ -1246,20 +1374,100 @@ fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()>
 }
 
 fn handle_production_stream(stream: &mut TcpStream, project: &mut ProductionProject) -> Result<()> {
-    let mut buffer = [0_u8; 8192];
-    let bytes = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..bytes]);
+    let request_read_timeout = project.config.request_read_timeout;
+    let max_request_bytes = project.config.max_request_bytes;
+    handle_production_stream_with_limits(stream, request_read_timeout, max_request_bytes, |path| {
+        project.handle_get(path)
+    })
+}
+
+fn handle_production_stream_concurrent(
+    stream: &mut TcpStream,
+    project: &Arc<Mutex<ProductionProject>>,
+) -> Result<()> {
+    let (request_read_timeout, max_request_bytes) = {
+        let project = project.lock().expect("production project mutex poisoned");
+        (
+            project.config.request_read_timeout,
+            project.config.max_request_bytes,
+        )
+    };
+    handle_production_stream_with_limits(stream, request_read_timeout, max_request_bytes, |path| {
+        let mut project = project.lock().expect("production project mutex poisoned");
+        project.handle_get(path)
+    })
+}
+
+fn handle_production_stream_with_limits<F>(
+    stream: &mut TcpStream,
+    request_read_timeout: Duration,
+    max_request_bytes: usize,
+    mut handle_get: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<DevResponse>,
+{
+    stream.set_read_timeout(Some(
+        request_read_timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT),
+    ))?;
+    let request = match read_http_request(stream, max_request_bytes)? {
+        RequestReadResult::Request(request) => request,
+        RequestReadResult::Response(response) => {
+            write_response(stream, &response)?;
+            return Ok(());
+        }
+    };
     let write_options = ResponseWriteOptions {
         gzip: client_accepts_gzip(&request),
     };
     let response = match parse_request_line(&request) {
-        Some(("GET", path)) => project.handle_get(path)?,
+        Some(("GET", path)) => handle_get(path)?,
         Some((_method, _path)) => DevResponse::method_not_allowed(),
         None => DevResponse::bad_request("invalid HTTP request line"),
     };
 
     write_response_with_options(stream, &response, write_options)?;
     Ok(())
+}
+
+enum RequestReadResult {
+    Request(String),
+    Response(DevResponse),
+}
+
+fn read_http_request(
+    stream: &mut TcpStream,
+    max_request_bytes: usize,
+) -> Result<RequestReadResult> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes) => {
+                request.extend_from_slice(&buffer[..bytes]);
+                if request.len() > max_request_bytes {
+                    return Ok(RequestReadResult::Response(DevResponse::payload_too_large()));
+                }
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(RequestReadResult::Response(DevResponse::request_timeout()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Ok(RequestReadResult::Request(
+        String::from_utf8_lossy(&request).into_owned(),
+    ))
 }
 
 fn write_response(stream: &mut TcpStream, response: &DevResponse) -> Result<()> {
@@ -2379,6 +2587,110 @@ process.stdout.write(JSON.stringify({
         let mut output = String::new();
         decoder.read_to_string(&mut output).unwrap();
         output
+    }
+
+    #[test]
+    fn production_config_defaults_are_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = production_project_for(&app);
+
+        assert_eq!(
+            project.config.request_read_timeout,
+            DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT
+        );
+        assert_eq!(
+            project.config.max_request_bytes,
+            DEFAULT_PRODUCTION_MAX_REQUEST_BYTES
+        );
+        assert_eq!(
+            project.config.max_in_flight_requests,
+            DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS
+        );
+    }
+
+    #[test]
+    fn production_config_builders_clamp_empty_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = ProductionProject::new(
+            production_project_for(&app)
+                .config
+                .with_request_read_timeout(Duration::ZERO)
+                .with_max_request_bytes(0)
+                .with_max_in_flight_requests(0),
+        );
+
+        assert_eq!(
+            project.config.request_read_timeout,
+            MIN_PRODUCTION_REQUEST_READ_TIMEOUT
+        );
+        assert_eq!(project.config.max_request_bytes, 1);
+        assert_eq!(project.config.max_in_flight_requests, 1);
+    }
+
+    #[test]
+    fn production_in_flight_limit_caps_parallel_permits() {
+        let limit = ProductionInFlightLimit::new(2);
+        let first = limit.try_acquire().expect("first permit");
+        let second = limit.try_acquire().expect("second permit");
+
+        assert!(limit.try_acquire().is_none());
+
+        drop(first);
+        let third = limit.try_acquire().expect("permit after release");
+        drop(second);
+        drop(third);
+    }
+
+    #[test]
+    fn production_adapter_rejects_oversized_request_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = production_project_for(&app);
+        project.config.max_request_bytes = 32;
+
+        let response = production_http_request(
+            project,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Long: 1234567890\r\n\r\n",
+        );
+        let headers = response_headers(&response);
+        let body = String::from_utf8_lossy(response_body(&response));
+
+        assert!(headers.starts_with("HTTP/1.1 413 Payload Too Large"));
+        assert!(headers.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(headers.contains("Content-Length:"));
+        assert_eq!(body, "Payload Too Large\n");
+    }
+
+    #[test]
+    fn production_adapter_times_out_silent_request_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = production_project_for(&app);
+        project.config.request_read_timeout = Duration::from_millis(50);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            serve_production_listener_once(listener, &mut project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout"));
+        assert!(response.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(response.ends_with("Request Timeout\n"));
     }
 
     #[test]
