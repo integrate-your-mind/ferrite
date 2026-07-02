@@ -18,7 +18,8 @@
   "scripts": {
     "build": "cargo build -p ferrite-node && node scripts/copy-native.mjs",
     "prebuild:package": "pnpm build && node scripts/create-prebuild-package.mjs",
+    "prebuild:verify": "node scripts/verify-prebuild-package.mjs dist/prebuild",
     "test": "pnpm build && node --test test/*.test.mjs",
-    "typecheck": "node --check binding.js && node --check index.js && node --check scripts/copy-native.mjs && node --check scripts/create-prebuild-package.mjs"
+    "typecheck": "node --check binding.js && node --check index.js && node --check scripts/copy-native.mjs && node --check scripts/create-prebuild-package.mjs && node --check scripts/verify-prebuild-package.mjs"
   }
 }
