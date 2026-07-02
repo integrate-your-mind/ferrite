@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   NATIVE_CHECKSUM_ALGORITHM,
+  SUPPORTED_NATIVE_PREBUILD_TARGETS,
   nativeBindingCandidates,
   nativePrebuildPackageName,
   resolveNativeBindingPath,
@@ -20,6 +21,26 @@ test("nativePrebuildPackageName maps supported platforms", () => {
     "@ferrite/node-linux-x64-gnu",
   );
   assert.equal(nativePrebuildPackageName({ platform: "freebsd", arch: "x64" }), null);
+});
+
+test("supported native prebuild targets stay aligned with package-name mapping", () => {
+  assert.deepEqual(
+    SUPPORTED_NATIVE_PREBUILD_TARGETS.map((target) => ({
+      packageName: nativePrebuildPackageName({
+        platform: target.platform,
+        arch: target.arch,
+      }),
+      os: target.os,
+      cpu: target.cpu,
+    })),
+    [
+      { packageName: "@ferrite/node-darwin-arm64", os: "darwin", cpu: "arm64" },
+      { packageName: "@ferrite/node-darwin-x64", os: "darwin", cpu: "x64" },
+      { packageName: "@ferrite/node-linux-arm64-gnu", os: "linux", cpu: "arm64" },
+      { packageName: "@ferrite/node-linux-x64-gnu", os: "linux", cpu: "x64" },
+      { packageName: "@ferrite/node-win32-x64-msvc", os: "win32", cpu: "x64" },
+    ],
+  );
 });
 
 test("resolveNativeBindingPath honors explicit environment overrides", () => {

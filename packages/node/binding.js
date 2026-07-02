@@ -15,13 +15,50 @@ const packageRoot = dirname(fileURLToPath(import.meta.url));
 const PREBUILD_CHECKSUM_FILE = "ferrite-node.sha256.json";
 export const NATIVE_CHECKSUM_ALGORITHM = "sha256";
 
-const PREBUILD_PACKAGES = new Map([
-  ["darwin:arm64", "@ferrite/node-darwin-arm64"],
-  ["darwin:x64", "@ferrite/node-darwin-x64"],
-  ["linux:arm64", "@ferrite/node-linux-arm64-gnu"],
-  ["linux:x64", "@ferrite/node-linux-x64-gnu"],
-  ["win32:x64", "@ferrite/node-win32-x64-msvc"],
+export const SUPPORTED_NATIVE_PREBUILD_TARGETS = Object.freeze([
+  Object.freeze({
+    platform: "darwin",
+    arch: "arm64",
+    packageName: "@ferrite/node-darwin-arm64",
+    os: "darwin",
+    cpu: "arm64",
+  }),
+  Object.freeze({
+    platform: "darwin",
+    arch: "x64",
+    packageName: "@ferrite/node-darwin-x64",
+    os: "darwin",
+    cpu: "x64",
+  }),
+  Object.freeze({
+    platform: "linux",
+    arch: "arm64",
+    packageName: "@ferrite/node-linux-arm64-gnu",
+    os: "linux",
+    cpu: "arm64",
+  }),
+  Object.freeze({
+    platform: "linux",
+    arch: "x64",
+    packageName: "@ferrite/node-linux-x64-gnu",
+    os: "linux",
+    cpu: "x64",
+  }),
+  Object.freeze({
+    platform: "win32",
+    arch: "x64",
+    packageName: "@ferrite/node-win32-x64-msvc",
+    os: "win32",
+    cpu: "x64",
+  }),
 ]);
+
+const PREBUILD_PACKAGES = new Map(
+  SUPPORTED_NATIVE_PREBUILD_TARGETS.map((target) => [
+    `${target.platform}:${target.arch}`,
+    target.packageName,
+  ]),
+);
 
 export function nativePrebuildPackageName({ platform = currentPlatform, arch = currentArch } = {}) {
   return PREBUILD_PACKAGES.get(`${platform}:${arch}`) ?? null;
