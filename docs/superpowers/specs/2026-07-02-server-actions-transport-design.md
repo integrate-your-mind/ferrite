@@ -1,8 +1,10 @@
 # Server Actions Transport Design
 
+Status note, July 2, 2026: milestone 062 now has a proof doc and local implementation, and milestone 065 added an opt-in DOM form enhancer. This spec records the original target shape and remaining gaps; it should be read as implementation guidance and history, not current product status.
+
 ## Purpose
 
-Milestone 062 starts Ferrite's server-action story. The current framework can render server-first routes, proxy imported `"use client"` modules into client-reference islands, and expose validated server-payload JSON/stream responses. It does not yet have a mutation path where a client or progressive-enhanced form can invoke a server-owned function and receive a validated result.
+Milestone 062 started Ferrite's server-action story. At the time this spec was written, the framework could render server-first routes, proxy imported `"use client"` modules into client-reference islands, and expose validated server-payload JSON/stream responses, but it did not yet have a mutation path where a client or progressive-enhanced form could invoke a server-owned function and receive a validated result.
 
 This milestone adds the first server-action transport slice, not full React Flight compatibility. The goal is to make action references explicit, serializable, validated by the Rust protocol crate, and invokable through dev and production HTTP adapters for form submissions.
 

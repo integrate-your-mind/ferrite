@@ -26,6 +26,7 @@ import {
 import {
   applyServerPayload,
   createServerPayloadNavigator,
+  enhanceServerActionForms,
   fetchAndApplyServerPayload,
   fetchAndApplyServerPayloadStream,
   hydrate,
@@ -1181,6 +1182,136 @@ test("server payload navigator applies same-origin document payloads and updates
   assert.equal(container.textContent, "Post nextLoaded details");
 
   navigator.destroy();
+});
+
+test("server action form enhancer submits Ferrite action forms through validated fetch responses", async () => {
+  const { window, container } = createContainer("https://example.com/posts/abc");
+  container.innerHTML = `
+    <form action="/_ferrite/action" method="post" class="editor">
+      <input type="hidden" name="__ferrite_action" value="app/posts/[id]/page.tsx#savePost">
+      <input type="hidden" name="__ferrite_route" value="/posts/abc">
+      <input name="title" value="Hello Ferrite">
+      <input name="tag" value="rust">
+      <input name="tag" value="tsx">
+      <button type="submit" name="intent" value="save">Save</button>
+    </form>
+    <form action="/contact" method="post"><button type="submit">Contact</button></form>
+  `;
+  const submissions = [];
+  const responses = [];
+  const enhancer = enhanceServerActionForms(container, {
+    window,
+    fetch: async (input, init) => {
+      const formData = init?.body;
+      assert.ok(formData instanceof window.FormData);
+      submissions.push({
+        input,
+        method: init?.method,
+        credentials: init?.credentials,
+        fields: Array.from(formData.entries()),
+      });
+
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({
+          ferrite: "server-action-response",
+          version: 1,
+          status: "ok",
+          data: { saved: true },
+        }),
+      };
+    },
+    onResponse({ response, form }) {
+      responses.push({ response, className: form.className });
+    },
+  });
+
+  const actionForm = container.querySelector("form.editor");
+  const actionSubmit = actionForm.querySelector("button");
+  const actionEvent = new window.SubmitEvent("submit", {
+    bubbles: true,
+    cancelable: true,
+    submitter: actionSubmit,
+  });
+  actionForm.dispatchEvent(actionEvent);
+  await flushScheduledWork();
+
+  assert.equal(actionEvent.defaultPrevented, true);
+  assert.deepEqual(submissions, [
+    {
+      input: "https://example.com/_ferrite/action",
+      method: "POST",
+      credentials: "same-origin",
+      fields: [
+        ["__ferrite_action", "app/posts/[id]/page.tsx#savePost"],
+        ["__ferrite_route", "/posts/abc"],
+        ["title", "Hello Ferrite"],
+        ["tag", "rust"],
+        ["tag", "tsx"],
+        ["intent", "save"],
+      ],
+    },
+  ]);
+  assert.deepEqual(responses, [
+    {
+      response: {
+        ferrite: "server-action-response",
+        version: 1,
+        status: "ok",
+        data: { saved: true },
+      },
+      className: "editor",
+    },
+  ]);
+
+  const normalForm = container.querySelector('form[action="/contact"]');
+  const normalEvent = new window.SubmitEvent("submit", { bubbles: true, cancelable: true });
+  normalForm.dispatchEvent(normalEvent);
+  await flushScheduledWork();
+
+  assert.equal(normalEvent.defaultPrevented, false);
+  assert.equal(submissions.length, 1);
+
+  enhancer.destroy();
+  actionForm.dispatchEvent(new window.SubmitEvent("submit", { bubbles: true, cancelable: true }));
+  await flushScheduledWork();
+  assert.equal(submissions.length, 1);
+});
+
+test("server action form enhancer reports invalid action responses", async () => {
+  const { window, container } = createContainer("https://example.com/posts/abc");
+  container.innerHTML = `
+    <form action="/_ferrite/action" method="post">
+      <input type="hidden" name="__ferrite_action" value="app/posts/[id]/page.tsx#savePost">
+      <input type="hidden" name="__ferrite_route" value="/posts/abc">
+      <button type="submit">Save</button>
+    </form>
+  `;
+  const errors = [];
+  enhanceServerActionForms(container, {
+    window,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ ferrite: "not-server-action-response" }),
+    }),
+    onError({ error, form }) {
+      errors.push({ message: errorMessage(error), action: form.action });
+    },
+  });
+
+  const form = container.querySelector("form");
+  const event = new window.SubmitEvent("submit", { bubbles: true, cancelable: true });
+  form.dispatchEvent(event);
+  await flushScheduledWork();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /expected ferrite marker "server-action-response"/);
+  assert.equal(errors[0].action, "https://example.com/_ferrite/action");
 });
 
 test("server payload navigator streams shell before chunks and updates history after completion", async () => {

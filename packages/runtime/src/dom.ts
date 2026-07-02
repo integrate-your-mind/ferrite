@@ -34,10 +34,11 @@ import {
   parseClientReferenceId,
   validateClientReferenceParts,
   validateClientReferencePayload,
+  validateServerActionResponse,
   validateServerPayloadPacket,
   validateServerPayloadStreamFrame,
 } from "./protocol.js";
-import type { CompactNode, ServerPayloadChunk, ServerPayloadPacket } from "./protocol.js";
+import type { CompactNode, ServerActionResponse, ServerPayloadChunk, ServerPayloadPacket } from "./protocol.js";
 
 type HookState = unknown[];
 type EffectPhase = "layout" | "passive";
@@ -76,8 +77,19 @@ type PendingEffect = {
   effect: EffectCallback;
   deps?: EffectDependencyList;
 };
+type FormDataConstructor = new (form?: HTMLFormElement) => FormData;
+type NamedSubmitter = HTMLElement & {
+  disabled?: boolean;
+  form?: HTMLFormElement | null;
+  name?: string;
+  type?: string;
+  value?: string;
+};
 
 const SERVER_PAYLOAD_HISTORY_STATE_KEY = "__ferriteServerPayloadNavigation";
+const SERVER_ACTION_URL = "/_ferrite/action";
+const SERVER_ACTION_ID_FIELD = "__ferrite_action";
+const SERVER_ACTION_ROUTE_FIELD = "__ferrite_route";
 
 class RenderYield extends Error {
   constructor() {
@@ -134,6 +146,30 @@ export type ServerPayloadNavigateOptions = {
 export type ServerPayloadNavigator = {
   prefetch(input: string | URL): Promise<ServerPayloadPacket | null>;
   navigate(input: string | URL, options?: ServerPayloadNavigateOptions): Promise<ServerPayloadPacket | null>;
+  destroy(): void;
+};
+
+export type ServerActionFormFetch = (input: string, init?: RequestInit) => Promise<Response>;
+
+export type ServerActionFormSubmission = {
+  form: HTMLFormElement;
+  response: ServerActionResponse;
+};
+
+export type ServerActionFormEnhancementError = {
+  error: unknown;
+  form: HTMLFormElement;
+};
+
+export type ServerActionFormEnhancerOptions = {
+  window?: Window;
+  fetch?: ServerActionFormFetch;
+  requestInit?: RequestInit;
+  onResponse?: (submission: ServerActionFormSubmission) => void | Promise<void>;
+  onError?: (failure: ServerActionFormEnhancementError) => void;
+};
+
+export type ServerActionFormEnhancer = {
   destroy(): void;
 };
 
@@ -243,6 +279,202 @@ export async function fetchAndApplyServerPayload(
 ): Promise<ServerPayloadPacket> {
   const packet = await fetchServerPayload(input, options);
   return applyServerPayload(root, packet);
+}
+
+export function enhanceServerActionForms(
+  eventRoot: ParentNode = globalThis.document,
+  options: ServerActionFormEnhancerOptions = {},
+): ServerActionFormEnhancer {
+  const actionWindow = options.window ?? globalThis.window;
+  if (!actionWindow?.document) {
+    throw new TypeError("Ferrite server action form enhancement requires a window with a document.");
+  }
+
+  if (!eventRoot || typeof eventRoot.addEventListener !== "function") {
+    throw new TypeError("Ferrite server action form enhancement requires an event root.");
+  }
+
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new TypeError("Ferrite server action form enhancement requires a fetch implementation.");
+  }
+
+  const handleSubmit = (event: Event) => {
+    const form = serverActionSubmitForm(event, actionWindow);
+    if (!form) {
+      return;
+    }
+
+    event.preventDefault();
+    const submitter = serverActionSubmitter(event, form);
+    void submitServerActionForm(form, submitter, actionWindow, fetchImpl, options).catch((error) => {
+      options.onError?.({ error, form });
+    });
+  };
+
+  eventRoot.addEventListener("submit", handleSubmit);
+
+  return {
+    destroy() {
+      eventRoot.removeEventListener("submit", handleSubmit);
+    },
+  };
+}
+
+function serverActionSubmitForm(event: Event, actionWindow: Window): HTMLFormElement | null {
+  if (event.defaultPrevented) {
+    return null;
+  }
+
+  const target = event.target;
+  if (!isHtmlFormElement(target)) {
+    return null;
+  }
+
+  const actionUrl = serverActionFormUrl(target, actionWindow);
+  if (!actionUrl) {
+    return null;
+  }
+
+  if (target.method.toLowerCase() !== "post") {
+    return null;
+  }
+
+  if (!hasServerActionMetadata(target)) {
+    return null;
+  }
+
+  return target;
+}
+
+async function submitServerActionForm(
+  form: HTMLFormElement,
+  submitter: NamedSubmitter | null,
+  actionWindow: Window,
+  fetchImpl: ServerActionFormFetch,
+  options: ServerActionFormEnhancerOptions,
+): Promise<void> {
+  const actionUrl = serverActionFormUrl(form, actionWindow);
+  if (!actionUrl) {
+    return;
+  }
+
+  const requestInit = options.requestInit ?? {};
+  const response = await fetchImpl(actionUrl.toString(), {
+    ...requestInit,
+    method: "POST",
+    credentials: requestInit.credentials ?? "same-origin",
+    body: createFormData(form, submitter, actionWindow),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Ferrite server action request failed with ${response.status} ${response.statusText || "Unknown Status"}.`,
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw new TypeError(
+      `Ferrite server action response must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const actionResponse = validateServerActionResponse(payload);
+  await options.onResponse?.({ form, response: actionResponse });
+
+  if (actionResponse.status === "redirect") {
+    actionWindow.location.assign(actionResponse.location);
+  }
+}
+
+function serverActionFormUrl(form: HTMLFormElement, actionWindow: Window): URL | null {
+  let actionUrl: URL;
+  try {
+    actionUrl = new URL(form.action, actionWindow.location.href);
+  } catch {
+    return null;
+  }
+
+  if (actionUrl.origin !== actionWindow.location.origin) {
+    return null;
+  }
+
+  if (actionUrl.pathname !== SERVER_ACTION_URL || actionUrl.search !== "" || actionUrl.hash !== "") {
+    return null;
+  }
+
+  return actionUrl;
+}
+
+function hasServerActionMetadata(form: HTMLFormElement): boolean {
+  return hasNonEmptyFormControl(form, SERVER_ACTION_ID_FIELD) && hasNonEmptyFormControl(form, SERVER_ACTION_ROUTE_FIELD);
+}
+
+function hasNonEmptyFormControl(form: HTMLFormElement, name: string): boolean {
+  const control = form.elements.namedItem(name);
+  if (!control || !("value" in control)) {
+    return false;
+  }
+
+  return "value" in control && typeof control.value === "string" && control.value.length > 0;
+}
+
+function isHtmlFormElement(target: EventTarget | null): target is HTMLFormElement {
+  if (!target || typeof target !== "object") {
+    return false;
+  }
+
+  const candidate = target as Partial<HTMLFormElement>;
+  return (
+    typeof candidate.action === "string" &&
+    typeof candidate.method === "string" &&
+    Boolean(candidate.elements) &&
+    typeof candidate.addEventListener === "function"
+  );
+}
+
+function serverActionSubmitter(event: Event, form: HTMLFormElement): NamedSubmitter | null {
+  const submitter = "submitter" in event ? (event as SubmitEvent).submitter : null;
+  if (!submitter || typeof submitter !== "object") {
+    return null;
+  }
+
+  const candidate = submitter as NamedSubmitter;
+  if (candidate.form && candidate.form !== form) {
+    return null;
+  }
+
+  return candidate;
+}
+
+function createFormData(form: HTMLFormElement, submitter: NamedSubmitter | null, actionWindow: Window): FormData {
+  const ownerWindow = form.ownerDocument.defaultView ?? actionWindow;
+  const constructorCandidate = (ownerWindow as unknown as { FormData?: FormDataConstructor }).FormData;
+  if (typeof constructorCandidate !== "function") {
+    throw new TypeError("Ferrite server action form enhancement requires FormData support.");
+  }
+
+  const formData = new constructorCandidate(form);
+  appendSubmitterFormData(formData, submitter);
+  return formData;
+}
+
+function appendSubmitterFormData(formData: FormData, submitter: NamedSubmitter | null): void {
+  if (!submitter || submitter.disabled === true || typeof submitter.name !== "string" || submitter.name.length === 0) {
+    return;
+  }
+
+  const value = typeof submitter.value === "string" ? submitter.value : "";
+  if (typeof submitter.type === "string" && submitter.type.toLowerCase() === "image") {
+    formData.append(`${submitter.name}.x`, "0");
+    formData.append(`${submitter.name}.y`, "0");
+    return;
+  }
+
+  formData.append(submitter.name, value);
 }
 
 export async function fetchAndApplyServerPayloadStream(
