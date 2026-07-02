@@ -28,7 +28,7 @@
 - Modify: `packages/node/binding.js`
 - Modify: `packages/node/test/binding-resolution.test.mjs`
 
-- [ ] **Step 1: Update `binding.js` target definitions**
+- [x] **Step 1: Update `binding.js` target definitions**
 
 Replace the current `PREBUILD_PACKAGES` definition with this target list plus map:
 
@@ -81,7 +81,7 @@ const PREBUILD_PACKAGES = new Map(
 
 Do not change `nativePrebuildPackageName()` semantics.
 
-- [ ] **Step 2: Add target-list assertions**
+- [x] **Step 2: Add target-list assertions**
 
 Update the import in `packages/node/test/binding-resolution.test.mjs`:
 
@@ -120,7 +120,7 @@ test("supported native prebuild targets stay aligned with package-name mapping",
 });
 ```
 
-- [ ] **Step 3: Run focused mapping tests**
+- [x] **Step 3: Run focused mapping tests**
 
 Run:
 
@@ -130,7 +130,7 @@ pnpm --filter @ferrite/node test
 
 Expected: PASS. The command rebuilds the local native addon and all `packages/node/test/*.test.mjs` tests pass.
 
-- [ ] **Step 4: Commit target metadata**
+- [x] **Step 4: Commit target metadata**
 
 ```bash
 git add packages/node/binding.js packages/node/test/binding-resolution.test.mjs
@@ -146,7 +146,7 @@ git commit -m "refactor(node): expose native prebuild targets"
 - Create: `packages/node/test/prebuild-verifier.test.mjs`
 - Modify: `packages/node/package.json`
 
-- [ ] **Step 1: Write failing verifier tests**
+- [x] **Step 1: Write failing verifier tests**
 
 Create `packages/node/test/prebuild-verifier.test.mjs`:
 
@@ -278,7 +278,7 @@ async function writePrebuildPackage(dir, { packageName, os, cpu, binding, sha256
 }
 ```
 
-- [ ] **Step 2: Run verifier tests to confirm failure**
+- [x] **Step 2: Run verifier tests to confirm failure**
 
 Run:
 
@@ -288,7 +288,7 @@ node --test packages/node/test/prebuild-verifier.test.mjs
 
 Expected: FAIL with an import error because `packages/node/scripts/verify-prebuild-package.mjs` does not exist yet.
 
-- [ ] **Step 3: Implement verifier script**
+- [x] **Step 3: Implement verifier script**
 
 Create `packages/node/scripts/verify-prebuild-package.mjs`:
 
@@ -495,7 +495,7 @@ if (import.meta.url === pathToFileURL(argv[1]).href) {
 }
 ```
 
-- [ ] **Step 4: Add package scripts**
+- [x] **Step 4: Add package scripts**
 
 Update `packages/node/package.json` scripts:
 
@@ -509,7 +509,7 @@ Update `packages/node/package.json` scripts:
 }
 ```
 
-- [ ] **Step 5: Run focused verifier tests**
+- [x] **Step 5: Run focused verifier tests**
 
 Run:
 
@@ -523,7 +523,7 @@ pnpm --filter @ferrite/node prebuild:verify
 
 Expected: all commands PASS. The verifier reports the generated current-platform package.
 
-- [ ] **Step 6: Commit verifier**
+- [x] **Step 6: Commit verifier**
 
 ```bash
 git add packages/node/binding.js packages/node/package.json packages/node/scripts/verify-prebuild-package.mjs packages/node/test/binding-resolution.test.mjs packages/node/test/prebuild-verifier.test.mjs
@@ -537,7 +537,7 @@ git commit -m "feat(node): verify native prebuild packages"
 **Files:**
 - Create: `.github/workflows/native-prebuild-dry-run.yml`
 
-- [ ] **Step 1: Create workflow**
+- [x] **Step 1: Create workflow**
 
 Create `.github/workflows/native-prebuild-dry-run.yml`:
 
@@ -675,7 +675,7 @@ jobs:
           --expect @ferrite/node-win32-x64-msvc
 ```
 
-- [ ] **Step 2: Run YAML-adjacent validation**
+- [x] **Step 2: Run YAML-adjacent validation**
 
 Run:
 
@@ -685,7 +685,7 @@ git diff --check -- .github/workflows/native-prebuild-dry-run.yml
 
 Expected: no whitespace errors.
 
-- [ ] **Step 3: Commit workflow**
+- [x] **Step 3: Commit workflow**
 
 ```bash
 git add .github/workflows/native-prebuild-dry-run.yml
@@ -702,7 +702,7 @@ git commit -m "ci(node): add native prebuild dry run"
 - Modify: `README.md`
 - Modify: `docs/architecture.md`
 
-- [ ] **Step 1: Add milestone plan**
+- [x] **Step 1: Add milestone plan**
 
 Create `docs/milestone-060-plan.md`:
 
@@ -728,7 +728,7 @@ Out of scope:
 - Runtime API changes.
 ```
 
-- [ ] **Step 2: Add milestone proof**
+- [x] **Step 2: Add milestone proof**
 
 Create `docs/milestone-060-proof.md`:
 
@@ -778,15 +778,15 @@ Ferrite can already generate checksum-backed optional native packages locally. T
 - Availability of every hosted runner in the matrix at execution time.
 ```
 
-- [ ] **Step 3: Update README boundary**
+- [x] **Step 3: Update README boundary**
 
 In `README.md`, update the feature list and current boundaries to mention dry-run native prebuild release automation. Keep the statement that npm publication is not done.
 
-- [ ] **Step 4: Update architecture boundary**
+- [x] **Step 4: Update architecture boundary**
 
 In `docs/architecture.md`, update the native package text and next milestones so the next release milestone is publish preparation rather than dry-run packaging.
 
-- [ ] **Step 5: Commit docs**
+- [x] **Step 5: Commit docs**
 
 ```bash
 git add README.md docs/architecture.md docs/milestone-060-plan.md docs/milestone-060-proof.md
@@ -800,7 +800,7 @@ git commit -m "docs(release): record native prebuild dry run proof"
 **Files:**
 - Review all changed files from Tasks 1-4.
 
-- [ ] **Step 1: Run focused release proof**
+- [x] **Step 1: Run focused release proof**
 
 Run:
 
@@ -811,7 +811,7 @@ pnpm --filter @ferrite/node prebuild:verify
 
 Expected: PASS. The verifier reports the generated current-platform package.
 
-- [ ] **Step 2: Run normal repository gates**
+- [x] **Step 2: Run normal repository gates**
 
 Run:
 
@@ -827,7 +827,7 @@ pnpm build:example
 
 Expected: all commands PASS.
 
-- [ ] **Step 3: Inspect final history and tree**
+- [x] **Step 3: Inspect final history and tree**
 
 Run:
 
@@ -857,6 +857,6 @@ Then open a PR summarizing:
 
 Expected: branch pushes successfully and PR URL is recorded.
 
-- [ ] **Step 5: If no remote exists, stop before push**
+- [x] **Step 5: If no remote exists, stop before push**
 
 If `git remote -v` is empty, do not fabricate a PR. Report the committed local work, verification commands, and the remote blocker.

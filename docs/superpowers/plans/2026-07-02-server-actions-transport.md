@@ -43,7 +43,7 @@
 - Modify: `packages/protocol/src/index.ts`
 - Modify: `packages/protocol/test/protocol.test.mjs`
 
-- [ ] **Step 1: Add failing Rust protocol tests**
+- [x] **Step 1: Add failing Rust protocol tests**
 
 Add tests near the existing client-reference and server-payload tests for:
 
@@ -71,7 +71,7 @@ let request = ServerActionRequest {
 validate_server_action_request(&request).unwrap();
 ```
 
-- [ ] **Step 2: Implement Rust protocol structs and validators**
+- [x] **Step 2: Implement Rust protocol structs and validators**
 
 Add constants:
 
@@ -120,7 +120,7 @@ pub struct ServerActionRequest {
 
 Represent `ServerActionResponse` as a tagged Rust enum with `status` values `ok`, `redirect`, `error`, and `payload`. Reuse `ServerPayloadPacket` for the payload variant so validation composes with existing server-payload checks.
 
-- [ ] **Step 3: Extend TypeScript protocol source generation**
+- [x] **Step 3: Extend TypeScript protocol source generation**
 
 In `typescript_protocol_source()`, export:
 
@@ -142,7 +142,7 @@ In `typescript_protocol_source()`, export:
 
 Keep validators fail-closed and side-effect-free. Do not depend on DOM APIs or `@ferrite/runtime`.
 
-- [ ] **Step 4: Regenerate and test protocol package**
+- [x] **Step 4: Regenerate and test protocol package**
 
 Run:
 
@@ -156,7 +156,7 @@ pnpm --filter @ferrite/protocol typecheck
 
 Expected: all pass, and `packages/protocol/src/index.ts` is the only generated TypeScript source changed in this task.
 
-- [ ] **Step 5: Commit the protocol contract**
+- [x] **Step 5: Commit the protocol contract**
 
 ```bash
 git add crates/ferrite-protocol/src/lib.rs packages/protocol/src/index.ts packages/protocol/test/protocol.test.mjs

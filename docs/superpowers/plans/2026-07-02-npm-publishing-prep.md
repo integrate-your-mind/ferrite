@@ -44,7 +44,7 @@ The dry-run workflow uses default local mode because the repository URL is not c
 - Create: `scripts/verify-npm-packages.test.mjs`
 - Modify: `package.json`
 
-- [ ] **Step 1: Create failing verifier tests**
+- [x] **Step 1: Create failing verifier tests**
 
 Create `scripts/verify-npm-packages.test.mjs`:
 
@@ -207,7 +207,7 @@ function completeReleaseManifest(name) {
 }
 ```
 
-- [ ] **Step 2: Add the root release verifier test script**
+- [x] **Step 2: Add the root release verifier test script**
 
 In `package.json`, add a script entry:
 
@@ -221,7 +221,7 @@ Change the root `test` script to run verifier tests before package tests:
 "test": "node --test scripts/*.test.mjs && cargo test --workspace && pnpm --filter @ferrite/protocol test && pnpm --filter @ferrite/protocol-wasm test && pnpm --filter @ferrite/runtime test && pnpm --filter @ferrite/node test"
 ```
 
-- [ ] **Step 3: Run the new failing test**
+- [x] **Step 3: Run the new failing test**
 
 Run:
 
@@ -237,7 +237,7 @@ Expected: FAIL because `scripts/verify-npm-packages.mjs` does not exist.
 - Create: `scripts/verify-npm-packages.mjs`
 - Modify: `package.json`
 
-- [ ] **Step 1: Add the verifier script**
+- [x] **Step 1: Add the verifier script**
 
 Create `scripts/verify-npm-packages.mjs` with these exports and CLI behavior:
 
@@ -585,7 +585,7 @@ if (argv[1] && import.meta.url === pathToFileURL(argv[1]).href) {
 }
 ```
 
-- [ ] **Step 2: Add the root release verifier command**
+- [x] **Step 2: Add the root release verifier command**
 
 In `package.json`, add:
 
@@ -593,7 +593,7 @@ In `package.json`, add:
 "release:verify:npm": "node scripts/verify-npm-packages.mjs"
 ```
 
-- [ ] **Step 3: Run verifier tests**
+- [x] **Step 3: Run verifier tests**
 
 Run:
 
@@ -603,7 +603,7 @@ pnpm test:release
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit verifier tests and implementation**
+- [x] **Step 4: Commit verifier tests and implementation**
 
 ```bash
 git add package.json scripts/verify-npm-packages.mjs scripts/verify-npm-packages.test.mjs
@@ -620,7 +620,7 @@ git commit -m "feat(release): verify npm package dry runs"
 - Modify: `packages/runtime/package.json`
 - Modify: `packages/node/package.json`
 
-- [ ] **Step 1: Add package metadata to `@ferrite/protocol`**
+- [x] **Step 1: Add package metadata to `@ferrite/protocol`**
 
 Add these fields after `private`:
 
@@ -633,7 +633,7 @@ Add these fields after `private`:
 },
 ```
 
-- [ ] **Step 2: Add package metadata to `@ferrite/protocol-wasm`**
+- [x] **Step 2: Add package metadata to `@ferrite/protocol-wasm`**
 
 Add these fields after `private`:
 
@@ -646,7 +646,7 @@ Add these fields after `private`:
 },
 ```
 
-- [ ] **Step 3: Add package metadata to `@ferrite/runtime`**
+- [x] **Step 3: Add package metadata to `@ferrite/runtime`**
 
 Add these fields after `private`:
 
@@ -659,7 +659,7 @@ Add these fields after `private`:
 },
 ```
 
-- [ ] **Step 4: Add package metadata to `@ferrite/node`**
+- [x] **Step 4: Add package metadata to `@ferrite/node`**
 
 Add these fields after `private`:
 
@@ -684,7 +684,7 @@ Replace the current `files` array:
 
 The main package keeps source-build resolution behavior for local development, but the npm package dry-run must not include `dist/ferrite-node.node`. Platform native bindings are represented by optional native packages.
 
-- [ ] **Step 5: Verify package metadata and dry-run pack output**
+- [x] **Step 5: Verify package metadata and dry-run pack output**
 
 Run:
 
@@ -694,7 +694,7 @@ pnpm release:verify:npm
 
 Expected: PASS and ignored report file `dist/npm-packages/npm-package-report.json` exists.
 
-- [ ] **Step 6: Verify the package tests still pass**
+- [x] **Step 6: Verify the package tests still pass**
 
 Run:
 
@@ -704,7 +704,7 @@ pnpm test:release
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit source package metadata**
+- [x] **Step 7: Commit source package metadata**
 
 ```bash
 git add packages/protocol/package.json packages/protocol-wasm/package.json packages/runtime/package.json packages/node/package.json
@@ -720,7 +720,7 @@ git commit -m "chore(release): add npm package metadata"
 - Modify: `packages/node/scripts/verify-prebuild-package.mjs`
 - Modify: `packages/node/test/prebuild-verifier.test.mjs`
 
-- [ ] **Step 1: Extend generated native package manifests**
+- [x] **Step 1: Extend generated native package manifests**
 
 In `packages/node/scripts/create-prebuild-package.mjs`, add these fields to the generated `manifest` object:
 
@@ -735,7 +735,7 @@ publishConfig: {
 
 The generated manifest must still include `name`, `version`, `os`, `cpu`, `files`, and `exports`.
 
-- [ ] **Step 2: Verify native metadata**
+- [x] **Step 2: Verify native metadata**
 
 In `assertPackageManifest()` in `packages/node/scripts/verify-prebuild-package.mjs`, add:
 
@@ -752,7 +752,7 @@ if (manifest.publishConfig?.access !== "public") {
 }
 ```
 
-- [ ] **Step 3: Update prebuild verifier fixtures**
+- [x] **Step 3: Update prebuild verifier fixtures**
 
 In `packages/node/test/prebuild-verifier.test.mjs`, update fixture package manifests to include:
 
@@ -786,7 +786,7 @@ test("rejects native packages without public publish metadata", async () => {
 });
 ```
 
-- [ ] **Step 4: Run native prebuild tests**
+- [x] **Step 4: Run native prebuild tests**
 
 Run:
 
@@ -796,7 +796,7 @@ pnpm --filter @ferrite/node test
 
 Expected: PASS.
 
-- [ ] **Step 5: Run native prebuild package verification**
+- [x] **Step 5: Run native prebuild package verification**
 
 Run:
 
@@ -807,7 +807,7 @@ pnpm --filter @ferrite/node prebuild:verify
 
 Expected: PASS and the generated package manifest includes public release metadata.
 
-- [ ] **Step 6: Commit native package metadata checks**
+- [x] **Step 6: Commit native package metadata checks**
 
 ```bash
 git add packages/node/scripts/create-prebuild-package.mjs packages/node/scripts/verify-prebuild-package.mjs packages/node/test/prebuild-verifier.test.mjs
@@ -821,7 +821,7 @@ git commit -m "chore(node): verify native package release metadata"
 **Files:**
 - Create: `.github/workflows/npm-publish-dry-run.yml`
 
-- [ ] **Step 1: Create the read-only dry-run workflow**
+- [x] **Step 1: Create the read-only dry-run workflow**
 
 Create `.github/workflows/npm-publish-dry-run.yml`:
 
@@ -899,7 +899,7 @@ jobs:
           if-no-files-found: error
 ```
 
-- [ ] **Step 2: Verify the workflow has no publishing credentials**
+- [x] **Step 2: Verify the workflow has no publishing credentials**
 
 Run:
 
@@ -909,7 +909,7 @@ rg -n "npm publish|NPM_TOKEN|NODE_AUTH_TOKEN|id-token: write|registry-url" .gith
 
 Expected: no matches.
 
-- [ ] **Step 3: Run the workflow's local commands**
+- [x] **Step 3: Run the workflow's local commands**
 
 Run:
 
@@ -921,7 +921,7 @@ pnpm release:verify:npm
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit workflow**
+- [x] **Step 4: Commit workflow**
 
 ```bash
 git add .github/workflows/npm-publish-dry-run.yml
@@ -938,7 +938,7 @@ git commit -m "ci(release): add npm package dry run"
 - Modify: `README.md`
 - Modify: `docs/architecture.md`
 
-- [ ] **Step 1: Add milestone plan**
+- [x] **Step 1: Add milestone plan**
 
 Create `docs/milestone-061-plan.md`:
 
@@ -965,7 +965,7 @@ Out of scope:
 - Selecting a public repository URL in a checkout with no Git remote.
 ```
 
-- [ ] **Step 2: Add proof document**
+- [x] **Step 2: Add proof document**
 
 Create `docs/milestone-061-proof.md` with sections for `Local proof`, `Remote proof not available`, `Real publish not performed`, `Known gaps`, and `Next milestone`.
 
@@ -979,7 +979,7 @@ The `Known gaps` section must include:
 - `npm publish` was not run.
 ```
 
-- [ ] **Step 3: Update README commands**
+- [x] **Step 3: Update README commands**
 
 In `README.md`, add these commands to the command block:
 
@@ -994,7 +994,7 @@ Add one current-boundary bullet:
 - npm package dry-run verification for the JS-facing packages is local-only until a GitHub remote and npm publisher state are configured.
 ```
 
-- [ ] **Step 4: Update architecture boundary**
+- [x] **Step 4: Update architecture boundary**
 
 In `docs/architecture.md`, update the TypeScript facade package bullets to mention local npm package dry-run verification.
 
@@ -1004,7 +1004,7 @@ In `## Next Milestones`, replace the first item with:
 1. Configure the GitHub remote and real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild artifact publication ordering.
 ```
 
-- [ ] **Step 5: Run docs and release checks**
+- [x] **Step 5: Run docs and release checks**
 
 Run:
 
@@ -1016,7 +1016,7 @@ pnpm lint
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit docs**
+- [x] **Step 6: Commit docs**
 
 ```bash
 git add docs/milestone-061-plan.md docs/milestone-061-proof.md README.md docs/architecture.md
@@ -1030,7 +1030,7 @@ git commit -m "docs(release): record npm publish prep proof"
 **Files:**
 - No planned source edits.
 
-- [ ] **Step 1: Run full local gates**
+- [x] **Step 1: Run full local gates**
 
 Run:
 
@@ -1050,7 +1050,7 @@ pnpm build:example
 
 Expected: all commands pass.
 
-- [ ] **Step 2: Check GitHub remote**
+- [x] **Step 2: Check GitHub remote**
 
 Run:
 
@@ -1060,7 +1060,7 @@ git remote -v
 
 Expected in this checkout: no output. If no remote exists, do not push and do not claim PR proof.
 
-- [ ] **Step 3: Record final local status**
+- [x] **Step 3: Record final local status**
 
 Run:
 

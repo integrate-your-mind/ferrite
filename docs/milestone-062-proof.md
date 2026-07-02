@@ -57,3 +57,4 @@ Ferrite does not yet have automatic `"use server"` export discovery or a static 
 - Upload streaming or file parts.
 - Auth helpers.
 - Client event actions outside progressive form submissions.
+- A client-side progressive-enhancement helper for action metadata/bootstrap.
