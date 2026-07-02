@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     fn typescript_protocol_mirror_matches_generated_source() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let protocol_ts = manifest_dir.join("../../packages/runtime/src/protocol.ts");
+        let protocol_ts = manifest_dir.join("../../packages/protocol/src/index.ts");
         let source = fs::read_to_string(&protocol_ts).unwrap_or_else(|error| {
             panic!(
                 "failed to read TypeScript protocol mirror at {}: {error}",

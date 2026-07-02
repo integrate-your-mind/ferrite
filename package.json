@@ -3,14 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "cargo build --workspace && pnpm --filter @ferrite/runtime build && pnpm --filter @ferrite/node build",
-    "build:example": "pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- build --project examples/basic",
+    "build": "cargo build --workspace && pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && pnpm --filter @ferrite/node build",
+    "build:example": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- build --project examples/basic",
     "check": "cargo run -p ferrite-cli -- check --project examples/basic",
-    "dev:once": "pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- dev --project examples/basic --once --request-path /posts/abc",
-    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @ferrite/runtime typecheck && pnpm --filter @ferrite/node typecheck",
-    "render:fixture": "pnpm --filter @ferrite/runtime build && node examples/basic/render.mjs | cargo run -p ferrite-cli -- render --input -",
-    "test": "cargo test --workspace && pnpm --filter @ferrite/runtime test && pnpm --filter @ferrite/node test",
-    "typecheck": "pnpm --filter @ferrite/runtime typecheck && cargo run -p ferrite-cli -- check --project examples/basic"
+    "dev:once": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- dev --project examples/basic --once --request-path /posts/abc",
+    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/runtime typecheck && pnpm --filter @ferrite/node typecheck",
+    "render:fixture": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && node examples/basic/render.mjs | cargo run -p ferrite-cli -- render --input -",
+    "test": "cargo test --workspace && pnpm --filter @ferrite/protocol test && pnpm --filter @ferrite/runtime test && pnpm --filter @ferrite/node test",
+    "typecheck": "pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/runtime typecheck && cargo run -p ferrite-cli -- check --project examples/basic"
   },
   "devDependencies": {
     "esbuild": "0.28.1",

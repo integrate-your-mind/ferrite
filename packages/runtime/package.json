@@ -25,10 +25,13 @@
     "bin",
     "dist"
   ],
+  "dependencies": {
+    "@ferrite/protocol": "workspace:*"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm --filter @ferrite/protocol build && tsc -p tsconfig.json",
     "test": "pnpm build && node --test test/*.test.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "pnpm --filter @ferrite/protocol build && tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
     "esbuild": "0.28.1",

@@ -30,7 +30,17 @@ importers:
 
   packages/node: {}
 
+  packages/protocol:
+    devDependencies:
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+
   packages/runtime:
+    dependencies:
+      '@ferrite/protocol':
+        specifier: workspace:*
+        version: link:../protocol
     devDependencies:
       esbuild:
         specifier: 0.28.1
