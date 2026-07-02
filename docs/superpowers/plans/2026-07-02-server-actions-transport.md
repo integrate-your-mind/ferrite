@@ -430,7 +430,7 @@ Add dependency-free parsers in `ferrite-dev-server`:
 
 URL decoding must reject malformed percent escapes. Multipart parsing should accept small text fields and reject parts with `filename=` or binary content disposition.
 
-- [ ] **Step 6: Add dev and production action handlers**
+- [x] **Step 6: Add dev and production action handlers**
 
 Add methods:
 
@@ -452,7 +452,7 @@ for both `DevProject` and `ProductionProject`. Behavior:
 
 Production should call `observe_request("POST", raw_path, ...)` just like GET.
 
-- [ ] **Step 7: Prove HTTP action behavior**
+- [x] **Step 7: Prove HTTP action behavior**
 
 Run:
 
@@ -466,7 +466,7 @@ pnpm dev:once
 
 Expected: existing GET, payload, gzip, timeout, observer, and worker-pool tests still pass; new POST tests cover normal, failure, and odd paths.
 
-- [ ] **Step 8: Commit Rust action transport**
+- [x] **Step 8: Commit Rust action transport**
 
 ```bash
 git add crates/ferrite-page-renderer/src/lib.rs crates/ferrite-dev-server/src/lib.rs

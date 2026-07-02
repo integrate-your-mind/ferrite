@@ -19,7 +19,9 @@ use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
 };
 use ferrite_protocol::{
+    SERVER_ACTION_REQUEST_MARKER, SERVER_ACTION_REQUEST_VERSION,
     SERVER_PAYLOAD_STREAM_FRAME_MARKER, SERVER_PAYLOAD_STREAM_FRAME_VERSION, ServerActionFormValue,
+    ServerActionRequest,
 };
 use ferrite_router::{Route, find_document_file, scan_app_dir, write_route_types};
 use flate2::Compression;
@@ -35,6 +37,9 @@ const SERVER_PAYLOAD_QUERY_NAME: &str = "__ferrite_payload";
 const SERVER_PAYLOAD_QUERY_VALUE: &str = "server";
 const SERVER_PAYLOAD_STREAM_QUERY_VALUE: &str = "stream";
 const SERVER_ACTION_PATH: &str = "/_ferrite/action";
+const SERVER_ACTION_ID_FIELD: &str = "__ferrite_action";
+const SERVER_ACTION_ROUTE_FIELD: &str = "__ferrite_route";
+const SERVER_ACTION_RESPONSE_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,6 +93,7 @@ impl From<serde_json::Error> for DevServerError {
 }
 
 pub type Result<T> = std::result::Result<T, DevServerError>;
+pub type HttpHeaders = BTreeMap<String, String>;
 
 #[derive(Debug, Clone)]
 pub struct DevServerConfig {
@@ -326,6 +332,25 @@ impl DevProject {
         }
     }
 
+    pub fn handle_post(
+        &mut self,
+        raw_path: &str,
+        headers: &HttpHeaders,
+        body: &[u8],
+    ) -> Result<DevResponse> {
+        if !raw_path.starts_with('/') {
+            return Err(DevServerError::InvalidRequestPath(raw_path.to_owned()));
+        }
+
+        self.ensure_fresh()?;
+        let path = strip_query(raw_path);
+        if path != SERVER_ACTION_PATH {
+            return Ok(DevResponse::method_not_allowed());
+        }
+
+        self.action_response(headers, body)
+    }
+
     fn ensure_fresh(&mut self) -> Result<()> {
         let fingerprint = fingerprint_app_dir(&self.config.app_dir)?;
         let changed = self
@@ -402,6 +427,51 @@ impl DevProject {
             }
         } else {
             DevResponse::not_found(render_not_found(self.build_id, path, &snapshot.routes))
+        }
+    }
+
+    fn action_response(&self, headers: &HttpHeaders, body: &[u8]) -> Result<DevResponse> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .expect("snapshot built before response");
+        let request = match server_action_request_from_form(headers, body) {
+            Ok(request) => request,
+            Err(response) => return Ok(*response),
+        };
+        let route_path = request.route_path.clone();
+        let Some(match_result) = match_route(&route_path, &snapshot.routes) else {
+            return Ok(DevResponse::not_found_text(format!(
+                "No Ferrite route matched server action route `{route_path}`"
+            )));
+        };
+        let renderer = PageRenderer::new(
+            self.config.project.clone(),
+            self.config.page_renderer.clone(),
+        );
+        let conventions = route_conventions(&match_result.route);
+
+        match renderer.invoke_server_action(
+            &match_result.route.file,
+            &match_result.route.layouts,
+            &match_result.params,
+            &conventions,
+            &request,
+        ) {
+            Ok(response) => server_action_json_response(response)
+                .map(|response| response.with_route_pattern(match_result.route.path.clone())),
+            Err(error) if is_unknown_server_action_error(&error) => {
+                Ok(DevResponse::not_found_text(format!(
+                    "No Ferrite server action `{}` was registered for `{}`",
+                    request.id, route_path
+                )))
+            }
+            Err(error) => Ok(DevResponse::internal_error(render_render_error(
+                self.build_id,
+                &route_path,
+                &match_result,
+                &error,
+            ))),
         }
     }
 
@@ -668,6 +738,22 @@ impl ProductionProject {
         Ok(response)
     }
 
+    pub fn handle_post(
+        &mut self,
+        raw_path: &str,
+        headers: &HttpHeaders,
+        body: &[u8],
+    ) -> Result<DevResponse> {
+        if !raw_path.starts_with('/') {
+            return Err(DevServerError::InvalidRequestPath(raw_path.to_owned()));
+        }
+
+        let started = Instant::now();
+        let response = self.handle_post_inner(raw_path, headers, body)?;
+        self.observe_request("POST", raw_path, &response, started.elapsed());
+        Ok(response)
+    }
+
     fn handle_get_inner(&mut self, raw_path: &str) -> Result<DevResponse> {
         self.ensure_ready()?;
         let path = strip_query(raw_path);
@@ -685,6 +771,22 @@ impl ProductionProject {
             Ok(mode) => Ok(self.route_response(path, mode)),
             Err(message) => Ok(DevResponse::bad_request(message)),
         }
+    }
+
+    fn handle_post_inner(
+        &mut self,
+        raw_path: &str,
+        headers: &HttpHeaders,
+        body: &[u8],
+    ) -> Result<DevResponse> {
+        self.ensure_ready()?;
+        let path = strip_query(raw_path);
+        if path != SERVER_ACTION_PATH {
+            return Ok(DevResponse::method_not_allowed().with_cache_control("no-store"));
+        }
+
+        self.action_response(headers, body)
+            .map(|response| response.with_cache_control("no-store"))
     }
 
     fn observe_request(
@@ -766,6 +868,51 @@ impl ProductionProject {
         } else {
             DevResponse::not_found(render_production_not_found(path, &snapshot.routes))
                 .with_cache_control("no-store")
+        }
+    }
+
+    fn action_response(&self, headers: &HttpHeaders, body: &[u8]) -> Result<DevResponse> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .expect("snapshot built before response");
+        let request = match server_action_request_from_form(headers, body) {
+            Ok(request) => request,
+            Err(response) => return Ok(*response),
+        };
+        let route_path = request.route_path.clone();
+        let Some(match_result) = match_route(&route_path, &snapshot.routes) else {
+            return Ok(DevResponse::not_found_text(format!(
+                "No Ferrite route matched server action route `{route_path}`"
+            )));
+        };
+        let renderer = PageRenderer::new(
+            self.config.project.clone(),
+            self.config.page_renderer.clone(),
+        )
+        .with_command_timeout(self.config.render_timeout);
+        let conventions = route_conventions(&match_result.route);
+
+        match renderer.invoke_server_action(
+            &match_result.route.file,
+            &match_result.route.layouts,
+            &match_result.params,
+            &conventions,
+            &request,
+        ) {
+            Ok(response) => server_action_json_response(response)
+                .map(|response| response.with_route_pattern(match_result.route.path.clone())),
+            Err(error) if is_unknown_server_action_error(&error) => {
+                Ok(DevResponse::not_found_text(format!(
+                    "No Ferrite server action `{}` was registered for `{}`",
+                    request.id, route_path
+                )))
+            }
+            Err(error) => Ok(production_render_error_response(
+                &route_path,
+                &match_result,
+                &error,
+            )),
         }
     }
 
@@ -1058,6 +1205,19 @@ impl DevResponse {
             reason: "Not Found",
             content_type: "text/html; charset=utf-8",
             body: body.into_bytes(),
+            stream: None,
+            cache_control: None,
+            route_pattern_header: None,
+            link_headers: Vec::new(),
+        }
+    }
+
+    pub fn not_found_text(message: impl Into<String>) -> Self {
+        Self {
+            status: 404,
+            reason: "Not Found",
+            content_type: "text/plain; charset=utf-8",
+            body: format!("Not Found: {}\n", message.into()).into_bytes(),
             stream: None,
             cache_control: None,
             route_pattern_header: None,
@@ -1516,6 +1676,7 @@ fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()>
     };
     let response = match request.method.as_str() {
         "GET" => project.handle_get(&request.path)?,
+        "POST" => project.handle_post(&request.path, &request.headers, &request.body)?,
         _ => DevResponse::method_not_allowed(),
     };
 
@@ -1526,9 +1687,16 @@ fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()>
 fn handle_production_stream(stream: &mut TcpStream, project: &mut ProductionProject) -> Result<()> {
     let request_read_timeout = project.config.request_read_timeout;
     let max_request_bytes = project.config.max_request_bytes;
-    handle_production_stream_with_limits(stream, request_read_timeout, max_request_bytes, |path| {
-        project.handle_get(path)
-    })
+    handle_production_stream_with_limits(
+        stream,
+        request_read_timeout,
+        max_request_bytes,
+        |request| match request.method.as_str() {
+            "GET" => project.handle_get(&request.path),
+            "POST" => project.handle_post(&request.path, &request.headers, &request.body),
+            _ => Ok(DevResponse::method_not_allowed()),
+        },
+    )
 }
 
 fn handle_production_stream_concurrent(
@@ -1542,20 +1710,29 @@ fn handle_production_stream_concurrent(
             project.config.max_request_bytes,
         )
     };
-    handle_production_stream_with_limits(stream, request_read_timeout, max_request_bytes, |path| {
-        let mut project = project.lock().expect("production project mutex poisoned");
-        project.handle_get(path)
-    })
+    handle_production_stream_with_limits(
+        stream,
+        request_read_timeout,
+        max_request_bytes,
+        |request| {
+            let mut project = project.lock().expect("production project mutex poisoned");
+            match request.method.as_str() {
+                "GET" => project.handle_get(&request.path),
+                "POST" => project.handle_post(&request.path, &request.headers, &request.body),
+                _ => Ok(DevResponse::method_not_allowed()),
+            }
+        },
+    )
 }
 
 fn handle_production_stream_with_limits<F>(
     stream: &mut TcpStream,
     request_read_timeout: Duration,
     max_request_bytes: usize,
-    mut handle_get: F,
+    mut handle_request: F,
 ) -> Result<()>
 where
-    F: FnMut(&str) -> Result<DevResponse>,
+    F: FnMut(&ParsedHttpRequest) -> Result<DevResponse>,
 {
     stream.set_read_timeout(Some(
         request_read_timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT),
@@ -1570,10 +1747,7 @@ where
     let write_options = ResponseWriteOptions {
         gzip: request.accepts_gzip(),
     };
-    let response = match request.method.as_str() {
-        "GET" => handle_get(&request.path)?,
-        _ => DevResponse::method_not_allowed(),
-    };
+    let response = handle_request(&request)?;
 
     write_response_with_options(stream, &response, write_options)?;
     Ok(())
@@ -2015,10 +2189,8 @@ fn strip_query(path: &str) -> &str {
     path.split_once('?').map_or(path, |(path, _query)| path)
 }
 
-#[allow(dead_code)]
 type FormParseResult<T> = std::result::Result<T, String>;
 
-#[allow(dead_code)]
 fn parse_urlencoded_form(body: &[u8]) -> FormParseResult<BTreeMap<String, ServerActionFormValue>> {
     let mut fields = BTreeMap::new();
     for pair in body.split(|byte| *byte == b'&') {
@@ -2041,7 +2213,6 @@ fn parse_urlencoded_form(body: &[u8]) -> FormParseResult<BTreeMap<String, Server
     Ok(fields)
 }
 
-#[allow(dead_code)]
 fn parse_multipart_form(
     content_type: &str,
     body: &[u8],
@@ -2091,7 +2262,90 @@ fn parse_multipart_form(
     Ok(fields)
 }
 
-#[allow(dead_code)]
+fn server_action_request_from_form(
+    headers: &HttpHeaders,
+    body: &[u8],
+) -> std::result::Result<ServerActionRequest, Box<DevResponse>> {
+    let mut form = parse_server_action_form(headers, body)
+        .map_err(|message| Box::new(DevResponse::bad_request(message)))?;
+    let id = remove_required_action_field(&mut form, SERVER_ACTION_ID_FIELD)?;
+    let route_path = remove_required_action_field(&mut form, SERVER_ACTION_ROUTE_FIELD)?;
+    let request = ServerActionRequest {
+        ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
+        version: SERVER_ACTION_REQUEST_VERSION,
+        id,
+        route_path,
+        form,
+    };
+    ferrite_protocol::validate_server_action_request(&request)
+        .map_err(|error| Box::new(DevResponse::bad_request(error.to_string())))?;
+
+    Ok(request)
+}
+
+fn parse_server_action_form(
+    headers: &HttpHeaders,
+    body: &[u8],
+) -> FormParseResult<BTreeMap<String, ServerActionFormValue>> {
+    let content_type = header_value(headers, "content-type")
+        .ok_or_else(|| "Content-Type is required for server action POST".to_owned())?;
+    let media_type = content_type
+        .split_once(';')
+        .map_or(content_type, |(media_type, _params)| media_type)
+        .trim();
+    if media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+        return parse_urlencoded_form(body);
+    }
+    if media_type.eq_ignore_ascii_case("multipart/form-data") {
+        return parse_multipart_form(content_type, body);
+    }
+
+    Err(format!(
+        "unsupported server action form content type `{content_type}`"
+    ))
+}
+
+fn header_value<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str).or_else(|| {
+        headers
+            .iter()
+            .find(|(candidate, _value)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_candidate, value)| value.as_str())
+    })
+}
+
+fn remove_required_action_field(
+    form: &mut BTreeMap<String, ServerActionFormValue>,
+    field: &str,
+) -> std::result::Result<String, Box<DevResponse>> {
+    match form.remove(field) {
+        Some(ServerActionFormValue::String(value)) if !value.is_empty() => Ok(value),
+        Some(ServerActionFormValue::String(_)) | None => Err(Box::new(DevResponse::bad_request(
+            format!("server action form requires `{field}`"),
+        ))),
+        Some(ServerActionFormValue::List(_)) => Err(Box::new(DevResponse::bad_request(format!(
+            "server action form field `{field}` must contain exactly one value"
+        )))),
+    }
+}
+
+fn server_action_json_response(
+    response: ferrite_protocol::ServerActionResponse,
+) -> Result<DevResponse> {
+    Ok(DevResponse::ok(
+        SERVER_ACTION_RESPONSE_CONTENT_TYPE,
+        serde_json::to_vec(&response)?,
+    ))
+}
+
+fn is_unknown_server_action_error(error: &PageRenderError) -> bool {
+    matches!(
+        error,
+        PageRenderError::NodeFailed { stderr, .. }
+            if stderr.contains("was not registered during route render")
+    )
+}
+
 fn decode_urlencoded_component(bytes: &[u8]) -> FormParseResult<String> {
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -2123,7 +2377,6 @@ fn decode_urlencoded_component(bytes: &[u8]) -> FormParseResult<String> {
         .map_err(|_| "urlencoded server action forms must be UTF-8 text".to_owned())
 }
 
-#[allow(dead_code)]
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -2133,7 +2386,6 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-#[allow(dead_code)]
 fn insert_form_value(
     fields: &mut BTreeMap<String, ServerActionFormValue>,
     name: String,
@@ -2158,7 +2410,6 @@ fn insert_form_value(
     }
 }
 
-#[allow(dead_code)]
 fn multipart_boundary(content_type: &str) -> FormParseResult<String> {
     for parameter in content_type.split(';').skip(1) {
         let Some((name, value)) = parameter.trim().split_once('=') else {
@@ -2177,7 +2428,6 @@ fn multipart_boundary(content_type: &str) -> FormParseResult<String> {
     Err("multipart server action form is missing a boundary".to_owned())
 }
 
-#[allow(dead_code)]
 fn parse_multipart_headers(headers: &str) -> FormParseResult<BTreeMap<String, String>> {
     let mut parsed = BTreeMap::new();
     for line in headers.lines() {
@@ -2196,7 +2446,6 @@ fn parse_multipart_headers(headers: &str) -> FormParseResult<BTreeMap<String, St
     Ok(parsed)
 }
 
-#[allow(dead_code)]
 fn multipart_disposition_is_form_data(value: &str) -> bool {
     value
         .split(';')
@@ -2204,7 +2453,6 @@ fn multipart_disposition_is_form_data(value: &str) -> bool {
         .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("form-data"))
 }
 
-#[allow(dead_code)]
 fn multipart_disposition_has_file(value: &str) -> bool {
     value.split(';').skip(1).any(|parameter| {
         parameter
@@ -2217,7 +2465,6 @@ fn multipart_disposition_has_file(value: &str) -> bool {
     })
 }
 
-#[allow(dead_code)]
 fn multipart_disposition_param(value: &str, expected_name: &str) -> Option<String> {
     value.split(';').skip(1).find_map(|parameter| {
         let (name, value) = parameter.trim().split_once('=')?;
@@ -2228,7 +2475,6 @@ fn multipart_disposition_param(value: &str, expected_name: &str) -> Option<Strin
     })
 }
 
-#[allow(dead_code)]
 fn strip_optional_quotes(value: &str) -> &str {
     value
         .strip_prefix('"')
@@ -3050,6 +3296,93 @@ process.stdout.write(JSON.stringify({
         ))
     }
 
+    fn action_project_for(app: &Path, renderer_body: &str) -> DevProject {
+        let project = app.parent().unwrap().to_path_buf();
+        let renderer = project.join("render-page.mjs");
+        make_script(&renderer, renderer_body);
+        let bundler = project.join("build-client.mjs");
+        make_script(
+            &bundler,
+            r#"
+process.stdout.write(JSON.stringify({
+  script: "/_ferrite/static/route.js",
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: []
+}));
+"#,
+        );
+        DevProject::new(DevServerConfig::new(
+            project.clone(),
+            app.to_path_buf(),
+            project.join(".ferrite/types/routes.d.ts"),
+            renderer,
+            bundler,
+            project.join(".ferrite/dev/static"),
+            "/_ferrite/static".to_owned(),
+        ))
+    }
+
+    fn action_production_project_for(app: &Path, renderer_body: &str) -> ProductionProject {
+        let dev_project = action_project_for(app, renderer_body);
+        let config = dev_project.config();
+        ProductionProject::new(ProductionServerConfig::new(
+            config.project.clone(),
+            config.app_dir.clone(),
+            config.types_out.clone(),
+            config.page_renderer.clone(),
+            config.client_bundler.clone(),
+            config.project.join(".ferrite/server/static"),
+            config.client_public_path.clone(),
+        ))
+    }
+
+    fn action_renderer_body() -> &'static str {
+        r##"
+const mode = process.argv[2];
+if (mode === "--server-action") {
+  const props = JSON.parse(process.argv[4]);
+  const layouts = JSON.parse(process.argv[5]);
+  const conventions = JSON.parse(process.argv[6]);
+  const request = JSON.parse(process.argv[7]);
+  if (request.id.endsWith("#missing")) {
+    console.error(`Ferrite server action "${request.id}" was not registered during route render.`);
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-action-response",
+    version: 1,
+    status: "ok",
+    data: {
+      id: request.id,
+      routePath: request.routePath,
+      title: request.form.title ?? null,
+      tag: request.form.tag ?? null,
+      params: props.params,
+      layoutCount: layouts.length,
+      hasLoading: Boolean(conventions.loading)
+    }
+  }));
+  process.exit(0);
+}
+console.error(`unexpected renderer mode ${mode}`);
+process.exit(1);
+"##
+    }
+
+    fn action_headers(content_type: &str) -> HttpHeaders {
+        BTreeMap::from([("content-type".to_owned(), content_type.to_owned())])
+    }
+
+    fn action_form_body(route: &str) -> Vec<u8> {
+        format!(
+            "__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route={}&title=Hello+Ferrite&tag=rust&tag=tsx",
+            route.replace('/', "%2F")
+        )
+        .into_bytes()
+    }
+
     #[cfg(unix)]
     fn make_script(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -3288,6 +3621,138 @@ process.stdout.write(JSON.stringify({
         };
         assert_eq!(response.status, 400);
         assert!(response.body_text().contains("Transfer-Encoding"));
+    }
+
+    #[test]
+    fn dev_action_post_invokes_route_action_with_urlencoded_form() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/layout.tsx"),
+            "export default function Layout() {}",
+        );
+        write(
+            &app.join("posts/[id]/loading.tsx"),
+            "export default function Loading() {}",
+        );
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let mut project = action_project_for(&app, action_renderer_body());
+
+        let response = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers("application/x-www-form-urlencoded"),
+                &action_form_body("/posts/abc"),
+            )
+            .unwrap();
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+        assert_eq!(body["status"], "ok");
+        assert_eq!(
+            body["data"],
+            json!({
+                "id": "app/posts/[id]/page.tsx#savePost",
+                "routePath": "/posts/abc",
+                "title": "Hello Ferrite",
+                "tag": ["rust", "tsx"],
+                "params": { "id": "abc" },
+                "layoutCount": 1,
+                "hasLoading": true
+            })
+        );
+    }
+
+    #[test]
+    fn dev_action_post_rejects_missing_metadata_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let mut project = action_project_for(&app, action_renderer_body());
+
+        let response = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers("application/x-www-form-urlencoded"),
+                b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&title=Hello",
+            )
+            .unwrap();
+
+        assert_eq!(response.status, 400);
+        assert!(response.body_text().contains("__ferrite_route"));
+    }
+
+    #[test]
+    fn dev_action_post_reports_unknown_routes_and_unsupported_media_types() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let mut project = action_project_for(&app, action_renderer_body());
+
+        let unknown = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers("application/x-www-form-urlencoded"),
+                &action_form_body("/missing"),
+            )
+            .unwrap();
+        assert_eq!(unknown.status, 404);
+        assert!(unknown.body_text().contains("/missing"));
+
+        let unsupported = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers("text/plain"),
+                &action_form_body("/posts/abc"),
+            )
+            .unwrap();
+        assert_eq!(unsupported.status, 400);
+        assert!(unsupported.body_text().contains("unsupported"));
+    }
+
+    #[test]
+    fn production_action_post_observes_real_socket_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let mut project = action_production_project_for(&app, action_renderer_body());
+        project.config.request_observer = Some(ProductionRequestObserver::new(move |event| {
+            captured_events.lock().unwrap().push(event);
+        }));
+        let body = action_form_body("/posts/abc");
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        let headers = response_headers(&response);
+        let body: Value = serde_json::from_slice(response_body(&response)).unwrap();
+        let events = events.lock().unwrap();
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(body["status"], "ok");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, "POST");
+        assert_eq!(events[0].path, "/_ferrite/action");
+        assert_eq!(events[0].status, 200);
+        assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
     }
 
     #[test]
