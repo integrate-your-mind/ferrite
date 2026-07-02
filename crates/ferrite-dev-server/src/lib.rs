@@ -661,7 +661,8 @@ impl ProductionProject {
                                 Ok(parts) => DevResponse::streaming_html(
                                     parts.shell,
                                     parts.chunks.into_iter().map(|chunk| chunk.html).collect(),
-                                ),
+                                )
+                                .with_modulepreload_links(client_bundle_scripts(&client_bundle)),
                                 Err(error) => DevResponse::internal_error(
                                     render_production_render_error(path, match_result, &error),
                                 ),
@@ -715,6 +716,7 @@ impl ProductionProject {
                                     shell,
                                     parts.chunks.into_iter().map(|chunk| chunk.html).collect(),
                                 )
+                                .with_modulepreload_links(client_bundle_scripts(&client_bundle))
                             }
                             Err(error) => DevResponse::internal_error(
                                 render_production_bundle_error(path, match_result, &error),
@@ -828,6 +830,7 @@ pub struct DevResponse {
     pub stream: Option<DevStreamBody>,
     pub cache_control: Option<&'static str>,
     pub route_pattern_header: Option<String>,
+    pub link_headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,6 +849,7 @@ impl DevResponse {
             stream: None,
             cache_control: None,
             route_pattern_header: None,
+            link_headers: Vec::new(),
         }
     }
 
@@ -875,6 +879,7 @@ impl DevResponse {
             }),
             cache_control: None,
             route_pattern_header: None,
+            link_headers: Vec::new(),
         }
     }
 
@@ -904,6 +909,7 @@ impl DevResponse {
             }),
             cache_control: None,
             route_pattern_header: None,
+            link_headers: Vec::new(),
         }
     }
 
@@ -916,6 +922,7 @@ impl DevResponse {
             stream: None,
             cache_control: None,
             route_pattern_header: None,
+            link_headers: Vec::new(),
         }
     }
 
@@ -928,6 +935,7 @@ impl DevResponse {
             stream: None,
             cache_control: None,
             route_pattern_header: None,
+            link_headers: Vec::new(),
         }
     }
 
@@ -940,6 +948,7 @@ impl DevResponse {
             stream: None,
             cache_control: None,
             route_pattern_header: None,
+            link_headers: Vec::new(),
         }
     }
 
@@ -952,6 +961,7 @@ impl DevResponse {
             stream: None,
             cache_control: None,
             route_pattern_header: None,
+            link_headers: Vec::new(),
         }
     }
 
@@ -962,6 +972,15 @@ impl DevResponse {
 
     pub fn with_route_pattern(mut self, value: impl Into<String>) -> Self {
         self.route_pattern_header = Some(value.into());
+        self
+    }
+
+    pub fn with_modulepreload_links(mut self, scripts: Vec<String>) -> Self {
+        self.link_headers.extend(
+            scripts
+                .into_iter()
+                .map(|script| format!("<{script}>; rel=modulepreload; as=script")),
+        );
         self
     }
 
@@ -1440,6 +1459,10 @@ fn write_response_metadata_headers(stream: &mut TcpStream, response: &DevRespons
             "X-Ferrite-Route-Pattern: {}\r\n",
             sanitize_header_value(route_pattern)
         )?;
+    }
+
+    for link in &response.link_headers {
+        write!(stream, "Link: {}\r\n", sanitize_header_value(link))?;
     }
 
     Ok(())
@@ -2302,6 +2325,21 @@ process.stdout.write(JSON.stringify({
         String::from_utf8_lossy(&response[..index]).into_owned()
     }
 
+    fn static_script_src(html: &str) -> String {
+        html.split("src=\"")
+            .find_map(|part| part.strip_prefix("/_ferrite/static/"))
+            .and_then(|part| part.split('"').next())
+            .map(|path| format!("/_ferrite/static/{path}"))
+            .expect("client script")
+    }
+
+    fn assert_modulepreload_link_header(headers: &str, script: &str) {
+        assert!(
+            headers.contains(&format!("Link: <{script}>; rel=modulepreload; as=script")),
+            "headers did not contain modulepreload Link for {script}:\n{headers}"
+        );
+    }
+
     fn response_body(response: &[u8]) -> &[u8] {
         let Some(index) = find_header_end(response) else {
             panic!("response did not contain HTTP header terminator");
@@ -2812,14 +2850,13 @@ process.stdout.write(JSON.stringify({
         assert!(body.contains("<title>Post abc</title>"));
         assert!(body.contains("<h1>Post abc</h1>"));
         assert!(body.contains(r#"<script type="module" src="/_ferrite/static/"#));
-        let script = body
-            .split("src=\"")
-            .find_map(|part| part.strip_prefix("/_ferrite/static/"))
-            .and_then(|part| part.split('"').next())
-            .map(|path| format!("/_ferrite/static/{path}"))
-            .expect("client script");
+        let script = static_script_src(&body);
         assert_fingerprinted_public_path(&script, ".js");
         assert!(body.contains(&format!(r#"<link rel="modulepreload" href="{script}">"#)));
+        assert_eq!(
+            response.link_headers,
+            vec![format!("<{script}>; rel=modulepreload; as=script")]
+        );
         assert!(!body.contains("/__ferrite/client.js"));
         assert!(!body.contains("data-ferrite-build-id"));
         assert!(!body.contains("ferrite-dev-root"));
@@ -2889,6 +2926,7 @@ process.stdout.write(JSON.stringify({
             Some("public, max-age=31536000, immutable")
         );
         assert_eq!(response.route_pattern_header, None);
+        assert!(response.link_headers.is_empty());
         assert!(response.body_text().contains("console.log('client')"));
 
         let unhashed = project.config().client_out_dir.join("manual.js");
@@ -2899,6 +2937,7 @@ process.stdout.write(JSON.stringify({
             unhashed_response.cache_control,
             Some("public, max-age=0, must-revalidate")
         );
+        assert!(unhashed_response.link_headers.is_empty());
     }
 
     #[test]
@@ -2948,6 +2987,9 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected non-strea
         assert!(response.contains("Cache-Control: no-store"));
         assert!(response.contains("X-Ferrite-Route-Pattern: /"));
         assert!(!response.contains("Content-Length:"));
+        let script = static_script_src(&response);
+        let headers = response.split("\r\n\r\n").next().expect("headers");
+        assert_modulepreload_link_header(headers, &script);
         assert!(response.contains("Production shell"));
         assert!(response.contains("Production chunk"));
         assert!(!response.contains("/__ferrite/client.js"));
@@ -2974,6 +3016,8 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected non-strea
         assert!(headers.contains("Vary: Accept-Encoding"));
         assert!(headers.contains("Content-Length:"));
         assert!(!headers.contains("Transfer-Encoding: chunked"));
+        let script = static_script_src(&body);
+        assert_modulepreload_link_header(&headers, &script);
         assert!(body.contains("<h1>Home Page</h1>"));
         assert!(!body.contains("/__ferrite/client.js"));
     }
@@ -2997,6 +3041,8 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected non-strea
         assert!(!headers.contains("Vary: Accept-Encoding"));
         assert!(headers.contains("Content-Length:"));
         assert!(!headers.contains("Transfer-Encoding: chunked"));
+        let script = static_script_src(&body);
+        assert_modulepreload_link_header(&headers, &script);
         assert!(body.contains("<h1>Home Page</h1>"));
     }
 
@@ -3020,6 +3066,7 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected non-strea
         assert!(headers.contains("Vary: Accept-Encoding"));
         assert!(headers.contains("Content-Length:"));
         assert!(!headers.contains("Transfer-Encoding: chunked"));
+        assert!(!headers.contains("Link:"));
         assert!(body.contains(r#""ferrite":"server-payload""#));
         assert!(body.contains("Home Page"));
     }
