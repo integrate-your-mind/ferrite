@@ -18,7 +18,7 @@ Evidence used:
 ## Current External State
 
 - [x] Local branch exists: `codex/protocol-wasm-validation`.
-- [x] Local milestone proof docs exist through milestone 062.
+- [x] Local milestone proof docs exist through milestone 063.
 - [x] Working tree docs were refreshed by a documentation subagent and reviewed locally.
 - [ ] Git remote is configured. `git remote -v` is empty in this checkout.
 - [ ] Work has been pushed to GitHub from this checkout.
@@ -89,6 +89,7 @@ Evidence used:
 - [x] 060: Native prebuild dry-run workflow and verifier.
 - [x] 061: npm package dry-run verifier and publish-prep metadata.
 - [x] 062: First form-based server-action POST transport and example form.
+- [x] 063: Staged npm tarball manifest verification.
 
 ## Vacuous Or Weak Test Audit
 
@@ -97,7 +98,8 @@ Evidence used:
 - [x] Replaced the weak `scripts/verify-npm-packages.test.mjs` report-directory test with a real `verifyNpmPackages()` report test that exercises package validation, build and pack hooks, and `npm-package-report.json` output.
 - [ ] `packages/node/test/binding-resolution.test.mjs` uses fake `require` and fake `readFileSync` helpers. These are acceptable unit tests for resolver branching, but they do not prove a package manager installed optional native packages correctly.
 - [ ] `packages/node/test/prebuild-verifier.test.mjs` uses synthetic temp prebuild package directories. This is good verifier coverage, but it is not hosted-runner proof that each supported platform artifact can be built and aggregated.
-- [ ] `scripts/verify-npm-packages.test.mjs` now exercises the verifier report path, but the verifier still validates release-shaped manifests in memory rather than proving the actual packed tarball manifests are release-shaped.
+- [x] `scripts/verify-npm-packages.test.mjs` now proves the verifier packs from staged release manifests, preserves source manifests, and rejects source-only fields in packed manifests.
+- [ ] The npm package verifier still lacks a clean-project install smoke that consumes the generated local tarballs together.
 - [ ] `packages/protocol-wasm/test/wasm.test.mjs` proves basic Rust WASM validation paths, but streaming payload validation and browser bundler integration for the WASM package remain unproven.
 - [ ] Runtime DOM coverage uses `happy-dom`. It is useful for deterministic unit and integration behavior, but it is not a real browser-engine proof for hydration, navigation, form submission, focus, pointer, or history behavior.
 - [ ] Several proof docs rely on `--once`, temp fixtures, or local generated packages. These are valid milestone checks, but they are not deployment proof.
@@ -108,8 +110,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 
 - [ ] GitHub state is local-only: no remote, no push, no PR, no remote CI run.
 - [ ] Native prebuild workflow proof is local plus committed YAML; the hosted runner matrix has not run from this checkout.
-- [ ] npm package proof is `npm pack --dry-run --json`; no package was published, and no clean-project install consumed the generated tarballs.
-- [ ] Live tarball inspection showed the actual package tarballs still contain source manifests with `private: true`; `@ferrite/runtime` and `@ferrite/protocol-wasm` also still contain `workspace:*` dependencies in their packed `package.json` files. The current verifier's release manifest rewrite is in-memory proof only.
+- [ ] npm package proof now includes local staged `npm pack --json` tarball manifest inspection; no package was published, and no clean-project install consumed the generated tarballs.
+- [x] Live staged-tarball inspection now proves packed manifests omit `private: true` and rewrite Ferrite `workspace:*` dependencies to `0.1.0` in `@ferrite/protocol-wasm` and `@ferrite/runtime`.
 - [ ] `@ferrite/node` optional prebuild resolution is partly proven with faked package resolution and locally generated package directories, not a real registry install.
 - [ ] Page-renderer server-action invocation tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary, but not a static deployment manifest or real app-module action registry.
 - [ ] Browser runtime proof uses Node plus `happy-dom`, not Playwright/WebDriver in Chromium/WebKit/Firefox.
@@ -119,7 +121,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 ## Productionization Checklist
 
 - [ ] Configure the GitHub remote, push the branch, open PRs, and record real PR URLs.
-- [ ] Run remote CI for lint, test, build, typecheck, example build, npm package dry-run, and native prebuild dry-run workflows.
+- [ ] Run remote CI for lint, test, build, typecheck, example build, npm package tarball verification, and native prebuild dry-run workflows.
 - [ ] Add static server-action manifests, automatic `"use server"` export discovery, and deployment-stable action IDs.
 - [ ] Add a browser-side progressive-enhancement helper for server-action form submissions and validated action responses.
 - [ ] Add real browser tests for hydration, payload navigation, streaming, popstate restoration, prefetching, and server-action form submission.
@@ -129,7 +131,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
 - [ ] Decide code-signing/notarization policy for native artifacts.
 - [ ] Add deployment documentation for production serve topology, TLS/proxy expectations, process supervision, environment variables, rollback, and observability.
-- [ ] Make the npm verifier pack release-shaped staging manifests, reject `private: true` and `workspace:*` in actual tarball manifests, and add package-install smoke tests that consume packed packages from a clean project.
+- [x] Make the npm verifier pack release-shaped staging manifests and reject `private: true` and `workspace:*` in actual tarball manifests.
+- [ ] Add package-install smoke tests that consume packed packages from a clean project.
 - [ ] Add browser bundler integration for the WASM protocol package where appropriate.
 - [ ] Add stronger protocol-WASM proof for streaming payload validation, not only basic server-payload JSON validation.
 - [ ] Add upload streaming or file-part support if server actions need file inputs; current behavior rejects file parts.
@@ -142,5 +145,5 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Current README and architecture docs now call out the missing static action manifest and client progressive-enhancement helper.
 - [x] Historical superpowers implementation plans now mark completed local work as checked where proof docs and commits show completion.
 - [x] Remote-dependent push/PR steps remain unclaimed because this checkout has no remote.
-- [x] The audit now distinguishes in-memory release-manifest verification from actual packed tarball manifest proof.
+- [x] The audit now distinguishes staged tarball manifest proof from remaining clean-install, remote-CI, and publication proof.
 - [ ] Historical proof docs are not rewritten to erase their original "Not Proven Yet" context; they should be read as milestone snapshots.

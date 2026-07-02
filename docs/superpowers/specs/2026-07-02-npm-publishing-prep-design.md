@@ -1,5 +1,7 @@
 # npm Publishing Prep Design
 
+Status note, July 2, 2026: this design captured the original milestone 061 dry-run verifier. Milestone 063 superseded the npm verifier behavior: `scripts/verify-npm-packages.mjs` now stages release-shaped package copies, runs real `npm pack --json`, inspects packed `package/package.json`, and records both release and packed manifests. Clean-project tarball installation, remote CI, and npm publication remain unproven.
+
 ## Purpose
 
 Milestone 061 prepares Ferrite's JavaScript-facing packages for real npm publication without publishing anything. Milestone 060 proved a dry-run native prebuild packaging path, but all workspace packages remain private and there is no remote, npm registry configuration, trusted publisher, or token setup in this checkout. This milestone should make the publishable package metadata explicit, prove package tarball contents locally, and draft release automation that can be enabled once GitHub/npm publishing state exists.
@@ -12,7 +14,7 @@ In scope:
 
 - Define which packages are intended to become public npm packages.
 - Add package metadata required for npm readiness: description, license, repository, publish access, keywords, and stable packed file lists.
-- Add a release verifier that can build each public package, run pack dry-runs, inspect packed contents, and fail on missing release files.
+- Add a release verifier that can build each public package, stage release manifests, inspect packed contents, and fail on missing release files.
 - Add a non-publishing release dry-run workflow for package publication checks.
 - Document local proof, remote proof gaps, and the next publishing milestone.
 
@@ -54,7 +56,7 @@ Each publishable source package should have:
 - precise `files`
 - exports with type entries where applicable
 
-`@ferrite/protocol`, `@ferrite/protocol-wasm`, and `@ferrite/runtime` can carry normal workspace dependencies during development, but publish verification must eventually inspect the exact `package.json` that npm would publish. The implemented local verifier rewrites and validates release-shaped manifests in memory and records them in `dist/npm-packages/npm-package-report.json`; it does not yet stage those manifests into the package directories before `npm pack --dry-run`. Until that changes, actual tarballs may still contain source manifests with `private: true` or `workspace:*`.
+`@ferrite/protocol`, `@ferrite/protocol-wasm`, and `@ferrite/runtime` can carry normal workspace dependencies during development. The current local verifier stages release-shaped package copies, runs real `npm pack --json`, inspects the packed `package/package.json`, and records both release and packed manifests in `dist/npm-packages/npm-package-report.json`. Packed manifests must not contain `private: true` or `workspace:*`.
 
 `@ferrite/node` needs special handling for platform packages. Adding optional dependencies for unpublished native packages directly to the source manifest can cause local installs to resolve packages that do not exist yet. The safer first slice is:
 
@@ -70,7 +72,7 @@ Add a dependency-free Node script, tentatively `scripts/verify-npm-packages.mjs`
 Responsibilities:
 
 - Build required packages before inspection.
-- Run `npm pack --dry-run --json` in each public package directory.
+- Run `npm pack --json` in each staged public package directory.
 - Parse the returned file list.
 - Verify required release contents for each package.
 - Verify package metadata fields.
@@ -81,7 +83,7 @@ Responsibilities:
 - Verify `@ferrite/node` includes `binding.js`, `index.js`, `index.d.ts`, and excludes local source-build `dist/ferrite-node.node` from the main package unless the design intentionally keeps source-build fallback artifacts in the package.
 - Verify generated native prebuild package manifests include `publishConfig.access: "public"` or an equivalent public publish path before actual publication is enabled.
 
-The verifier should not require npm authentication and should not contact the registry. Use `npm pack --dry-run --json` rather than `npm publish --dry-run` for local deterministic proof. `npm publish --dry-run` can remain documented as a later remote/manual proof because npm may perform registry or auth checks even in dry-run mode.
+The verifier should not require npm authentication and should not contact the registry. Use staged `npm pack --json` rather than `npm publish --dry-run` for local deterministic proof. `npm publish --dry-run` can remain documented as a later remote/manual proof because npm may perform registry or auth checks even in dry-run mode.
 
 ## Workflow Design
 

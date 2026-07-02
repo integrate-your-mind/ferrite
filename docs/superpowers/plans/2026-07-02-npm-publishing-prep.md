@@ -1,10 +1,12 @@
 # npm Publishing Prep Implementation Plan
 
+Status note, July 2, 2026: this plan records the original milestone 061 dry-run implementation. Milestone 063 superseded the npm verifier behavior: `scripts/verify-npm-packages.mjs` now stages release-shaped package copies, runs real `npm pack --json`, inspects packed `package/package.json`, and records both release and packed manifests. Dry-run snippets below are historical plan details, not the current verifier contract.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prepare Ferrite's JavaScript-facing packages for npm publication dry-runs without publishing packages or inventing unavailable GitHub/npm remote state.
 
-**Architecture:** Keep source packages private while adding release metadata that is knowable locally, then add a dependency-free verifier that builds packages, runs `npm pack --dry-run --json`, checks packed file lists, validates release-shaped manifests in memory, and fails closed for missing remote-only metadata when publish mode is requested. Add one read-only GitHub Actions dry-run workflow and milestone proof docs that separate local package proof from unavailable remote/npm proof.
+**Architecture:** Keep source packages private while adding release metadata that is knowable locally. The current verifier builds packages, stages release-shaped package copies, runs real `npm pack --json`, checks packed file lists, validates packed manifests from the tarball, and fails closed for missing remote-only metadata when publish mode is requested. The read-only GitHub Actions workflow remains non-publishing and remote proof remains unavailable in this checkout.
 
 **Tech Stack:** Node.js ESM scripts and `node:test`, pnpm workspace package scripts, npm CLI pack dry-runs, GitHub Actions, Rust/Cargo build gates, TypeScript package builds.
 
@@ -12,7 +14,7 @@
 
 ## File Structure
 
-- Create `scripts/verify-npm-packages.mjs`: build source packages, inspect package manifests, run `npm pack --dry-run --json`, validate packed files and release-shaped manifest invariants, and write JSON reports under `dist/npm-packages`.
+- Create `scripts/verify-npm-packages.mjs`: build source packages, inspect package manifests, stage release-shaped package copies, run `npm pack --json`, validate packed files and packed manifest invariants, and write JSON reports under `dist/npm-packages`.
 - Create `scripts/verify-npm-packages.test.mjs`: unit tests for manifest rewriting, workspace dependency rejection, required metadata checks, pack-output file checks, and remote-metadata publish-mode failures.
 - Modify `package.json`: add `release:verify:npm` and include the verifier test in the root `test` script.
 - Modify `packages/protocol/package.json`: add local release metadata that is knowable without a remote.
@@ -33,7 +35,7 @@ The current checkout has no configured Git remote and no confirmed npm publisher
 
 The verifier has two modes:
 
-- Default local mode: proves source package metadata, package file lists, workspace dependency rewriting in release-shaped report manifests, native optional dependency expectations in those report manifests, and `npm pack --dry-run` output without requiring a remote URL. It does not stage rewritten manifests into the package directories before packing.
+- Default local mode: proves source package metadata, staged package file lists, workspace dependency rewriting in packed tarball manifests, native optional dependency expectations in those packed manifests, and `npm pack --json` output without requiring a remote URL.
 - Publish-manifest mode: enabled by `--publish-manifest --repository-url <https-url>`. This mode validates that release-shaped manifests contain `repository`, `homepage`, `bugs`, no `private: true`, no `workspace:*`, public access, and native optional dependencies. It fails if the URL is missing.
 
 The dry-run workflow uses default local mode because the repository URL is not configured in this checkout. The proof document must list publish-manifest mode, real npm publication, trusted publishing, registry credentials, remote CI execution, and actual tarballs with rewritten publish manifests as not proven until those states exist.
@@ -991,12 +993,12 @@ pnpm release:verify:npm
 Add one current-boundary bullet:
 
 ```md
-- npm package dry-run verification for the JS-facing packages is local-only until a GitHub remote and npm publisher state are configured.
+- npm package tarball verification for the JS-facing packages is local-only until a GitHub remote and npm publisher state are configured.
 ```
 
 - [x] **Step 4: Update architecture boundary**
 
-In `docs/architecture.md`, update the TypeScript facade package bullets to mention local npm package dry-run verification.
+In `docs/architecture.md`, update the TypeScript facade package bullets to mention local npm package tarball verification.
 
 In `## Next Milestones`, replace the first item with:
 

@@ -1,13 +1,17 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { argv, cwd, exit } from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { gunzip as gunzipCallback } from "node:zlib";
 
 import { SUPPORTED_NATIVE_PREBUILD_TARGETS } from "../packages/node/binding.js";
 
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const reportDir = join(workspaceRoot, "dist", "npm-packages");
+const gunzip = promisify(gunzipCallback);
 
 export const RELEASE_PACKAGE_NAMES = Object.freeze([
   "@ferrite/protocol",
@@ -133,6 +137,20 @@ export function validatePackFiles({ packageName, files, requiredFiles, forbidden
   }
 }
 
+export function validatePackedManifest({ packageName, releaseManifest, packedManifest }) {
+  if (packedManifest.name !== releaseManifest.name) {
+    throw new Error(`${packageName}: tarball manifest name ${packedManifest.name ?? "<missing>"} does not match.`);
+  }
+  if (packedManifest.version !== releaseManifest.version) {
+    throw new Error(`${packageName}: tarball manifest version ${packedManifest.version ?? "<missing>"} does not match.`);
+  }
+  if (Object.hasOwn(packedManifest, "private")) {
+    throw new Error(`${packageName}: tarball manifest must not contain private.`);
+  }
+  assertNoWorkspaceSpecifiers(packageName, packedManifest);
+  assertReleaseDependencyFields(packageName, releaseManifest, packedManifest);
+}
+
 export async function verifyNpmPackages({
   publishManifestMode = false,
   repositoryUrl,
@@ -143,60 +161,83 @@ export async function verifyNpmPackages({
   workspaceRoot: packageWorkspaceRoot = workspaceRoot,
   reportDir: packageReportDir = reportDir,
   runCommand = run,
-  packDryRun = npmPackDryRun,
+  packPackage,
 } = {}) {
+  const packageVerifier = packPackage ?? npmPackPackage;
   const packageVersions = new Map();
   const manifests = new Map();
   const results = [];
+  const stageRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-stage-"));
 
-  for (const config of releasePackages) {
-    const sourceManifest =
-      packageManifests?.get(config.name) ??
-      (await readJson(join(packageWorkspaceRoot, config.directory, "package.json")));
-    manifests.set(config.name, sourceManifest);
-    packageVersions.set(config.name, sourceManifest.version);
+  try {
+    for (const config of releasePackages) {
+      const sourceManifest =
+        packageManifests?.get(config.name) ??
+        (await readJson(join(packageWorkspaceRoot, config.directory, "package.json")));
+      manifests.set(config.name, sourceManifest);
+      packageVersions.set(config.name, sourceManifest.version);
+    }
+
+    assertAlignedVersions(packageVersions);
+
+    for (const config of releasePackages) {
+      await runCommand(config.build[0], config.build[1], { cwd: packageWorkspaceRoot });
+      const packageDir = join(packageWorkspaceRoot, config.directory);
+      const sourceManifest = manifests.get(config.name);
+      const releaseManifest = createReleaseManifest(sourceManifest, {
+        packageVersions,
+        nativePackageNames,
+        repositoryUrl,
+      });
+      validateManifestMetadata({
+        packageName: config.name,
+        sourceManifest,
+        releaseManifest,
+        publishManifestMode,
+      });
+      const stagedPackageDir = await stageReleasePackage({
+        sourceDir: packageDir,
+        stageRoot,
+        packageName: config.name,
+        releaseManifest,
+      });
+      const packResult = normalizePackResult(config.name, await packageVerifier(stagedPackageDir));
+      validatePackFiles({
+        packageName: config.name,
+        files: packResult.files,
+        requiredFiles: config.requiredFiles,
+        forbiddenFiles: config.forbiddenFiles,
+      });
+      if (packResult.packedManifest) {
+        validatePackedManifest({
+          packageName: config.name,
+          releaseManifest,
+          packedManifest: packResult.packedManifest,
+        });
+      }
+      const result = {
+        name: config.name,
+        directory: config.directory,
+        version: sourceManifest.version,
+        files: packResult.files,
+        releaseManifest,
+      };
+      if (packResult.packedManifest) {
+        result.packedManifest = packResult.packedManifest;
+      }
+      results.push(result);
+    }
+
+    if (writeReports) {
+      await rm(packageReportDir, { force: true, recursive: true });
+      await mkdir(packageReportDir, { recursive: true });
+      await writeFile(join(packageReportDir, "npm-package-report.json"), `${JSON.stringify(results, null, 2)}\n`);
+    }
+
+    return results;
+  } finally {
+    await rm(stageRoot, { force: true, recursive: true });
   }
-
-  assertAlignedVersions(packageVersions);
-
-  for (const config of releasePackages) {
-    await runCommand(config.build[0], config.build[1], { cwd: packageWorkspaceRoot });
-    const packageDir = join(packageWorkspaceRoot, config.directory);
-    const sourceManifest = manifests.get(config.name);
-    const releaseManifest = createReleaseManifest(sourceManifest, {
-      packageVersions,
-      nativePackageNames,
-      repositoryUrl,
-    });
-    validateManifestMetadata({
-      packageName: config.name,
-      sourceManifest,
-      releaseManifest,
-      publishManifestMode,
-    });
-    const packFiles = await packDryRun(packageDir);
-    validatePackFiles({
-      packageName: config.name,
-      files: packFiles,
-      requiredFiles: config.requiredFiles,
-      forbiddenFiles: config.forbiddenFiles,
-    });
-    results.push({
-      name: config.name,
-      directory: config.directory,
-      version: sourceManifest.version,
-      files: packFiles,
-      releaseManifest,
-    });
-  }
-
-  if (writeReports) {
-    await rm(packageReportDir, { force: true, recursive: true });
-    await mkdir(packageReportDir, { recursive: true });
-    await writeFile(join(packageReportDir, "npm-package-report.json"), `${JSON.stringify(results, null, 2)}\n`);
-  }
-
-  return results;
 }
 
 function rewriteWorkspaceDependencies(manifest, packageVersions) {
@@ -231,6 +272,24 @@ function assertNoWorkspaceSpecifiers(packageName, manifest) {
   }
 }
 
+function assertReleaseDependencyFields(packageName, releaseManifest, packedManifest) {
+  for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+    const releaseDependencies = releaseManifest[field];
+    if (!releaseDependencies || typeof releaseDependencies !== "object") {
+      continue;
+    }
+    const packedDependencies = packedManifest[field];
+    if (!packedDependencies || typeof packedDependencies !== "object") {
+      throw new Error(`${packageName}: tarball manifest is missing ${field}.`);
+    }
+    for (const [name, range] of Object.entries(releaseDependencies)) {
+      if (packedDependencies[name] !== range) {
+        throw new Error(`${packageName}: tarball manifest ${field}.${name} does not match ${range}.`);
+      }
+    }
+  }
+}
+
 function assertAlignedVersions(packageVersions) {
   const versions = new Set(packageVersions.values());
   if (versions.size !== 1) {
@@ -246,23 +305,94 @@ function packageDirectoryFor(packageName) {
   return config.directory;
 }
 
-async function npmPackDryRun(packageDir) {
-  const output = await run("npm", ["pack", "--dry-run", "--json"], { cwd: packageDir, capture: true });
+async function stageReleasePackage({ sourceDir, stageRoot, packageName, releaseManifest }) {
+  const stagedPackageDir = join(stageRoot, sanitizePackageName(packageName));
+  await cp(sourceDir, stagedPackageDir, {
+    recursive: true,
+    filter: (source) => !source.split(/[\\/]/).includes("node_modules"),
+  });
+  await writeFile(join(stagedPackageDir, "package.json"), `${JSON.stringify(releaseManifest, null, 2)}\n`);
+  return stagedPackageDir;
+}
+
+function sanitizePackageName(packageName) {
+  return packageName.replace(/^@/, "").replace(/[\\/]/g, "-").replace(/[^A-Za-z0-9._-]/g, "-");
+}
+
+function normalizePackResult(packageName, packResult) {
+  if (Array.isArray(packResult)) {
+    return { files: packResult, packedManifest: undefined };
+  }
+  if (!packResult || typeof packResult !== "object" || !Array.isArray(packResult.files)) {
+    throw new Error(`${packageName}: package verifier did not return a packed file list.`);
+  }
+  return {
+    files: packResult.files,
+    packedManifest: packResult.packedManifest,
+  };
+}
+
+async function npmPackPackage(packageDir) {
+  const tarballDir = join(dirname(packageDir), ".tarballs");
+  await mkdir(tarballDir, { recursive: true });
+  const output = await run("npm", ["pack", "--json", "--pack-destination", tarballDir], { cwd: packageDir, capture: true });
   let parsed;
   try {
     parsed = JSON.parse(output);
   } catch (error) {
-    throw new Error(`${packageDir}: npm pack --dry-run --json returned invalid JSON: ${error.message}`);
+    throw new Error(`${packageDir}: npm pack --json returned invalid JSON: ${error.message}`);
   }
   const [entry] = parsed;
   if (!entry || !Array.isArray(entry.files)) {
     throw new Error(`${packageDir}: npm pack output did not include a file list.`);
   }
-  return entry.files.map((file) => file.path);
+  if (typeof entry.filename !== "string" || entry.filename.trim() === "") {
+    throw new Error(`${packageDir}: npm pack output did not include a tarball filename.`);
+  }
+  const packedManifest = await readTarballPackageManifest(join(tarballDir, entry.filename));
+  return {
+    files: entry.files.map((file) => file.path),
+    packedManifest,
+  };
 }
 
 async function readJson(path) {
   return JSON.parse(await readFile(path, "utf8"));
+}
+
+async function readTarballPackageManifest(tarballPath) {
+  const archive = await gunzip(await readFile(tarballPath));
+  let offset = 0;
+  while (offset + 512 <= archive.length) {
+    const header = archive.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) {
+      break;
+    }
+    const name = readTarString(header, 0, 100);
+    const prefix = readTarString(header, 345, 155);
+    const path = prefix ? `${prefix}/${name}` : name;
+    const sizeText = readTarString(header, 124, 12).trim();
+    const size = Number.parseInt(sizeText || "0", 8);
+    if (!Number.isFinite(size) || size < 0) {
+      throw new Error(`${tarballPath}: invalid tar entry size for ${path}.`);
+    }
+    const dataStart = offset + 512;
+    const dataEnd = dataStart + size;
+    if (dataEnd > archive.length) {
+      throw new Error(`${tarballPath}: truncated tar entry for ${path}.`);
+    }
+    if (path === "package/package.json") {
+      return JSON.parse(archive.subarray(dataStart, dataEnd).toString("utf8"));
+    }
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+  throw new Error(`${tarballPath}: package/package.json was not found.`);
+}
+
+function readTarString(buffer, start, length) {
+  const field = buffer.subarray(start, start + length);
+  const end = field.indexOf(0);
+  return field.subarray(0, end === -1 ? field.length : end).toString("utf8");
 }
 
 function assertString(value, message) {
@@ -337,7 +467,7 @@ async function main() {
   const options = parseArgs(argv.slice(2));
   const results = await verifyNpmPackages(options);
   for (const result of results) {
-    console.log(`Verified npm package dry-run for ${result.name} with ${result.files.length} packed files.`);
+    console.log(`Verified npm package tarball for ${result.name} with ${result.files.length} packed files.`);
   }
 }
 

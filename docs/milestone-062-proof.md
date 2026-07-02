@@ -41,6 +41,7 @@ Ferrite does not yet have automatic `"use server"` export discovery or a static 
 - `pnpm release:verify:npm`: passed; verified dry-runs for `@ferrite/protocol`, `@ferrite/protocol-wasm`, `@ferrite/runtime`, and `@ferrite/node`.
 - Later local commit `c2f535e fix(runtime): flush client bundle responses` fixed the client bundle executor so route client bundle responses are flushed before process exit.
 - Later local commit `efe44cc test(release): verify npm package reports` strengthened `scripts/verify-npm-packages.test.mjs` so the report test now exercises `verifyNpmPackages()` with package validation, build and pack hooks, and `npm-package-report.json` output.
+- Follow-up milestone 063 changed `pnpm release:verify:npm` from dry-run file-list proof to staged real-tarball proof that inspects packed manifests.
 
 ## Remote State
 
@@ -53,7 +54,7 @@ Ferrite does not yet have automatic `"use server"` export discovery or a static 
 - Remote CI, because this checkout has no configured Git remote.
 - A real pull request, for the same no-remote reason.
 - npm publication.
-- npm tarballs with rewritten publish manifests; the current release verifier records rewritten manifests in a report but does not stage them into real packed tarballs.
+- Clean-project installs from generated local npm tarballs.
 - Flight-compatible React Server Components.
 - Automatic `"use server"` discovery.
 - A static server-action manifest or persistent deployment registry.

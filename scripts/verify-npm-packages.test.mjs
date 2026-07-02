@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   createReleaseManifest,
   validateManifestMetadata,
   validatePackFiles,
+  validatePackedManifest,
   verifyNpmPackages,
 } from "./verify-npm-packages.mjs";
 
@@ -131,6 +132,45 @@ test("pack file validation accepts required files and rejects forbidden files", 
   );
 });
 
+test("packed manifest validation rejects source-only release blockers", () => {
+  const releaseManifest = {
+    name: "@ferrite/runtime",
+    version: "0.1.0",
+    dependencies: {
+      "@ferrite/protocol": "0.1.0",
+    },
+  };
+
+  assert.throws(
+    () =>
+      validatePackedManifest({
+        packageName: "@ferrite/runtime",
+        releaseManifest,
+        packedManifest: {
+          ...releaseManifest,
+          private: true,
+        },
+      }),
+    /@ferrite\/runtime: tarball manifest must not contain private/,
+  );
+
+  assert.throws(
+    () =>
+      validatePackedManifest({
+        packageName: "@ferrite/runtime",
+        releaseManifest,
+        packedManifest: {
+          name: "@ferrite/runtime",
+          version: "0.1.0",
+          dependencies: {
+            "@ferrite/protocol": "workspace:*",
+          },
+        },
+      }),
+    /@ferrite\/runtime: release manifest contains workspace specifier dependencies.@ferrite\/protocol/,
+  );
+});
+
 test("verifier validates packages and writes the inspected report", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-npm-report-"));
   const buildCalls = [];
@@ -168,7 +208,7 @@ test("verifier validates packages and writes the inspected report", async () => 
         buildCalls.push({ command, args, cwd: options.cwd });
         return "";
       },
-      packDryRun: async (packageDir) => {
+      packPackage: async (packageDir) => {
         packCalls.push(packageDir);
         return ["package/dist/index.js", "package/dist/index.d.ts"];
       },
@@ -187,8 +227,107 @@ test("verifier validates packages and writes the inspected report", async () => 
       },
     ]);
     assert.equal(packCalls.length, 1);
-    assert.equal(packCalls[0].endsWith("packages/protocol"), true);
+    assert.notEqual(packCalls[0], join(process.cwd(), "packages/protocol"));
     assert.deepEqual(report, results);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("verifier packs a staged release manifest instead of the source manifest", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-stage-"));
+  try {
+    await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
+    await mkdir(join(root, "packages", "runtime", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
+    await writeFile(join(root, "packages", "runtime", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "runtime", "dist", "index.d.ts"), "export {};\n");
+    await writeFile(
+      join(root, "packages", "protocol", "package.json"),
+      `${JSON.stringify(
+        {
+          name: "@ferrite/protocol",
+          version: "0.1.0",
+          private: true,
+          description: "Ferrite protocol package.",
+          license: "UNLICENSED",
+          keywords: ["ferrite"],
+          files: ["dist"],
+          exports: { ".": "./dist/index.js" },
+          publishConfig: { access: "public" },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await writeFile(
+      join(root, "packages", "runtime", "package.json"),
+      `${JSON.stringify(
+        {
+          name: "@ferrite/runtime",
+          version: "0.1.0",
+          private: true,
+          description: "Ferrite runtime package.",
+          license: "UNLICENSED",
+          keywords: ["ferrite"],
+          files: ["dist"],
+          exports: { ".": "./dist/index.js" },
+          dependencies: {
+            "@ferrite/protocol": "workspace:*",
+          },
+          publishConfig: { access: "public" },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const results = await verifyNpmPackages({
+      releasePackages: [
+        {
+          name: "@ferrite/protocol",
+          directory: "packages/protocol",
+          build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+          requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+          forbiddenFiles: ["src/index.ts", "test"],
+        },
+        {
+          name: "@ferrite/runtime",
+          directory: "packages/runtime",
+          build: ["pnpm", ["--filter", "@ferrite/runtime", "build"]],
+          requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+          forbiddenFiles: ["src/index.ts", "test"],
+        },
+      ],
+      nativePackageNames: [],
+      workspaceRoot: root,
+      reportDir: join(root, "reports"),
+      runCommand: async () => "",
+      packPackage: async (packageDir) => {
+        const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
+        assert.equal(Object.hasOwn(manifest, "private"), false);
+        assert.notEqual(packageDir, join(root, "packages", manifest.name.replace("@ferrite/", "")));
+        if (manifest.name === "@ferrite/runtime") {
+          assert.deepEqual(manifest.dependencies, {
+            "@ferrite/protocol": "0.1.0",
+          });
+        }
+        return {
+          files: ["package/dist/index.js", "package/dist/index.d.ts", "package/package.json"],
+          packedManifest: manifest,
+        };
+      },
+    });
+
+    const runtimeSourceManifest = JSON.parse(await readFile(join(root, "packages", "runtime", "package.json"), "utf8"));
+    assert.equal(runtimeSourceManifest.private, true);
+    assert.deepEqual(runtimeSourceManifest.dependencies, {
+      "@ferrite/protocol": "workspace:*",
+    });
+    assert.deepEqual(results[1].packedManifest.dependencies, {
+      "@ferrite/protocol": "0.1.0",
+    });
   } finally {
     await rm(root, { force: true, recursive: true });
   }
