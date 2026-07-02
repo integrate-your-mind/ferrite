@@ -4,7 +4,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -34,6 +38,7 @@ const DEFAULT_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub enum DevServerError {
@@ -110,6 +115,48 @@ impl DevServerConfig {
             client_out_dir,
             client_public_path,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProductionShutdownController {
+    shutdown: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProductionShutdownSignal {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl ProductionShutdownController {
+    pub fn new_pair() -> (Self, ProductionShutdownSignal) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                shutdown: Arc::clone(&shutdown),
+            },
+            ProductionShutdownSignal { shutdown },
+        )
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+}
+
+impl ProductionShutdownSignal {
+    pub fn never() -> Self {
+        Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
     }
 }
 
@@ -1116,59 +1163,60 @@ impl DevResponse {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ProductionInFlightLimit {
-    max: usize,
-    state: Arc<(Mutex<usize>, Condvar)>,
+#[derive(Debug)]
+struct ProductionWorkerPool {
+    sender: mpsc::Sender<TcpStream>,
+    workers: Vec<thread::JoinHandle<()>>,
 }
 
-impl ProductionInFlightLimit {
-    fn new(max: usize) -> Self {
-        Self {
-            max: max.max(1),
-            state: Arc::new((Mutex::new(0), Condvar::new())),
+impl ProductionWorkerPool {
+    fn new(worker_count: usize, project: Arc<Mutex<ProductionProject>>) -> Self {
+        let worker_count = worker_count.max(1);
+        let (sender, receiver) = mpsc::channel::<TcpStream>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for _ in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            let project = Arc::clone(&project);
+            workers.push(thread::spawn(move || {
+                loop {
+                    let stream = {
+                        let receiver = receiver
+                            .lock()
+                            .expect("production worker receiver mutex poisoned");
+                        receiver.recv()
+                    };
+                    let Ok(mut stream) = stream else {
+                        break;
+                    };
+                    let _ = handle_production_stream_concurrent(&mut stream, &project);
+                }
+            }));
         }
+
+        Self { sender, workers }
     }
 
-    fn acquire(&self) -> ProductionInFlightPermit {
-        let (lock, condition) = &*self.state;
-        let mut in_flight = lock.lock().expect("in-flight limiter mutex poisoned");
-        while *in_flight >= self.max {
-            in_flight = condition
-                .wait(in_flight)
-                .expect("in-flight limiter mutex poisoned");
-        }
-        *in_flight += 1;
-        ProductionInFlightPermit {
-            state: Arc::clone(&self.state),
-        }
+    fn send(&self, stream: TcpStream) -> Result<()> {
+        self.sender.send(stream).map_err(|_| {
+            DevServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "production worker pool is closed",
+            ))
+        })
     }
 
     #[cfg(test)]
-    fn try_acquire(&self) -> Option<ProductionInFlightPermit> {
-        let (lock, _condition) = &*self.state;
-        let mut in_flight = lock.lock().expect("in-flight limiter mutex poisoned");
-        if *in_flight >= self.max {
-            return None;
-        }
-        *in_flight += 1;
-        Some(ProductionInFlightPermit {
-            state: Arc::clone(&self.state),
-        })
+    fn worker_count(&self) -> usize {
+        self.workers.len()
     }
-}
 
-#[derive(Debug)]
-struct ProductionInFlightPermit {
-    state: Arc<(Mutex<usize>, Condvar)>,
-}
-
-impl Drop for ProductionInFlightPermit {
-    fn drop(&mut self) {
-        let (lock, condition) = &*self.state;
-        let mut in_flight = lock.lock().expect("in-flight limiter mutex poisoned");
-        *in_flight = in_flight.saturating_sub(1);
-        condition.notify_one();
+    fn shutdown(self) {
+        drop(self.sender);
+        for worker in self.workers {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -1411,18 +1459,39 @@ pub fn serve_production_listener_concurrent(
     listener: TcpListener,
     project: ProductionProject,
 ) -> Result<()> {
-    let limit = ProductionInFlightLimit::new(project.config.max_in_flight_requests);
+    serve_production_listener_with_shutdown(listener, project, ProductionShutdownSignal::never())
+}
+
+pub fn serve_production_listener_with_shutdown(
+    listener: TcpListener,
+    project: ProductionProject,
+    shutdown: ProductionShutdownSignal,
+) -> Result<()> {
+    listener.set_nonblocking(true)?;
+    let worker_count = project.config.max_in_flight_requests;
     let project = Arc::new(Mutex::new(project));
-    loop {
-        let permit = limit.acquire();
-        let (stream, _addr) = listener.accept()?;
-        let project = Arc::clone(&project);
-        thread::spawn(move || {
-            let _permit = permit;
-            let mut stream = stream;
-            let _ = handle_production_stream_concurrent(&mut stream, &project);
-        });
+    let pool = ProductionWorkerPool::new(worker_count, project);
+
+    while !shutdown.is_shutdown() {
+        match listener.accept() {
+            Ok((stream, _addr)) => pool.send(stream)?,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(PRODUCTION_ACCEPT_POLL_INTERVAL);
+            }
+            Err(error) => {
+                pool.shutdown();
+                return Err(error.into());
+            }
+        }
     }
+
+    pool.shutdown();
+    Ok(())
 }
 
 pub fn serve_production_listener_once(
@@ -2689,6 +2758,26 @@ process.stdout.write(JSON.stringify({
         output
     }
 
+    fn request_to_addr(addr: std::net::SocketAddr, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.write_all(request).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn wait_for_path(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn production_config_defaults_are_bounded() {
         let temp = tempfile::tempdir().unwrap();
@@ -2806,17 +2895,100 @@ setInterval(() => {}, 1000);
     }
 
     #[test]
-    fn production_in_flight_limit_caps_parallel_permits() {
-        let limit = ProductionInFlightLimit::new(2);
-        let first = limit.try_acquire().expect("first permit");
-        let second = limit.try_acquire().expect("second permit");
+    fn production_worker_pool_clamps_empty_worker_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = Arc::new(Mutex::new(production_project_for(&app)));
 
-        assert!(limit.try_acquire().is_none());
+        let pool = ProductionWorkerPool::new(0, project);
 
-        drop(first);
-        let third = limit.try_acquire().expect("permit after release");
-        drop(second);
-        drop(third);
+        assert_eq!(pool.worker_count(), 1);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn production_worker_pool_serves_multiple_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Post() {}",
+        );
+        let project = production_project_for(&app);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (controller, signal) = ProductionShutdownController::new_pair();
+
+        let server = thread::spawn(move || {
+            serve_production_listener_with_shutdown(listener, project, signal).unwrap();
+        });
+
+        let home = request_to_addr(addr, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let post = request_to_addr(addr, b"GET /posts/abc HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        controller.shutdown();
+        server.join().unwrap();
+
+        assert!(home.starts_with("HTTP/1.1 200 OK"));
+        assert!(home.contains("X-Ferrite-Route-Pattern: /"));
+        assert!(post.starts_with("HTTP/1.1 200 OK"));
+        assert!(post.contains("X-Ferrite-Route-Pattern: /posts/:id"));
+    }
+
+    #[test]
+    fn production_shutdown_drains_accepted_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let marker = temp.path().join("render-started.txt");
+        let marker_json = serde_json::to_string(marker.to_str().unwrap()).unwrap();
+        let project = production_project_for(&app);
+        make_script(
+            &temp.path().join("render-page.mjs"),
+            &format!(
+                r#"
+const fs = await import("node:fs/promises");
+const mode = process.argv[2];
+if (mode === "--metadata") {{
+  process.stdout.write(JSON.stringify({{ title: "Drained", description: "Shutdown drain" }}));
+  process.exit(0);
+}}
+if (mode === "--stream") {{
+  await fs.writeFile({marker_json}, "started");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  process.stdout.write(JSON.stringify({{
+    ferrite: "render-stream",
+    version: 1,
+    shell: [2, "main", {{}}, [[2, "h1", {{}}, [[0, "Drained request"]]]]],
+    chunks: []
+  }}));
+  process.exit(0);
+}}
+process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
+"#
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (controller, signal) = ProductionShutdownController::new_pair();
+
+        let server = thread::spawn(move || {
+            serve_production_listener_with_shutdown(listener, project, signal).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        wait_for_path(&marker);
+        controller.shutdown();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("Drained request"));
     }
 
     #[test]
