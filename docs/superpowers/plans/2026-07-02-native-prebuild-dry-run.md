@@ -296,7 +296,7 @@ Create `packages/node/scripts/verify-prebuild-package.mjs`:
 import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { argv, exitCode } from "node:process";
+import process, { argv } from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
@@ -490,7 +490,7 @@ async function main() {
 if (import.meta.url === pathToFileURL(argv[1]).href) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
-    exitCode = 1;
+    process.exitCode = 1;
   });
 }
 ```
