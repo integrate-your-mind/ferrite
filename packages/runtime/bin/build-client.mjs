@@ -41,17 +41,15 @@ await mkdir(outDir, { recursive: true });
 if (!(await routeHasClientDirective([pageFile, ...layoutFiles]))) {
   const clientReferences = await collectClientReferences([pageFile, ...layoutFiles], projectRoot);
   const referenceBundles = await bundleClientReferences(clientReferences, projectRoot, outDir, publicPath);
-  process.stdout.write(
-    `${JSON.stringify({
-      script: null,
-      styles: [],
-      outputs: referenceBundles.outputs,
-      sourcemaps: referenceBundles.sourcemaps,
-      assets: referenceBundles.assets,
-      clientReferences: referenceBundles.clientReferences,
-      hydration: "server",
-    })}\n`,
-  );
+  await writeResponse({
+    script: null,
+    styles: [],
+    outputs: referenceBundles.outputs,
+    sourcemaps: referenceBundles.sourcemaps,
+    assets: referenceBundles.assets,
+    clientReferences: referenceBundles.clientReferences,
+    hydration: "server",
+  });
   process.exit(0);
 }
 
@@ -118,7 +116,7 @@ try {
     clientReferences: [],
   };
 
-  process.stdout.write(`${JSON.stringify(response)}\n`);
+  await writeResponse(response);
 } catch (error) {
   console.error(error instanceof Error ? error.stack || error.message : String(error));
   process.exit(1);
@@ -140,6 +138,18 @@ function relativeOut(outDir, outputPath) {
 
 function publicUrl(publicPath, relativePath) {
   return `${publicPath}/${relativePath}`.replace(/\/{2,}/g, "/");
+}
+
+async function writeResponse(response) {
+  await new Promise((resolveWrite, rejectWrite) => {
+    process.stdout.write(`${JSON.stringify(response)}\n`, (error) => {
+      if (error) {
+        rejectWrite(error);
+        return;
+      }
+      resolveWrite();
+    });
+  });
 }
 
 function ferriteRuntimeAliasPlugin() {
