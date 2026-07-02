@@ -10,13 +10,15 @@
     }
   },
   "files": [
+    "binding.js",
     "dist",
     "index.d.ts",
     "index.js"
   ],
   "scripts": {
     "build": "cargo build -p ferrite-node && node scripts/copy-native.mjs",
+    "prebuild:package": "pnpm build && node scripts/create-prebuild-package.mjs",
     "test": "pnpm build && node --test test/*.test.mjs",
-    "typecheck": "node --check index.js && node --check scripts/copy-native.mjs"
+    "typecheck": "node --check binding.js && node --check index.js && node --check scripts/copy-native.mjs && node --check scripts/create-prebuild-package.mjs"
   }
 }
