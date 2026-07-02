@@ -33,10 +33,10 @@ The current checkout has no configured Git remote and no confirmed npm publisher
 
 The verifier has two modes:
 
-- Default local mode: proves source package metadata, package file lists, workspace dependency rewriting, native optional dependency expectations, and `npm pack --dry-run` output without requiring a remote URL.
+- Default local mode: proves source package metadata, package file lists, workspace dependency rewriting in release-shaped report manifests, native optional dependency expectations in those report manifests, and `npm pack --dry-run` output without requiring a remote URL. It does not stage rewritten manifests into the package directories before packing.
 - Publish-manifest mode: enabled by `--publish-manifest --repository-url <https-url>`. This mode validates that release-shaped manifests contain `repository`, `homepage`, `bugs`, no `private: true`, no `workspace:*`, public access, and native optional dependencies. It fails if the URL is missing.
 
-The dry-run workflow uses default local mode because the repository URL is not configured in this checkout. The proof document must list publish-manifest mode, real npm publication, trusted publishing, registry credentials, and remote CI execution as not proven until those states exist.
+The dry-run workflow uses default local mode because the repository URL is not configured in this checkout. The proof document must list publish-manifest mode, real npm publication, trusted publishing, registry credentials, remote CI execution, and actual tarballs with rewritten publish manifests as not proven until those states exist.
 
 ## Task 1: Add Release Verifier Tests
 
@@ -950,7 +950,7 @@ Goal: prove Ferrite's JavaScript-facing packages can be built and inspected as n
 Scope:
 
 - Add locally knowable npm package metadata to public Ferrite package manifests.
-- Add a verifier for package builds, release-shaped manifests, and `npm pack --dry-run` file output.
+- Add a verifier for package builds, release-shaped report manifests, and `npm pack --dry-run` file output.
 - Verify native prebuild package release metadata.
 - Add a read-only GitHub Actions npm package dry-run workflow.
 - Document proof and remote publishing gaps.

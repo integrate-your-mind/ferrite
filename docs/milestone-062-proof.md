@@ -39,11 +39,13 @@ Ferrite does not yet have automatic `"use server"` export discovery or a static 
 - `pnpm dev:once`: passed.
 - `pnpm build:example`: passed.
 - `pnpm release:verify:npm`: passed; verified dry-runs for `@ferrite/protocol`, `@ferrite/protocol-wasm`, `@ferrite/runtime`, and `@ferrite/node`.
+- Later local commit `c2f535e fix(runtime): flush client bundle responses` fixed the client bundle executor so route client bundle responses are flushed before process exit.
+- Later local commit `efe44cc test(release): verify npm package reports` strengthened `scripts/verify-npm-packages.test.mjs` so the report test now exercises `verifyNpmPackages()` with package validation, build and pack hooks, and `npm-package-report.json` output.
 
 ## Remote State
 
 - `git status --short --branch`: branch `codex/protocol-wasm-validation` with local working changes before this proof commit.
-- `git log --oneline -8`: latest local commits included `d12ceb2 feat(dev-server): handle server action posts` and `de4c09c feat(dev-server): parse server action posts`.
+- `git log --oneline -8`: latest local commits now include `efe44cc test(release): verify npm package reports`, `c2f535e fix(runtime): flush client bundle responses`, `d12ceb2 feat(dev-server): handle server action posts`, and `de4c09c feat(dev-server): parse server action posts`.
 - `git remote -v`: no configured remote, so no push or pull request could be created from this checkout.
 
 ## Not Proven
@@ -51,6 +53,7 @@ Ferrite does not yet have automatic `"use server"` export discovery or a static 
 - Remote CI, because this checkout has no configured Git remote.
 - A real pull request, for the same no-remote reason.
 - npm publication.
+- npm tarballs with rewritten publish manifests; the current release verifier records rewritten manifests in a report but does not stage them into real packed tarballs.
 - Flight-compatible React Server Components.
 - Automatic `"use server"` discovery.
 - A static server-action manifest or persistent deployment registry.

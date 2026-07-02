@@ -54,7 +54,7 @@ Each publishable source package should have:
 - precise `files`
 - exports with type entries where applicable
 
-`@ferrite/protocol`, `@ferrite/protocol-wasm`, and `@ferrite/runtime` can carry normal workspace dependencies during development, but publish verification must inspect the packed manifest that npm would publish. The verifier should ensure no `workspace:*` dependency specifier remains in packed output.
+`@ferrite/protocol`, `@ferrite/protocol-wasm`, and `@ferrite/runtime` can carry normal workspace dependencies during development, but publish verification must eventually inspect the exact `package.json` that npm would publish. The implemented local verifier rewrites and validates release-shaped manifests in memory and records them in `dist/npm-packages/npm-package-report.json`; it does not yet stage those manifests into the package directories before `npm pack --dry-run`. Until that changes, actual tarballs may still contain source manifests with `private: true` or `workspace:*`.
 
 `@ferrite/node` needs special handling for platform packages. Adding optional dependencies for unpublished native packages directly to the source manifest can cause local installs to resolve packages that do not exist yet. The safer first slice is:
 
@@ -74,8 +74,8 @@ Responsibilities:
 - Parse the returned file list.
 - Verify required release contents for each package.
 - Verify package metadata fields.
-- Verify packed manifests do not contain `private: true` when running in publish-manifest mode.
-- Verify packed manifests do not contain `workspace:*` dependency specifiers.
+- Verify release-shaped manifests do not contain `private: true` when running in publish-manifest mode.
+- Verify release-shaped manifests do not contain `workspace:*` dependency specifiers, and add a later tarball-staging check that proves the same invariant in actual packed package manifests.
 - Verify package names and versions are aligned across Ferrite packages.
 - Verify `@ferrite/protocol-wasm` includes `dist/ferrite_protocol_wasm.wasm`.
 - Verify `@ferrite/node` includes `binding.js`, `index.js`, `index.d.ts`, and excludes local source-build `dist/ferrite-node.node` from the main package unless the design intentionally keeps source-build fallback artifacts in the package.
@@ -115,7 +115,7 @@ The next milestone should add a real publish workflow only after:
 - npm trusted publishing or token-based publishing is configured.
 - Release trigger policy is chosen, such as tag-based or GitHub release-based.
 - The native prebuild dry-run has passed on every supported runner.
-- Package tarball verification passes locally and in CI.
+- Package tarball verification passes locally and in CI, including manifest inspection after rewritten publish manifests are staged.
 
 When real publishing is enabled, scoped packages should publish with public access and provenance. For first-time scoped package publication, the command shape should be equivalent to:
 
@@ -134,6 +134,7 @@ The verifier should fail closed for:
 - Version mismatches between Ferrite packages.
 - Missing WASM artifact in `@ferrite/protocol-wasm`.
 - Missing expected native package metadata.
+- Rewritten release manifests existing only in report output instead of the actual packed tarball.
 - Any attempted publish command in the dry-run workflow.
 
 Error messages should identify the package, field, and expected invariant.
@@ -161,6 +162,7 @@ Remote proof after a GitHub remote exists:
 - Successful `npm-publish-dry-run.yml`.
 - Artifact containing pack inspection reports.
 - Existing native prebuild dry-run passing for every supported runner.
+- A clean-project install from staged tarballs whose package manifests no longer contain source-only `private` or `workspace:*` fields.
 
 ## Documentation Updates
 
@@ -170,13 +172,14 @@ Update `README.md` and `docs/architecture.md` to distinguish:
 
 - npm publication is prepared but not performed.
 - remote CI proof is unavailable in this local checkout until a remote exists.
+- the current verifier proves release-shaped manifests in report output, not actual rewritten tarball manifests.
 - real publish automation remains the next release milestone.
 
 ## Acceptance Criteria
 
 - The intended publishable package set is explicit.
 - Package metadata is ready for dry-run publication checks.
-- Local package verifier proves packed content and metadata invariants.
+- Local package verifier proves packed file lists and report-level release-manifest invariants, with actual rewritten tarball manifests left as an explicit follow-up.
 - The dry-run workflow has no publish side effects and no registry credentials.
 - Full local gates pass.
 - The proof document lists npm publishing, trusted publishing setup, registry credentials, and real remote CI execution as not proven when they are not available.
