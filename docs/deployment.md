@@ -15,7 +15,7 @@ Ferrite can:
 - return server-payload JSON with `?__ferrite_payload=server`
 - return line-delimited server-payload stream frames with `?__ferrite_payload=stream`
 - accept explicit form-based server-action POSTs at `POST /_ferrite/action`
-- reject action POSTs when browser-supplied `Origin` or `Referer` hosts differ from `Host`
+- require a valid `Host` header for action POSTs and reject action POSTs when browser-supplied `Origin` or `Referer` hosts differ from `Host`
 - gzip eligible HTML and payload responses when `Accept-Encoding` allows it
 - bound request reads, request size, in-flight workers, and render subprocess timeouts
 - drain accepted production requests through the Rust shutdown-aware listener API

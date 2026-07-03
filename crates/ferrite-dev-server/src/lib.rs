@@ -2454,7 +2454,9 @@ fn enforce_server_action_origin(
     headers: &HttpHeaders,
 ) -> std::result::Result<(), Box<DevResponse>> {
     let Some(host_header) = header_value(headers, "host") else {
-        return Ok(());
+        return Err(Box::new(DevResponse::forbidden(
+            "server action Host header is required",
+        )));
     };
     let Some(host) = normalize_authority(host_header) else {
         return Err(Box::new(DevResponse::forbidden(
@@ -3924,6 +3926,14 @@ process.exit(1);
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("Host"));
+
+        let missing_host = action_headers("application/x-www-form-urlencoded");
+        let response =
+            server_action_request_from_form(&missing_host, &action_form_body("/posts/abc"))
+                .expect_err("missing host should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("Host header is required"));
     }
 
     #[test]
@@ -3947,7 +3957,7 @@ process.exit(1);
         let response = project
             .handle_post(
                 "/_ferrite/action",
-                &action_headers("application/x-www-form-urlencoded"),
+                &action_headers_with_host("application/x-www-form-urlencoded"),
                 &action_form_body("/posts/abc"),
             )
             .unwrap();
@@ -4007,7 +4017,7 @@ process.exit(1);
         let response = project
             .handle_post(
                 "/_ferrite/action",
-                &action_headers("application/x-www-form-urlencoded"),
+                &action_headers_with_host("application/x-www-form-urlencoded"),
                 b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&title=Hello",
             )
             .unwrap();
@@ -4029,7 +4039,7 @@ process.exit(1);
         let unknown = project
             .handle_post(
                 "/_ferrite/action",
-                &action_headers("application/x-www-form-urlencoded"),
+                &action_headers_with_host("application/x-www-form-urlencoded"),
                 &action_form_body("/missing"),
             )
             .unwrap();
@@ -4039,7 +4049,7 @@ process.exit(1);
         let unsupported = project
             .handle_post(
                 "/_ferrite/action",
-                &action_headers("text/plain"),
+                &action_headers_with_host("text/plain"),
                 &action_form_body("/posts/abc"),
             )
             .unwrap();
