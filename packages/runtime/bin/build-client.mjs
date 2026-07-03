@@ -50,6 +50,17 @@ const runtimeSrcRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "s
 const outDir = resolve(outDirArg);
 const publicPath = publicPathArg.replace(/\/$/, "");
 const entryName = routeToEntryName(routePath);
+const fileLoaders = {
+  ".png": "file",
+  ".jpg": "file",
+  ".jpeg": "file",
+  ".gif": "file",
+  ".svg": "file",
+  ".webp": "file",
+  ".woff": "file",
+  ".woff2": "file",
+  ".wasm": "file",
+};
 await mkdir(outDir, { recursive: true });
 
 if (!(await routeHasClientDirective([pageFile, ...layoutFiles]))) {
@@ -109,21 +120,13 @@ try {
     outdir: outDir,
     entryNames: entryName,
     assetNames: "assets/[name]-[hash]",
+    publicPath,
     sourcemap: true,
     metafile: true,
     jsx: "automatic",
     jsxImportSource: "@ferrite/runtime",
     plugins: [ferriteRuntimeAliasPlugin()],
-    loader: {
-      ".png": "file",
-      ".jpg": "file",
-      ".jpeg": "file",
-      ".gif": "file",
-      ".svg": "file",
-      ".webp": "file",
-      ".woff": "file",
-      ".woff2": "file",
-    },
+    loader: fileLoaders,
     logLevel: "silent",
   });
 
@@ -258,19 +261,11 @@ async function bundleActionBootstrap(routeEntryName, projectRoot, outDir, public
       outdir: outDir,
       entryNames: entryName,
       assetNames: "assets/[name]-[hash]",
+      publicPath,
       sourcemap: true,
       metafile: true,
       plugins: [ferriteRuntimeAliasPlugin()],
-      loader: {
-        ".png": "file",
-        ".jpg": "file",
-        ".jpeg": "file",
-        ".gif": "file",
-        ".svg": "file",
-        ".webp": "file",
-        ".woff": "file",
-        ".woff2": "file",
-      },
+      loader: fileLoaders,
       logLevel: "silent",
     });
     return summarizeBuildResult(result, outDir, entryFile, publicPath);
@@ -301,21 +296,13 @@ async function bundleClientReference(clientReference, projectRoot, outDir, publi
       outdir: outDir,
       entryNames: entryName,
       assetNames: "assets/[name]-[hash]",
+      publicPath,
       sourcemap: true,
       metafile: true,
       jsx: "automatic",
       jsxImportSource: "@ferrite/runtime",
       plugins: [ferriteRuntimeAliasPlugin()],
-      loader: {
-        ".png": "file",
-        ".jpg": "file",
-        ".jpeg": "file",
-        ".gif": "file",
-        ".svg": "file",
-        ".webp": "file",
-        ".woff": "file",
-        ".woff2": "file",
-      },
+      loader: fileLoaders,
       logLevel: "silent",
     });
     return summarizeBuildResult(result, outDir, entryFile, publicPath);
