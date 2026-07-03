@@ -97,6 +97,7 @@ Evidence used:
 - [x] 068: Dedicated server-only route action bootstrap asset.
 - [x] 069: Chromium proof for generated server-action form enhancement.
 - [x] 070: Server-action `Origin`/`Referer` same-host rejection in dev and production adapters.
+- [x] 071: Rust-backed WASM validation for server-payload stream frames.
 
 ## Vacuous Or Weak Test Audit
 
@@ -107,7 +108,7 @@ Evidence used:
 - [ ] `packages/node/test/prebuild-verifier.test.mjs` uses synthetic temp prebuild package directories. This is good verifier coverage, but it is not hosted-runner proof that each supported platform artifact can be built and aggregated.
 - [x] `scripts/verify-npm-packages.test.mjs` now proves the verifier packs from staged release manifests, preserves source manifests, and rejects source-only fields in packed manifests.
 - [x] The npm package verifier now clean-installs the generated local tarballs together in an offline temp project, smoke-imports protocol/runtime/WASM-safe packages, and checks `@ferrite/node` package presence without importing unpublished native prebuilds.
-- [ ] `packages/protocol-wasm/test/wasm.test.mjs` proves basic Rust WASM validation paths, but streaming payload validation and browser bundler integration for the WASM package remain unproven.
+- [ ] `packages/protocol-wasm/test/wasm.test.mjs` now proves Rust WASM validation for server-payload packets and stream frames. Browser bundler integration for the WASM package remains unproven.
 - [ ] Runtime DOM coverage now includes Chromium proof for generated server-action form enhancement, but most hydration, navigation, streaming, focus, pointer, and history behavior still relies on deterministic `happy-dom` coverage.
 - [x] `enhanceServerActionForms()` has focused red-to-green coverage for the normal enhanced submit path, invalid response failure path, plain-form fallback, and listener cleanup.
 - [ ] Several proof docs rely on `--once`, temp fixtures, or local generated packages. These are valid milestone checks, but they are not deployment proof.
@@ -146,7 +147,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Make the npm verifier pack release-shaped staging manifests and reject `private: true` and `workspace:*` in actual tarball manifests.
 - [x] Add package-install smoke tests that consume packed packages from a clean project.
 - [ ] Add browser bundler integration for the WASM protocol package where appropriate.
-- [ ] Add stronger protocol-WASM proof for streaming payload validation, not only basic server-payload JSON validation.
+- [x] Add stronger protocol-WASM proof for streaming payload validation, not only basic server-payload JSON validation.
 - [ ] Add upload streaming or file-part support if server actions need file inputs; current behavior rejects file parts.
 - [ ] Add client event actions only after the form-action registry and security model are stable.
 - [ ] Define the long-term RSC/Flight compatibility strategy; current payload protocol is Ferrite-owned and not Flight-compatible.

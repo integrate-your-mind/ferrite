@@ -1,10 +1,11 @@
-import type { ServerPayloadPacket } from "@ferrite/protocol";
+import type { ServerPayloadPacket, ServerPayloadStreamFrame } from "@ferrite/protocol";
 
 type FerriteProtocolWasmExports = WebAssembly.Exports & {
   memory: WebAssembly.Memory;
   ferrite_alloc(len: number): number;
   ferrite_dealloc(ptr: number, len: number): void;
   ferrite_validate_server_payload_json(ptr: number, len: number): number;
+  ferrite_validate_server_payload_stream_frame_json(ptr: number, len: number): number;
   ferrite_last_error_ptr(): number;
   ferrite_last_error_len(): number;
   ferrite_clear_last_error(): void;
@@ -13,6 +14,8 @@ type FerriteProtocolWasmExports = WebAssembly.Exports & {
 export type FerriteProtocolWasm = {
   validateServerPayloadJson(json: string): void;
   validateServerPayload(payload: ServerPayloadPacket): ServerPayloadPacket;
+  validateServerPayloadStreamFrameJson(json: string): void;
+  validateServerPayloadStreamFrame(frame: ServerPayloadStreamFrame): ServerPayloadStreamFrame;
 };
 
 export async function instantiateFerriteProtocolWasm(
@@ -25,11 +28,22 @@ export async function instantiateFerriteProtocolWasm(
   const decoder = new TextDecoder();
 
   function validateServerPayloadJson(json: string): void {
+    validateJsonWithWasm(json, exports.ferrite_validate_server_payload_json);
+  }
+
+  function validateServerPayloadStreamFrameJson(json: string): void {
+    validateJsonWithWasm(json, exports.ferrite_validate_server_payload_stream_frame_json);
+  }
+
+  function validateJsonWithWasm(
+    json: string,
+    validate: (ptr: number, len: number) => number,
+  ): void {
     const bytes = encoder.encode(json);
     const ptr = exports.ferrite_alloc(bytes.length);
     try {
       new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
-      if (exports.ferrite_validate_server_payload_json(ptr, bytes.length) !== 1) {
+      if (validate(ptr, bytes.length) !== 1) {
         throw new TypeError(readLastError(exports, decoder));
       }
     } finally {
@@ -42,6 +56,11 @@ export async function instantiateFerriteProtocolWasm(
     validateServerPayload(payload) {
       validateServerPayloadJson(JSON.stringify(payload));
       return payload;
+    },
+    validateServerPayloadStreamFrameJson,
+    validateServerPayloadStreamFrame(frame) {
+      validateServerPayloadStreamFrameJson(JSON.stringify(frame));
+      return frame;
     },
   };
 }
@@ -71,6 +90,7 @@ function validateExports(exports: WebAssembly.Exports): FerriteProtocolWasmExpor
     "ferrite_alloc",
     "ferrite_dealloc",
     "ferrite_validate_server_payload_json",
+    "ferrite_validate_server_payload_stream_frame_json",
     "ferrite_last_error_ptr",
     "ferrite_last_error_len",
     "ferrite_clear_last_error",

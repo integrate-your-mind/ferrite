@@ -40,6 +40,28 @@ test("returns typed payloads after WASM validation", async () => {
   assert.equal(protocol.validateServerPayload(payload), payload);
 });
 
+test("validates server payload stream frames through Rust WASM", async () => {
+  const protocol = await loadProtocolWasm();
+  const shell = {
+    ferrite: "server-payload-frame",
+    version: 1,
+    kind: "shell",
+    shell: [0, "shell"],
+    clientReferences: [],
+  };
+  const chunk = {
+    ferrite: "server-payload-frame",
+    version: 1,
+    kind: "chunk",
+    chunk: { id: "s0", root: [0, "chunk"], clientReferences: [] },
+  };
+
+  assert.doesNotThrow(() =>
+    protocol.validateServerPayloadStreamFrameJson(JSON.stringify(shell)),
+  );
+  assert.equal(protocol.validateServerPayloadStreamFrame(chunk), chunk);
+});
+
 test("rejects invalid server payloads through Rust WASM", async () => {
   const protocol = await loadProtocolWasm();
 
@@ -51,6 +73,21 @@ test("rejects invalid server payloads through Rust WASM", async () => {
         shell: [0, "shell"],
         clientReferences: [],
         chunks: [{ id: "bad id", root: [0, "chunk"], clientReferences: [] }],
+      })),
+    /invalid stream chunk id/,
+  );
+});
+
+test("rejects invalid stream frames through Rust WASM", async () => {
+  const protocol = await loadProtocolWasm();
+
+  assert.throws(
+    () =>
+      protocol.validateServerPayloadStreamFrameJson(JSON.stringify({
+        ferrite: "server-payload-frame",
+        version: 1,
+        kind: "chunk",
+        chunk: { id: "bad id", root: [0, "chunk"], clientReferences: [] },
       })),
     /invalid stream chunk id/,
   );
