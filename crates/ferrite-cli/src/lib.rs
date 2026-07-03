@@ -1,3 +1,4 @@
+use std::env;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -254,6 +255,12 @@ struct ServeArgs {
         help = "Maximum production requests handled concurrently"
     )]
     max_in_flight_requests: usize,
+
+    #[arg(
+        long,
+        help = "Environment variable containing the server-action CSRF token required for action POSTs"
+    )]
+    server_action_csrf_token_env: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -312,12 +319,15 @@ pub enum CliError {
     MissingTsConfig(PathBuf),
     TypeScriptNotFound(PathBuf),
     TypeScriptFailed(Option<i32>),
+    Config(String),
 }
 
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
-            CliError::MissingTsConfig(_) | CliError::TypeScriptNotFound(_) => 2,
+            CliError::MissingTsConfig(_)
+            | CliError::TypeScriptNotFound(_)
+            | CliError::Config(_) => 2,
             _ => 1,
         }
     }
@@ -344,6 +354,7 @@ impl fmt::Display for CliError {
                 Some(code) => write!(f, "TypeScript check failed with exit code {code}"),
                 None => write!(f, "TypeScript check was terminated by signal"),
             },
+            CliError::Config(message) => write!(f, "{message}"),
         }
     }
 }
@@ -524,21 +535,25 @@ fn run_cli(cli: Cli) -> Result<()> {
             let client_out = resolve_project_path(&project, &args.client_out);
             let page_renderer = normalize_current_path(&args.page_renderer)?;
             let client_bundler = normalize_current_path(&args.client_bundler)?;
-            let mut production_project = ProductionProject::new(
-                ProductionServerConfig::new(
-                    project.clone(),
-                    app_dir.clone(),
-                    types_out.clone(),
-                    page_renderer.clone(),
-                    client_bundler.clone(),
-                    client_out.clone(),
-                    args.client_public_path.clone(),
-                )
-                .with_render_timeout(Duration::from_millis(args.render_timeout_ms))
-                .with_request_read_timeout(Duration::from_millis(args.request_read_timeout_ms))
-                .with_max_request_bytes(args.max_request_bytes)
-                .with_max_in_flight_requests(args.max_in_flight_requests),
-            );
+            let server_action_csrf_token =
+                resolve_server_action_csrf_token(args.server_action_csrf_token_env.as_deref())?;
+            let mut config = ProductionServerConfig::new(
+                project.clone(),
+                app_dir.clone(),
+                types_out.clone(),
+                page_renderer.clone(),
+                client_bundler.clone(),
+                client_out.clone(),
+                args.client_public_path.clone(),
+            )
+            .with_render_timeout(Duration::from_millis(args.render_timeout_ms))
+            .with_request_read_timeout(Duration::from_millis(args.request_read_timeout_ms))
+            .with_max_request_bytes(args.max_request_bytes)
+            .with_max_in_flight_requests(args.max_in_flight_requests);
+            if let Some(token) = server_action_csrf_token {
+                config = config.with_server_action_csrf_token(token);
+            }
+            let mut production_project = ProductionProject::new(config);
             let production_limits = ServeLimitsOutput::from(production_project.config());
 
             if args.once {
@@ -697,6 +712,31 @@ fn print_build_report(report: &BuildReport) {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn resolve_server_action_csrf_token(env_name: Option<&str>) -> Result<Option<String>> {
+    let Some(env_name) = env_name else {
+        return Ok(None);
+    };
+    if env_name.trim().is_empty() {
+        return Err(CliError::Config(
+            "--server-action-csrf-token-env requires a non-empty environment variable name"
+                .to_owned(),
+        ));
+    }
+
+    let value = env::var(env_name).map_err(|error| {
+        CliError::Config(format!(
+            "could not read server action CSRF token from `{env_name}`: {error}"
+        ))
+    })?;
+    if value.is_empty() {
+        return Err(CliError::Config(format!(
+            "server action CSRF token environment variable `{env_name}` must not be empty"
+        )));
+    }
+
+    Ok(Some(value))
 }
 
 fn run_typescript_check(project: &Path) -> Result<()> {
@@ -914,6 +954,38 @@ mod tests {
         assert_eq!(args.request_read_timeout_ms, 750);
         assert_eq!(args.max_request_bytes, 4096);
         assert_eq!(args.max_in_flight_requests, 8);
+    }
+
+    #[test]
+    fn serve_accepts_server_action_csrf_token_env_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--server-action-csrf-token-env",
+            "FERRITE_ACTION_CSRF",
+            "--once",
+        ])
+        .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(
+            args.server_action_csrf_token_env.as_deref(),
+            Some("FERRITE_ACTION_CSRF")
+        );
+    }
+
+    #[test]
+    fn server_action_csrf_token_env_requires_existing_non_empty_value() {
+        let missing_env = format!("FERRITE_MISSING_CSRF_TOKEN_FOR_TEST_{}", std::process::id());
+        let missing = resolve_server_action_csrf_token(Some(&missing_env)).unwrap_err();
+        assert!(matches!(missing, CliError::Config(_)));
+        assert_eq!(missing.exit_code(), 2);
+
+        let empty = resolve_server_action_csrf_token(Some("")).unwrap_err();
+        assert!(matches!(empty, CliError::Config(_)));
+        assert_eq!(empty.exit_code(), 2);
     }
 
     #[test]

@@ -128,6 +128,7 @@ export type DocumentRenderOptions = {
   routePath: string;
   routePattern?: string;
   buildId?: number;
+  serverActionCsrfToken?: string;
   metadata?: Metadata;
   preloadScripts?: string[];
   styles?: string[];
@@ -165,6 +166,7 @@ export type ServerActionReference<Output = unknown> = {
 export type ServerRenderOptions = {
   routePath?: string;
   routePattern?: string;
+  serverActionCsrfToken?: string;
 };
 
 export type ServerActionInvokeOptions = {
@@ -197,6 +199,7 @@ type PendingStreamChunk = {
 type ServerActionRenderContext = {
   routePath?: string;
   routePattern?: string;
+  csrfToken?: string;
   actions: Map<string, ServerActionReference>;
 };
 
@@ -205,7 +208,12 @@ type MaybePromise<T> = T | Promise<T>;
 const SERVER_ACTION_URL = "/_ferrite/action";
 const SERVER_ACTION_ID_FIELD = "__ferrite_action";
 const SERVER_ACTION_ROUTE_FIELD = "__ferrite_route";
-const RESERVED_SERVER_ACTION_FIELDS = new Set([SERVER_ACTION_ID_FIELD, SERVER_ACTION_ROUTE_FIELD]);
+const SERVER_ACTION_CSRF_FIELD = "__ferrite_csrf";
+const RESERVED_SERVER_ACTION_FIELDS = new Set([
+  SERVER_ACTION_ID_FIELD,
+  SERVER_ACTION_ROUTE_FIELD,
+  SERVER_ACTION_CSRF_FIELD,
+]);
 const serverActionContextStorage = new AsyncLocalStorage<ServerActionRenderContext>();
 
 export function createClientReference<Props extends Record<string, unknown> = Record<string, unknown>>(
@@ -758,9 +766,14 @@ function createServerRenderContext(stream: boolean): ServerRenderContext {
 }
 
 function withServerActionRenderContext<T>(options: ServerRenderOptions, render: () => T): T {
+  if (options.serverActionCsrfToken !== undefined && typeof options.serverActionCsrfToken !== "string") {
+    throw new TypeError("Ferrite server action CSRF token must be a string when provided.");
+  }
+
   const context: ServerActionRenderContext = {
     routePath: options.routePath,
     routePattern: options.routePattern,
+    csrfToken: options.serverActionCsrfToken,
     actions: new Map(),
   };
   return serverActionContextStorage.run(context, render);
@@ -778,6 +791,7 @@ function documentRenderOptionsToServerRenderOptions(options: DocumentRenderOptio
   return {
     routePath: options.routePath,
     routePattern: options.routePattern,
+    serverActionCsrfToken: options.serverActionCsrfToken,
   };
 }
 
@@ -1022,11 +1036,23 @@ function renderServerActionFormMaybe(
   const renderedChildren = renderServerChildrenMaybe(props.children as Child, context);
   if (isPromiseLike(renderedChildren)) {
     return renderedChildren.then((children) =>
-      createSerializedServerActionForm(serializedProps, action.id, actionContext.routePath as string, children),
+      createSerializedServerActionForm(
+        serializedProps,
+        action.id,
+        actionContext.routePath as string,
+        children,
+        actionContext.csrfToken,
+      ),
     );
   }
 
-  return createSerializedServerActionForm(serializedProps, action.id, actionContext.routePath, renderedChildren);
+  return createSerializedServerActionForm(
+    serializedProps,
+    action.id,
+    actionContext.routePath,
+    renderedChildren,
+    actionContext.csrfToken,
+  );
 }
 
 function createSerializedServerActionForm(
@@ -1034,17 +1060,22 @@ function createSerializedServerActionForm(
   actionId: string,
   routePath: string,
   children: SerializableNode[],
+  csrfToken?: string,
 ): SerializableNode {
   assertNoReservedServerActionFields(children);
+  const hiddenFields = [
+    createHiddenServerActionInput(SERVER_ACTION_ID_FIELD, actionId),
+    createHiddenServerActionInput(SERVER_ACTION_ROUTE_FIELD, routePath),
+  ];
+  if (csrfToken !== undefined) {
+    hiddenFields.push(createHiddenServerActionInput(SERVER_ACTION_CSRF_FIELD, csrfToken));
+  }
+
   return {
     kind: "element",
     tag: "form",
     props,
-    children: [
-      createHiddenServerActionInput(SERVER_ACTION_ID_FIELD, actionId),
-      createHiddenServerActionInput(SERVER_ACTION_ROUTE_FIELD, routePath),
-      ...children,
-    ],
+    children: [...hiddenFields, ...children],
   };
 }
 

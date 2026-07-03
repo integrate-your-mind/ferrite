@@ -212,6 +212,7 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                             route_path: route_path.clone(),
                             route_pattern: None,
                             build_id: None,
+                            server_action_csrf_token: None,
                             metadata: metadata.clone(),
                             preload_scripts: client_bundle_scripts(&client_bundle),
                             styles: client_bundle_styles(&client_bundle),

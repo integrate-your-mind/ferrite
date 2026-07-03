@@ -41,6 +41,7 @@ const SERVER_PAYLOAD_STREAM_QUERY_VALUE: &str = "stream";
 const SERVER_ACTION_PATH: &str = "/_ferrite/action";
 const SERVER_ACTION_ID_FIELD: &str = "__ferrite_action";
 const SERVER_ACTION_ROUTE_FIELD: &str = "__ferrite_route";
+const SERVER_ACTION_CSRF_FIELD: &str = "__ferrite_csrf";
 const SERVER_ACTION_RESPONSE_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
@@ -114,6 +115,7 @@ pub struct DevServerConfig {
     pub client_bundler: PathBuf,
     pub client_out_dir: PathBuf,
     pub client_public_path: String,
+    pub server_action_csrf_token: Option<String>,
 }
 
 impl DevServerConfig {
@@ -134,6 +136,7 @@ impl DevServerConfig {
             client_bundler,
             client_out_dir,
             client_public_path,
+            server_action_csrf_token: None,
         }
     }
 }
@@ -229,6 +232,7 @@ pub struct ProductionServerConfig {
     pub render_timeout: Duration,
     pub max_request_bytes: usize,
     pub max_in_flight_requests: usize,
+    pub server_action_csrf_token: Option<String>,
     pub request_observer: Option<ProductionRequestObserver>,
 }
 
@@ -254,6 +258,7 @@ impl ProductionServerConfig {
             render_timeout: DEFAULT_PRODUCTION_RENDER_TIMEOUT,
             max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
             max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
+            server_action_csrf_token: None,
             request_observer: None,
         }
     }
@@ -270,6 +275,11 @@ impl ProductionServerConfig {
 
     pub fn with_max_in_flight_requests(mut self, requests: usize) -> Self {
         self.max_in_flight_requests = requests.max(1);
+        self
+    }
+
+    pub fn with_server_action_csrf_token(mut self, token: impl Into<String>) -> Self {
+        self.server_action_csrf_token = Some(token.into());
         self
     }
 
@@ -439,10 +449,7 @@ impl DevProject {
             .expect("snapshot built before response");
 
         if let Some(match_result) = match_route(path, &snapshot.routes) {
-            let renderer = PageRenderer::new(
-                self.config.project.clone(),
-                self.config.page_renderer.clone(),
-            );
+            let renderer = self.page_renderer();
             let conventions = route_conventions(&match_result.route);
             match mode {
                 RouteResponseMode::Html => {
@@ -468,12 +475,27 @@ impl DevProject {
         }
     }
 
+    fn page_renderer(&self) -> PageRenderer {
+        let renderer = PageRenderer::new(
+            self.config.project.clone(),
+            self.config.page_renderer.clone(),
+        );
+        match &self.config.server_action_csrf_token {
+            Some(token) => renderer.with_server_action_csrf_token(token.clone()),
+            None => renderer,
+        }
+    }
+
     fn action_response(&self, headers: &HttpHeaders, body: &[u8]) -> Result<DevResponse> {
         let snapshot = self
             .snapshot
             .as_ref()
             .expect("snapshot built before response");
-        let request = match server_action_request_from_form(headers, body) {
+        let request = match server_action_request_from_form(
+            headers,
+            body,
+            self.config.server_action_csrf_token.as_deref(),
+        ) {
             Ok(request) => request,
             Err(response) => return Ok(*response),
         };
@@ -483,10 +505,7 @@ impl DevProject {
                 "No Ferrite route matched server action route `{route_path}`"
             )));
         };
-        let renderer = PageRenderer::new(
-            self.config.project.clone(),
-            self.config.page_renderer.clone(),
-        );
+        let renderer = self.page_renderer();
         let conventions = route_conventions(&match_result.route);
 
         match renderer.invoke_server_action(
@@ -563,6 +582,10 @@ impl DevProject {
                                     route_path: path.to_owned(),
                                     route_pattern: Some(match_result.route.path.clone()),
                                     build_id: Some(self.build_id),
+                                    server_action_csrf_token: self
+                                        .config
+                                        .server_action_csrf_token
+                                        .clone(),
                                     metadata: metadata.clone(),
                                     preload_scripts: Vec::new(),
                                     styles: client_bundle_styles(&client_bundle),
@@ -725,6 +748,10 @@ impl DevProject {
                                     route_path: path.to_owned(),
                                     route_pattern: Some(match_result.route.path.clone()),
                                     build_id: Some(self.build_id),
+                                    server_action_csrf_token: self
+                                        .config
+                                        .server_action_csrf_token
+                                        .clone(),
                                     metadata: metadata.clone(),
                                     preload_scripts: Vec::new(),
                                     styles: client_bundle_styles(&client_bundle),
@@ -910,11 +937,7 @@ impl ProductionProject {
             .expect("snapshot built before response");
 
         if let Some(match_result) = match_route(path, &snapshot.routes) {
-            let renderer = PageRenderer::new(
-                self.config.project.clone(),
-                self.config.page_renderer.clone(),
-            )
-            .with_command_timeout(self.config.render_timeout);
+            let renderer = self.page_renderer();
             let conventions = route_conventions(&match_result.route);
             match mode {
                 RouteResponseMode::Html => self.route_stream_response(
@@ -949,12 +972,28 @@ impl ProductionProject {
         }
     }
 
+    fn page_renderer(&self) -> PageRenderer {
+        let renderer = PageRenderer::new(
+            self.config.project.clone(),
+            self.config.page_renderer.clone(),
+        )
+        .with_command_timeout(self.config.render_timeout);
+        match &self.config.server_action_csrf_token {
+            Some(token) => renderer.with_server_action_csrf_token(token.clone()),
+            None => renderer,
+        }
+    }
+
     fn action_response(&self, headers: &HttpHeaders, body: &[u8]) -> Result<DevResponse> {
         let snapshot = self
             .snapshot
             .as_ref()
             .expect("snapshot built before response");
-        let request = match server_action_request_from_form(headers, body) {
+        let request = match server_action_request_from_form(
+            headers,
+            body,
+            self.config.server_action_csrf_token.as_deref(),
+        ) {
             Ok(request) => request,
             Err(response) => return Ok(*response),
         };
@@ -964,11 +1003,7 @@ impl ProductionProject {
                 "No Ferrite route matched server action route `{route_path}`"
             )));
         };
-        let renderer = PageRenderer::new(
-            self.config.project.clone(),
-            self.config.page_renderer.clone(),
-        )
-        .with_command_timeout(self.config.render_timeout);
+        let renderer = self.page_renderer();
         let conventions = route_conventions(&match_result.route);
 
         match renderer.invoke_server_action(
@@ -1049,6 +1084,10 @@ impl ProductionProject {
                                         route_path: path.to_owned(),
                                         route_pattern: Some(match_result.route.path.clone()),
                                         build_id: None,
+                                        server_action_csrf_token: self
+                                            .config
+                                            .server_action_csrf_token
+                                            .clone(),
                                         metadata: metadata.clone(),
                                         preload_scripts: client_bundle_scripts(&client_bundle),
                                         styles: client_bundle_styles(&client_bundle),
@@ -1196,6 +1235,10 @@ impl ProductionProject {
                                         route_path: path.to_owned(),
                                         route_pattern: Some(match_result.route.path.clone()),
                                         build_id: None,
+                                        server_action_csrf_token: self
+                                            .config
+                                            .server_action_csrf_token
+                                            .clone(),
                                         metadata: metadata.clone(),
                                         preload_scripts: client_bundle_scripts(&client_bundle),
                                         styles: client_bundle_styles(&client_bundle),
@@ -2431,12 +2474,14 @@ fn parse_multipart_form(
 fn server_action_request_from_form(
     headers: &HttpHeaders,
     body: &[u8],
+    expected_csrf_token: Option<&str>,
 ) -> std::result::Result<ServerActionRequest, Box<DevResponse>> {
     enforce_server_action_origin(headers)?;
     let mut form = parse_server_action_form(headers, body)
         .map_err(|message| Box::new(DevResponse::bad_request(message)))?;
     let id = remove_required_action_field(&mut form, SERVER_ACTION_ID_FIELD)?;
     let route_path = remove_required_action_field(&mut form, SERVER_ACTION_ROUTE_FIELD)?;
+    enforce_server_action_csrf_token(&mut form, expected_csrf_token)?;
     let request = ServerActionRequest {
         ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
         version: SERVER_ACTION_REQUEST_VERSION,
@@ -2448,6 +2493,42 @@ fn server_action_request_from_form(
         .map_err(|error| Box::new(DevResponse::bad_request(error.to_string())))?;
 
     Ok(request)
+}
+
+fn enforce_server_action_csrf_token(
+    form: &mut BTreeMap<String, ServerActionFormValue>,
+    expected_token: Option<&str>,
+) -> std::result::Result<(), Box<DevResponse>> {
+    let Some(expected_token) = expected_token else {
+        form.remove(SERVER_ACTION_CSRF_FIELD);
+        return Ok(());
+    };
+
+    let received_token =
+        remove_required_action_field(form, SERVER_ACTION_CSRF_FIELD).map_err(|_| {
+            Box::new(DevResponse::forbidden(
+                "server action CSRF token is required",
+            ))
+        })?;
+    if !constant_time_eq(received_token.as_bytes(), expected_token.as_bytes()) {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action CSRF token is invalid",
+        )));
+    }
+
+    Ok(())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut diff = 0;
+    for (left, right) in left.iter().zip(right) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 fn enforce_server_action_origin(
@@ -3658,6 +3739,14 @@ process.exit(1);
         .into_bytes()
     }
 
+    fn action_form_body_with_csrf(route: &str, token: &str) -> Vec<u8> {
+        format!(
+            "__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route={}&__ferrite_csrf={token}&title=Hello+Ferrite&tag=rust&tag=tsx",
+            route.replace('/', "%2F")
+        )
+        .into_bytes()
+    }
+
     #[cfg(unix)]
     fn make_script(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -3904,14 +3993,14 @@ process.exit(1);
         same_origin.insert("origin".to_owned(), "http://localhost:3000".to_owned());
 
         let request =
-            server_action_request_from_form(&same_origin, &action_form_body("/posts/abc"))
+            server_action_request_from_form(&same_origin, &action_form_body("/posts/abc"), None)
                 .expect("same-origin action request should parse");
         assert_eq!(request.route_path, "/posts/abc");
 
         let mut cross_origin = same_origin.clone();
         cross_origin.insert("origin".to_owned(), "https://evil.example".to_owned());
         let response =
-            server_action_request_from_form(&cross_origin, &action_form_body("/posts/abc"))
+            server_action_request_from_form(&cross_origin, &action_form_body("/posts/abc"), None)
                 .expect_err("cross-origin action request should be rejected");
 
         assert_eq!(response.status, 403);
@@ -3921,7 +4010,7 @@ process.exit(1);
         malformed_host.insert("host".to_owned(), "local host".to_owned());
         malformed_host.insert("origin".to_owned(), "http://localhost".to_owned());
         let response =
-            server_action_request_from_form(&malformed_host, &action_form_body("/posts/abc"))
+            server_action_request_from_form(&malformed_host, &action_form_body("/posts/abc"), None)
                 .expect_err("malformed host should be rejected");
 
         assert_eq!(response.status, 403);
@@ -3929,11 +4018,50 @@ process.exit(1);
 
         let missing_host = action_headers("application/x-www-form-urlencoded");
         let response =
-            server_action_request_from_form(&missing_host, &action_form_body("/posts/abc"))
+            server_action_request_from_form(&missing_host, &action_form_body("/posts/abc"), None)
                 .expect_err("missing host should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("Host header is required"));
+    }
+
+    #[test]
+    fn action_form_csrf_guard_requires_matching_configured_token() {
+        let headers = action_headers_with_host("application/x-www-form-urlencoded");
+        let body =
+            b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&title=Hello";
+        let request = server_action_request_from_form(&headers, body, Some("token-123"))
+            .expect("matching CSRF token should parse");
+
+        assert_eq!(request.route_path, "/posts/abc");
+        assert!(!request.form.contains_key(SERVER_ACTION_CSRF_FIELD));
+        assert_eq!(
+            request.form.get("title"),
+            Some(&ServerActionFormValue::String("Hello".to_owned()))
+        );
+
+        let missing = action_form_body("/posts/abc");
+        let response = server_action_request_from_form(&headers, &missing, Some("token-123"))
+            .expect_err("missing CSRF token should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("CSRF token is required"));
+
+        let wrong =
+            b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=wrong";
+        let response = server_action_request_from_form(&headers, wrong, Some("token-123"))
+            .expect_err("wrong CSRF token should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("CSRF token is invalid"));
+
+        let duplicate =
+            b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&__ferrite_csrf=token-123";
+        let response = server_action_request_from_form(&headers, duplicate, Some("token-123"))
+            .expect_err("duplicate CSRF token should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("CSRF token is required"));
     }
 
     #[test]
@@ -3978,6 +4106,42 @@ process.exit(1);
                 "hasLoading": true
             })
         );
+    }
+
+    #[test]
+    fn dev_action_post_requires_configured_csrf_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let mut project = action_project_for(&app, action_renderer_body());
+        project.config.server_action_csrf_token = Some("csrf-token-123".to_owned());
+
+        let missing = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                &action_form_body("/posts/abc"),
+            )
+            .unwrap();
+
+        assert_eq!(missing.status, 403);
+        assert!(missing.body_text().contains("CSRF token is required"));
+
+        let response = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                &action_form_body_with_csrf("/posts/abc", "csrf-token-123"),
+            )
+            .unwrap();
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["data"]["routePath"], "/posts/abc");
     }
 
     #[test]

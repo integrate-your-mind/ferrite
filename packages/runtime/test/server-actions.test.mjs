@@ -214,6 +214,29 @@ test("server render serializes server action forms to POST metadata", async () =
   );
 });
 
+test("server render serializes configured server action CSRF tokens", async () => {
+  const savePost = createSaveAction();
+  const page = {
+    default() {
+      return createElement("form", { action: savePost }, createElement("button", { type: "submit" }, "Save"));
+    },
+  };
+
+  const rendered = await renderPageModule(page, {}, [], {}, {
+    routePath: "/posts/abc",
+    routePattern: "/posts/[id]",
+    serverActionCsrfToken: "csrf-token-123",
+  });
+
+  assert.equal(rendered.kind, "element");
+  assert.equal(rendered.children[2].kind, "element");
+  assert.deepEqual(rendered.children[2].props, {
+    type: "hidden",
+    name: "__ferrite_csrf",
+    value: "csrf-token-123",
+  });
+});
+
 test("server action forms reject conflicting methods and reserved hidden fields", async () => {
   const savePost = createSaveAction();
 
@@ -242,6 +265,26 @@ test("server action forms reject conflicting methods and reserved hidden fields"
               "form",
               { action: savePost },
               createElement("input", { type: "hidden", name: "__ferrite_action", value: "other" }),
+            );
+          },
+        },
+        {},
+        [],
+        {},
+        { routePath: "/posts/abc", routePattern: "/posts/[id]" },
+      ),
+    /reserved Ferrite server action field/,
+  );
+
+  await assert.rejects(
+    () =>
+      renderPageModule(
+        {
+          default() {
+            return createElement(
+              "form",
+              { action: savePost },
+              createElement("input", { type: "hidden", name: "__ferrite_csrf", value: "fake" }),
             );
           },
         },

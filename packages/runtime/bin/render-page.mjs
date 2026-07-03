@@ -26,6 +26,7 @@ const serverActionMode = mode === "--server-action";
 const documentFile = documentMode ? fourthArg : undefined;
 const documentOptionsJson = documentMode ? fifthArg : "{}";
 const actionRequestJson = serverActionMode ? fifthArg : "{}";
+const routeRenderOptionsJson = documentMode || serverActionMode ? "{}" : fifthArg;
 const conventionsJson = documentMode ? sixthArg : (fourthArg ?? "{}");
 
 if (!pageFile) {
@@ -69,6 +70,16 @@ if (documentMode) {
     documentOptions = JSON.parse(documentOptionsJson);
   } catch (error) {
     console.error(`invalid document options JSON: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(2);
+  }
+}
+
+let routeRenderOptions = {};
+if (!documentMode && !serverActionMode) {
+  try {
+    routeRenderOptions = JSON.parse(routeRenderOptionsJson);
+  } catch (error) {
+    console.error(`invalid render options JSON: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(2);
   }
 }
@@ -184,6 +195,7 @@ try {
       props,
       entryModule.layoutModules,
       entryModule.conventionModules,
+      routeRenderOptions,
     );
     process.stdout.write(`${JSON.stringify(stream)}\n`);
   } else if (mode === "--server-payload") {
@@ -192,6 +204,7 @@ try {
       props,
       entryModule.layoutModules,
       entryModule.conventionModules,
+      routeRenderOptions,
     );
     process.stdout.write(`${JSON.stringify(payload)}\n`);
   } else if (mode === "--server-action") {
@@ -252,6 +265,7 @@ try {
       props,
       entryModule.layoutModules,
       entryModule.conventionModules,
+      routeRenderOptions,
     );
     process.stdout.write(`${JSON.stringify(serializable)}\n`);
   }

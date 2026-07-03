@@ -16,6 +16,7 @@ Ferrite can:
 - return line-delimited server-payload stream frames with `?__ferrite_payload=stream`
 - accept explicit form-based server-action POSTs at `POST /_ferrite/action`
 - require a valid `Host` header for action POSTs and reject action POSTs when browser-supplied `Origin` or `Referer` hosts differ from `Host`
+- optionally require a hidden server-action CSRF token loaded from an environment variable
 - gzip eligible HTML and payload responses when `Accept-Encoding` allows it
 - bound request reads, request size, in-flight workers, and render subprocess timeouts
 - drain accepted production requests through the Rust shutdown-aware listener API
@@ -81,6 +82,7 @@ cargo run -p ferrite-cli -- build --project /srv/app --out /srv/app/.ferrite/bui
 Start the production server:
 
 ```sh
+export FERRITE_ACTION_CSRF='<generated-secret-token>'
 cargo run -p ferrite-cli -- serve \
   --project /srv/app \
   --host 127.0.0.1 \
@@ -88,7 +90,8 @@ cargo run -p ferrite-cli -- serve \
   --render-timeout-ms 30000 \
   --request-read-timeout-ms 5000 \
   --max-request-bytes 16384 \
-  --max-in-flight-requests 64
+  --max-in-flight-requests 64 \
+  --server-action-csrf-token-env FERRITE_ACTION_CSRF
 ```
 
 For a packaged binary, run the installed `ferrite` executable with the same arguments.
@@ -104,6 +107,7 @@ Use command arguments for the current runtime knobs:
 - `--request-read-timeout-ms`: maximum time to wait while reading each production HTTP request
 - `--max-request-bytes`: maximum bytes allowed for each production HTTP request header and body
 - `--max-in-flight-requests`: maximum production requests handled concurrently
+- `--server-action-csrf-token-env`: environment variable containing the token rendered into server-action forms and required on action POSTs
 - `--once`: deterministic one-request mode for smoke tests
 - `--request-path`: request target for `--once` smoke tests
 
@@ -122,7 +126,7 @@ curl -i -H 'Accept-Encoding: gzip' http://127.0.0.1:3000/posts/abc
 curl -i http://127.0.0.1:3000/_ferrite/static/<known-built-asset>
 ```
 
-For routes with server-action forms, submit a normal same-host action POST and a cross-origin rejection probe. Do not treat server actions as auth-complete until CSRF/session binding and replay protection are implemented.
+For routes with server-action forms, submit a normal same-host action POST with the rendered `__ferrite_csrf` field, a missing-token rejection probe, and a cross-origin rejection probe. Do not treat server actions as auth-complete until token rotation/session binding, auth integration, and replay protection are implemented.
 
 ## Observability
 
@@ -161,9 +165,9 @@ Rollback should restore the previous artifact set and restart the Ferrite proces
 
 ## Security Notes
 
-Current production hardening is incomplete. Before handling real authenticated mutations, Ferrite still needs:
+Current production hardening is incomplete. Ferrite can require one configured hidden server-action CSRF token for rendered forms, but before handling real authenticated mutations it still needs:
 
-- CSRF token and session binding for server actions
+- CSRF token rotation and session binding for server actions
 - replay protection guidance
 - deployment-stable inferred action IDs or an explicit persistent action registry
 - trusted-proxy configuration for forwarded host, protocol, and client IP headers
@@ -171,7 +175,7 @@ Current production hardening is incomplete. Before handling real authenticated m
 - upload/file-part policy if file actions are enabled later
 - structured audit logging for action attempts and rejections
 
-Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately.
+Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately. If server actions are enabled in production, set `--server-action-csrf-token-env` and rotate the referenced secret as part of the deployment process.
 
 ## Known Gaps
 

@@ -86,6 +86,7 @@ pub struct PageRenderer {
     project: PathBuf,
     script: PathBuf,
     command_timeout: Option<Duration>,
+    server_action_csrf_token: Option<String>,
 }
 
 impl PageRenderer {
@@ -94,6 +95,7 @@ impl PageRenderer {
             project,
             script,
             command_timeout: None,
+            server_action_csrf_token: None,
         }
     }
 
@@ -104,6 +106,11 @@ impl PageRenderer {
 
     pub fn without_command_timeout(mut self) -> Self {
         self.command_timeout = None;
+        self
+    }
+
+    pub fn with_server_action_csrf_token(mut self, token: impl Into<String>) -> Self {
+        self.server_action_csrf_token = Some(token.into());
         self
     }
 
@@ -134,12 +141,14 @@ impl PageRenderer {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
         let conventions_json = serde_json::to_string(conventions)?;
+        let render_options_json = self.render_options_json()?;
         let mut command = self.node_command();
         command
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
-            .arg(conventions_json);
+            .arg(conventions_json)
+            .arg(render_options_json);
         let output = self.run_command(command)?;
 
         if !output.status.success() {
@@ -180,13 +189,15 @@ impl PageRenderer {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
         let conventions_json = serde_json::to_string(conventions)?;
+        let render_options_json = self.render_options_json()?;
         let mut command = self.node_command();
         command
             .arg("--stream")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
-            .arg(conventions_json);
+            .arg(conventions_json)
+            .arg(render_options_json);
         let output = self.run_command(command)?;
 
         if !output.status.success() {
@@ -227,13 +238,15 @@ impl PageRenderer {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
         let conventions_json = serde_json::to_string(conventions)?;
+        let render_options_json = self.render_options_json()?;
         let mut command = self.node_command();
         command
             .arg("--server-payload")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
-            .arg(conventions_json);
+            .arg(conventions_json)
+            .arg(render_options_json);
         let output = self.run_command(command)?;
 
         if !output.status.success() {
@@ -274,13 +287,15 @@ impl PageRenderer {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(layouts)?;
         let conventions_json = serde_json::to_string(conventions)?;
+        let render_options_json = self.render_options_json()?;
         let mut command = self.node_command();
         command
             .arg("--server-payload")
             .arg(page_file)
             .arg(props_json)
             .arg(layouts_json)
-            .arg(conventions_json);
+            .arg(conventions_json)
+            .arg(render_options_json);
         let output = self.run_command(command)?;
 
         if !output.status.success() {
@@ -643,6 +658,12 @@ impl PageRenderer {
         Ok(json)
     }
 
+    fn render_options_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&PageRenderOptions {
+            server_action_csrf_token: self.server_action_csrf_token.as_deref(),
+        })?)
+    }
+
     fn node_command(&self) -> Command {
         let mut command = Command::new("node");
         command.arg(&self.script).current_dir(&self.project);
@@ -800,12 +821,21 @@ pub struct DocumentRenderOptions {
     pub route_pattern: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_action_csrf_token: Option<String>,
     pub metadata: PageMetadata,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preload_scripts: Vec<String>,
     pub styles: Vec<String>,
     pub scripts: Vec<String>,
     pub default_title: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageRenderOptions<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_action_csrf_token: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -889,6 +919,32 @@ process.stdout.write(JSON.stringify({
             .unwrap();
 
         assert_eq!(html, "<h1>Post packet</h1>");
+    }
+
+    #[test]
+    fn passes_server_action_csrf_token_to_page_render_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(
+            &script,
+            r#"
+const options = JSON.parse(process.argv[6]);
+process.stdout.write(JSON.stringify({
+  kind: "element",
+  tag: "span",
+  props: {},
+  children: [{ kind: "text", value: options.serverActionCsrfToken }]
+}));
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script)
+            .with_server_action_csrf_token("csrf-token-123");
+
+        let html = renderer.render_page_to_html(&page, &[], &[]).unwrap();
+
+        assert_eq!(html, "<span>csrf-token-123</span>");
     }
 
     #[test]
@@ -1554,6 +1610,7 @@ process.stdout.write(JSON.stringify({
                     route_path: "/docs/guide/intro".to_owned(),
                     route_pattern: None,
                     build_id: None,
+                    server_action_csrf_token: None,
                     metadata: PageMetadata {
                         title: Some("Docs".to_owned()),
                         description: None,
@@ -1612,6 +1669,7 @@ process.stdout.write(JSON.stringify({
                     route_path: "/docs/guide/intro".to_owned(),
                     route_pattern: None,
                     build_id: None,
+                    server_action_csrf_token: None,
                     metadata: PageMetadata {
                         title: Some("Docs".to_owned()),
                         description: None,
@@ -1670,6 +1728,7 @@ process.stdout.write(JSON.stringify({
                     route_path: "/".to_owned(),
                     route_pattern: None,
                     build_id: None,
+                    server_action_csrf_token: None,
                     metadata: PageMetadata::default(),
                     preload_scripts: vec![],
                     styles: vec![],
@@ -1717,6 +1776,7 @@ process.stdout.write(JSON.stringify({
                     route_path: "/".to_owned(),
                     route_pattern: None,
                     build_id: None,
+                    server_action_csrf_token: None,
                     metadata: PageMetadata::default(),
                     preload_scripts: vec![],
                     styles: vec![],
@@ -1758,6 +1818,7 @@ process.exit(1);
                     route_path: "/".to_owned(),
                     route_pattern: None,
                     build_id: None,
+                    server_action_csrf_token: None,
                     metadata: PageMetadata::default(),
                     preload_scripts: vec![],
                     styles: vec![],
