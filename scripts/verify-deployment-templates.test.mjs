@@ -18,6 +18,7 @@ test("deployment templates keep production serve flags aligned", async () => {
     assert.match(source, /--trusted-proxy-public-origin/);
     assert.match(source, /--trusted-proxy-client-ip-hops 1/);
     assert.match(source, /--access-log json/);
+    assert.match(source, /--action-log json/);
   }
 
   assert.match(systemd, /--host 127\.0\.0\.1/);

@@ -18,6 +18,7 @@ Ferrite can:
 - require a valid `Host` header for action POSTs and reject action POSTs when browser-supplied `Origin` or `Referer` hosts differ from `Host`
 - optionally require a hidden server-action CSRF token loaded from an environment variable
 - derive access-log client IPs from the TCP peer by default, or from `X-Forwarded-For` only when an explicit trusted-proxy hop count is configured
+- emit request outcome access logs and server-action audit logs to stderr in plain or JSON format
 - gzip eligible HTML and payload responses when `Accept-Encoding` allows it
 - bound request reads, request size, in-flight workers, and render subprocess timeouts
 - drain accepted production requests through the Rust shutdown-aware listener API
@@ -95,7 +96,8 @@ cargo run -p ferrite-cli -- serve \
   --server-action-csrf-token-env FERRITE_ACTION_CSRF \
   --trusted-proxy-public-origin https://app.example.com \
   --trusted-proxy-client-ip-hops 1 \
-  --access-log json
+  --access-log json \
+  --action-log json
 ```
 
 For a packaged binary, run the installed `ferrite` executable with the same arguments.
@@ -107,7 +109,7 @@ Ferrite includes first-pass deployment templates for a private-beta topology:
 - `deploy/systemd/ferrite.service`: process manager template for a private `127.0.0.1:3000` Ferrite service.
 - `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that owns `Host`, `X-Forwarded-Proto`, and `X-Forwarded-Host`.
 - `deploy/ferrite.env.example`: runtime environment variables for CSRF and public origin configuration.
-- `deploy/container/Dockerfile`: container template that builds the workspace, runs as a non-root runtime user, and starts `ferrite serve` with production limits, CSRF, trusted-proxy origin checks, trusted forwarded client-IP hop count, and JSON access logs.
+- `deploy/container/Dockerfile`: container template that builds the workspace, runs as a non-root runtime user, and starts `ferrite serve` with production limits, CSRF, trusted-proxy origin checks, trusted forwarded client-IP hop count, JSON access logs, and JSON action audit logs.
 
 These templates are checked by `scripts/verify-deployment-templates.test.mjs`. The container template also has a local Docker build and container smoke for the basic example route, including JSON access-log output. This is still not proof of a hosted staging deployment. Before using these templates for a paid beta, run the chosen template behind the real proxy, capture access logs, run the smoke tests below, and record rollback steps for the exact artifact version.
 
@@ -126,10 +128,11 @@ Use command arguments for the current runtime knobs:
 - `--trusted-proxy-public-origin`: optional public HTTP(S) origin for server-action POST origin checks behind a trusted reverse proxy; when set, action POSTs require matching `X-Forwarded-Proto` and `X-Forwarded-Host`
 - `--trusted-proxy-client-ip-hops`: optional `X-Forwarded-For` trust policy for access-log `client_ip`; it requires `--trusted-proxy-public-origin` and selects the client IP before the configured number of trusted proxy hops
 - `--access-log`: optional `plain` or `json` production request outcome logs emitted to stderr
+- `--action-log`: optional `plain` or `json` production server-action audit logs emitted to stderr
 - `--once`: deterministic one-request mode for smoke tests
 - `--request-path`: request target for `--once` smoke tests
 
-The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request/render limits, server-action trusted-proxy public-origin checks, trusted forwarded client-IP access-log policy, and stderr access logs, but not metrics exporters or tracing sinks.
+The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request/render limits, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, and stderr action audit logs, but not metrics exporters, tracing sinks, or external audit sinks.
 
 ## Smoke Tests
 
@@ -157,16 +160,28 @@ Ferrite's Rust production API can attach request observer hooks that receive:
 - client IP, derived from the TCP peer unless an explicit trusted `X-Forwarded-For` hop policy is configured
 - elapsed duration
 
-Applications embedding the Rust server should bridge those events into their logging, metrics, or tracing stack. The CLI does not yet expose first-class external log sink configuration, trace IDs, or metrics exporters.
+Ferrite's Rust production API can also attach server-action observer hooks that receive:
+
+- action id when the request parsed far enough to identify one
+- submitted route path when the request parsed far enough to identify one
+- matched route pattern when known
+- response status
+- accepted or rejected outcome
+- client IP, derived from the same trusted-client-IP policy used for request logs
+- elapsed duration
+
+Applications embedding the Rust server should bridge those events into their logging, metrics, tracing, or audit stack. The CLI does not yet expose first-class external log sink configuration, trace IDs, metrics exporters, or external audit exporters.
 
 The CLI can emit request outcome access logs to stderr:
 
 ```sh
 cargo run -p ferrite-cli -- serve --project /srv/app --access-log plain
 cargo run -p ferrite-cli -- serve --project /srv/app --access-log json
+cargo run -p ferrite-cli -- serve --project /srv/app --action-log plain
+cargo run -p ferrite-cli -- serve --project /srv/app --action-log json
 ```
 
-Access log events include method, path, status, route pattern when known, derived client IP when available, and elapsed milliseconds. They do not include request headers or request bodies, so server-action form data and CSRF tokens are not logged by the Ferrite CLI access-log path.
+Access log events include method, path, status, route pattern when known, derived client IP when available, and elapsed milliseconds. Action log events include action id, submitted route path, matched route pattern when known, status, accepted/rejected outcome, derived client IP when available, and elapsed milliseconds. Neither CLI log path includes request headers, request bodies, form fields, or CSRF tokens, so server-action form data and CSRF tokens are not logged by the Ferrite CLI access-log or action-log paths.
 
 At the proxy layer, capture:
 
@@ -200,7 +215,7 @@ Current production hardening is incomplete. Ferrite can require one configured h
 - deployment-stable inferred action IDs or an explicit persistent action registry
 - cookie and SameSite guidance
 - upload/file-part policy if file actions are enabled later
-- structured audit logging beyond request outcome access logs for action attempts and rejections
+- external metrics, tracing, and audit sinks beyond stderr request/action logs
 
 Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately. If server actions are enabled in production, set `--server-action-csrf-token-env` and rotate the referenced secret as part of the deployment process. If the public TLS origin differs from the upstream Ferrite bind origin, set `--trusted-proxy-public-origin` and configure the proxy to own and sanitize the forwarded proto/host headers. If access logs need public client IPs behind the proxy, set `--trusted-proxy-client-ip-hops` to the exact number of trusted proxy hops and make the edge proxy overwrite `X-Forwarded-For`.
 
@@ -209,7 +224,7 @@ Until those exist, deploy server actions only for controlled beta scenarios or b
 - No npm packages are published yet.
 - No GitHub remote or remote CI proof exists in this checkout.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
-- The production CLI exposes the main request/render limits, server-action trusted-proxy public-origin checks, trusted forwarded client-IP access-log policy, and stderr access logs, but not metrics exporters or tracing sinks.
+- The production CLI exposes the main request/render limits, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, and stderr action audit logs, but not metrics exporters, tracing sinks, or external audit sinks.
 - First-pass container, systemd, and nginx templates exist with local static verification and container smoke proof, but no official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
 - There is no first-class metrics exporter or tracing integration.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.

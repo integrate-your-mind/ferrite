@@ -8,8 +8,9 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrite_builder::{BuildConfig, BuildReport};
 use ferrite_dev_server::{
-    DevProject, DevResponse, DevServerConfig, ProductionProject, ProductionRequestEvent,
-    ProductionServerConfig, ProductionTrustedProxyConfig,
+    DevProject, DevResponse, DevServerConfig, ProductionActionEvent, ProductionActionOutcome,
+    ProductionProject, ProductionRequestEvent, ProductionServerConfig,
+    ProductionTrustedProxyConfig,
 };
 use ferrite_router::{Route, scan_app_dir, write_route_types};
 use serde::Serialize;
@@ -281,6 +282,13 @@ struct ServeArgs {
         help = "Emit production request access logs to stderr in the selected format"
     )]
     access_log: Option<AccessLogFormat>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Emit production server-action audit logs to stderr in the selected format"
+    )]
+    action_log: Option<AccessLogFormat>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -596,6 +604,11 @@ fn run_cli(cli: Cli) -> Result<()> {
                     eprintln!("{}", format_access_log_event(&event, format));
                 });
             }
+            if let Some(format) = args.action_log {
+                config = config.with_action_observer(move |event| {
+                    eprintln!("{}", format_action_log_event(&event, format));
+                });
+            }
             let mut production_project = ProductionProject::new(config);
             let production_limits = ServeLimitsOutput::from(production_project.config());
 
@@ -876,6 +889,31 @@ fn format_access_log_event(event: &ProductionRequestEvent, format: AccessLogForm
     }
 }
 
+fn format_action_log_event(event: &ProductionActionEvent, format: AccessLogFormat) -> String {
+    let output = ActionLogEventOutput::from(event);
+    match format {
+        AccessLogFormat::Plain => {
+            let action = output.action_id.unwrap_or("-");
+            let route = output.route_path.unwrap_or("-");
+            let pattern = output.route_pattern.unwrap_or("-");
+            let client_ip = output.client_ip.unwrap_or("-");
+            format!(
+                "action={} route={} pattern={} status={} outcome={} client_ip={} elapsed_ms={}",
+                action,
+                route,
+                pattern,
+                output.status,
+                action_outcome_str(output.outcome),
+                client_ip,
+                output.elapsed_ms
+            )
+        }
+        AccessLogFormat::Json => {
+            serde_json::to_string(&output).expect("action log event output is serializable")
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct RoutesOutput {
     project: PathBuf,
@@ -971,6 +1009,38 @@ impl<'a> From<&'a ProductionRequestEvent> for AccessLogEventOutput<'a> {
             client_ip: event.client_ip.as_deref(),
             elapsed_ms: duration_millis_u64(event.elapsed),
         }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ActionLogEventOutput<'a> {
+    action_id: Option<&'a str>,
+    route_path: Option<&'a str>,
+    route_pattern: Option<&'a str>,
+    status: u16,
+    outcome: ProductionActionOutcome,
+    client_ip: Option<&'a str>,
+    elapsed_ms: u64,
+}
+
+impl<'a> From<&'a ProductionActionEvent> for ActionLogEventOutput<'a> {
+    fn from(event: &'a ProductionActionEvent) -> Self {
+        Self {
+            action_id: event.action_id.as_deref(),
+            route_path: event.route_path.as_deref(),
+            route_pattern: event.route_pattern.as_deref(),
+            status: event.status,
+            outcome: event.outcome,
+            client_ip: event.client_ip.as_deref(),
+            elapsed_ms: duration_millis_u64(event.elapsed),
+        }
+    }
+}
+
+fn action_outcome_str(outcome: ProductionActionOutcome) -> &'static str {
+    match outcome {
+        ProductionActionOutcome::Accepted => "accepted",
+        ProductionActionOutcome::Rejected => "rejected",
     }
 }
 
@@ -1148,6 +1218,17 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_action_log_format_flag() {
+        let cli =
+            Cli::try_parse_from(["ferrite", "serve", "--action-log", "json", "--once"]).unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.action_log, Some(AccessLogFormat::Json));
+    }
+
+    #[test]
     fn formats_access_log_events_without_headers_or_body() {
         let event = ProductionRequestEvent {
             method: "POST".to_owned(),
@@ -1172,6 +1253,38 @@ mod tests {
         assert_eq!(json["client_ip"], "203.0.113.10");
         assert_eq!(json["elapsed_ms"], 17);
         assert!(json.get("headers").is_none());
+        assert!(json.get("body").is_none());
+    }
+
+    #[test]
+    fn formats_action_log_events_without_form_data_or_tokens() {
+        let event = ProductionActionEvent {
+            action_id: Some("app/posts/[id]/page.tsx#savePost".to_owned()),
+            route_path: Some("/posts/abc".to_owned()),
+            route_pattern: Some("/posts/[id]".to_owned()),
+            status: 403,
+            outcome: ProductionActionOutcome::Rejected,
+            client_ip: Some("203.0.113.10".to_owned()),
+            elapsed: Duration::from_millis(19),
+        };
+
+        assert_eq!(
+            format_action_log_event(&event, AccessLogFormat::Plain),
+            "action=app/posts/[id]/page.tsx#savePost route=/posts/abc pattern=/posts/[id] status=403 outcome=rejected client_ip=203.0.113.10 elapsed_ms=19"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&format_action_log_event(&event, AccessLogFormat::Json)).unwrap();
+        assert_eq!(json["action_id"], "app/posts/[id]/page.tsx#savePost");
+        assert_eq!(json["route_path"], "/posts/abc");
+        assert_eq!(json["route_pattern"], "/posts/[id]");
+        assert_eq!(json["status"], 403);
+        assert_eq!(json["outcome"], "rejected");
+        assert_eq!(json["client_ip"], "203.0.113.10");
+        assert_eq!(json["elapsed_ms"], 19);
+        assert!(json.get("form").is_none());
+        assert!(json.get("headers").is_none());
+        assert!(json.get("csrf").is_none());
         assert!(json.get("body").is_none());
     }
 

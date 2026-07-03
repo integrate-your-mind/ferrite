@@ -36,6 +36,7 @@ Current demoable scope is the local `examples/basic` end-to-end path:
 - Streaming and payload behavior: stream-capable dev/serve paths, server payload JSON/stream-frame surfaces, same-origin payload navigation, prefetch and popstate restoration support with Chromium proof.
 - Island hydration: server-first routes, `use client` islands, route and client-reference bundles, and immutable fingerprinted assets.
 - Server-action first transport: form-based `POST /_ferrite/action` with explicit action manifest collection and browser enhancement for route/client-reference/server-only action forms (Chromium proof).
+- Production logs: request outcome access logs and first-pass server-action audit logs can be emitted to stderr in plain or JSON format.
 
 Not sellable yet as a hosted platform:
 - No npm publish in this checkout, no remote CI runs, no hosted staging run of the deployment templates, and only local/prototype operational proof.
@@ -63,8 +64,8 @@ Not sellable yet as a hosted platform:
 - File uploads (`multipart` file parts) are intentionally rejected.
 
 5. Observability + operations depth
-- Request observer hooks exist in Rust, and the CLI can emit plain or JSON request outcome access logs.
-- There are still no first-class metrics/tracing exporters or richer action-specific audit sinks.
+- Request observer and action observer hooks exist in Rust, and the CLI can emit plain or JSON request outcome access logs plus server-action audit logs to stderr.
+- There are still no first-class metrics/tracing exporters or external audit sinks.
 - Some browser edge cases remain in happy-dom coverage rather than full cross-browser proof.
 
 ## 2-Week Private Beta Plan
@@ -76,7 +77,7 @@ Not sellable yet as a hosted platform:
 - Day 3–4: harden CI proof by integrating and running full local gate set in remote CI (release lint/test/build, `release:verify:npm`, native prebuild dry-run, browser proof).
 - Day 5: complete deployment hardening pass 1:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
-  - publish restart/rollback runbook, CLI access-log schema, and metrics/tracing integration plan.
+  - publish restart/rollback runbook, CLI request/action log schemas, and metrics/tracing integration plan.
 - Day 6–7: security backlog pass:
   - session-bound token or equivalent CSRF design,
   - explicit replay and token rotation plan,
@@ -84,7 +85,7 @@ Not sellable yet as a hosted platform:
 
 ### Week 2
 - Day 8–10: close server-action reliability and UX:
-  - add server-action production failure-path telemetry,
+  - exercise server-action production failure-path audit logs in hosted staging and decide the external sink contract,
   - validate rejection/mismatch flows in real browser automation and one negative-path test per route/action class.
 - Day 11–12: npm publishing readies:
   - decide trusted publishing or `NPM_TOKEN`,
@@ -147,8 +148,8 @@ Launch here means paid beta availability to external teams under explicit usage 
   - Session-bound CSRF token strategy implemented (or explicit alternate) and tested for rotation/replay.
   - Trusted-proxy public-origin checks and forwarded client-IP access-log policy exercised behind the chosen staging proxy with forwarded-header sanitization.
 - Operational proof:
-  - CLI access-log output captured in staging and integrated with the chosen log collector.
-  - Metrics/tracing path for request observer events and action endpoint outcomes.
+  - CLI request access-log and server-action audit-log output captured in staging and integrated with the chosen log collector.
+  - Metrics/tracing path for request observer events and action observer outcomes.
   - Negative-path coverage for malformed routes, action failures, malformed payloads, and origin/referer mismatches in automated CI.
 - Product-readiness proof:
   - Explicitly separate "validated features" from "local-only proof" in public docs and sales copy.

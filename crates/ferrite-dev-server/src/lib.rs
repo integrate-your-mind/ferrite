@@ -221,6 +221,51 @@ impl fmt::Debug for ProductionRequestObserver {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionActionEvent {
+    pub action_id: Option<String>,
+    pub route_path: Option<String>,
+    pub route_pattern: Option<String>,
+    pub status: u16,
+    pub outcome: ProductionActionOutcome,
+    pub client_ip: Option<String>,
+    pub elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionActionOutcome {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone)]
+pub struct ProductionActionObserver {
+    observe: Arc<dyn Fn(ProductionActionEvent) + Send + Sync>,
+}
+
+impl ProductionActionObserver {
+    pub fn new<F>(observe: F) -> Self
+    where
+        F: Fn(ProductionActionEvent) + Send + Sync + 'static,
+    {
+        Self {
+            observe: Arc::new(observe),
+        }
+    }
+
+    fn observe(&self, event: ProductionActionEvent) {
+        (self.observe)(event);
+    }
+}
+
+impl fmt::Debug for ProductionActionObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProductionActionObserver")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionTrustedProxyConfig {
     public_origin: HttpOrigin,
 }
@@ -256,6 +301,7 @@ pub struct ProductionServerConfig {
     pub trusted_proxy: Option<ProductionTrustedProxyConfig>,
     pub trusted_proxy_client_ip_hops: Option<usize>,
     pub request_observer: Option<ProductionRequestObserver>,
+    pub action_observer: Option<ProductionActionObserver>,
 }
 
 impl ProductionServerConfig {
@@ -284,6 +330,7 @@ impl ProductionServerConfig {
             trusted_proxy: None,
             trusted_proxy_client_ip_hops: None,
             request_observer: None,
+            action_observer: None,
         }
     }
 
@@ -327,6 +374,14 @@ impl ProductionServerConfig {
         F: Fn(ProductionRequestEvent) + Send + Sync + 'static,
     {
         self.request_observer = Some(ProductionRequestObserver::new(observer));
+        self
+    }
+
+    pub fn with_action_observer<F>(mut self, observer: F) -> Self
+    where
+        F: Fn(ProductionActionEvent) + Send + Sync + 'static,
+    {
+        self.action_observer = Some(ProductionActionObserver::new(observer));
         self
     }
 }
@@ -913,7 +968,7 @@ impl ProductionProject {
         }
 
         let started = Instant::now();
-        let response = self.handle_post_inner(raw_path, headers, body)?;
+        let response = self.handle_post_inner(raw_path, headers, body, &request_context)?;
         self.observe_request(
             "POST",
             raw_path,
@@ -948,6 +1003,7 @@ impl ProductionProject {
         raw_path: &str,
         headers: &HttpHeaders,
         body: &[u8],
+        request_context: &ProductionRequestContext,
     ) -> Result<DevResponse> {
         self.ensure_ready()?;
         let path = strip_query(raw_path);
@@ -955,7 +1011,7 @@ impl ProductionProject {
             return Ok(DevResponse::method_not_allowed().with_cache_control("no-store"));
         }
 
-        self.action_response(headers, body)
+        self.action_response(headers, body, request_context)
             .map(|response| response.with_cache_control("no-store"))
     }
 
@@ -986,6 +1042,32 @@ impl ProductionProject {
     ) -> ProductionRequestContext {
         ProductionRequestContext {
             client_ip: production_client_ip(headers, peer_ip, &self.config),
+        }
+    }
+
+    fn observe_action(
+        &self,
+        action_id: Option<String>,
+        route_path: Option<String>,
+        route_pattern: Option<String>,
+        response: &DevResponse,
+        elapsed: Duration,
+        request_context: &ProductionRequestContext,
+    ) {
+        if let Some(observer) = &self.config.action_observer {
+            observer.observe(ProductionActionEvent {
+                action_id,
+                route_path,
+                route_pattern,
+                status: response.status,
+                outcome: if response.status < 400 {
+                    ProductionActionOutcome::Accepted
+                } else {
+                    ProductionActionOutcome::Rejected
+                },
+                client_ip: request_context.client_ip.clone(),
+                elapsed,
+            });
         }
     }
 
@@ -1061,7 +1143,13 @@ impl ProductionProject {
         }
     }
 
-    fn action_response(&self, headers: &HttpHeaders, body: &[u8]) -> Result<DevResponse> {
+    fn action_response(
+        &self,
+        headers: &HttpHeaders,
+        body: &[u8],
+        request_context: &ProductionRequestContext,
+    ) -> Result<DevResponse> {
+        let started = Instant::now();
         let snapshot = self
             .snapshot
             .as_ref()
@@ -1073,18 +1161,38 @@ impl ProductionProject {
             self.config.trusted_proxy.as_ref(),
         ) {
             Ok(request) => request,
-            Err(response) => return Ok(*response),
+            Err(response) => {
+                let response = *response;
+                self.observe_action(
+                    None,
+                    None,
+                    None,
+                    &response,
+                    started.elapsed(),
+                    request_context,
+                );
+                return Ok(response);
+            }
         };
+        let action_id = request.id.clone();
         let route_path = request.route_path.clone();
         let Some(match_result) = match_route(&route_path, &snapshot.routes) else {
-            return Ok(DevResponse::not_found_text(format!(
+            let response = DevResponse::not_found_text(format!(
                 "No Ferrite route matched server action route `{route_path}`"
-            )));
+            ));
+            self.observe_action(
+                Some(action_id),
+                Some(route_path),
+                None,
+                &response,
+                started.elapsed(),
+                request_context,
+            );
+            return Ok(response);
         };
         let renderer = self.page_renderer();
         let conventions = route_conventions(&match_result.route);
-
-        match renderer.invoke_server_action(
+        let response = match renderer.invoke_server_action(
             &match_result.route.file,
             &match_result.route.layouts,
             &match_result.params,
@@ -1104,7 +1212,16 @@ impl ProductionProject {
                 &match_result,
                 &error,
             )),
-        }
+        }?;
+        self.observe_action(
+            Some(action_id),
+            Some(route_path),
+            response.route_pattern_header.clone(),
+            &response,
+            started.elapsed(),
+            request_context,
+        );
+        Ok(response)
     }
 
     fn route_stream_response(
@@ -4604,6 +4721,79 @@ process.exit(1);
         assert_eq!(events[0].path, "/_ferrite/action");
         assert_eq!(events[0].status, 200);
         assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
+        assert!(events[0].client_ip.is_some());
+    }
+
+    #[test]
+    fn production_action_observer_records_success_and_rejection_without_form_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let mut project = action_production_project_for(&app, action_renderer_body());
+        project.config.action_observer = Some(ProductionActionObserver::new(move |event| {
+            captured_events.lock().unwrap().push(event);
+        }));
+        let body = action_form_body("/posts/abc");
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        assert!(response_headers(&response).starts_with("HTTP/1.1 200 OK"));
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].action_id.as_deref(),
+            Some("app/posts/[id]/page.tsx#savePost")
+        );
+        assert_eq!(events[0].route_path.as_deref(), Some("/posts/abc"));
+        assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
+        assert_eq!(events[0].status, 200);
+        assert_eq!(events[0].outcome, ProductionActionOutcome::Accepted);
+        assert!(events[0].client_ip.is_some());
+        assert!(events[0].elapsed > Duration::ZERO);
+        assert_ne!(events[0].action_id.as_deref(), Some("Hello Ferrite"));
+    }
+
+    #[test]
+    fn production_action_observer_records_parse_rejections() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let mut project = action_production_project_for(&app, action_renderer_body());
+        project.config.action_observer = Some(ProductionActionObserver::new(move |event| {
+            captured_events.lock().unwrap().push(event);
+        }));
+        let body = b"title=Hello+Ferrite";
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body.to_vec()).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        assert!(response_headers(&response).starts_with("HTTP/1.1 400 Bad Request"));
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action_id, None);
+        assert_eq!(events[0].route_path, None);
+        assert_eq!(events[0].route_pattern, None);
+        assert_eq!(events[0].status, 400);
+        assert_eq!(events[0].outcome, ProductionActionOutcome::Rejected);
         assert!(events[0].client_ip.is_some());
     }
 
