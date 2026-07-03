@@ -17,6 +17,7 @@ const knownModes = new Set([
   "--document-stream",
   "--document-server-payload",
   "--server-action",
+  "--server-action-manifest",
 ]);
 const mode = knownModes.has(args[0]) ? args.shift() : "render";
 const [pageFile, propsJson = "{}", layoutsJson = "[]", fourthArg, fifthArg = "{}", sixthArg = "{}"] = args;
@@ -29,7 +30,7 @@ const conventionsJson = documentMode ? sixthArg : (fourthArg ?? "{}");
 
 if (!pageFile) {
   console.error(
-    "usage: render-page [--static-params|--metadata|--stream|--server-payload|--document|--document-stream|--document-server-payload|--server-action] <page-file> [props-json] [layouts-json] [document-file|conventions-json] [document-options-json|action-request-json]",
+    "usage: render-page [--static-params|--metadata|--stream|--server-payload|--document|--document-stream|--document-server-payload|--server-action|--server-action-manifest] <page-file> [props-json] [layouts-json] [document-file|conventions-json] [document-options-json|action-request-json]",
   );
   process.exit(2);
 }
@@ -203,6 +204,18 @@ try {
       { routePattern: routePatternFromPageFile(pageFile, projectRoot) },
     );
     process.stdout.write(`${JSON.stringify(response)}\n`);
+  } else if (mode === "--server-action-manifest") {
+    const manifest = await server.collectServerActionsFromPageModule(
+      entryModule.pageModule,
+      props,
+      entryModule.layoutModules,
+      entryModule.conventionModules,
+      {
+        routePath: concreteRoutePathFromPageFile(pageFile, projectRoot, props.params ?? {}),
+        routePattern: routePatternFromPageFile(pageFile, projectRoot),
+      },
+    );
+    process.stdout.write(`${JSON.stringify(manifest)}\n`);
   } else if (mode === "--document") {
     const document = await server.renderDocumentModuleToPacket(
       entryModule.pageModule,
@@ -394,6 +407,56 @@ function routePatternFromPageFile(pageFile, projectRoot) {
 
   const routeSegments = parts.slice(appIndex + 1, -1).filter((segment) => !isRouteGroupSegment(segment));
   return routeSegments.length === 0 ? "/" : `/${routeSegments.join("/")}`;
+}
+
+function concreteRoutePathFromPageFile(pageFile, projectRoot, params) {
+  const pattern = routePatternFromPageFile(pageFile, projectRoot);
+  if (!pattern || pattern === "/") {
+    return "/";
+  }
+
+  const routeSegments = pattern
+    .trimStart()
+    .replace(/^\/+/, "")
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => concreteRouteSegment(segment, params));
+  return `/${routeSegments.flat().join("/")}`;
+}
+
+function concreteRouteSegment(segment, params) {
+  if (segment.startsWith("[[...") && segment.endsWith("]]")) {
+    const name = segment.slice(5, -2);
+    const value = params[name];
+    return Array.isArray(value) ? value.map(encodeRouteSegment) : [];
+  }
+
+  if (segment.startsWith("[...") && segment.endsWith("]")) {
+    const name = segment.slice(4, -1);
+    const value = params[name];
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new TypeError(`Ferrite route param "${name}" must be a non-empty array for ${segment}.`);
+    }
+    return value.map(encodeRouteSegment);
+  }
+
+  if (segment.startsWith("[") && segment.endsWith("]")) {
+    const name = segment.slice(1, -1);
+    const value = params[name];
+    if (typeof value !== "string" || value.length === 0) {
+      throw new TypeError(`Ferrite route param "${name}" must be a non-empty string for ${segment}.`);
+    }
+    return encodeRouteSegment(value);
+  }
+
+  return segment;
+}
+
+function encodeRouteSegment(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError("Ferrite route params must contain non-empty string segments.");
+  }
+  return encodeURIComponent(value);
 }
 
 function isRouteGroupSegment(segment) {

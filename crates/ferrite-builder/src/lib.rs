@@ -8,6 +8,7 @@ use ferrite_client_bundler::{
 };
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
+    ServerActionManifest,
 };
 use ferrite_router::{Route, RouteParamKind, find_document_file, scan_app_dir, write_route_types};
 use serde::Serialize;
@@ -108,7 +109,7 @@ impl BuildConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BuildReport {
     pub out_dir: PathBuf,
     pub routes_count: usize,
@@ -117,6 +118,7 @@ pub struct BuildReport {
     pub skipped_dynamic_routes: Vec<String>,
     pub manifest_file: PathBuf,
     pub client_bundles: Vec<ClientBundle>,
+    pub server_action_manifests: Vec<ServerActionManifest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -132,6 +134,7 @@ struct BuildManifest<'a> {
     page_metadata: &'a [PageMetadataEntry],
     skipped_dynamic_routes: &'a [String],
     client_bundles: &'a [ClientBundle],
+    server_action_manifests: &'a [ServerActionManifest],
 }
 
 pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
@@ -146,6 +149,7 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
     let mut page_metadata = Vec::new();
     let mut skipped_dynamic_routes = Vec::new();
     let mut client_bundles = Vec::new();
+    let mut server_action_manifests = Vec::new();
     let mut generated_route_paths = BTreeSet::new();
     let client_out_dir = config.out_dir.join("_ferrite/static");
     if client_out_dir.exists() {
@@ -238,6 +242,15 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                 metadata,
             });
             client_bundles.push(client_bundle);
+            let action_manifest = page_renderer.collect_server_actions(
+                &route.file,
+                &route.layouts,
+                &ordered_params,
+                &conventions,
+            )?;
+            if !action_manifest.actions.is_empty() {
+                server_action_manifests.push(action_manifest);
+            }
         }
     }
 
@@ -248,6 +261,7 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
         page_metadata: &page_metadata,
         skipped_dynamic_routes: &skipped_dynamic_routes,
         client_bundles: &client_bundles,
+        server_action_manifests: &server_action_manifests,
     };
     fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
 
@@ -259,6 +273,7 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
         skipped_dynamic_routes,
         manifest_file,
         client_bundles,
+        server_action_manifests,
     })
 }
 
@@ -698,12 +713,18 @@ const mode = process.argv[2];
 const staticMode = mode === "--static-params";
 const metadataMode = mode === "--metadata";
 const documentMode = mode === "--document";
-const page = staticMode || metadataMode || documentMode ? process.argv[3] : process.argv[2];
+const serverActionManifestMode = mode === "--server-action-manifest";
+const explicitMode = staticMode || metadataMode || documentMode || serverActionManifestMode;
+const page = explicitMode ? process.argv[3] : process.argv[2];
 if (staticMode) {
   process.stdout.write(JSON.stringify({ has_generate_static_params: false, params: [] }));
   process.exit(0);
 }
-const props = metadataMode || documentMode ? JSON.parse(process.argv[4]) : {};
+const props = explicitMode ? JSON.parse(process.argv[4]) : {};
+if (serverActionManifestMode) {
+  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
+  process.exit(0);
+}
 const title = page.includes("about") ? "About Page" : page.includes("docs") ? "Docs Page" : "Home Page";
 if (metadataMode) {
   const metadataTitle = page.includes("[id]") ? `Post ${props.params.id}` : title;
@@ -1011,6 +1032,69 @@ process.stdout.write(JSON.stringify({
     }
 
     #[test]
+    fn build_manifest_records_server_action_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("app/posts/[id]/page.tsx"),
+            "export function generateStaticParams() { return [{ id: 'alpha' }]; } export default function Page() {}",
+        );
+        let config = build_config(temp.path());
+        make_script(
+            &config.page_renderer,
+            r#"
+const mode = process.argv[2];
+if (mode === "--static-params") {
+  process.stdout.write(JSON.stringify({ has_generate_static_params: true, params: [{ id: "alpha" }] }));
+  process.exit(0);
+}
+if (mode === "--metadata") {
+  process.stdout.write(JSON.stringify({ title: "Post alpha" }));
+  process.exit(0);
+}
+if (mode === "--server-action-manifest") {
+  const props = JSON.parse(process.argv[4]);
+  process.stdout.write(JSON.stringify({
+    routePath: `/posts/${props.params.id}`,
+    routePattern: "/posts/[id]",
+    actions: [{
+      ferrite: "server-action-reference",
+      version: 1,
+      id: "app/posts/[id]/page.tsx#savePost",
+      routePattern: "/posts/[id]",
+      url: "/_ferrite/action",
+      bound: {}
+    }]
+  }));
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({
+  kind: "element",
+  tag: "main",
+  props: {},
+  children: [{ kind: "text", value: "Post alpha" }]
+}));
+"#,
+        );
+
+        let report = build_project(&config).unwrap();
+
+        assert_eq!(report.server_action_manifests.len(), 1);
+        assert_eq!(report.server_action_manifests[0].route_path, "/posts/alpha");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config.out_dir.join("ferrite-build.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["server_action_manifests"][0]["actions"][0]["id"].as_str(),
+            Some("app/posts/[id]/page.tsx#savePost")
+        );
+        assert_eq!(
+            manifest["server_action_manifests"][0]["actions"][0]["routePattern"].as_str(),
+            Some("/posts/[id]")
+        );
+    }
+
+    #[test]
     fn builds_with_custom_document_file() {
         let temp = tempfile::tempdir().unwrap();
         write(
@@ -1058,6 +1142,10 @@ if (mode === "--static-params") {
 }
 if (mode === "--metadata") {
   process.stdout.write(JSON.stringify({ title: "Home Page", description: "Metadata for Home Page" }));
+  process.exit(0);
+}
+if (mode === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
   process.exit(0);
 }
 const conventions = JSON.parse(process.argv[5]);
@@ -1124,7 +1212,9 @@ process.stdout.write(JSON.stringify({
 const mode = process.argv[2];
 const staticMode = mode === "--static-params";
 const metadataMode = mode === "--metadata";
-const page = staticMode || metadataMode ? process.argv[3] : process.argv[2];
+const serverActionManifestMode = mode === "--server-action-manifest";
+const explicitMode = staticMode || metadataMode || serverActionManifestMode;
+const page = explicitMode ? process.argv[3] : process.argv[2];
 if (staticMode) {
   const result = page.includes("[id]")
     ? { has_generate_static_params: true, params: [{ id: "alpha" }, { id: "beta" }] }
@@ -1132,7 +1222,11 @@ if (staticMode) {
   process.stdout.write(JSON.stringify(result));
   process.exit(0);
 }
-const props = JSON.parse(metadataMode ? process.argv[4] : process.argv[3]);
+const props = JSON.parse(explicitMode ? process.argv[4] : process.argv[3]);
+if (serverActionManifestMode) {
+  process.stdout.write(JSON.stringify({ routePath: page.includes("[id]") ? `/posts/${props.params.id}` : "/", actions: [] }));
+  process.exit(0);
+}
 const title = page.includes("[id]") ? `Post ${props.params.id}` : "Home Page";
 if (metadataMode) {
   process.stdout.write(JSON.stringify({
@@ -1194,6 +1288,7 @@ process.stdout.write(JSON.stringify({
 const mode = process.argv[2];
 const staticMode = mode === "--static-params";
 const metadataMode = mode === "--metadata";
+const serverActionManifestMode = mode === "--server-action-manifest";
 if (staticMode) {
   process.stdout.write(JSON.stringify({
     has_generate_static_params: true,
@@ -1201,7 +1296,11 @@ if (staticMode) {
   }));
   process.exit(0);
 }
-const props = JSON.parse(metadataMode ? process.argv[4] : process.argv[3]);
+const props = JSON.parse(metadataMode || serverActionManifestMode ? process.argv[4] : process.argv[3]);
+if (serverActionManifestMode) {
+  process.stdout.write(JSON.stringify({ routePath: `/docs/${props.params.slug.join("/")}`, actions: [] }));
+  process.exit(0);
+}
 const title = `Docs ${props.params.slug.join("/")}`;
 if (metadataMode) {
   process.stdout.write(JSON.stringify({ title, description: `Metadata for ${title}` }));
@@ -1262,6 +1361,7 @@ process.stdout.write(JSON.stringify({
 const mode = process.argv[2];
 const staticMode = mode === "--static-params";
 const metadataMode = mode === "--metadata";
+const serverActionManifestMode = mode === "--server-action-manifest";
 if (staticMode) {
   process.stdout.write(JSON.stringify({
     has_generate_static_params: true,
@@ -1269,8 +1369,12 @@ if (staticMode) {
   }));
   process.exit(0);
 }
-const props = JSON.parse(metadataMode ? process.argv[4] : process.argv[3]);
+const props = JSON.parse(metadataMode || serverActionManifestMode ? process.argv[4] : process.argv[3]);
 const slug = Array.isArray(props.params.slug) ? props.params.slug.join("/") : "index";
+if (serverActionManifestMode) {
+  process.stdout.write(JSON.stringify({ routePath: slug === "index" ? "/docs" : `/docs/${slug}`, actions: [] }));
+  process.exit(0);
+}
 const title = `Docs ${slug}`;
 if (metadataMode) {
   process.stdout.write(JSON.stringify({ title }));
@@ -1328,6 +1432,10 @@ if (process.argv[2] === "--static-params") {
   }));
   process.exit(0);
 }
+if (process.argv[2] === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/posts/alpha", actions: [] }));
+  process.exit(0);
+}
 process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
 "#,
         );
@@ -1356,6 +1464,10 @@ if (process.argv[2] === "--static-params") {
     has_generate_static_params: true,
     params: [{}, { slug: [] }]
   }));
+  process.exit(0);
+}
+if (process.argv[2] === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/docs", actions: [] }));
   process.exit(0);
 }
 process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
@@ -1394,6 +1506,10 @@ if (process.argv[2] === "--static-params") {
     has_generate_static_params: true,
     params
   }));
+  process.exit(0);
+}
+if (process.argv[2] === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/docs/api", actions: [] }));
   process.exit(0);
 }
 process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));

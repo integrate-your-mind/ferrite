@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createElement } from "../dist/index.js";
-import { createServerAction, renderPageModule } from "../dist/server.js";
+import { collectServerActionsFromPageModule, createServerAction, renderPageModule } from "../dist/server.js";
 
 function createSaveAction(id = "app/posts/[id]/page.tsx#savePost") {
   return createServerAction({
@@ -50,6 +50,44 @@ test("server actions inherit the active route pattern while rendering", async ()
       value: "app/posts/[id]/page.tsx#saveInlinePost",
     },
     children: [],
+  });
+});
+
+test("server action manifest collection records route-scoped form actions without running them", async () => {
+  let actionRuns = 0;
+  const page = {
+    default() {
+      const savePost = createServerAction({
+        id: "app/posts/[id]/page.tsx#saveInlinePost",
+        async run() {
+          actionRuns += 1;
+          return { ok: true };
+        },
+      });
+
+      return createElement("form", { action: savePost }, createElement("button", { type: "submit" }, "Save"));
+    },
+  };
+
+  const manifest = await collectServerActionsFromPageModule(page, {}, [], {}, {
+    routePath: "/posts/abc",
+    routePattern: "/posts/[id]",
+  });
+
+  assert.equal(actionRuns, 0);
+  assert.deepEqual(manifest, {
+    routePath: "/posts/abc",
+    routePattern: "/posts/[id]",
+    actions: [
+      {
+        ferrite: "server-action-reference",
+        version: 1,
+        id: "app/posts/[id]/page.tsx#saveInlinePost",
+        routePattern: "/posts/[id]",
+        url: "/_ferrite/action",
+        bound: {},
+      },
+    ],
   });
 });
 

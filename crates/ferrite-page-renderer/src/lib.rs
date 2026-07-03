@@ -6,7 +6,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferrite_protocol::{ServerActionRequest, ServerActionResponse};
+use ferrite_protocol::{ServerActionReferencePayload, ServerActionRequest, ServerActionResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -331,6 +331,42 @@ impl PageRenderer {
         let response: ServerActionResponse = serde_json::from_slice(&output.stdout)?;
         ferrite_protocol::validate_server_action_response(&response)?;
         Ok(response)
+    }
+
+    pub fn collect_server_actions(
+        &self,
+        page_file: &Path,
+        layouts: &[PathBuf],
+        params: &[(String, Value)],
+        conventions: &RouteConventions,
+    ) -> Result<ServerActionManifest> {
+        let props = PageProps {
+            params: params.iter().cloned().collect(),
+        };
+        let props_json = serde_json::to_string(&props)?;
+        let layouts_json = serde_json::to_string(layouts)?;
+        let conventions_json = serde_json::to_string(conventions)?;
+        let mut command = self.node_command();
+        command
+            .arg("--server-action-manifest")
+            .arg(page_file)
+            .arg(props_json)
+            .arg(layouts_json)
+            .arg(conventions_json);
+        let output = self.run_command(command)?;
+
+        if !output.status.success() {
+            return Err(PageRenderError::NodeFailed {
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let manifest: ServerActionManifest = serde_json::from_slice(&output.stdout)?;
+        for action in &manifest.actions {
+            ferrite_protocol::validate_server_action_reference_payload(action)?;
+        }
+        Ok(manifest)
     }
 
     pub fn generate_static_params(&self, page_file: &Path) -> Result<StaticParamsResult> {
@@ -679,6 +715,16 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<R
 pub struct StaticParamsResult {
     pub has_generate_static_params: bool,
     pub params: Vec<BTreeMap<String, Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerActionManifest {
+    pub route_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ServerActionReferencePayload>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1116,6 +1162,55 @@ process.stdout.write(JSON.stringify({
             ServerActionResponseOutcome::Error {
                 message: "Action exploded".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn collects_server_action_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(
+            &script,
+            r#"
+const props = JSON.parse(process.argv[4]);
+const layouts = JSON.parse(process.argv[5]);
+process.stdout.write(JSON.stringify({
+  routePath: `/posts/${props.params.id}`,
+  routePattern: "/posts/[id]",
+  actions: [{
+    ferrite: "server-action-reference",
+    version: 1,
+    id: "app/posts/[id]/page.tsx#savePost",
+    routePattern: "/posts/[id]",
+    url: "/_ferrite/action",
+    bound: { layoutCount: layouts.length }
+  }]
+}));
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        let layout = temp.path().join("layout.tsx");
+        fs::write(&page, "").unwrap();
+        fs::write(&layout, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script);
+
+        let manifest = renderer
+            .collect_server_actions(
+                &page,
+                &[layout],
+                &[("id".to_owned(), json!("alpha"))],
+                &RouteConventions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(manifest.route_path, "/posts/alpha");
+        assert_eq!(manifest.route_pattern.as_deref(), Some("/posts/[id]"));
+        assert_eq!(manifest.actions.len(), 1);
+        assert_eq!(manifest.actions[0].id, "app/posts/[id]/page.tsx#savePost");
+        assert_eq!(manifest.actions[0].url, "/_ferrite/action");
+        assert_eq!(
+            manifest.actions[0].bound.get("layoutCount"),
+            Some(&json!(1))
         );
     }
 

@@ -17,13 +17,14 @@ use ferrite_client_bundler::{
 };
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
+    ServerActionManifest,
 };
 use ferrite_protocol::{
     SERVER_ACTION_REQUEST_MARKER, SERVER_ACTION_REQUEST_VERSION,
     SERVER_PAYLOAD_STREAM_FRAME_MARKER, SERVER_PAYLOAD_STREAM_FRAME_VERSION, ServerActionFormValue,
     ServerActionRequest,
 };
-use ferrite_router::{Route, find_document_file, scan_app_dir, write_route_types};
+use ferrite_router::{Route, RouteParamKind, find_document_file, scan_app_dir, write_route_types};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::Serialize;
@@ -52,6 +53,7 @@ const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[derive(Debug)]
 pub enum DevServerError {
     Router(ferrite_router::RouterError),
+    PageRender(PageRenderError),
     Io(std::io::Error),
     Json(serde_json::Error),
     InvalidRequestPath(String),
@@ -62,6 +64,7 @@ impl fmt::Display for DevServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DevServerError::Router(error) => write!(f, "{error}"),
+            DevServerError::PageRender(error) => write!(f, "{error}"),
             DevServerError::Io(error) => write!(f, "{error}"),
             DevServerError::Json(error) => write!(f, "{error}"),
             DevServerError::InvalidRequestPath(path) => {
@@ -77,6 +80,12 @@ impl std::error::Error for DevServerError {}
 impl From<ferrite_router::RouterError> for DevServerError {
     fn from(error: ferrite_router::RouterError) -> Self {
         DevServerError::Router(error)
+    }
+}
+
+impl From<PageRenderError> for DevServerError {
+    fn from(error: PageRenderError) -> Self {
+        DevServerError::PageRender(error)
     }
 }
 
@@ -376,11 +385,39 @@ impl DevProject {
             .snapshot
             .as_ref()
             .expect("snapshot built before response");
+        let server_action_manifests = self.collect_server_action_manifests(&snapshot.routes)?;
         let body = serde_json::to_string_pretty(&BuildManifest {
             build_id: self.build_id,
             routes: &snapshot.routes,
+            server_action_manifests: &server_action_manifests,
         })?;
         Ok(DevResponse::ok("application/json; charset=utf-8", body))
+    }
+
+    fn collect_server_action_manifests(
+        &self,
+        routes: &[Route],
+    ) -> Result<Vec<ServerActionManifest>> {
+        let renderer = PageRenderer::new(
+            self.config.project.clone(),
+            self.config.page_renderer.clone(),
+        );
+        let mut manifests = Vec::new();
+
+        for route in routes {
+            let params = representative_route_params(route);
+            let manifest = renderer.collect_server_actions(
+                &route.file,
+                &route.layouts,
+                &params,
+                &route_conventions(route),
+            )?;
+            if !manifest.actions.is_empty() {
+                manifests.push(manifest);
+            }
+        }
+
+        Ok(manifests)
     }
 
     fn routes_response(&self) -> Result<DevResponse> {
@@ -1419,6 +1456,7 @@ enum ServerPayloadResponseKind {
 struct BuildManifest<'a> {
     build_id: u64,
     routes: &'a [Route],
+    server_action_manifests: &'a [ServerActionManifest],
 }
 
 #[derive(Debug, Serialize)]
@@ -1431,6 +1469,23 @@ fn route_conventions(route: &Route) -> RouteConventions {
         loading: route.loading.clone(),
         error: route.error.clone(),
     }
+}
+
+fn representative_route_params(route: &Route) -> Vec<(String, Value)> {
+    route
+        .params
+        .iter()
+        .filter_map(|param| match param.kind {
+            RouteParamKind::Dynamic => {
+                Some((param.name.clone(), Value::String(param.name.clone())))
+            }
+            RouteParamKind::CatchAll => Some((
+                param.name.clone(),
+                Value::Array(vec![Value::String(param.name.clone())]),
+            )),
+            RouteParamKind::OptionalCatchAll => None,
+        })
+        .collect()
 }
 
 fn production_client_bundle(
@@ -3143,7 +3198,8 @@ const serverPayloadMode = mode === "--server-payload";
 const documentMode = mode === "--document";
 const documentStreamMode = mode === "--document-stream";
 const documentServerPayloadMode = mode === "--document-server-payload";
-const explicitMode = metadataMode || streamMode || serverPayloadMode || documentMode || documentStreamMode || documentServerPayloadMode;
+const serverActionManifestMode = mode === "--server-action-manifest";
+const explicitMode = metadataMode || streamMode || serverPayloadMode || documentMode || documentStreamMode || documentServerPayloadMode || serverActionManifestMode;
 const page = explicitMode ? process.argv[3] : process.argv[2];
 const props = JSON.parse(explicitMode ? process.argv[4] : process.argv[3]);
 const slug = Array.isArray(props.params.slug) ? props.params.slug.join("/") : "index";
@@ -3237,6 +3293,21 @@ if (documentServerPayloadMode) {
     ]],
     clientReferences: [],
     chunks: []
+  }));
+  process.exit(0);
+}
+if (serverActionManifestMode) {
+  process.stdout.write(JSON.stringify({
+    routePath: page.includes("[id]") ? `/posts/${props.params.id}` : "/",
+    routePattern: page.includes("[id]") ? "/posts/[id]" : "/",
+    actions: page.includes("[id]") ? [{
+      ferrite: "server-action-reference",
+      version: 1,
+      id: "app/posts/[id]/page.tsx#savePost",
+      routePattern: "/posts/[id]",
+      url: "/_ferrite/action",
+      bound: {}
+    }] : []
   }));
   process.exit(0);
 }
@@ -4073,6 +4144,18 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
         let routes = project.handle_get("/__ferrite/routes").unwrap();
         assert_eq!(routes.status, 200);
         assert!(routes.body_text().contains("\"/posts/:id\""));
+
+        let build = project.handle_get("/__ferrite/build").unwrap();
+        assert_eq!(build.status, 200);
+        let manifest: serde_json::Value = serde_json::from_str(&build.body_text()).unwrap();
+        assert_eq!(
+            manifest["server_action_manifests"][0]["routePath"].as_str(),
+            Some("/posts/id")
+        );
+        assert_eq!(
+            manifest["server_action_manifests"][0]["actions"][0]["id"].as_str(),
+            Some("app/posts/[id]/page.tsx#savePost")
+        );
     }
 
     #[test]

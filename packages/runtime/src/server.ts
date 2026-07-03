@@ -40,6 +40,7 @@ import type {
   ClientReferencePayload,
   ClientReferenceSerializableValue,
   ServerActionRequest,
+  ServerActionReferencePayload,
   ServerActionResponse,
 } from "./protocol.js";
 
@@ -168,6 +169,12 @@ export type ServerRenderOptions = {
 
 export type ServerActionInvokeOptions = {
   routePattern?: string;
+};
+
+export type ServerActionManifest = {
+  routePath: string;
+  routePattern?: string;
+  actions: ServerActionReferencePayload[];
 };
 
 export type StaticParamsResult = {
@@ -349,6 +356,36 @@ export async function invokeServerActionFromPageModule(
       }
     },
   );
+}
+
+export async function collectServerActionsFromPageModule(
+  module: PageModule,
+  props: Record<string, unknown> = {},
+  layouts: LayoutModule[] = [],
+  conventions: RouteConventionModules = {},
+  renderOptions: ServerRenderOptions = {},
+): Promise<ServerActionManifest> {
+  if (typeof renderOptions.routePath !== "string" || renderOptions.routePath.length === 0) {
+    throw new TypeError("Ferrite server action manifest collection requires a routePath render option.");
+  }
+
+  return withServerActionRenderContext(renderOptions, async () => {
+    const rendered = await renderPageChild(module, props, layouts, conventions);
+    await renderServerChildFinal(rendered);
+    const actionContext = currentServerActionContext();
+    return {
+      routePath: renderOptions.routePath as string,
+      ...(renderOptions.routePattern ? { routePattern: renderOptions.routePattern } : {}),
+      actions: [...(actionContext?.actions.values() ?? [])].map((action) =>
+        createServerActionReferencePayload({
+          id: action.id,
+          routePattern: action.routePattern,
+          url: SERVER_ACTION_URL,
+          bound: {},
+        }),
+      ),
+    };
+  });
 }
 
 export async function renderDocumentModule(

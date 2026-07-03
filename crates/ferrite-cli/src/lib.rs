@@ -645,6 +645,10 @@ fn print_build_report(report: &BuildReport) {
     println!("html files: {}", report.html_files.len());
     println!("client bundles: {}", report.client_bundles.len());
     println!(
+        "server action manifests: {}",
+        report.server_action_manifests.len()
+    );
+    println!(
         "skipped dynamic routes: {}",
         report.skipped_dynamic_routes.len()
     );

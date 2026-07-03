@@ -66,6 +66,18 @@ async function renderPageAction(projectRoot, pageFile, request, props = {}) {
   return validateServerActionResponse(JSON.parse(stdout));
 }
 
+async function renderPageActionManifest(projectRoot, pageFile, props = {}) {
+  const { stdout } = await execFileAsync(
+    "node",
+    [renderPageScript, "--server-action-manifest", pageFile, JSON.stringify(props), "[]"],
+    {
+      cwd: projectRoot,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  return JSON.parse(stdout);
+}
+
 test("render-page proxies nested use client imports into client reference markers", async () => {
   await withTempProject(async (projectRoot) => {
     const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
@@ -179,6 +191,51 @@ test("render-page invokes a registered server action", async () => {
         routePath: "/posts/alpha",
       },
     });
+  });
+});
+
+test("render-page emits registered server action manifest without invoking actions", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
+    const sideEffectFile = join(projectRoot, "side-effect.txt");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `import { writeFile } from "node:fs/promises";`,
+        `import { createServerAction } from "@ferrite/runtime/server";`,
+        "",
+        `export default function Page({ params }) {`,
+        `  const savePost = createServerAction({`,
+        `    id: "app/posts/[id]/page.tsx#savePost",`,
+        `    async run() {`,
+        `      await writeFile(${JSON.stringify(sideEffectFile)}, "ran");`,
+        `      return { ok: true };`,
+        `    },`,
+        `  });`,
+        `  return <form action={savePost}><button type="submit">Save {params.id}</button></form>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
+    const manifest = await renderPageActionManifest(projectRoot, pageFile, { params: { id: "alpha" } });
+
+    assert.deepEqual(manifest, {
+      routePath: "/posts/alpha",
+      routePattern: "/posts/[id]",
+      actions: [
+        {
+          ferrite: "server-action-reference",
+          version: 1,
+          id: "app/posts/[id]/page.tsx#savePost",
+          routePattern: "/posts/[id]",
+          url: "/_ferrite/action",
+          bound: {},
+        },
+      ],
+    });
+    await assert.rejects(() => readFile(sideEffectFile, "utf8"), { code: "ENOENT" });
   });
 });
 

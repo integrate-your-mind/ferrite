@@ -10,7 +10,7 @@ Evidence used:
 - `git remote -v`
 - `README.md`
 - `docs/architecture.md`
-- `docs/milestone-001-proof.md` through `docs/milestone-065-proof.md`
+- `docs/milestone-001-proof.md` through `docs/milestone-066-proof.md`
 - `package.json`
 - representative tests under `packages/`, `scripts/`, and `crates/`
 - live `npm pack --json` tarball manifest inspection plus clean offline install smoke for the JS-facing packages
@@ -18,7 +18,7 @@ Evidence used:
 ## Current External State
 
 - [x] Local branch exists: `codex/protocol-wasm-validation`.
-- [x] Local milestone proof docs exist through milestone 065.
+- [x] Local milestone proof docs exist through milestone 066.
 - [x] Working tree docs were audited and refreshed locally.
 - [ ] Git remote is configured. `git remote -v` is empty in this checkout.
 - [ ] Work has been pushed to GitHub from this checkout.
@@ -92,6 +92,7 @@ Evidence used:
 - [x] 063: Staged npm tarball manifest verification.
 - [x] 064: Clean npm tarball install smoke.
 - [x] 065: Browser server-action form enhancement helper.
+- [x] 066: Explicit server-action reference manifests in build/dev metadata.
 
 ## Vacuous Or Weak Test Audit
 
@@ -116,16 +117,17 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] npm package proof now includes local staged `npm pack --json` tarball manifest inspection plus clean offline install of the generated tarballs; no package was published and no remote CI run consumed the artifacts.
 - [x] Live staged-tarball inspection now proves packed manifests omit `private: true` and rewrite Ferrite `workspace:*` dependencies to `0.1.0` in `@ferrite/protocol-wasm` and `@ferrite/runtime`.
 - [ ] `@ferrite/node` optional prebuild resolution is partly proven with faked package resolution and locally generated package directories, not a real registry install.
-- [ ] Page-renderer server-action invocation tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary, but not a static deployment manifest or real app-module action registry.
+- [ ] Page-renderer server-action invocation and manifest tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary and explicit rendered-form manifest collection, but not automatic `"use server"` discovery or a real deployment action registry.
 - [ ] Browser runtime proof uses Node plus `happy-dom`, not Playwright/WebDriver in Chromium/WebKit/Firefox.
 - [ ] Dev/serve proof is local socket and one-shot proof, not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
-- [ ] Server actions are explicit form transport plus an opt-in DOM form enhancer. There is still no deployment-stable action manifest, automatic `"use server"` discovery, app bootstrap wiring, real browser proof, upload streaming, or client event action surface.
+- [ ] Server actions are explicit form transport plus an opt-in DOM form enhancer and explicit rendered-form manifests. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, app bootstrap wiring, real browser proof, upload streaming, or client event action surface.
 
 ## Productionization Checklist
 
 - [ ] Configure the GitHub remote, push the branch, open PRs, and record real PR URLs.
 - [ ] Run remote CI for lint, test, build, typecheck, example build, npm package tarball/install verification, and native prebuild dry-run workflows.
-- [ ] Add static server-action manifests, automatic `"use server"` export discovery, and deployment-stable action IDs.
+- [x] Add explicit server-action manifests for rendered `createServerAction()` form references in build/dev metadata.
+- [ ] Add automatic `"use server"` export discovery, deployment-stable inferred action IDs, and a persistent deployment action registry.
 - [x] Add a browser-side progressive-enhancement helper for server-action form submissions and validated action responses.
 - [ ] Wire the server-action form enhancer into app bootstrap/client bundles where appropriate instead of requiring manual caller setup.
 - [ ] Add real browser tests for hydration, payload navigation, streaming, popstate restoration, prefetching, and server-action form submission.
@@ -146,7 +148,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 
 ## Documentation Sync Notes
 
-- [x] Current README and architecture docs now call out the implemented form enhancer and the missing static action manifest, automatic action discovery, app bootstrap wiring, and real browser proof.
+- [x] Current README and architecture docs now call out the implemented form enhancer, explicit server-action manifests, and the missing automatic action discovery, deployment-stable inferred IDs, app bootstrap wiring, and real browser proof.
 - [x] Historical superpowers implementation plans now mark completed local work as checked where proof docs and commits show completion.
 - [x] Remote-dependent push/PR steps remain unclaimed because this checkout has no remote.
 - [x] The audit now distinguishes staged tarball manifest and clean-install proof from remaining remote-CI and publication proof.
