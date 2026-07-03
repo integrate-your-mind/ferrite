@@ -47,4 +47,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-CMD ["sh", "-c", "ferrite serve --project /srv/ferrite/app --host 0.0.0.0 --port 3000 --render-timeout-ms 30000 --request-read-timeout-ms 5000 --max-request-bytes 16384 --max-in-flight-requests 64 --server-action-csrf-token-env FERRITE_ACTION_CSRF --trusted-proxy-public-origin \"$FERRITE_PUBLIC_ORIGIN\" --trusted-proxy-client-ip-hops 1 --access-log json --action-log json"]
+CMD ["sh", "-c", "ferrite serve --project /srv/ferrite/app --host 0.0.0.0 --port 3000 --render-timeout-ms 30000 --request-read-timeout-ms 5000 --max-request-bytes 16384 --max-in-flight-requests 64 --server-action-csrf-token-env FERRITE_ACTION_CSRF --server-action-csrf-cookie-name ferrite_action_csrf --trusted-proxy-public-origin \"$FERRITE_PUBLIC_ORIGIN\" --trusted-proxy-client-ip-hops 1 --access-log json --action-log json"]

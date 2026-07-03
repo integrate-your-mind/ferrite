@@ -59,7 +59,7 @@ Not sellable yet as a hosted platform:
 
 4. Server-action security gaps
 - Explicit form transport only, not automatic `"use server"` discovery.
-- CSRF is opt-in and static-token based; no session-bound token rotation/replay defense, cookie guidance, or first-class auth middleware integration.
+- CSRF is opt-in and static-token based with optional SameSite/HttpOnly/Secure double-submit cookie binding; no session-bound token rotation/replay defense or first-class auth middleware integration.
 - Trusted-proxy public-origin checks and explicit forwarded client-IP access-log policy now exist, but production topology proof is not finalized.
 - File uploads (`multipart` file parts) are intentionally rejected.
 
@@ -79,7 +79,7 @@ Not sellable yet as a hosted platform:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
   - publish restart/rollback runbook, CLI request/action log schemas, and metrics/tracing integration plan.
 - Day 6–7: security backlog pass:
-  - session-bound token or equivalent CSRF design,
+  - session-bound token or equivalent CSRF design beyond the current double-submit cookie binding,
   - explicit replay and token rotation plan,
   - trusted-proxy deployment test matrix, including forwarded proto/host and forwarded client-IP policy.
 
@@ -145,7 +145,7 @@ Launch here means paid beta availability to external teams under explicit usage 
   - One documented and reproducible deployment stack (proxy + process manager or container + health/smoke checks) run in staging.
   - Rollback drill captured with artifact/version lock record.
 - Server-action security proof:
-  - Session-bound CSRF token strategy implemented (or explicit alternate) and tested for rotation/replay.
+  - Session-bound CSRF token strategy implemented (or explicit alternate beyond static double-submit cookie binding) and tested for rotation/replay.
   - Trusted-proxy public-origin checks and forwarded client-IP access-log policy exercised behind the chosen staging proxy with forwarded-header sanitization.
 - Operational proof:
   - CLI request access-log and server-action audit-log output captured in staging and integrated with the chosen log collector.

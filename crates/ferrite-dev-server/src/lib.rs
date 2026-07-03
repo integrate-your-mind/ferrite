@@ -43,6 +43,7 @@ const SERVER_ACTION_ID_FIELD: &str = "__ferrite_action";
 const SERVER_ACTION_ROUTE_FIELD: &str = "__ferrite_route";
 const SERVER_ACTION_CSRF_FIELD: &str = "__ferrite_csrf";
 const SERVER_ACTION_RESPONSE_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+const SERVER_ACTION_CSRF_COOKIE_ATTRIBUTES: &str = "Path=/; SameSite=Lax; HttpOnly; Secure";
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -298,6 +299,7 @@ pub struct ProductionServerConfig {
     pub max_request_bytes: usize,
     pub max_in_flight_requests: usize,
     pub server_action_csrf_token: Option<String>,
+    pub server_action_csrf_cookie_name: Option<String>,
     pub trusted_proxy: Option<ProductionTrustedProxyConfig>,
     pub trusted_proxy_client_ip_hops: Option<usize>,
     pub request_observer: Option<ProductionRequestObserver>,
@@ -327,6 +329,7 @@ impl ProductionServerConfig {
             max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
             max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
             server_action_csrf_token: None,
+            server_action_csrf_cookie_name: None,
             trusted_proxy: None,
             trusted_proxy_client_ip_hops: None,
             request_observer: None,
@@ -351,6 +354,11 @@ impl ProductionServerConfig {
 
     pub fn with_server_action_csrf_token(mut self, token: impl Into<String>) -> Self {
         self.server_action_csrf_token = Some(token.into());
+        self
+    }
+
+    pub fn with_server_action_csrf_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.server_action_csrf_cookie_name = Some(name.into());
         self
     }
 
@@ -584,6 +592,7 @@ impl DevProject {
             headers,
             body,
             self.config.server_action_csrf_token.as_deref(),
+            None,
             None,
         ) {
             Ok(request) => request,
@@ -1095,7 +1104,7 @@ impl ProductionProject {
             .as_ref()
             .expect("snapshot built before response");
 
-        if let Some(match_result) = match_route(path, &snapshot.routes) {
+        let response = if let Some(match_result) = match_route(path, &snapshot.routes) {
             let renderer = self.page_renderer();
             let conventions = route_conventions(&match_result.route);
             match mode {
@@ -1128,6 +1137,20 @@ impl ProductionProject {
         } else {
             DevResponse::not_found(render_production_not_found(path, &snapshot.routes))
                 .with_cache_control("no-store")
+        };
+        self.with_server_action_csrf_cookie(response)
+    }
+
+    fn with_server_action_csrf_cookie(&self, response: DevResponse) -> DevResponse {
+        let (Some(name), Some(token)) = (
+            self.config.server_action_csrf_cookie_name.as_deref(),
+            self.config.server_action_csrf_token.as_deref(),
+        ) else {
+            return response;
+        };
+        match server_action_csrf_cookie_header(name, token) {
+            Some(header) => response.with_set_cookie_header(header),
+            None => response,
         }
     }
 
@@ -1158,6 +1181,7 @@ impl ProductionProject {
             headers,
             body,
             self.config.server_action_csrf_token.as_deref(),
+            self.config.server_action_csrf_cookie_name.as_deref(),
             self.config.trusted_proxy.as_ref(),
         ) {
             Ok(request) => request,
@@ -1483,6 +1507,7 @@ pub struct DevResponse {
     pub cache_control: Option<&'static str>,
     pub route_pattern_header: Option<String>,
     pub link_headers: Vec<String>,
+    pub set_cookie_headers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1502,6 +1527,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1532,6 +1558,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1562,6 +1589,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1575,6 +1603,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1588,6 +1617,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1601,6 +1631,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1614,6 +1645,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1627,6 +1659,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1640,6 +1673,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1653,6 +1687,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1666,6 +1701,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1679,6 +1715,7 @@ impl DevResponse {
             cache_control: None,
             route_pattern_header: None,
             link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
         }
     }
 
@@ -1689,6 +1726,11 @@ impl DevResponse {
 
     pub fn with_route_pattern(mut self, value: impl Into<String>) -> Self {
         self.route_pattern_header = Some(value.into());
+        self
+    }
+
+    pub fn with_set_cookie_header(mut self, value: impl Into<String>) -> Self {
+        self.set_cookie_headers.push(value.into());
         self
     }
 
@@ -2588,6 +2630,10 @@ fn write_response_metadata_headers(stream: &mut TcpStream, response: &DevRespons
         write!(stream, "Link: {}\r\n", sanitize_header_value(link))?;
     }
 
+    for cookie in &response.set_cookie_headers {
+        write!(stream, "Set-Cookie: {}\r\n", sanitize_header_value(cookie))?;
+    }
+
     Ok(())
 }
 
@@ -2699,6 +2745,7 @@ fn server_action_request_from_form(
     headers: &HttpHeaders,
     body: &[u8],
     expected_csrf_token: Option<&str>,
+    csrf_cookie_name: Option<&str>,
     trusted_proxy: Option<&ProductionTrustedProxyConfig>,
 ) -> std::result::Result<ServerActionRequest, Box<DevResponse>> {
     enforce_server_action_origin(headers, trusted_proxy)?;
@@ -2706,7 +2753,7 @@ fn server_action_request_from_form(
         .map_err(|message| Box::new(DevResponse::bad_request(message)))?;
     let id = remove_required_action_field(&mut form, SERVER_ACTION_ID_FIELD)?;
     let route_path = remove_required_action_field(&mut form, SERVER_ACTION_ROUTE_FIELD)?;
-    enforce_server_action_csrf_token(&mut form, expected_csrf_token)?;
+    enforce_server_action_csrf_token(&mut form, headers, expected_csrf_token, csrf_cookie_name)?;
     let request = ServerActionRequest {
         ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
         version: SERVER_ACTION_REQUEST_VERSION,
@@ -2722,10 +2769,17 @@ fn server_action_request_from_form(
 
 fn enforce_server_action_csrf_token(
     form: &mut BTreeMap<String, ServerActionFormValue>,
+    headers: &HttpHeaders,
     expected_token: Option<&str>,
+    cookie_name: Option<&str>,
 ) -> std::result::Result<(), Box<DevResponse>> {
     let Some(expected_token) = expected_token else {
         form.remove(SERVER_ACTION_CSRF_FIELD);
+        if cookie_name.is_some() {
+            return Err(Box::new(DevResponse::forbidden(
+                "server action CSRF cookie binding requires a configured token",
+            )));
+        }
         return Ok(());
     };
 
@@ -2741,7 +2795,63 @@ fn enforce_server_action_csrf_token(
         )));
     }
 
+    if let Some(cookie_name) = cookie_name {
+        let Some(cookie_token) = server_action_cookie_value(headers, cookie_name) else {
+            return Err(Box::new(DevResponse::forbidden(
+                "server action CSRF cookie is required",
+            )));
+        };
+        if !constant_time_eq(cookie_token.as_bytes(), expected_token.as_bytes()) {
+            return Err(Box::new(DevResponse::forbidden(
+                "server action CSRF cookie is invalid",
+            )));
+        }
+    }
+
     Ok(())
+}
+
+fn server_action_cookie_value(headers: &HttpHeaders, cookie_name: &str) -> Option<String> {
+    let header = headers.get("cookie")?;
+    for part in header.split(';') {
+        let Some((name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim() == cookie_name {
+            let value = value.trim();
+            return Some(
+                value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or(value)
+                    .to_owned(),
+            );
+        }
+    }
+    None
+}
+
+fn server_action_csrf_cookie_header(name: &str, token: &str) -> Option<String> {
+    if !is_valid_cookie_name(name) || !is_valid_cookie_value(token) {
+        return None;
+    }
+    Some(format!(
+        "{name}={token}; {SERVER_ACTION_CSRF_COOKIE_ATTRIBUTES}"
+    ))
+}
+
+fn is_valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'0'..=b'9' | b'A'..=b'Z' | b'^' | b'_' | b'`' | b'a'..=b'z' | b'|' | b'~'))
+}
+
+fn is_valid_cookie_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(
+            |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+        )
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -4332,6 +4442,7 @@ process.exit(1);
             &action_form_body("/posts/abc"),
             None,
             None,
+            None,
         )
         .expect("same-origin action request should parse");
         assert_eq!(request.route_path, "/posts/abc");
@@ -4341,6 +4452,7 @@ process.exit(1);
         let response = server_action_request_from_form(
             &cross_origin,
             &action_form_body("/posts/abc"),
+            None,
             None,
             None,
         )
@@ -4357,6 +4469,7 @@ process.exit(1);
             &action_form_body("/posts/abc"),
             None,
             None,
+            None,
         )
         .expect_err("malformed host should be rejected");
 
@@ -4367,6 +4480,7 @@ process.exit(1);
         let response = server_action_request_from_form(
             &missing_host,
             &action_form_body("/posts/abc"),
+            None,
             None,
             None,
         )
@@ -4398,6 +4512,7 @@ process.exit(1);
             &headers,
             &action_form_body("/posts/abc"),
             None,
+            None,
             Some(&trusted_proxy),
         )
         .expect("trusted proxy public origin should parse");
@@ -4407,6 +4522,7 @@ process.exit(1);
         let response = server_action_request_from_form(
             &headers,
             &action_form_body("/posts/abc"),
+            None,
             None,
             Some(&trusted_proxy),
         )
@@ -4432,6 +4548,7 @@ process.exit(1);
             &headers,
             &action_form_body("/posts/abc"),
             None,
+            None,
             Some(&trusted_proxy),
         )
         .expect_err("trusted proxy mode should require forwarded proto and host");
@@ -4443,6 +4560,7 @@ process.exit(1);
         let mismatched_host = server_action_request_from_form(
             &headers,
             &action_form_body("/posts/abc"),
+            None,
             None,
             Some(&trusted_proxy),
         )
@@ -4496,8 +4614,9 @@ process.exit(1);
         let headers = action_headers_with_host("application/x-www-form-urlencoded");
         let body =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&title=Hello";
-        let request = server_action_request_from_form(&headers, body, Some("token-123"), None)
-            .expect("matching CSRF token should parse");
+        let request =
+            server_action_request_from_form(&headers, body, Some("token-123"), None, None)
+                .expect("matching CSRF token should parse");
 
         assert_eq!(request.route_path, "/posts/abc");
         assert!(!request.form.contains_key(SERVER_ACTION_CSRF_FIELD));
@@ -4507,16 +4626,18 @@ process.exit(1);
         );
 
         let missing = action_form_body("/posts/abc");
-        let response = server_action_request_from_form(&headers, &missing, Some("token-123"), None)
-            .expect_err("missing CSRF token should be rejected");
+        let response =
+            server_action_request_from_form(&headers, &missing, Some("token-123"), None, None)
+                .expect_err("missing CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("CSRF token is required"));
 
         let wrong =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=wrong";
-        let response = server_action_request_from_form(&headers, wrong, Some("token-123"), None)
-            .expect_err("wrong CSRF token should be rejected");
+        let response =
+            server_action_request_from_form(&headers, wrong, Some("token-123"), None, None)
+                .expect_err("wrong CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("CSRF token is invalid"));
@@ -4524,11 +4645,59 @@ process.exit(1);
         let duplicate =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&__ferrite_csrf=token-123";
         let response =
-            server_action_request_from_form(&headers, duplicate, Some("token-123"), None)
+            server_action_request_from_form(&headers, duplicate, Some("token-123"), None, None)
                 .expect_err("duplicate CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("CSRF token is required"));
+    }
+
+    #[test]
+    fn action_form_csrf_cookie_guard_requires_matching_cookie() {
+        let mut headers = action_headers_with_host("application/x-www-form-urlencoded");
+        headers.insert(
+            "cookie".to_owned(),
+            "theme=dark; ferrite_action_csrf=token-123".to_owned(),
+        );
+        let body =
+            b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&title=Hello";
+        let request = server_action_request_from_form(
+            &headers,
+            body,
+            Some("token-123"),
+            Some("ferrite_action_csrf"),
+            None,
+        )
+        .expect("matching hidden token and cookie should parse");
+
+        assert_eq!(request.route_path, "/posts/abc");
+        assert!(!request.form.contains_key(SERVER_ACTION_CSRF_FIELD));
+
+        headers.remove("cookie");
+        let response = server_action_request_from_form(
+            &headers,
+            body,
+            Some("token-123"),
+            Some("ferrite_action_csrf"),
+            None,
+        )
+        .expect_err("missing CSRF cookie should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("CSRF cookie is required"));
+
+        headers.insert("cookie".to_owned(), "ferrite_action_csrf=wrong".to_owned());
+        let response = server_action_request_from_form(
+            &headers,
+            body,
+            Some("token-123"),
+            Some("ferrite_action_csrf"),
+            None,
+        )
+        .expect_err("mismatched CSRF cookie should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("CSRF cookie is invalid"));
     }
 
     #[test]
@@ -4795,6 +4964,88 @@ process.exit(1);
         assert_eq!(events[0].status, 400);
         assert_eq!(events[0].outcome, ProductionActionOutcome::Rejected);
         assert!(events[0].client_ip.is_some());
+    }
+
+    #[test]
+    fn production_action_csrf_cookie_binding_sets_cookie_and_rejects_missing_cookie() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() { return <form></form>; }",
+        );
+        let mut project = action_production_project_for(
+            &app,
+            r##"
+const mode = process.argv[2];
+if (mode === "--metadata") {
+  process.stdout.write(JSON.stringify({ title: "Post" }));
+  process.exit(0);
+}
+if (mode === "--stream") {
+  process.stdout.write(JSON.stringify({
+    ferrite: "render-stream",
+    version: 1,
+    shell: [2, "main", {}, [[2, "h1", {}, [[0, "Post"]]]]],
+    chunks: []
+  }));
+  process.exit(0);
+}
+if (mode === "--server-action") {
+  const request = JSON.parse(process.argv[7]);
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-action-response",
+    version: 1,
+    status: "ok",
+    data: { routePath: request.routePath }
+  }));
+  process.exit(0);
+}
+console.error(`unexpected renderer mode ${mode}`);
+process.exit(1);
+"##,
+        );
+        project.config.server_action_csrf_token = Some("token-123".to_owned());
+        project.config.server_action_csrf_cookie_name = Some("ferrite_action_csrf".to_owned());
+
+        let get_response =
+            project.with_server_action_csrf_cookie(DevResponse::ok("text/html; charset=utf-8", ""));
+        assert_eq!(
+            get_response.set_cookie_headers,
+            vec![
+                "ferrite_action_csrf=token-123; Path=/; SameSite=Lax; HttpOnly; Secure".to_owned()
+            ]
+        );
+
+        let body = action_form_body_with_csrf("/posts/abc", "token-123");
+        let missing_cookie = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                &body,
+            )
+            .unwrap();
+
+        assert_eq!(missing_cookie.status, 403);
+        assert!(
+            missing_cookie
+                .body_text()
+                .contains("CSRF cookie is required")
+        );
+
+        let mut headers = action_headers_with_host("application/x-www-form-urlencoded");
+        headers.insert(
+            "cookie".to_owned(),
+            "ferrite_action_csrf=token-123".to_owned(),
+        );
+        let accepted = project
+            .handle_post("/_ferrite/action", &headers, &body)
+            .unwrap();
+        let accepted_body: Value = serde_json::from_slice(&accepted.body).unwrap();
+
+        assert_eq!(accepted.status, 200);
+        assert_eq!(accepted_body["status"], "ok");
+        assert_eq!(accepted_body["data"]["routePath"], "/posts/abc");
     }
 
     #[test]

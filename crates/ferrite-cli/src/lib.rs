@@ -266,6 +266,12 @@ struct ServeArgs {
 
     #[arg(
         long,
+        help = "Cookie name used to bind server-action CSRF POSTs to the rendered CSRF token"
+    )]
+    server_action_csrf_cookie_name: Option<String>,
+
+    #[arg(
+        long,
         help = "Trusted public HTTP(S) origin for server-action POSTs behind a reverse proxy; requires matching X-Forwarded-Proto and X-Forwarded-Host"
     )]
     trusted_proxy_public_origin: Option<String>,
@@ -571,6 +577,10 @@ fn run_cli(cli: Cli) -> Result<()> {
             let client_bundler = normalize_current_path(&args.client_bundler)?;
             let server_action_csrf_token =
                 resolve_server_action_csrf_token(args.server_action_csrf_token_env.as_deref())?;
+            let server_action_csrf_cookie_name = resolve_server_action_csrf_cookie_name(
+                args.server_action_csrf_cookie_name.as_deref(),
+                server_action_csrf_token.as_deref(),
+            )?;
             let trusted_proxy =
                 resolve_trusted_proxy_public_origin(args.trusted_proxy_public_origin.as_deref())?;
             let trusted_proxy_client_ip_hops = resolve_trusted_proxy_client_ip_hops(
@@ -592,6 +602,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             .with_max_in_flight_requests(args.max_in_flight_requests);
             if let Some(token) = server_action_csrf_token {
                 config = config.with_server_action_csrf_token(token);
+            }
+            if let Some(cookie_name) = server_action_csrf_cookie_name {
+                config = config.with_server_action_csrf_cookie_name(cookie_name);
             }
             if let Some(trusted_proxy) = trusted_proxy {
                 config = config.with_trusted_proxy(trusted_proxy);
@@ -793,6 +806,46 @@ fn resolve_server_action_csrf_token(env_name: Option<&str>) -> Result<Option<Str
     }
 
     Ok(Some(value))
+}
+
+fn resolve_server_action_csrf_cookie_name(
+    cookie_name: Option<&str>,
+    csrf_token: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(cookie_name) = cookie_name else {
+        return Ok(None);
+    };
+    if csrf_token.is_none() {
+        return Err(CliError::Config(
+            "--server-action-csrf-cookie-name requires --server-action-csrf-token-env".to_owned(),
+        ));
+    }
+    if !is_valid_cookie_name(cookie_name) {
+        return Err(CliError::Config(
+            "--server-action-csrf-cookie-name must be a non-empty RFC6265 cookie name".to_owned(),
+        ));
+    }
+    let csrf_token = csrf_token.expect("checked above");
+    if !is_valid_cookie_value(csrf_token) {
+        return Err(CliError::Config(
+            "server action CSRF token must be cookie-safe when --server-action-csrf-cookie-name is used".to_owned(),
+        ));
+    }
+    Ok(Some(cookie_name.to_owned()))
+}
+
+fn is_valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'0'..=b'9' | b'A'..=b'Z' | b'^' | b'_' | b'`' | b'a'..=b'z' | b'|' | b'~'))
+}
+
+fn is_valid_cookie_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(
+            |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+        )
 }
 
 fn resolve_trusted_proxy_public_origin(
@@ -1168,6 +1221,26 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_server_action_csrf_cookie_name_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--server-action-csrf-cookie-name",
+            "ferrite_action_csrf",
+            "--once",
+        ])
+        .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(
+            args.server_action_csrf_cookie_name.as_deref(),
+            Some("ferrite_action_csrf")
+        );
+    }
+
+    #[test]
     fn serve_accepts_trusted_proxy_public_origin_flag() {
         let cli = Cli::try_parse_from([
             "ferrite",
@@ -1298,6 +1371,30 @@ mod tests {
         let empty = resolve_server_action_csrf_token(Some("")).unwrap_err();
         assert!(matches!(empty, CliError::Config(_)));
         assert_eq!(empty.exit_code(), 2);
+    }
+
+    #[test]
+    fn server_action_csrf_cookie_name_requires_token_and_cookie_safe_values() {
+        let missing_token =
+            resolve_server_action_csrf_cookie_name(Some("ferrite_action_csrf"), None).unwrap_err();
+        assert!(matches!(missing_token, CliError::Config(_)));
+        assert_eq!(missing_token.exit_code(), 2);
+
+        let valid =
+            resolve_server_action_csrf_cookie_name(Some("ferrite_action_csrf"), Some("token-123"))
+                .unwrap();
+        assert_eq!(valid.as_deref(), Some("ferrite_action_csrf"));
+
+        let bad_name = resolve_server_action_csrf_cookie_name(Some("bad name"), Some("token-123"))
+            .unwrap_err();
+        assert!(matches!(bad_name, CliError::Config(_)));
+        assert_eq!(bad_name.exit_code(), 2);
+
+        let bad_token =
+            resolve_server_action_csrf_cookie_name(Some("ferrite_action_csrf"), Some("bad;token"))
+                .unwrap_err();
+        assert!(matches!(bad_token, CliError::Config(_)));
+        assert_eq!(bad_token.exit_code(), 2);
     }
 
     #[test]

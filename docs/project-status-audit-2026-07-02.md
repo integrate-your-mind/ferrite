@@ -10,7 +10,7 @@ Evidence used:
 - `git remote -v`
 - `README.md`
 - `docs/architecture.md`
-- `docs/milestone-001-proof.md` through `docs/milestone-085-proof.md`
+- `docs/milestone-001-proof.md` through `docs/milestone-086-proof.md`
 - `package.json`
 - representative tests under `packages/`, `scripts/`, and `crates/`
 - live `npm pack --json` tarball manifest inspection plus clean offline install smoke for the JS-facing packages
@@ -18,7 +18,7 @@ Evidence used:
 ## Current External State
 
 - [x] Local branch exists: `codex/protocol-wasm-validation`.
-- [x] Local milestone proof docs exist through milestone 085.
+- [x] Local milestone proof docs exist through milestone 086.
 - [x] Working tree docs were audited and refreshed locally.
 - [ ] Git remote is configured. `git remote -v` is empty in this checkout.
 - [ ] Work has been pushed to GitHub from this checkout.
@@ -112,6 +112,7 @@ Evidence used:
 - [x] 083: First-pass systemd, nginx, and container deployment templates.
 - [x] 084: Explicit trusted-proxy client-IP access-log policy.
 - [x] 085: Production server-action audit logs for action attempts and rejections.
+- [x] 086: Production server-action CSRF double-submit cookie binding.
 
 ## Vacuous Or Weak Test Audit
 
@@ -140,7 +141,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Browser runtime proof now includes Chromium coverage for generated server-action form enhancement, payload prefetch consumption, browser URL/title updates, stream-frame navigation, stream-mode popstate restoration, malformed programmatic payload rejection without DOM/history mutation, and malformed clicked-payload fallback to normal document navigation. Failed or malformed popstate fallback behavior, hydration mismatch paths, and many focus/pointer/history edge cases still mostly rely on Node plus `happy-dom`.
 - [ ] Dev/serve proof is local socket and one-shot proof, not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
 - [ ] Deployment templates now have static verifier coverage for serve flags, proxy forwarded headers, trusted forwarded client-IP hop policy, non-root container runtime, health-check presence, and a local Docker container smoke for the basic example route, but they have not been run in a hosted staging environment.
-- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, dedicated server-only action bootstrap assets, Chromium proof for enhanced route/island/server-only action forms, required action `Host`, same-host rejection for browser-supplied cross-origin `Origin`/`Referer` headers, opt-in trusted-proxy public-origin validation, explicit trusted forwarded client-IP log policy, opt-in hidden CSRF token enforcement, and production action observer/audit-log proof. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, session-bound CSRF integration, replay protection, upload streaming, client event action surface, hosted staging proof, or external audit sink.
+- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, dedicated server-only action bootstrap assets, Chromium proof for enhanced route/island/server-only action forms, required action `Host`, same-host rejection for browser-supplied cross-origin `Origin`/`Referer` headers, opt-in trusted-proxy public-origin validation, explicit trusted forwarded client-IP log policy, opt-in hidden CSRF token enforcement, opt-in production double-submit CSRF cookie binding, and production action observer/audit-log proof. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, session-bound CSRF token rotation, replay protection, upload streaming, client event action surface, hosted staging proof, or external audit sink.
 
 ## Productionization Checklist
 
@@ -156,7 +157,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Require a valid `Host` header for server-action POSTs before origin/referer comparison.
 - [x] Add opt-in hidden CSRF token rendering and server-action POST enforcement.
 - [x] Add opt-in trusted-proxy public-origin validation for server-action POSTs using `X-Forwarded-Proto` and `X-Forwarded-Host`.
-- [ ] Add full server-action CSRF/session/replay hardening: token rotation, session binding, cookie guidance, replay considerations, and clearer auth integration guidance.
+- [x] Add opt-in production CSRF double-submit cookie binding for server-action POSTs.
+- [ ] Add full server-action CSRF/session/replay hardening: token rotation, session binding, replay considerations, and clearer auth integration guidance.
 - [x] Add explicit trusted-proxy client-IP access-log policy for forwarded client address headers.
 - [x] Add production CLI access-log output for request observer events without headers or bodies.
 - [x] Add first-pass production server-action audit logs for action attempts and rejections without headers, bodies, form fields, or CSRF tokens.
@@ -187,6 +189,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Deployment docs now describe the current production adapter path, proxy/TLS assumptions, smoke tests, rollback, observability hooks, and security gaps without claiming deployed proof.
 - [x] `ferrite serve` now exposes the main production request and render limits documented in the deployment guide.
 - [x] Deployment docs now document `--server-action-csrf-token-env` as the opt-in server-action CSRF token path while preserving remaining session/replay/auth gaps.
+- [x] Deployment docs now document `--server-action-csrf-cookie-name` as the opt-in production double-submit cookie binding path while preserving remaining session/replay/auth gaps.
 - [x] Deployment docs now document `--access-log plain|json` as the CLI request outcome logging path while preserving remaining metrics/tracing gaps.
 - [x] Deployment docs now document `--action-log plain|json` as the CLI server-action audit-log path while preserving remaining external sink and hosted-staging gaps.
 - [x] Deployment docs now document `--trusted-proxy-public-origin` as the opt-in server-action trusted-proxy origin path while preserving remaining session/replay/auth gaps.
