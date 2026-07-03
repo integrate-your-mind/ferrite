@@ -1,0 +1,371 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { extname, join, resolve } from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+import { chromium } from "playwright-core";
+
+const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const chromeExecutable = process.env.FERRITE_BROWSER_EXECUTABLE ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+
+test("generated action form bootstrap works in Chromium for route, island, and server-only assets", async (t) => {
+  if (!existsSync(chromeExecutable)) {
+    t.skip(`Chrome executable not found at ${chromeExecutable}`);
+    return;
+  }
+
+  const project = await createBrowserFixtureProject();
+  t.after(async () => {
+    await rm(project, { recursive: true, force: true });
+  });
+
+  await run("cargo", ["run", "-p", "ferrite-cli", "--", "build", "--project", project], { cwd: repoRoot });
+
+  const { server, origin, receivedActions } = await serveBuild(join(project, ".ferrite/build"));
+  t.after(async () => {
+    await new Promise((resolveClose) => server.close(resolveClose));
+  });
+
+  const browser = await chromium.launch({ executablePath: chromeExecutable, headless: true });
+  t.after(async () => {
+    await browser.close();
+  });
+
+  await assertEnhancedSubmission(browser, origin, receivedActions, {
+    path: "/client-action",
+    heading: "Client action",
+    title: "Client title",
+    action: "app/client-action/page.tsx#saveClient",
+    scriptExpectation: /\/_ferrite\/static\/route-client-action\.[a-f0-9]{16}\.js/,
+  });
+  await assertEnhancedSubmission(browser, origin, receivedActions, {
+    path: "/island-action",
+    heading: "Island action",
+    title: "Island title",
+    action: "app/island-action/ActionIsland.tsx#saveIsland",
+    scriptExpectation: /\/_ferrite\/static\/client-reference-app-island-action-ActionIsland-tsx-default\.[a-f0-9]{16}\.js/,
+  });
+  await assertEnhancedSubmission(browser, origin, receivedActions, {
+    path: "/server-action",
+    heading: "Server-only action",
+    title: "Server title",
+    action: "app/server-action/page.tsx#saveServer",
+    scriptExpectation: /\/_ferrite\/static\/route-server-action-action-bootstrap\.[a-f0-9]{16}\.js/,
+    absentScriptExpectation: /\/_ferrite\/static\/route-server-action\.[a-f0-9]{16}\.js/,
+  });
+});
+
+async function assertEnhancedSubmission(browser, origin, receivedActions, route) {
+  const page = await browser.newPage();
+  try {
+    const response = await page.goto(`${origin}${route.path}`, { waitUntil: "networkidle" });
+    assert.equal(response?.status(), 200);
+    const html = await page.content();
+    assert.match(html, route.scriptExpectation);
+    if (route.absentScriptExpectation) {
+      assert.doesNotMatch(html, route.absentScriptExpectation);
+    }
+
+    await page.getByRole("button", { name: "Save" }).click();
+    const request = await receivedActions.next({ timeoutMs: 5000, label: route.path });
+
+    assert.equal(page.url(), `${origin}${route.path}`);
+    await page.getByRole("heading", { name: route.heading }).waitFor();
+    assert.deepEqual(request, {
+      path: "/_ferrite/action",
+      method: "POST",
+      fields: {
+        __ferrite_action: [route.action],
+        __ferrite_route: [route.path],
+        title: [route.title],
+      },
+    });
+  } finally {
+    await page.close();
+  }
+}
+
+async function createBrowserFixtureProject() {
+  const project = await mkdtemp(join(tmpdir(), "ferrite-browser-actions-"));
+  await mkdir(join(project, "app/client-action"), { recursive: true });
+  await mkdir(join(project, "app/island-action"), { recursive: true });
+  await mkdir(join(project, "app/server-action"), { recursive: true });
+  await mkdir(join(project, "node_modules/@ferrite"), { recursive: true });
+  await symlink(join(repoRoot, "packages/runtime"), join(project, "node_modules/@ferrite/runtime"), "dir");
+  await symlink(join(repoRoot, "packages/protocol"), join(project, "node_modules/@ferrite/protocol"), "dir");
+  await writeFile(
+    join(project, "package.json"),
+    JSON.stringify({ type: "module", dependencies: { "@ferrite/runtime": "workspace:*" } }, null, 2),
+  );
+  await writeFile(
+    join(project, "tsconfig.json"),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          jsx: "react-jsx",
+          jsxImportSource: "@ferrite/runtime",
+          module: "ES2022",
+          moduleResolution: "Bundler",
+          skipLibCheck: true,
+          strict: true,
+          target: "ES2022",
+        },
+        include: ["app/**/*.tsx", ".ferrite/types/**/*.d.ts"],
+      },
+      null,
+      2,
+    ),
+  );
+  await writeFile(
+    join(project, "app/document.tsx"),
+    `import type { Child } from "@ferrite/runtime";
+
+export default function Document({ children, head }: { children: Child; head: Child }) {
+  return (
+    <html>
+      <head>{head}</head>
+      <body>{children}</body>
+    </html>
+  );
+}
+`,
+  );
+  await writeFile(
+    join(project, "app/client-action/page.tsx"),
+    `"use client";
+
+export default function ClientActionPage() {
+  return (
+    <main>
+      <h1>Client action</h1>
+      <form action="/_ferrite/action" method="post">
+        <input type="hidden" name="__ferrite_action" value="app/client-action/page.tsx#saveClient" />
+        <input type="hidden" name="__ferrite_route" value="/client-action" />
+        <input name="title" value="Client title" />
+        <button type="submit">Save</button>
+      </form>
+    </main>
+  );
+}
+`,
+  );
+  await writeFile(
+    join(project, "app/island-action/ActionIsland.tsx"),
+    `"use client";
+
+export default function ActionIsland() {
+  return (
+    <form action="/_ferrite/action" method="post">
+      <input type="hidden" name="__ferrite_action" value="app/island-action/ActionIsland.tsx#saveIsland" />
+      <input type="hidden" name="__ferrite_route" value="/island-action" />
+      <input name="title" value="Island title" />
+      <button type="submit">Save</button>
+    </form>
+  );
+}
+`,
+  );
+  await writeFile(
+    join(project, "app/island-action/page.tsx"),
+    `import ActionIsland from "./ActionIsland";
+
+export default function IslandActionPage() {
+  return (
+    <main>
+      <h1>Island action</h1>
+      <ActionIsland />
+    </main>
+  );
+}
+`,
+  );
+  await writeFile(
+    join(project, "app/server-action/page.tsx"),
+    `import { createServerAction } from "@ferrite/runtime/server";
+
+export default function ServerActionPage() {
+  const saveServer = createServerAction({
+    id: "app/server-action/page.tsx#saveServer",
+    routePattern: "/server-action",
+    async run({ form }) {
+      "use server";
+      return { title: form.title };
+    },
+  });
+
+  return (
+    <main>
+      <h1>Server-only action</h1>
+      <form action={saveServer}>
+        <input name="title" value="Server title" />
+        <button type="submit">Save</button>
+      </form>
+    </main>
+  );
+}
+`,
+  );
+  return project;
+}
+
+async function serveBuild(buildDir) {
+  const receivedActions = createAsyncQueue();
+  const server = createServer(async (request, response) => {
+    try {
+      if (request.url === "/_ferrite/action" && request.method === "POST") {
+        const body = await readBody(request);
+        receivedActions.push({
+          path: request.url,
+          method: request.method,
+          fields: fieldsFromBody(body, request.headers["content-type"] ?? ""),
+        });
+        response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ ferrite: "server-action-response", version: 1, status: "ok", data: { saved: true } }));
+        return;
+      }
+
+      const file = resolveStaticFile(buildDir, request.url ?? "/");
+      if (!file) {
+        response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        response.end("Not Found");
+        return;
+      }
+      response.writeHead(200, { "content-type": contentType(file) });
+      createReadStream(file).pipe(response);
+    } catch (error) {
+      response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      response.end(error instanceof Error ? error.stack : String(error));
+    }
+  });
+  await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const address = server.address();
+  return { server, origin: `http://127.0.0.1:${address.port}`, receivedActions };
+}
+
+function resolveStaticFile(buildDir, url) {
+  const pathname = new URL(url, "http://localhost").pathname;
+  const relativePath = pathname.replace(/^\/+/, "");
+  const candidates =
+    relativePath === ""
+      ? [join(buildDir, "index.html")]
+      : [join(buildDir, relativePath), join(buildDir, relativePath, "index.html")];
+  return candidates.find((candidate) => isFile(candidate) && !relativePath.includes(".."));
+}
+
+function isFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function contentType(file) {
+  switch (extname(file)) {
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+      return "text/javascript; charset=utf-8";
+    case ".map":
+      return "application/json; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function readBody(request) {
+  const chunks = [];
+  for await (const chunk of request) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function fieldsFromBody(body, contentType) {
+  if (contentType.startsWith("multipart/form-data")) {
+    return fieldsFromMultipartBody(body, contentType);
+  }
+
+  const fields = {};
+  const params = new URLSearchParams(body);
+  for (const [name, value] of params) {
+    fields[name] ??= [];
+    fields[name].push(value);
+  }
+  return fields;
+}
+
+function fieldsFromMultipartBody(body, contentType) {
+  const boundary = contentType.match(/\bboundary=([^;]+)/)?.[1];
+  assert.ok(boundary, "multipart action request includes a boundary");
+  const fields = {};
+  for (const part of body.split(`--${boundary}`)) {
+    if (!part.includes("Content-Disposition")) {
+      continue;
+    }
+    const [rawHeaders, rawValue = ""] = part.replace(/^\r\n/, "").split("\r\n\r\n");
+    const name = rawHeaders.match(/\bname="([^"]+)"/)?.[1];
+    if (!name) {
+      continue;
+    }
+    fields[name] ??= [];
+    fields[name].push(rawValue.replace(/\r\n$/, ""));
+  }
+  return fields;
+}
+
+function createAsyncQueue() {
+  const values = [];
+  const waiters = [];
+  return {
+    push(value) {
+      const waiter = waiters.shift();
+      if (waiter) {
+        waiter(value);
+      } else {
+        values.push(value);
+      }
+    },
+    next({ timeoutMs, label }) {
+      const value = values.shift();
+      if (value) {
+        return Promise.resolve(value);
+      }
+      return new Promise((resolveNext, rejectNext) => {
+        const waiter = (nextValue) => {
+          clearTimeout(timeout);
+          resolveNext(nextValue);
+        };
+        const timeout = setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index !== -1) {
+            waiters.splice(index, 1);
+          }
+          rejectNext(new Error(`Timed out waiting for enhanced server action request from ${label}`));
+        }, timeoutMs);
+        waiters.push(waiter);
+      });
+    },
+  };
+}
+
+async function run(command, args, options) {
+  const child = spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
+  const stdout = [];
+  const stderr = [];
+  child.stdout.on("data", (chunk) => stdout.push(chunk));
+  child.stderr.on("data", (chunk) => stderr.push(chunk));
+  const status = await new Promise((resolveExit) => child.on("exit", resolveExit));
+  if (status !== 0) {
+    throw new Error(
+      `${command} ${args.join(" ")} failed with exit code ${status}\n${Buffer.concat(stdout).toString("utf8")}${Buffer.concat(stderr).toString("utf8")}`,
+    );
+  }
+}
