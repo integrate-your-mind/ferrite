@@ -219,6 +219,25 @@ impl fmt::Debug for ProductionRequestObserver {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionTrustedProxyConfig {
+    public_origin: HttpOrigin,
+}
+
+impl ProductionTrustedProxyConfig {
+    pub fn new(public_origin: &str) -> std::result::Result<Self, String> {
+        let public_origin = http_header_origin(public_origin).ok_or_else(|| {
+            "trusted proxy public origin must be an absolute HTTP(S) origin without a path"
+                .to_owned()
+        })?;
+        Ok(Self { public_origin })
+    }
+
+    pub fn public_origin(&self) -> String {
+        self.public_origin.to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductionServerConfig {
     pub project: PathBuf,
@@ -233,6 +252,7 @@ pub struct ProductionServerConfig {
     pub max_request_bytes: usize,
     pub max_in_flight_requests: usize,
     pub server_action_csrf_token: Option<String>,
+    pub trusted_proxy: Option<ProductionTrustedProxyConfig>,
     pub request_observer: Option<ProductionRequestObserver>,
 }
 
@@ -259,6 +279,7 @@ impl ProductionServerConfig {
             max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
             max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
             server_action_csrf_token: None,
+            trusted_proxy: None,
             request_observer: None,
         }
     }
@@ -280,6 +301,11 @@ impl ProductionServerConfig {
 
     pub fn with_server_action_csrf_token(mut self, token: impl Into<String>) -> Self {
         self.server_action_csrf_token = Some(token.into());
+        self
+    }
+
+    pub fn with_trusted_proxy(mut self, trusted_proxy: ProductionTrustedProxyConfig) -> Self {
+        self.trusted_proxy = Some(trusted_proxy);
         self
     }
 
@@ -495,6 +521,7 @@ impl DevProject {
             headers,
             body,
             self.config.server_action_csrf_token.as_deref(),
+            None,
         ) {
             Ok(request) => request,
             Err(response) => return Ok(*response),
@@ -993,6 +1020,7 @@ impl ProductionProject {
             headers,
             body,
             self.config.server_action_csrf_token.as_deref(),
+            self.config.trusted_proxy.as_ref(),
         ) {
             Ok(request) => request,
             Err(response) => return Ok(*response),
@@ -2475,8 +2503,9 @@ fn server_action_request_from_form(
     headers: &HttpHeaders,
     body: &[u8],
     expected_csrf_token: Option<&str>,
+    trusted_proxy: Option<&ProductionTrustedProxyConfig>,
 ) -> std::result::Result<ServerActionRequest, Box<DevResponse>> {
-    enforce_server_action_origin(headers)?;
+    enforce_server_action_origin(headers, trusted_proxy)?;
     let mut form = parse_server_action_form(headers, body)
         .map_err(|message| Box::new(DevResponse::bad_request(message)))?;
     let id = remove_required_action_field(&mut form, SERVER_ACTION_ID_FIELD)?;
@@ -2531,8 +2560,26 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpOrigin {
+    scheme: String,
+    authority: String,
+}
+
+impl fmt::Display for HttpOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}://{}", self.scheme, self.authority)
+    }
+}
+
+enum ServerActionOriginExpectation {
+    HostAuthority(String),
+    TrustedProxyOrigin(HttpOrigin),
+}
+
 fn enforce_server_action_origin(
     headers: &HttpHeaders,
+    trusted_proxy: Option<&ProductionTrustedProxyConfig>,
 ) -> std::result::Result<(), Box<DevResponse>> {
     let Some(host_header) = header_value(headers, "host") else {
         return Err(Box::new(DevResponse::forbidden(
@@ -2544,34 +2591,86 @@ fn enforce_server_action_origin(
             "server action Host must be a valid HTTP authority",
         )));
     };
+    let expectation = match trusted_proxy {
+        Some(config) => {
+            enforce_trusted_proxy_forwarded_origin(headers, &config.public_origin)?;
+            ServerActionOriginExpectation::TrustedProxyOrigin(config.public_origin.clone())
+        }
+        None => ServerActionOriginExpectation::HostAuthority(host),
+    };
 
     if let Some(origin) = non_empty_header(headers, "origin") {
-        let Some(origin_host) = http_header_origin_authority(origin) else {
+        let Some(origin) = http_header_origin(origin) else {
             return Err(Box::new(DevResponse::forbidden(
                 "server action Origin must be an absolute HTTP(S) origin",
             )));
         };
-        if origin_host != host {
+        if !server_action_origin_matches(&origin, &expectation) {
             return Err(Box::new(DevResponse::forbidden(
-                "server action Origin does not match the request Host",
+                "server action Origin does not match the trusted request origin",
             )));
         }
     }
 
     if let Some(referer) = non_empty_header(headers, "referer") {
-        let Some(referer_host) = http_header_url_authority(referer) else {
+        let Some(referer_origin) = http_header_url_origin(referer) else {
             return Err(Box::new(DevResponse::forbidden(
                 "server action Referer must be an absolute HTTP(S) URL",
             )));
         };
-        if referer_host != host {
+        if !server_action_origin_matches(&referer_origin, &expectation) {
             return Err(Box::new(DevResponse::forbidden(
-                "server action Referer does not match the request Host",
+                "server action Referer does not match the trusted request origin",
             )));
         }
     }
 
     Ok(())
+}
+
+fn enforce_trusted_proxy_forwarded_origin(
+    headers: &HttpHeaders,
+    expected: &HttpOrigin,
+) -> std::result::Result<(), Box<DevResponse>> {
+    let Some(forwarded_proto) = first_forwarded_header_value(headers, "x-forwarded-proto") else {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action X-Forwarded-Proto is required for trusted proxy mode",
+        )));
+    };
+    let forwarded_proto = forwarded_proto.to_ascii_lowercase();
+    if forwarded_proto != expected.scheme {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action X-Forwarded-Proto does not match the trusted public origin",
+        )));
+    }
+
+    let Some(forwarded_host) = first_forwarded_header_value(headers, "x-forwarded-host") else {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action X-Forwarded-Host is required for trusted proxy mode",
+        )));
+    };
+    let Some(forwarded_host) = normalize_authority(forwarded_host) else {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action X-Forwarded-Host must be a valid HTTP authority",
+        )));
+    };
+    if forwarded_host != expected.authority {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action X-Forwarded-Host does not match the trusted public origin",
+        )));
+    }
+
+    Ok(())
+}
+
+fn server_action_origin_matches(
+    origin: &HttpOrigin,
+    expectation: &ServerActionOriginExpectation,
+) -> bool {
+    match expectation {
+        ServerActionOriginExpectation::HostAuthority(authority) => &origin.authority == authority,
+        ServerActionOriginExpectation::TrustedProxyOrigin(expected) => origin == expected,
+    }
 }
 
 fn parse_server_action_form(
@@ -2611,29 +2710,42 @@ fn non_empty_header<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str>
         .filter(|value| !value.is_empty())
 }
 
-fn http_header_origin_authority(value: &str) -> Option<String> {
+fn first_forwarded_header_value<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
+    non_empty_header(headers, name)
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn http_header_origin(value: &str) -> Option<HttpOrigin> {
     let trimmed = value.trim();
     let (scheme, rest) = trimmed.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return None;
-    }
+    let scheme = normalize_http_scheme(scheme)?;
     if rest.contains('/') || rest.contains('?') || rest.contains('#') {
         return None;
     }
-    normalize_authority(rest)
+    let authority = normalize_authority(rest)?;
+    Some(HttpOrigin { scheme, authority })
 }
 
-fn http_header_url_authority(value: &str) -> Option<String> {
+fn http_header_url_origin(value: &str) -> Option<HttpOrigin> {
     let trimmed = value.trim();
     let (scheme, rest) = trimmed.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return None;
-    }
+    let scheme = normalize_http_scheme(scheme)?;
     let authority = rest
         .split(['/', '?', '#'])
         .next()
         .filter(|authority| !authority.is_empty())?;
-    normalize_authority(authority)
+    let authority = normalize_authority(authority)?;
+    Some(HttpOrigin { scheme, authority })
+}
+
+fn normalize_http_scheme(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("http") || value.eq_ignore_ascii_case("https") {
+        Some(value.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 fn normalize_authority(value: &str) -> Option<String> {
@@ -3992,16 +4104,24 @@ process.exit(1);
         let mut same_origin = action_headers_with_host("application/x-www-form-urlencoded");
         same_origin.insert("origin".to_owned(), "http://localhost:3000".to_owned());
 
-        let request =
-            server_action_request_from_form(&same_origin, &action_form_body("/posts/abc"), None)
-                .expect("same-origin action request should parse");
+        let request = server_action_request_from_form(
+            &same_origin,
+            &action_form_body("/posts/abc"),
+            None,
+            None,
+        )
+        .expect("same-origin action request should parse");
         assert_eq!(request.route_path, "/posts/abc");
 
         let mut cross_origin = same_origin.clone();
         cross_origin.insert("origin".to_owned(), "https://evil.example".to_owned());
-        let response =
-            server_action_request_from_form(&cross_origin, &action_form_body("/posts/abc"), None)
-                .expect_err("cross-origin action request should be rejected");
+        let response = server_action_request_from_form(
+            &cross_origin,
+            &action_form_body("/posts/abc"),
+            None,
+            None,
+        )
+        .expect_err("cross-origin action request should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("Origin"));
@@ -4009,20 +4129,104 @@ process.exit(1);
         let mut malformed_host = action_headers_with_host("application/x-www-form-urlencoded");
         malformed_host.insert("host".to_owned(), "local host".to_owned());
         malformed_host.insert("origin".to_owned(), "http://localhost".to_owned());
-        let response =
-            server_action_request_from_form(&malformed_host, &action_form_body("/posts/abc"), None)
-                .expect_err("malformed host should be rejected");
+        let response = server_action_request_from_form(
+            &malformed_host,
+            &action_form_body("/posts/abc"),
+            None,
+            None,
+        )
+        .expect_err("malformed host should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("Host"));
 
         let missing_host = action_headers("application/x-www-form-urlencoded");
-        let response =
-            server_action_request_from_form(&missing_host, &action_form_body("/posts/abc"), None)
-                .expect_err("missing host should be rejected");
+        let response = server_action_request_from_form(
+            &missing_host,
+            &action_form_body("/posts/abc"),
+            None,
+            None,
+        )
+        .expect_err("missing host should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("Host header is required"));
+    }
+
+    #[test]
+    fn action_form_trusted_proxy_origin_uses_forwarded_public_origin() {
+        let trusted_proxy = ProductionTrustedProxyConfig::new("https://app.example.com").unwrap();
+        let mut headers = BTreeMap::from([
+            (
+                "content-type".to_owned(),
+                "application/x-www-form-urlencoded".to_owned(),
+            ),
+            ("host".to_owned(), "127.0.0.1:3000".to_owned()),
+            ("x-forwarded-proto".to_owned(), "https".to_owned()),
+            ("x-forwarded-host".to_owned(), "app.example.com".to_owned()),
+            ("origin".to_owned(), "https://app.example.com".to_owned()),
+            (
+                "referer".to_owned(),
+                "https://app.example.com/posts/abc".to_owned(),
+            ),
+        ]);
+
+        let request = server_action_request_from_form(
+            &headers,
+            &action_form_body("/posts/abc"),
+            None,
+            Some(&trusted_proxy),
+        )
+        .expect("trusted proxy public origin should parse");
+        assert_eq!(request.route_path, "/posts/abc");
+
+        headers.insert("origin".to_owned(), "http://app.example.com".to_owned());
+        let response = server_action_request_from_form(
+            &headers,
+            &action_form_body("/posts/abc"),
+            None,
+            Some(&trusted_proxy),
+        )
+        .expect_err("origin scheme mismatch should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("Origin"));
+    }
+
+    #[test]
+    fn action_form_trusted_proxy_origin_requires_matching_forwarded_headers() {
+        let trusted_proxy = ProductionTrustedProxyConfig::new("https://app.example.com").unwrap();
+        let mut headers = BTreeMap::from([
+            (
+                "content-type".to_owned(),
+                "application/x-www-form-urlencoded".to_owned(),
+            ),
+            ("host".to_owned(), "127.0.0.1:3000".to_owned()),
+            ("origin".to_owned(), "https://app.example.com".to_owned()),
+        ]);
+
+        let missing_forwarded = server_action_request_from_form(
+            &headers,
+            &action_form_body("/posts/abc"),
+            None,
+            Some(&trusted_proxy),
+        )
+        .expect_err("trusted proxy mode should require forwarded proto and host");
+        assert_eq!(missing_forwarded.status, 403);
+        assert!(missing_forwarded.body_text().contains("X-Forwarded-Proto"));
+
+        headers.insert("x-forwarded-proto".to_owned(), "https".to_owned());
+        headers.insert("x-forwarded-host".to_owned(), "evil.example".to_owned());
+        let mismatched_host = server_action_request_from_form(
+            &headers,
+            &action_form_body("/posts/abc"),
+            None,
+            Some(&trusted_proxy),
+        )
+        .expect_err("trusted proxy mode should reject mismatched forwarded host");
+
+        assert_eq!(mismatched_host.status, 403);
+        assert!(mismatched_host.body_text().contains("X-Forwarded-Host"));
     }
 
     #[test]
@@ -4030,7 +4234,7 @@ process.exit(1);
         let headers = action_headers_with_host("application/x-www-form-urlencoded");
         let body =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&title=Hello";
-        let request = server_action_request_from_form(&headers, body, Some("token-123"))
+        let request = server_action_request_from_form(&headers, body, Some("token-123"), None)
             .expect("matching CSRF token should parse");
 
         assert_eq!(request.route_path, "/posts/abc");
@@ -4041,7 +4245,7 @@ process.exit(1);
         );
 
         let missing = action_form_body("/posts/abc");
-        let response = server_action_request_from_form(&headers, &missing, Some("token-123"))
+        let response = server_action_request_from_form(&headers, &missing, Some("token-123"), None)
             .expect_err("missing CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
@@ -4049,7 +4253,7 @@ process.exit(1);
 
         let wrong =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=wrong";
-        let response = server_action_request_from_form(&headers, wrong, Some("token-123"))
+        let response = server_action_request_from_form(&headers, wrong, Some("token-123"), None)
             .expect_err("wrong CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
@@ -4057,8 +4261,9 @@ process.exit(1);
 
         let duplicate =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&__ferrite_csrf=token-123";
-        let response = server_action_request_from_form(&headers, duplicate, Some("token-123"))
-            .expect_err("duplicate CSRF token should be rejected");
+        let response =
+            server_action_request_from_form(&headers, duplicate, Some("token-123"), None)
+                .expect_err("duplicate CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("CSRF token is required"));
@@ -4278,6 +4483,33 @@ process.exit(1);
 
         assert!(headers.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(body.contains("Referer"));
+    }
+
+    #[test]
+    fn production_action_post_accepts_trusted_proxy_public_origin_on_real_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let mut project = action_production_project_for(&app, action_renderer_body());
+        project.config.trusted_proxy =
+            Some(ProductionTrustedProxyConfig::new("https://app.example.com").unwrap());
+        let body = action_form_body("/posts/abc");
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: 127.0.0.1:3000\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: app.example.com\r\nOrigin: https://app.example.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        let headers = response_headers(&response);
+        let body: Value = serde_json::from_slice(response_body(&response)).unwrap();
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["data"]["routePath"], "/posts/abc");
     }
 
     #[test]

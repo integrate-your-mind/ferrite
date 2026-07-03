@@ -10,7 +10,7 @@ Evidence used:
 - `git remote -v`
 - `README.md`
 - `docs/architecture.md`
-- `docs/milestone-001-proof.md` through `docs/milestone-081-proof.md`
+- `docs/milestone-001-proof.md` through `docs/milestone-082-proof.md`
 - `package.json`
 - representative tests under `packages/`, `scripts/`, and `crates/`
 - live `npm pack --json` tarball manifest inspection plus clean offline install smoke for the JS-facing packages
@@ -108,6 +108,7 @@ Evidence used:
 - [x] 079: Server-action POSTs require a valid `Host` before origin/referer checks.
 - [x] 080: Opt-in hidden CSRF token rendering and server-action POST enforcement.
 - [x] 081: Production CLI access logs for request observer events.
+- [x] 082: Opt-in trusted-proxy public-origin validation for server-action POSTs.
 
 ## Vacuous Or Weak Test Audit
 
@@ -135,7 +136,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Page-renderer server-action invocation and manifest tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary and explicit rendered-form manifest collection, but not automatic `"use server"` discovery or a real deployment action registry.
 - [ ] Browser runtime proof now includes Chromium coverage for generated server-action form enhancement, payload prefetch consumption, browser URL/title updates, stream-frame navigation, stream-mode popstate restoration, malformed programmatic payload rejection without DOM/history mutation, and malformed clicked-payload fallback to normal document navigation. Failed or malformed popstate fallback behavior, hydration mismatch paths, and many focus/pointer/history edge cases still mostly rely on Node plus `happy-dom`.
 - [ ] Dev/serve proof is local socket and one-shot proof, not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
-- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, dedicated server-only action bootstrap assets, Chromium proof for enhanced route/island/server-only action forms, required action `Host`, same-host rejection for browser-supplied cross-origin `Origin`/`Referer` headers, and opt-in hidden CSRF token enforcement. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, session-bound CSRF integration, replay protection, upload streaming, or client event action surface.
+- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, dedicated server-only action bootstrap assets, Chromium proof for enhanced route/island/server-only action forms, required action `Host`, same-host rejection for browser-supplied cross-origin `Origin`/`Referer` headers, opt-in trusted-proxy public-origin validation, and opt-in hidden CSRF token enforcement. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, session-bound CSRF integration, replay protection, upload streaming, or client event action surface.
 
 ## Productionization Checklist
 
@@ -150,7 +151,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Add server-action browser header hardening: reject action POSTs when a present `Origin` or `Referer` host differs from the request `Host`.
 - [x] Require a valid `Host` header for server-action POSTs before origin/referer comparison.
 - [x] Add opt-in hidden CSRF token rendering and server-action POST enforcement.
-- [ ] Add full server-action CSRF/session/replay hardening: token rotation, session binding, cookie guidance, trusted proxy configuration, replay considerations, and clearer auth integration guidance.
+- [x] Add opt-in trusted-proxy public-origin validation for server-action POSTs using `X-Forwarded-Proto` and `X-Forwarded-Host`.
+- [ ] Add full server-action CSRF/session/replay hardening: token rotation, session binding, cookie guidance, forwarded client-IP trust policy, replay considerations, and clearer auth integration guidance.
 - [x] Add production CLI access-log output for request observer events without headers or bodies.
 - [ ] Add first-class metrics/tracing sinks and richer audit exporters for request/action observer events.
 - [x] Expose production request-read timeout, request-byte, and in-flight request limits through the `ferrite serve` CLI.
@@ -178,4 +180,5 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] `ferrite serve` now exposes the main production request and render limits documented in the deployment guide.
 - [x] Deployment docs now document `--server-action-csrf-token-env` as the opt-in server-action CSRF token path while preserving remaining session/replay/auth gaps.
 - [x] Deployment docs now document `--access-log plain|json` as the CLI request outcome logging path while preserving remaining metrics/tracing gaps.
+- [x] Deployment docs now document `--trusted-proxy-public-origin` as the opt-in server-action trusted-proxy origin path while preserving remaining session/replay/auth gaps.
 - [ ] Historical proof docs are not rewritten to erase their original "Not Proven Yet" context; they should be read as milestone snapshots.

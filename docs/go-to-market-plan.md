@@ -59,7 +59,7 @@ Not sellable yet as a hosted platform:
 4. Server-action security gaps
 - Explicit form transport only, not automatic `"use server"` discovery.
 - CSRF is opt-in and static-token based; no session-bound token rotation/replay defense, cookie guidance, or first-class auth middleware integration.
-- Trusted-proxy header handling is not finalized.
+- Trusted-proxy public-origin checks now exist for action POSTs, but forwarded client-IP trust policy and production topology proof are not finalized.
 - File uploads (`multipart` file parts) are intentionally rejected.
 
 5. Observability + operations depth
@@ -80,7 +80,7 @@ Not sellable yet as a hosted platform:
 - Day 6–7: security backlog pass:
   - session-bound token or equivalent CSRF design,
   - explicit replay and token rotation plan,
-  - trusted-proxy policy decision and test matrix.
+  - trusted-proxy deployment test matrix, including forwarded proto/host and client-IP policy.
 
 ### Week 2
 - Day 8–10: close server-action reliability and UX:
@@ -145,6 +145,7 @@ Launch here means paid beta availability to external teams under explicit usage 
   - Rollback drill captured with artifact/version lock record.
 - Server-action security proof:
   - Session-bound CSRF token strategy implemented (or explicit alternate) and tested for rotation/replay.
+  - Trusted-proxy public-origin checks exercised behind the chosen staging proxy with forwarded-header sanitization.
 - Operational proof:
   - CLI access-log output captured in staging and integrated with the chosen log collector.
   - Metrics/tracing path for request observer events and action endpoint outcomes.

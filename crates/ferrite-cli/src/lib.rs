@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrite_builder::{BuildConfig, BuildReport};
 use ferrite_dev_server::{
     DevProject, DevResponse, DevServerConfig, ProductionProject, ProductionRequestEvent,
-    ProductionServerConfig,
+    ProductionServerConfig, ProductionTrustedProxyConfig,
 };
 use ferrite_router::{Route, scan_app_dir, write_route_types};
 use serde::Serialize;
@@ -262,6 +262,12 @@ struct ServeArgs {
         help = "Environment variable containing the server-action CSRF token required for action POSTs"
     )]
     server_action_csrf_token_env: Option<String>,
+
+    #[arg(
+        long,
+        help = "Trusted public HTTP(S) origin for server-action POSTs behind a reverse proxy; requires matching X-Forwarded-Proto and X-Forwarded-Host"
+    )]
+    trusted_proxy_public_origin: Option<String>,
 
     #[arg(
         long,
@@ -551,6 +557,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             let client_bundler = normalize_current_path(&args.client_bundler)?;
             let server_action_csrf_token =
                 resolve_server_action_csrf_token(args.server_action_csrf_token_env.as_deref())?;
+            let trusted_proxy =
+                resolve_trusted_proxy_public_origin(args.trusted_proxy_public_origin.as_deref())?;
             let mut config = ProductionServerConfig::new(
                 project.clone(),
                 app_dir.clone(),
@@ -566,6 +574,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             .with_max_in_flight_requests(args.max_in_flight_requests);
             if let Some(token) = server_action_csrf_token {
                 config = config.with_server_action_csrf_token(token);
+            }
+            if let Some(trusted_proxy) = trusted_proxy {
+                config = config.with_trusted_proxy(trusted_proxy);
             }
             if let Some(format) = args.access_log {
                 config = config.with_request_observer(move |event| {
@@ -756,6 +767,24 @@ fn resolve_server_action_csrf_token(env_name: Option<&str>) -> Result<Option<Str
     }
 
     Ok(Some(value))
+}
+
+fn resolve_trusted_proxy_public_origin(
+    public_origin: Option<&str>,
+) -> Result<Option<ProductionTrustedProxyConfig>> {
+    let Some(public_origin) = public_origin else {
+        return Ok(None);
+    };
+    if public_origin.trim().is_empty() {
+        return Err(CliError::Config(
+            "--trusted-proxy-public-origin requires a non-empty HTTP(S) origin".to_owned(),
+        ));
+    }
+    ProductionTrustedProxyConfig::new(public_origin)
+        .map(Some)
+        .map_err(|message| {
+            CliError::Config(format!("invalid trusted proxy public origin: {message}"))
+        })
 }
 
 fn run_typescript_check(project: &Path) -> Result<()> {
@@ -1033,6 +1062,26 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_trusted_proxy_public_origin_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--trusted-proxy-public-origin",
+            "https://app.example.com",
+            "--once",
+        ])
+        .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(
+            args.trusted_proxy_public_origin.as_deref(),
+            Some("https://app.example.com")
+        );
+    }
+
+    #[test]
     fn serve_accepts_access_log_format_flag() {
         let cli =
             Cli::try_parse_from(["ferrite", "serve", "--access-log", "json", "--once"]).unwrap();
@@ -1079,6 +1128,23 @@ mod tests {
         let empty = resolve_server_action_csrf_token(Some("")).unwrap_err();
         assert!(matches!(empty, CliError::Config(_)));
         assert_eq!(empty.exit_code(), 2);
+    }
+
+    #[test]
+    fn trusted_proxy_public_origin_requires_valid_http_origin() {
+        let config = resolve_trusted_proxy_public_origin(Some("https://app.example.com")).unwrap();
+        let config = config.expect("trusted proxy config should be built");
+        assert_eq!(config.public_origin(), "https://app.example.com");
+
+        let with_path =
+            resolve_trusted_proxy_public_origin(Some("https://app.example.com/path")).unwrap_err();
+        assert!(matches!(with_path, CliError::Config(_)));
+        assert_eq!(with_path.exit_code(), 2);
+
+        let unsupported_scheme =
+            resolve_trusted_proxy_public_origin(Some("ftp://app.example.com")).unwrap_err();
+        assert!(matches!(unsupported_scheme, CliError::Config(_)));
+        assert_eq!(unsupported_scheme.exit_code(), 2);
     }
 
     #[test]
