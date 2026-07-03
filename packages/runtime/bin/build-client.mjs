@@ -63,7 +63,7 @@ try {
     entryFile,
     [
       `import { createElement } from "@ferrite/runtime";`,
-      `import { hydrate } from "@ferrite/runtime/dom";`,
+      `import { bootstrapServerActionForms, hydrate } from "@ferrite/runtime/dom";`,
       `import Page from ${JSON.stringify(resolve(pageFile))};`,
       ...layoutFiles.map((file, index) => `import Layout${index} from ${JSON.stringify(resolve(file))};`),
       "",
@@ -73,6 +73,9 @@ try {
       `const root = document.getElementById("ferrite-root") || document.getElementById("ferrite-dev-root");`,
       `if (root) {`,
       `  hydrate(tree, root);`,
+      `}`,
+      `if (typeof document !== "undefined") {`,
+      `  bootstrapServerActionForms(document);`,
       `}`,
       "",
     ].join("\n"),
@@ -252,7 +255,7 @@ async function bundleClientReference(clientReference, projectRoot, outDir, publi
 
 function clientReferenceEntrySource(clientReference) {
   return [
-    `import { hydrateClientReference } from "@ferrite/runtime/dom";`,
+    `import { bootstrapServerActionForms, hydrateClientReference } from "@ferrite/runtime/dom";`,
     clientReferenceImportStatement(clientReference),
     "",
     `const registration = {`,
@@ -267,6 +270,7 @@ function clientReferenceEntrySource(clientReference) {
     `  hydrateClientReference(registration);`,
     `}`,
     `if (typeof document !== "undefined") {`,
+    `  bootstrapServerActionForms(document);`,
     `  if (document.readyState === "loading") {`,
     `    document.addEventListener("DOMContentLoaded", hydrateMarkedIslands, { once: true });`,
     `  } else {`,

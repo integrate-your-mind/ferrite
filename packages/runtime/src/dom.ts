@@ -173,6 +173,8 @@ export type ServerActionFormEnhancer = {
   destroy(): void;
 };
 
+const serverActionFormBootstraps = new WeakMap<ParentNode, ServerActionFormEnhancer>();
+
 export function mount(child: Child, container: Element): RootHandle {
   if (!container.ownerDocument) {
     throw new TypeError("Ferrite mount requires a container attached to a document.");
@@ -279,6 +281,26 @@ export async function fetchAndApplyServerPayload(
 ): Promise<ServerPayloadPacket> {
   const packet = await fetchServerPayload(input, options);
   return applyServerPayload(root, packet);
+}
+
+export function bootstrapServerActionForms(
+  eventRoot: ParentNode = globalThis.document,
+  options: ServerActionFormEnhancerOptions = {},
+): ServerActionFormEnhancer {
+  const existing = serverActionFormBootstraps.get(eventRoot);
+  if (existing) {
+    return existing;
+  }
+
+  const enhancer = enhanceServerActionForms(eventRoot, options);
+  const bootstrap = {
+    destroy() {
+      enhancer.destroy();
+      serverActionFormBootstraps.delete(eventRoot);
+    },
+  };
+  serverActionFormBootstraps.set(eventRoot, bootstrap);
+  return bootstrap;
 }
 
 export function enhanceServerActionForms(

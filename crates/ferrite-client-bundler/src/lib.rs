@@ -623,6 +623,107 @@ export function ShareButton({ id }) {
         )));
     }
 
+    #[test]
+    fn real_runner_bootstraps_server_action_form_enhancement() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        fs::create_dir_all(temp.path().join("node_modules/@ferrite")).unwrap();
+        symlink_dir(
+            &repo_root.join("packages/runtime"),
+            &temp.path().join("node_modules/@ferrite/runtime"),
+        );
+        fs::create_dir_all(temp.path().join("app/actions")).unwrap();
+        fs::write(
+            temp.path().join("app/actions/page.tsx"),
+            r#"
+"use client";
+
+export default function Page() {
+  return <form method="post" action="/_ferrite/action"><button>Save</button></form>;
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("app/actions/ActionButton.tsx"),
+            r#"
+"use client";
+
+export default function ActionButton() {
+  return <button type="button">Client action</button>;
+}
+"#,
+        )
+        .unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+        let bundler = ClientBundler::new(temp.path().to_path_buf(), script);
+
+        let route_bundle = bundler
+            .bundle_route(
+                &temp.path().join("app/actions/page.tsx"),
+                &[],
+                "/actions",
+                &[],
+                &temp.path().join(".ferrite/build/_ferrite/static"),
+                "/_ferrite/static",
+            )
+            .unwrap();
+
+        let route_script = route_bundle
+            .script
+            .as_deref()
+            .expect("client route emits a script")
+            .trim_start_matches("/_ferrite/static/");
+        let route_js = fs::read_to_string(
+            temp.path()
+                .join(".ferrite/build/_ferrite/static")
+                .join(route_script),
+        )
+        .unwrap();
+        assert!(route_js.contains("bootstrapServerActionForms"));
+
+        fs::write(
+            temp.path().join("app/actions/page.tsx"),
+            r#"
+import ActionButton from "./ActionButton";
+
+export default function Page() {
+  return <ActionButton />;
+}
+"#,
+        )
+        .unwrap();
+
+        let server_bundle = bundler
+            .bundle_route(
+                &temp.path().join("app/actions/page.tsx"),
+                &[],
+                "/actions",
+                &[],
+                &temp.path().join(".ferrite/build/_ferrite/static"),
+                "/_ferrite/static",
+            )
+            .unwrap();
+
+        let reference_script = server_bundle.client_references[0]
+            .script
+            .as_deref()
+            .expect("client reference emits a script")
+            .trim_start_matches("/_ferrite/static/");
+        let reference_js = fs::read_to_string(
+            temp.path()
+                .join(".ferrite/build/_ferrite/static")
+                .join(reference_script),
+        )
+        .unwrap();
+        assert!(reference_js.contains("bootstrapServerActionForms"));
+    }
+
     #[cfg(unix)]
     fn symlink_dir(original: &Path, link: &Path) {
         std::os::unix::fs::symlink(original, link).unwrap();

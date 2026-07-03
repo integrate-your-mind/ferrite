@@ -10,7 +10,7 @@ Evidence used:
 - `git remote -v`
 - `README.md`
 - `docs/architecture.md`
-- `docs/milestone-001-proof.md` through `docs/milestone-066-proof.md`
+- `docs/milestone-001-proof.md` through `docs/milestone-067-proof.md`
 - `package.json`
 - representative tests under `packages/`, `scripts/`, and `crates/`
 - live `npm pack --json` tarball manifest inspection plus clean offline install smoke for the JS-facing packages
@@ -18,7 +18,7 @@ Evidence used:
 ## Current External State
 
 - [x] Local branch exists: `codex/protocol-wasm-validation`.
-- [x] Local milestone proof docs exist through milestone 066.
+- [x] Local milestone proof docs exist through milestone 067.
 - [x] Working tree docs were audited and refreshed locally.
 - [ ] Git remote is configured. `git remote -v` is empty in this checkout.
 - [ ] Work has been pushed to GitHub from this checkout.
@@ -93,6 +93,7 @@ Evidence used:
 - [x] 064: Clean npm tarball install smoke.
 - [x] 065: Browser server-action form enhancement helper.
 - [x] 066: Explicit server-action reference manifests in build/dev metadata.
+- [x] 067: Idempotent generated client entrypoint server-action form bootstrap.
 
 ## Vacuous Or Weak Test Audit
 
@@ -120,7 +121,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Page-renderer server-action invocation and manifest tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary and explicit rendered-form manifest collection, but not automatic `"use server"` discovery or a real deployment action registry.
 - [ ] Browser runtime proof uses Node plus `happy-dom`, not Playwright/WebDriver in Chromium/WebKit/Firefox.
 - [ ] Dev/serve proof is local socket and one-shot proof, not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
-- [ ] Server actions are explicit form transport plus an opt-in DOM form enhancer and explicit rendered-form manifests. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, app bootstrap wiring, real browser proof, upload streaming, or client event action surface.
+- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, and generated client-entrypoint bootstrap. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, dedicated bootstrap asset for server-only action routes, real browser proof, upload streaming, or client event action surface.
 
 ## Productionization Checklist
 
@@ -129,7 +130,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Add explicit server-action manifests for rendered `createServerAction()` form references in build/dev metadata.
 - [ ] Add automatic `"use server"` export discovery, deployment-stable inferred action IDs, and a persistent deployment action registry.
 - [x] Add a browser-side progressive-enhancement helper for server-action form submissions and validated action responses.
-- [ ] Wire the server-action form enhancer into app bootstrap/client bundles where appropriate instead of requiring manual caller setup.
+- [x] Wire the server-action form enhancer into generated route/client-reference browser entrypoints where browser JavaScript already exists.
+- [ ] Emit a dedicated action-enhancer browser asset for server-only routes that contain server-action forms but no route/client-reference script.
 - [ ] Add real browser tests for hydration, payload navigation, streaming, popstate restoration, prefetching, and server-action form submission.
 - [ ] Add server-action security hardening: origin/CSRF policy, cookie/session integration points, replay considerations, and clearer auth guidance.
 - [ ] Add first-class production logging/tracing sinks for request observer events.
@@ -148,7 +150,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 
 ## Documentation Sync Notes
 
-- [x] Current README and architecture docs now call out the implemented form enhancer, explicit server-action manifests, and the missing automatic action discovery, deployment-stable inferred IDs, app bootstrap wiring, and real browser proof.
+- [x] Current README and architecture docs now call out the implemented form enhancer, explicit server-action manifests, generated client-entrypoint bootstrap, and the missing automatic action discovery, deployment-stable inferred IDs, server-only-route enhancer assets, and real browser proof.
 - [x] Historical superpowers implementation plans now mark completed local work as checked where proof docs and commits show completion.
 - [x] Remote-dependent push/PR steps remain unclaimed because this checkout has no remote.
 - [x] The audit now distinguishes staged tarball manifest and clean-install proof from remaining remote-CI and publication proof.

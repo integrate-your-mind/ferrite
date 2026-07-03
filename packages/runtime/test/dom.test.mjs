@@ -25,6 +25,7 @@ import {
 } from "../dist/index.js";
 import {
   applyServerPayload,
+  bootstrapServerActionForms,
   createServerPayloadNavigator,
   enhanceServerActionForms,
   fetchAndApplyServerPayload,
@@ -1312,6 +1313,46 @@ test("server action form enhancer reports invalid action responses", async () =>
   assert.equal(errors.length, 1);
   assert.match(errors[0].message, /expected ferrite marker "server-action-response"/);
   assert.equal(errors[0].action, "https://example.com/_ferrite/action");
+});
+
+test("server action form bootstrap is idempotent for generated entrypoints", async () => {
+  const { window, container } = createContainer("https://example.com/posts/abc");
+  container.innerHTML = `
+    <form action="/_ferrite/action" method="post">
+      <input type="hidden" name="__ferrite_action" value="app/posts/[id]/page.tsx#savePost">
+      <input type="hidden" name="__ferrite_route" value="/posts/abc">
+      <button type="submit">Save</button>
+    </form>
+  `;
+  const submissions = [];
+  const fetch = async () => {
+    submissions.push("submit");
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({
+        ferrite: "server-action-response",
+        version: 1,
+        status: "ok",
+        data: null,
+      }),
+    };
+  };
+
+  const first = bootstrapServerActionForms(window.document, { window, fetch });
+  const second = bootstrapServerActionForms(window.document, { window, fetch });
+  assert.equal(first, second);
+
+  const form = container.querySelector("form");
+  form.dispatchEvent(new window.SubmitEvent("submit", { bubbles: true, cancelable: true }));
+  await flushScheduledWork();
+
+  assert.deepEqual(submissions, ["submit"]);
+  first.destroy();
+  form.dispatchEvent(new window.SubmitEvent("submit", { bubbles: true, cancelable: true }));
+  await flushScheduledWork();
+  assert.deepEqual(submissions, ["submit"]);
 });
 
 test("server payload navigator streams shell before chunks and updates history after completion", async () => {
