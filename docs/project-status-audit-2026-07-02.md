@@ -10,7 +10,7 @@ Evidence used:
 - `git remote -v`
 - `README.md`
 - `docs/architecture.md`
-- `docs/milestone-001-proof.md` through `docs/milestone-067-proof.md`
+- `docs/milestone-001-proof.md` through `docs/milestone-073-proof.md`
 - `package.json`
 - representative tests under `packages/`, `scripts/`, and `crates/`
 - live `npm pack --json` tarball manifest inspection plus clean offline install smoke for the JS-facing packages
@@ -99,6 +99,7 @@ Evidence used:
 - [x] 070: Server-action `Origin`/`Referer` same-host rejection in dev and production adapters.
 - [x] 071: Rust-backed WASM validation for server-payload stream frames.
 - [x] 072: Browser bundler emits `@ferrite/protocol-wasm` WASM assets through the static public path.
+- [x] 073: Chromium proof for server-payload prefetch navigation and stream-frame navigation.
 
 ## Vacuous Or Weak Test Audit
 
@@ -110,7 +111,7 @@ Evidence used:
 - [x] `scripts/verify-npm-packages.test.mjs` now proves the verifier packs from staged release manifests, preserves source manifests, and rejects source-only fields in packed manifests.
 - [x] The npm package verifier now clean-installs the generated local tarballs together in an offline temp project, smoke-imports protocol/runtime/WASM-safe packages, and checks `@ferrite/node` package presence without importing unpublished native prebuilds.
 - [x] `packages/protocol-wasm/test/wasm.test.mjs` now proves Rust WASM validation for server-payload packets and stream frames; `test/browser-wasm-bundler.test.mjs` proves generated client bundles can import and emit the protocol WASM artifact through the configured public path.
-- [ ] Runtime DOM coverage now includes Chromium proof for generated server-action form enhancement, but most hydration, navigation, streaming, focus, pointer, and history behavior still relies on deterministic `happy-dom` coverage.
+- [ ] Runtime DOM coverage now includes Chromium proof for generated server-action form enhancement plus payload prefetch/navigation and stream-frame navigation, but hydration mismatch paths, popstate restoration, malformed payload failures, and many focus/pointer/history edge cases still rely on deterministic `happy-dom` coverage.
 - [x] `enhanceServerActionForms()` has focused red-to-green coverage for the normal enhanced submit path, invalid response failure path, plain-form fallback, and listener cleanup.
 - [ ] Several proof docs rely on `--once`, temp fixtures, or local generated packages. These are valid milestone checks, but they are not deployment proof.
 
@@ -124,7 +125,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Live staged-tarball inspection now proves packed manifests omit `private: true` and rewrite Ferrite `workspace:*` dependencies to `0.1.0` in `@ferrite/protocol-wasm` and `@ferrite/runtime`.
 - [ ] `@ferrite/node` optional prebuild resolution is partly proven with faked package resolution and locally generated package directories, not a real registry install.
 - [ ] Page-renderer server-action invocation and manifest tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary and explicit rendered-form manifest collection, but not automatic `"use server"` discovery or a real deployment action registry.
-- [ ] Browser runtime proof now includes Chromium coverage for generated server-action form enhancement, but payload navigation, streaming, popstate restoration, prefetching, focus, pointer, and history behavior still mostly rely on Node plus `happy-dom`.
+- [ ] Browser runtime proof now includes Chromium coverage for generated server-action form enhancement, payload prefetch consumption, browser URL/title updates, and stream-frame navigation. Popstate restoration, malformed payload failures, hydration mismatch paths, and many focus/pointer/history edge cases still mostly rely on Node plus `happy-dom`.
 - [ ] Dev/serve proof is local socket and one-shot proof, not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
 - [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, dedicated server-only action bootstrap assets, Chromium proof for enhanced route/island/server-only action forms, and same-host rejection for browser-supplied cross-origin `Origin`/`Referer` headers. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, CSRF token/session binding, replay protection, upload streaming, or client event action surface.
 
@@ -137,7 +138,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Add a browser-side progressive-enhancement helper for server-action form submissions and validated action responses.
 - [x] Wire the server-action form enhancer into generated route/client-reference browser entrypoints where browser JavaScript already exists.
 - [x] Emit a dedicated action-enhancer browser asset for server-only routes that contain server-action forms but no route/client-reference script.
-- [ ] Add real browser tests for broader hydration behavior, payload navigation, streaming, popstate restoration, and prefetching.
+- [ ] Add real browser tests for broader hydration behavior, payload navigation, streaming, popstate restoration, and prefetching. Payload prefetch/navigation and stream-frame navigation now have a first Chromium proof; hydration mismatch paths, popstate restoration, malformed payload failures, and broader focus/pointer/history edges still need browser coverage.
 - [x] Add server-action browser header hardening: reject action POSTs when a present `Origin` or `Referer` host differs from the request `Host`.
 - [ ] Add full server-action CSRF/session/replay hardening: token/session binding, cookie guidance, trusted proxy configuration, replay considerations, and clearer auth integration guidance.
 - [ ] Add first-class production logging/tracing sinks for request observer events.
