@@ -13,7 +13,7 @@ import { chromium } from "playwright-core";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const chromeExecutable = process.env.FERRITE_BROWSER_EXECUTABLE ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
-test("server payload navigator handles prefetch and stream navigation in Chromium", async (t) => {
+test("server payload navigator handles prefetch, stream navigation, and popstate in Chromium", async (t) => {
   if (!existsSync(chromeExecutable)) {
     t.skip(`Chrome executable not found at ${chromeExecutable}`);
     return;
@@ -75,6 +75,28 @@ test("server payload navigator handles prefetch and stream navigation in Chromiu
   assert.equal(page.url(), `${origin}/posts/stream`);
   assert.equal(await page.title(), "Stream title");
   assert(requests.includes("/posts/stream?__ferrite_payload=stream"));
+
+  await page.evaluate(() => {
+    history.back();
+  });
+  await waitForRequest(requests, "/posts/prefetched?__ferrite_payload=stream", {
+    after: requests.length,
+  });
+  await page.getByRole("heading", { name: "Prefetched route" }).waitFor();
+  await page.getByText("Loaded prefetched details").waitFor();
+  assert.equal(page.url(), `${origin}/posts/prefetched`);
+  assert.equal(await page.title(), "Prefetched title");
+
+  await page.evaluate(() => {
+    history.forward();
+  });
+  await waitForRequest(requests, "/posts/stream?__ferrite_payload=stream", {
+    after: requests.length,
+  });
+  await page.getByRole("heading", { name: "Stream route" }).waitFor();
+  await page.getByText("Loaded stream details").waitFor();
+  assert.equal(page.url(), `${origin}/posts/stream`);
+  assert.equal(await page.title(), "Stream title");
   assert.deepEqual(pageErrors, []);
 });
 
@@ -157,6 +179,15 @@ async function servePayloadNavigationFixture(publicDir) {
         return;
       }
 
+      if (url.pathname === "/posts/prefetched" && url.searchParams.get("__ferrite_payload") === "stream") {
+        response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8" });
+        response.write(`${JSON.stringify(serverPayloadStreamFrame("prefetched-shell"))}\n`);
+        setTimeout(() => {
+          response.end(`${JSON.stringify(serverPayloadStreamFrame("prefetched-chunk"))}\n`);
+        }, 50);
+        return;
+      }
+
       if (url.pathname === "/posts/stream" && url.searchParams.get("__ferrite_payload") === "stream") {
         response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8" });
         response.write(`${JSON.stringify(serverPayloadStreamFrame("shell"))}\n`);
@@ -209,6 +240,37 @@ function serverPayloadPacket(route) {
 }
 
 function serverPayloadStreamFrame(kind) {
+  if (kind === "prefetched-shell") {
+    return {
+      ferrite: "server-payload-frame",
+      version: 1,
+      kind: "shell",
+      shell: documentPayloadShell({
+        route: "/posts/prefetched",
+        title: "Prefetched title",
+        heading: "Prefetched route",
+        fallback: "Loading prefetched details",
+        linkHref: "/posts/stream",
+        linkId: "stream-link",
+        linkText: "Stream route",
+      }),
+      clientReferences: [],
+    };
+  }
+
+  if (kind === "prefetched-chunk") {
+    return {
+      ferrite: "server-payload-frame",
+      version: 1,
+      kind: "chunk",
+      chunk: {
+        id: "prefetched-details",
+        root: [2, "strong", {}, [[0, "Loaded prefetched details"]]],
+        clientReferences: [],
+      },
+    };
+  }
+
   if (kind === "shell") {
     return {
       ferrite: "server-payload-frame",
@@ -284,10 +346,10 @@ function contentType(file) {
   }
 }
 
-async function waitForRequest(requests, expected) {
+async function waitForRequest(requests, expected, options = {}) {
   const started = Date.now();
   while (Date.now() - started < 5000) {
-    if (requests.includes(expected)) {
+    if (requests.slice(options.after ?? 0).includes(expected)) {
       return;
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
