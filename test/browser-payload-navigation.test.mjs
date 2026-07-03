@@ -37,11 +37,6 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
   const page = await browser.newPage();
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error));
-  page.on("console", (message) => {
-    if (message.type() === "error") {
-      pageErrors.push(new Error(message.text()));
-    }
-  });
   t.after(async () => {
     await page.close();
   });
@@ -53,6 +48,25 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
 
   await page.hover("#prefetch-link");
   await waitForRequest(requests, "/posts/prefetched?__ferrite_payload=server");
+
+  await page.evaluate(() => {
+    globalThis.ferriteRuntimeTest.malformedNavigation = globalThis.ferriteRuntimeTest.navigator
+      .navigate("/posts/malformed")
+      .then(
+        () => "resolved",
+        (error) => (error instanceof Error ? error.message : String(error)),
+      );
+  });
+  await waitForRequest(requests, "/posts/malformed?__ferrite_payload=server");
+  const malformedError = await page.evaluate(() => globalThis.ferriteRuntimeTest.malformedNavigation);
+  assert.match(malformedError, /unsupported opcode bad/);
+  await page.waitForFunction(() =>
+    Boolean(globalThis.ferriteRuntimeTest?.errors.some((message) => message.includes("unsupported opcode bad"))),
+  );
+  await page.getByRole("heading", { name: "Old route" }).waitFor();
+  assert.equal(page.url(), `${origin}/`);
+  assert.equal(await page.title(), "Old title");
+  assert.equal(await page.locator("#ferrite-root").getAttribute("data-route"), "/posts/old");
 
   await page.click("#prefetch-link");
   await page.getByRole("heading", { name: "Prefetched route" }).waitFor();
@@ -76,28 +90,33 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
   assert.equal(await page.title(), "Stream title");
   assert(requests.includes("/posts/stream?__ferrite_payload=stream"));
 
+  const beforeBackRequests = requests.length;
   await page.evaluate(() => {
     history.back();
   });
   await waitForRequest(requests, "/posts/prefetched?__ferrite_payload=stream", {
-    after: requests.length,
+    after: beforeBackRequests,
   });
   await page.getByRole("heading", { name: "Prefetched route" }).waitFor();
   await page.getByText("Loaded prefetched details").waitFor();
   assert.equal(page.url(), `${origin}/posts/prefetched`);
   assert.equal(await page.title(), "Prefetched title");
 
+  const beforeForwardRequests = requests.length;
   await page.evaluate(() => {
     history.forward();
   });
   await waitForRequest(requests, "/posts/stream?__ferrite_payload=stream", {
-    after: requests.length,
+    after: beforeForwardRequests,
   });
   await page.getByRole("heading", { name: "Stream route" }).waitFor();
   await page.getByText("Loaded stream details").waitFor();
   assert.equal(page.url(), `${origin}/posts/stream`);
   assert.equal(await page.title(), "Stream title");
-  assert.deepEqual(pageErrors, []);
+  assert.deepEqual(
+    pageErrors.map((error) => error.message),
+    [],
+  );
 });
 
 async function createPayloadNavigationFixture() {
@@ -121,6 +140,7 @@ async function createPayloadNavigationFixture() {
       `    createElement("h1", null, "Old route"),`,
       `    createElement("a", { href: "/posts/prefetched", id: "prefetch-link" }, "Prefetch route"),`,
       `    createElement("a", { href: "/posts/stream", id: "stream-link" }, "Stream route"),`,
+      `    createElement("a", { href: "/posts/malformed", id: "malformed-link" }, "Malformed route"),`,
       `  ),`,
       `  container,`,
       `);`,
@@ -176,6 +196,12 @@ async function servePayloadNavigationFixture(publicDir) {
       if (url.pathname === "/posts/prefetched" && url.searchParams.get("__ferrite_payload") === "server") {
         response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         response.end(JSON.stringify(serverPayloadPacket("prefetched")));
+        return;
+      }
+
+      if (url.pathname === "/posts/malformed" && url.searchParams.get("__ferrite_payload") === "server") {
+        response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ ferrite: "server-payload", version: 1, shell: ["bad"], clientReferences: [], chunks: [] }));
         return;
       }
 
