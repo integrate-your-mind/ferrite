@@ -10,7 +10,7 @@ Evidence used:
 - `git remote -v`
 - `README.md`
 - `docs/architecture.md`
-- `docs/milestone-001-proof.md` through `docs/milestone-076-proof.md`
+- `docs/milestone-001-proof.md` through `docs/milestone-077-proof.md`
 - `package.json`
 - representative tests under `packages/`, `scripts/`, and `crates/`
 - live `npm pack --json` tarball manifest inspection plus clean offline install smoke for the JS-facing packages
@@ -103,6 +103,7 @@ Evidence used:
 - [x] 074: Chromium proof for stream-mode popstate payload restoration.
 - [x] 075: Chromium proof for malformed server-payload rejection without DOM/history mutation.
 - [x] 076: Chromium proof for malformed clicked-payload fallback to normal document navigation.
+- [x] 077: Operator-facing deployment guide for the current production adapter.
 
 ## Vacuous Or Weak Test Audit
 
@@ -148,7 +149,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
 - [ ] Decide code-signing/notarization policy for native artifacts.
-- [ ] Add deployment documentation for production serve topology, TLS/proxy expectations, process supervision, environment variables, rollback, and observability.
+- [x] Add deployment documentation for production serve topology, TLS/proxy expectations, runtime configuration, rollback, and observability.
+- [ ] Add concrete process manager, container, Helm, or managed-platform deployment templates once the target deployment surface is chosen.
 - [x] Make the npm verifier pack release-shaped staging manifests and reject `private: true` and `workspace:*` in actual tarball manifests.
 - [x] Add package-install smoke tests that consume packed packages from a clean project.
 - [x] Add browser bundler integration for the WASM protocol package where appropriate.
@@ -164,4 +166,5 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Historical superpowers implementation plans now mark completed local work as checked where proof docs and commits show completion.
 - [x] Remote-dependent push/PR steps remain unclaimed because this checkout has no remote.
 - [x] The audit now distinguishes staged tarball manifest and clean-install proof from remaining remote-CI and publication proof.
+- [x] Deployment docs now describe the current production adapter path, proxy/TLS assumptions, smoke tests, rollback, observability hooks, and security gaps without claiming deployed proof.
 - [ ] Historical proof docs are not rewritten to erase their original "Not Proven Yet" context; they should be read as milestone snapshots.
