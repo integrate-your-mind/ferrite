@@ -16,6 +16,7 @@ test("deployment templates keep production serve flags aligned", async () => {
     assert.match(source, /--max-in-flight-requests 64/);
     assert.match(source, /--server-action-csrf-token-env FERRITE_ACTION_CSRF/);
     assert.match(source, /--trusted-proxy-public-origin/);
+    assert.match(source, /--trusted-proxy-client-ip-hops 1/);
     assert.match(source, /--access-log json/);
   }
 

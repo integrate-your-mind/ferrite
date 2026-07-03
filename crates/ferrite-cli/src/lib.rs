@@ -271,6 +271,12 @@ struct ServeArgs {
 
     #[arg(
         long,
+        help = "Trust X-Forwarded-For for access-log client_ip after this many trusted proxy hops; requires --trusted-proxy-public-origin"
+    )]
+    trusted_proxy_client_ip_hops: Option<usize>,
+
+    #[arg(
+        long,
         value_enum,
         help = "Emit production request access logs to stderr in the selected format"
     )]
@@ -559,6 +565,10 @@ fn run_cli(cli: Cli) -> Result<()> {
                 resolve_server_action_csrf_token(args.server_action_csrf_token_env.as_deref())?;
             let trusted_proxy =
                 resolve_trusted_proxy_public_origin(args.trusted_proxy_public_origin.as_deref())?;
+            let trusted_proxy_client_ip_hops = resolve_trusted_proxy_client_ip_hops(
+                args.trusted_proxy_client_ip_hops,
+                trusted_proxy.is_some(),
+            )?;
             let mut config = ProductionServerConfig::new(
                 project.clone(),
                 app_dir.clone(),
@@ -577,6 +587,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             }
             if let Some(trusted_proxy) = trusted_proxy {
                 config = config.with_trusted_proxy(trusted_proxy);
+            }
+            if let Some(hops) = trusted_proxy_client_ip_hops {
+                config = config.with_trusted_proxy_client_ip_hops(hops);
             }
             if let Some(format) = args.access_log {
                 config = config.with_request_observer(move |event| {
@@ -787,6 +800,26 @@ fn resolve_trusted_proxy_public_origin(
         })
 }
 
+fn resolve_trusted_proxy_client_ip_hops(
+    hops: Option<usize>,
+    trusted_proxy_configured: bool,
+) -> Result<Option<usize>> {
+    let Some(hops) = hops else {
+        return Ok(None);
+    };
+    if !trusted_proxy_configured {
+        return Err(CliError::Config(
+            "--trusted-proxy-client-ip-hops requires --trusted-proxy-public-origin".to_owned(),
+        ));
+    }
+    if hops == 0 {
+        return Err(CliError::Config(
+            "--trusted-proxy-client-ip-hops must be at least 1".to_owned(),
+        ));
+    }
+    Ok(Some(hops))
+}
+
 fn run_typescript_check(project: &Path) -> Result<()> {
     let tsconfig = project.join("tsconfig.json");
     if !tsconfig.is_file() {
@@ -831,9 +864,10 @@ fn format_access_log_event(event: &ProductionRequestEvent, format: AccessLogForm
     match format {
         AccessLogFormat::Plain => {
             let route = output.route_pattern.unwrap_or("-");
+            let client_ip = output.client_ip.unwrap_or("-");
             format!(
-                "method={} path={} status={} route={} elapsed_ms={}",
-                output.method, output.path, output.status, route, output.elapsed_ms
+                "method={} path={} status={} route={} client_ip={} elapsed_ms={}",
+                output.method, output.path, output.status, route, client_ip, output.elapsed_ms
             )
         }
         AccessLogFormat::Json => {
@@ -923,6 +957,7 @@ struct AccessLogEventOutput<'a> {
     path: &'a str,
     status: u16,
     route_pattern: Option<&'a str>,
+    client_ip: Option<&'a str>,
     elapsed_ms: u64,
 }
 
@@ -933,6 +968,7 @@ impl<'a> From<&'a ProductionRequestEvent> for AccessLogEventOutput<'a> {
             path: &event.path,
             status: event.status,
             route_pattern: event.route_pattern.as_deref(),
+            client_ip: event.client_ip.as_deref(),
             elapsed_ms: duration_millis_u64(event.elapsed),
         }
     }
@@ -1082,6 +1118,25 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_trusted_proxy_client_ip_hops_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--trusted-proxy-public-origin",
+            "https://app.example.com",
+            "--trusted-proxy-client-ip-hops",
+            "2",
+            "--once",
+        ])
+        .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.trusted_proxy_client_ip_hops, Some(2));
+    }
+
+    #[test]
     fn serve_accepts_access_log_format_flag() {
         let cli =
             Cli::try_parse_from(["ferrite", "serve", "--access-log", "json", "--once"]).unwrap();
@@ -1099,12 +1154,13 @@ mod tests {
             path: "/_ferrite/action".to_owned(),
             status: 403,
             route_pattern: Some("/posts/[id]".to_owned()),
+            client_ip: Some("203.0.113.10".to_owned()),
             elapsed: Duration::from_millis(17),
         };
 
         assert_eq!(
             format_access_log_event(&event, AccessLogFormat::Plain),
-            "method=POST path=/_ferrite/action status=403 route=/posts/[id] elapsed_ms=17"
+            "method=POST path=/_ferrite/action status=403 route=/posts/[id] client_ip=203.0.113.10 elapsed_ms=17"
         );
 
         let json: serde_json::Value =
@@ -1113,6 +1169,7 @@ mod tests {
         assert_eq!(json["path"], "/_ferrite/action");
         assert_eq!(json["status"], 403);
         assert_eq!(json["route_pattern"], "/posts/[id]");
+        assert_eq!(json["client_ip"], "203.0.113.10");
         assert_eq!(json["elapsed_ms"], 17);
         assert!(json.get("headers").is_none());
         assert!(json.get("body").is_none());
@@ -1145,6 +1202,25 @@ mod tests {
             resolve_trusted_proxy_public_origin(Some("ftp://app.example.com")).unwrap_err();
         assert!(matches!(unsupported_scheme, CliError::Config(_)));
         assert_eq!(unsupported_scheme.exit_code(), 2);
+    }
+
+    #[test]
+    fn trusted_proxy_client_ip_hops_requires_positive_value() {
+        assert_eq!(
+            resolve_trusted_proxy_client_ip_hops(Some(2), true).unwrap(),
+            Some(2)
+        );
+
+        let zero = resolve_trusted_proxy_client_ip_hops(Some(0), true).unwrap_err();
+        assert!(matches!(zero, CliError::Config(_)));
+        assert_eq!(zero.exit_code(), 2);
+    }
+
+    #[test]
+    fn trusted_proxy_client_ip_hops_requires_trusted_proxy_origin() {
+        let missing_proxy = resolve_trusted_proxy_client_ip_hops(Some(1), false).unwrap_err();
+        assert!(matches!(missing_proxy, CliError::Config(_)));
+        assert_eq!(missing_proxy.exit_code(), 2);
     }
 
     #[test]

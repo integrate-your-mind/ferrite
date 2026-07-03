@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -189,6 +189,7 @@ pub struct ProductionRequestEvent {
     pub path: String,
     pub status: u16,
     pub route_pattern: Option<String>,
+    pub client_ip: Option<String>,
     pub elapsed: Duration,
 }
 
@@ -253,6 +254,7 @@ pub struct ProductionServerConfig {
     pub max_in_flight_requests: usize,
     pub server_action_csrf_token: Option<String>,
     pub trusted_proxy: Option<ProductionTrustedProxyConfig>,
+    pub trusted_proxy_client_ip_hops: Option<usize>,
     pub request_observer: Option<ProductionRequestObserver>,
 }
 
@@ -280,6 +282,7 @@ impl ProductionServerConfig {
             max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
             server_action_csrf_token: None,
             trusted_proxy: None,
+            trusted_proxy_client_ip_hops: None,
             request_observer: None,
         }
     }
@@ -306,6 +309,11 @@ impl ProductionServerConfig {
 
     pub fn with_trusted_proxy(mut self, trusted_proxy: ProductionTrustedProxyConfig) -> Self {
         self.trusted_proxy = Some(trusted_proxy);
+        self
+    }
+
+    pub fn with_trusted_proxy_client_ip_hops(mut self, hops: usize) -> Self {
+        self.trusted_proxy_client_ip_hops = Some(hops.max(1));
         self
     }
 
@@ -860,13 +868,27 @@ impl ProductionProject {
     }
 
     pub fn handle_get(&mut self, raw_path: &str) -> Result<DevResponse> {
+        self.handle_get_with_context(raw_path, ProductionRequestContext::default())
+    }
+
+    fn handle_get_with_context(
+        &mut self,
+        raw_path: &str,
+        request_context: ProductionRequestContext,
+    ) -> Result<DevResponse> {
         if !raw_path.starts_with('/') {
             return Err(DevServerError::InvalidRequestPath(raw_path.to_owned()));
         }
 
         let started = Instant::now();
         let response = self.handle_get_inner(raw_path)?;
-        self.observe_request("GET", raw_path, &response, started.elapsed());
+        self.observe_request(
+            "GET",
+            raw_path,
+            &response,
+            started.elapsed(),
+            request_context,
+        );
         Ok(response)
     }
 
@@ -876,13 +898,29 @@ impl ProductionProject {
         headers: &HttpHeaders,
         body: &[u8],
     ) -> Result<DevResponse> {
+        self.handle_post_with_context(raw_path, headers, body, ProductionRequestContext::default())
+    }
+
+    fn handle_post_with_context(
+        &mut self,
+        raw_path: &str,
+        headers: &HttpHeaders,
+        body: &[u8],
+        request_context: ProductionRequestContext,
+    ) -> Result<DevResponse> {
         if !raw_path.starts_with('/') {
             return Err(DevServerError::InvalidRequestPath(raw_path.to_owned()));
         }
 
         let started = Instant::now();
         let response = self.handle_post_inner(raw_path, headers, body)?;
-        self.observe_request("POST", raw_path, &response, started.elapsed());
+        self.observe_request(
+            "POST",
+            raw_path,
+            &response,
+            started.elapsed(),
+            request_context,
+        );
         Ok(response)
     }
 
@@ -927,6 +965,7 @@ impl ProductionProject {
         path: impl Into<String>,
         response: &DevResponse,
         elapsed: Duration,
+        request_context: ProductionRequestContext,
     ) {
         if let Some(observer) = &self.config.request_observer {
             observer.observe(ProductionRequestEvent {
@@ -934,8 +973,19 @@ impl ProductionProject {
                 path: path.into(),
                 status: response.status,
                 route_pattern: response.route_pattern_header.clone(),
+                client_ip: request_context.client_ip,
                 elapsed,
             });
+        }
+    }
+
+    fn request_context(
+        &self,
+        headers: &HttpHeaders,
+        peer_ip: Option<IpAddr>,
+    ) -> ProductionRequestContext {
+        ProductionRequestContext {
+            client_ip: production_client_ip(headers, peer_ip, &self.config),
         }
     }
 
@@ -1299,6 +1349,11 @@ impl ProductionProject {
             },
         }
     }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ProductionRequestContext {
+    client_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1924,13 +1979,25 @@ fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()>
 fn handle_production_stream(stream: &mut TcpStream, project: &mut ProductionProject) -> Result<()> {
     let request_read_timeout = project.config.request_read_timeout;
     let max_request_bytes = project.config.max_request_bytes;
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     handle_production_stream_with_limits(
         stream,
         request_read_timeout,
         max_request_bytes,
         |request| match request.method.as_str() {
-            "GET" => project.handle_get(&request.path),
-            "POST" => project.handle_post(&request.path, &request.headers, &request.body),
+            "GET" => {
+                let context = project.request_context(&request.headers, peer_ip);
+                project.handle_get_with_context(&request.path, context)
+            }
+            "POST" => {
+                let context = project.request_context(&request.headers, peer_ip);
+                project.handle_post_with_context(
+                    &request.path,
+                    &request.headers,
+                    &request.body,
+                    context,
+                )
+            }
             _ => Ok(DevResponse::method_not_allowed()),
         },
     )
@@ -1940,6 +2007,7 @@ fn handle_production_stream_concurrent(
     stream: &mut TcpStream,
     project: &Arc<Mutex<ProductionProject>>,
 ) -> Result<()> {
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     let (request_read_timeout, max_request_bytes) = {
         let project = project.lock().expect("production project mutex poisoned");
         (
@@ -1954,8 +2022,19 @@ fn handle_production_stream_concurrent(
         |request| {
             let mut project = project.lock().expect("production project mutex poisoned");
             match request.method.as_str() {
-                "GET" => project.handle_get(&request.path),
-                "POST" => project.handle_post(&request.path, &request.headers, &request.body),
+                "GET" => {
+                    let context = project.request_context(&request.headers, peer_ip);
+                    project.handle_get_with_context(&request.path, context)
+                }
+                "POST" => {
+                    let context = project.request_context(&request.headers, peer_ip);
+                    project.handle_post_with_context(
+                        &request.path,
+                        &request.headers,
+                        &request.body,
+                        context,
+                    )
+                }
                 _ => Ok(DevResponse::method_not_allowed()),
             }
         },
@@ -2715,6 +2794,33 @@ fn first_forwarded_header_value<'a>(headers: &'a HttpHeaders, name: &str) -> Opt
         .and_then(|value| value.split(',').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn production_client_ip(
+    headers: &HttpHeaders,
+    peer_ip: Option<IpAddr>,
+    config: &ProductionServerConfig,
+) -> Option<String> {
+    let Some(trusted_hops) = config.trusted_proxy_client_ip_hops else {
+        return peer_ip.map(|ip| ip.to_string());
+    };
+    forwarded_client_ip(headers, trusted_hops).or_else(|| peer_ip.map(|ip| ip.to_string()))
+}
+
+fn forwarded_client_ip(headers: &HttpHeaders, trusted_hops: usize) -> Option<String> {
+    let value = non_empty_header(headers, "x-forwarded-for")?;
+    let ips = value
+        .split(',')
+        .map(str::trim)
+        .map(str::parse::<IpAddr>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    let trusted_hops = trusted_hops.max(1);
+    if ips.len() <= trusted_hops {
+        return None;
+    }
+    ips.get(ips.len() - trusted_hops - 1)
+        .map(|ip| ip.to_string())
 }
 
 fn http_header_origin(value: &str) -> Option<HttpOrigin> {
@@ -4230,6 +4336,45 @@ process.exit(1);
     }
 
     #[test]
+    fn trusted_proxy_client_ip_policy_uses_configured_forwarded_hops() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut config = production_project_for(&app).config;
+        let peer_ip = Some("127.0.0.1".parse::<IpAddr>().unwrap());
+        let mut headers = BTreeMap::from([(
+            "x-forwarded-for".to_owned(),
+            "203.0.113.10, 198.51.100.5, 127.0.0.1".to_owned(),
+        )]);
+
+        assert_eq!(
+            production_client_ip(&headers, peer_ip, &config).as_deref(),
+            Some("127.0.0.1")
+        );
+
+        config = config.with_trusted_proxy_client_ip_hops(1);
+        assert_eq!(
+            production_client_ip(&headers, peer_ip, &config).as_deref(),
+            Some("198.51.100.5")
+        );
+
+        config = config.with_trusted_proxy_client_ip_hops(2);
+        assert_eq!(
+            production_client_ip(&headers, peer_ip, &config).as_deref(),
+            Some("203.0.113.10")
+        );
+
+        headers.insert(
+            "x-forwarded-for".to_owned(),
+            "203.0.113.10, not-an-ip, 127.0.0.1".to_owned(),
+        );
+        assert_eq!(
+            production_client_ip(&headers, peer_ip, &config).as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
     fn action_form_csrf_guard_requires_matching_configured_token() {
         let headers = action_headers_with_host("application/x-www-form-urlencoded");
         let body =
@@ -4459,6 +4604,7 @@ process.exit(1);
         assert_eq!(events[0].path, "/_ferrite/action");
         assert_eq!(events[0].status, 200);
         assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
+        assert!(events[0].client_ip.is_some());
     }
 
     #[test]
