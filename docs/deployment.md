@@ -91,7 +91,8 @@ cargo run -p ferrite-cli -- serve \
   --request-read-timeout-ms 5000 \
   --max-request-bytes 16384 \
   --max-in-flight-requests 64 \
-  --server-action-csrf-token-env FERRITE_ACTION_CSRF
+  --server-action-csrf-token-env FERRITE_ACTION_CSRF \
+  --access-log json
 ```
 
 For a packaged binary, run the installed `ferrite` executable with the same arguments.
@@ -108,10 +109,11 @@ Use command arguments for the current runtime knobs:
 - `--max-request-bytes`: maximum bytes allowed for each production HTTP request header and body
 - `--max-in-flight-requests`: maximum production requests handled concurrently
 - `--server-action-csrf-token-env`: environment variable containing the token rendered into server-action forms and required on action POSTs
+- `--access-log`: optional `plain` or `json` production request outcome logs emitted to stderr
 - `--once`: deterministic one-request mode for smoke tests
 - `--request-path`: request target for `--once` smoke tests
 
-The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request and render limits, but not structured log sinks, metrics exporters, or trusted-proxy settings.
+The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request/render limits and stderr access logs, but not metrics exporters, tracing sinks, or trusted-proxy settings.
 
 ## Smoke Tests
 
@@ -138,7 +140,16 @@ Ferrite's Rust production API can attach request observer hooks that receive:
 - route pattern
 - elapsed duration
 
-Applications embedding the Rust server should bridge those events into their logging, metrics, or tracing stack. The CLI does not yet expose first-class log sink configuration, structured access logs, trace IDs, or metrics exporters.
+Applications embedding the Rust server should bridge those events into their logging, metrics, or tracing stack. The CLI does not yet expose first-class external log sink configuration, trace IDs, or metrics exporters.
+
+The CLI can emit request outcome access logs to stderr:
+
+```sh
+cargo run -p ferrite-cli -- serve --project /srv/app --access-log plain
+cargo run -p ferrite-cli -- serve --project /srv/app --access-log json
+```
+
+Access log events include method, path, status, route pattern when known, and elapsed milliseconds. They do not include request headers or request bodies, so server-action form data and CSRF tokens are not logged by the Ferrite CLI access-log path.
 
 At the proxy layer, capture:
 
@@ -173,7 +184,7 @@ Current production hardening is incomplete. Ferrite can require one configured h
 - trusted-proxy configuration for forwarded host, protocol, and client IP headers
 - cookie and SameSite guidance
 - upload/file-part policy if file actions are enabled later
-- structured audit logging for action attempts and rejections
+- structured audit logging beyond request outcome access logs for action attempts and rejections
 
 Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately. If server actions are enabled in production, set `--server-action-csrf-token-env` and rotate the referenced secret as part of the deployment process.
 
@@ -182,7 +193,7 @@ Until those exist, deploy server actions only for controlled beta scenarios or b
 - No npm packages are published yet.
 - No GitHub remote or remote CI proof exists in this checkout.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
-- The production CLI exposes the main request and render limits, but not structured log sinks, metrics exporters, or trusted-proxy settings.
+- The production CLI exposes the main request/render limits and stderr access logs, but not metrics exporters, tracing sinks, or trusted-proxy settings.
 - There is no official container image, systemd unit, Helm chart, or managed platform adapter.
 - There is no first-class metrics exporter or tracing integration.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.

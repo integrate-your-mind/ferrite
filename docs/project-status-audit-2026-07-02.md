@@ -10,7 +10,7 @@ Evidence used:
 - `git remote -v`
 - `README.md`
 - `docs/architecture.md`
-- `docs/milestone-001-proof.md` through `docs/milestone-080-proof.md`
+- `docs/milestone-001-proof.md` through `docs/milestone-081-proof.md`
 - `package.json`
 - representative tests under `packages/`, `scripts/`, and `crates/`
 - live `npm pack --json` tarball manifest inspection plus clean offline install smoke for the JS-facing packages
@@ -107,6 +107,7 @@ Evidence used:
 - [x] 078: Production `ferrite serve` flags for request-read timeout, max request bytes, and in-flight request limits.
 - [x] 079: Server-action POSTs require a valid `Host` before origin/referer checks.
 - [x] 080: Opt-in hidden CSRF token rendering and server-action POST enforcement.
+- [x] 081: Production CLI access logs for request observer events.
 
 ## Vacuous Or Weak Test Audit
 
@@ -150,7 +151,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Require a valid `Host` header for server-action POSTs before origin/referer comparison.
 - [x] Add opt-in hidden CSRF token rendering and server-action POST enforcement.
 - [ ] Add full server-action CSRF/session/replay hardening: token rotation, session binding, cookie guidance, trusted proxy configuration, replay considerations, and clearer auth integration guidance.
-- [ ] Add first-class production logging/tracing sinks for request observer events.
+- [x] Add production CLI access-log output for request observer events without headers or bodies.
+- [ ] Add first-class metrics/tracing sinks and richer audit exporters for request/action observer events.
 - [x] Expose production request-read timeout, request-byte, and in-flight request limits through the `ferrite serve` CLI.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
@@ -175,4 +177,5 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Deployment docs now describe the current production adapter path, proxy/TLS assumptions, smoke tests, rollback, observability hooks, and security gaps without claiming deployed proof.
 - [x] `ferrite serve` now exposes the main production request and render limits documented in the deployment guide.
 - [x] Deployment docs now document `--server-action-csrf-token-env` as the opt-in server-action CSRF token path while preserving remaining session/replay/auth gaps.
+- [x] Deployment docs now document `--access-log plain|json` as the CLI request outcome logging path while preserving remaining metrics/tracing gaps.
 - [ ] Historical proof docs are not rewritten to erase their original "Not Proven Yet" context; they should be read as milestone snapshots.

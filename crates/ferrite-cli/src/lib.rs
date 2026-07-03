@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrite_builder::{BuildConfig, BuildReport};
 use ferrite_dev_server::{
-    DevProject, DevResponse, DevServerConfig, ProductionProject, ProductionServerConfig,
+    DevProject, DevResponse, DevServerConfig, ProductionProject, ProductionRequestEvent,
+    ProductionServerConfig,
 };
 use ferrite_router::{Route, scan_app_dir, write_route_types};
 use serde::Serialize;
@@ -261,6 +262,19 @@ struct ServeArgs {
         help = "Environment variable containing the server-action CSRF token required for action POSTs"
     )]
     server_action_csrf_token_env: Option<String>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Emit production request access logs to stderr in the selected format"
+    )]
+    access_log: Option<AccessLogFormat>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum AccessLogFormat {
+    Plain,
+    Json,
 }
 
 #[derive(Debug, Args)]
@@ -553,6 +567,11 @@ fn run_cli(cli: Cli) -> Result<()> {
             if let Some(token) = server_action_csrf_token {
                 config = config.with_server_action_csrf_token(token);
             }
+            if let Some(format) = args.access_log {
+                config = config.with_request_observer(move |event| {
+                    eprintln!("{}", format_access_log_event(&event, format));
+                });
+            }
             let mut production_project = ProductionProject::new(config);
             let production_limits = ServeLimitsOutput::from(production_project.config());
 
@@ -778,6 +797,22 @@ fn find_tsc(project: &Path) -> Option<PathBuf> {
     })
 }
 
+fn format_access_log_event(event: &ProductionRequestEvent, format: AccessLogFormat) -> String {
+    let output = AccessLogEventOutput::from(event);
+    match format {
+        AccessLogFormat::Plain => {
+            let route = output.route_pattern.unwrap_or("-");
+            format!(
+                "method={} path={} status={} route={} elapsed_ms={}",
+                output.method, output.path, output.status, route, output.elapsed_ms
+            )
+        }
+        AccessLogFormat::Json => {
+            serde_json::to_string(&output).expect("access log event output is serializable")
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct RoutesOutput {
     project: PathBuf,
@@ -851,6 +886,27 @@ struct ServeStartedOutput<'a> {
     max_request_bytes: usize,
     max_in_flight_requests: usize,
     url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessLogEventOutput<'a> {
+    method: &'a str,
+    path: &'a str,
+    status: u16,
+    route_pattern: Option<&'a str>,
+    elapsed_ms: u64,
+}
+
+impl<'a> From<&'a ProductionRequestEvent> for AccessLogEventOutput<'a> {
+    fn from(event: &'a ProductionRequestEvent) -> Self {
+        Self {
+            method: &event.method,
+            path: &event.path,
+            status: event.status,
+            route_pattern: event.route_pattern.as_deref(),
+            elapsed_ms: duration_millis_u64(event.elapsed),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, Serialize)]
@@ -974,6 +1030,43 @@ mod tests {
             args.server_action_csrf_token_env.as_deref(),
             Some("FERRITE_ACTION_CSRF")
         );
+    }
+
+    #[test]
+    fn serve_accepts_access_log_format_flag() {
+        let cli =
+            Cli::try_parse_from(["ferrite", "serve", "--access-log", "json", "--once"]).unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.access_log, Some(AccessLogFormat::Json));
+    }
+
+    #[test]
+    fn formats_access_log_events_without_headers_or_body() {
+        let event = ProductionRequestEvent {
+            method: "POST".to_owned(),
+            path: "/_ferrite/action".to_owned(),
+            status: 403,
+            route_pattern: Some("/posts/[id]".to_owned()),
+            elapsed: Duration::from_millis(17),
+        };
+
+        assert_eq!(
+            format_access_log_event(&event, AccessLogFormat::Plain),
+            "method=POST path=/_ferrite/action status=403 route=/posts/[id] elapsed_ms=17"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&format_access_log_event(&event, AccessLogFormat::Json)).unwrap();
+        assert_eq!(json["method"], "POST");
+        assert_eq!(json["path"], "/_ferrite/action");
+        assert_eq!(json["status"], 403);
+        assert_eq!(json["route_pattern"], "/posts/[id]");
+        assert_eq!(json["elapsed_ms"], 17);
+        assert!(json.get("headers").is_none());
+        assert!(json.get("body").is_none());
     }
 
     #[test]
