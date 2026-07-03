@@ -295,6 +295,12 @@ struct ServeArgs {
         help = "Emit production server-action audit logs to stderr in the selected format"
     )]
     action_log: Option<AccessLogFormat>,
+
+    #[arg(
+        long,
+        help = "Expose in-memory production request/action counters as Prometheus text at this absolute path"
+    )]
+    metrics_path: Option<String>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -587,6 +593,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 args.trusted_proxy_client_ip_hops,
                 trusted_proxy.is_some(),
             )?;
+            let metrics_path = resolve_metrics_path(args.metrics_path.as_deref())?;
             let mut config = ProductionServerConfig::new(
                 project.clone(),
                 app_dir.clone(),
@@ -611,6 +618,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             }
             if let Some(hops) = trusted_proxy_client_ip_hops {
                 config = config.with_trusted_proxy_client_ip_hops(hops);
+            }
+            if let Some(metrics_path) = metrics_path {
+                config = config.with_metrics_path(metrics_path);
             }
             if let Some(format) = args.access_log {
                 config = config.with_request_observer(move |event| {
@@ -884,6 +894,28 @@ fn resolve_trusted_proxy_client_ip_hops(
         ));
     }
     Ok(Some(hops))
+}
+
+fn resolve_metrics_path(path: Option<&str>) -> Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if path.trim().is_empty() || !path.starts_with('/') {
+        return Err(CliError::Config(
+            "--metrics-path requires an absolute path starting with `/`".to_owned(),
+        ));
+    }
+    if path.contains('?') || path.contains('#') {
+        return Err(CliError::Config(
+            "--metrics-path must not contain a query string or fragment".to_owned(),
+        ));
+    }
+    if path == "/_ferrite/action" {
+        return Err(CliError::Config(
+            "--metrics-path must not shadow the server-action endpoint".to_owned(),
+        ));
+    }
+    Ok(Some(path.to_owned()))
 }
 
 fn run_typescript_check(project: &Path) -> Result<()> {
@@ -1302,6 +1334,23 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_metrics_path_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--metrics-path",
+            "/__ferrite/metrics",
+            "--once",
+        ])
+        .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.metrics_path.as_deref(), Some("/__ferrite/metrics"));
+    }
+
+    #[test]
     fn formats_access_log_events_without_headers_or_body() {
         let event = ProductionRequestEvent {
             method: "POST".to_owned(),
@@ -1431,6 +1480,28 @@ mod tests {
         let missing_proxy = resolve_trusted_proxy_client_ip_hops(Some(1), false).unwrap_err();
         assert!(matches!(missing_proxy, CliError::Config(_)));
         assert_eq!(missing_proxy.exit_code(), 2);
+    }
+
+    #[test]
+    fn metrics_path_requires_absolute_non_action_path() {
+        assert_eq!(
+            resolve_metrics_path(Some("/__ferrite/metrics"))
+                .unwrap()
+                .as_deref(),
+            Some("/__ferrite/metrics")
+        );
+
+        let relative = resolve_metrics_path(Some("__ferrite/metrics")).unwrap_err();
+        assert!(matches!(relative, CliError::Config(_)));
+        assert_eq!(relative.exit_code(), 2);
+
+        let query = resolve_metrics_path(Some("/__ferrite/metrics?format=prom")).unwrap_err();
+        assert!(matches!(query, CliError::Config(_)));
+        assert_eq!(query.exit_code(), 2);
+
+        let action = resolve_metrics_path(Some("/_ferrite/action")).unwrap_err();
+        assert!(matches!(action, CliError::Config(_)));
+        assert_eq!(action.exit_code(), 2);
     }
 
     #[test]

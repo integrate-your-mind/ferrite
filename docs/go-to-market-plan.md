@@ -65,7 +65,7 @@ Not sellable yet as a hosted platform:
 
 5. Observability + operations depth
 - Request observer and action observer hooks exist in Rust, and the CLI can emit plain or JSON request outcome access logs plus server-action audit logs to stderr.
-- There are still no first-class metrics/tracing exporters or external audit sinks.
+- The CLI can expose in-memory Prometheus-style request/action counters with `--metrics-path`, but there are still no tracing exporters or external audit sinks.
 - Some browser edge cases remain in happy-dom coverage rather than full cross-browser proof.
 
 ## 2-Week Private Beta Plan
@@ -149,7 +149,7 @@ Launch here means paid beta availability to external teams under explicit usage 
   - Trusted-proxy public-origin checks and forwarded client-IP access-log policy exercised behind the chosen staging proxy with forwarded-header sanitization.
 - Operational proof:
   - CLI request access-log and server-action audit-log output captured in staging and integrated with the chosen log collector.
-  - Metrics/tracing path for request observer events and action observer outcomes.
+  - Metrics scrape captured from `--metrics-path`, plus a decided tracing path for request observer events and action observer outcomes.
   - Negative-path coverage for malformed routes, action failures, malformed payloads, and origin/referer mismatches in automated CI.
 - Product-readiness proof:
   - Explicitly separate "validated features" from "local-only proof" in public docs and sales copy.

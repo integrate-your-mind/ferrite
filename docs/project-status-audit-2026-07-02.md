@@ -162,7 +162,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Add explicit trusted-proxy client-IP access-log policy for forwarded client address headers.
 - [x] Add production CLI access-log output for request observer events without headers or bodies.
 - [x] Add first-pass production server-action audit logs for action attempts and rejections without headers, bodies, form fields, or CSRF tokens.
-- [ ] Add first-class metrics/tracing sinks and richer external audit exporters for request/action observer events.
+- [x] Add first-pass in-memory Prometheus text metrics for request/action observer outcomes.
+- [ ] Add first-class tracing sinks and richer external audit exporters for request/action observer events.
 - [x] Expose production request-read timeout, request-byte, and in-flight request limits through the `ferrite serve` CLI.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
@@ -192,6 +193,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Deployment docs now document `--server-action-csrf-cookie-name` as the opt-in production double-submit cookie binding path while preserving remaining session/replay/auth gaps.
 - [x] Deployment docs now document `--access-log plain|json` as the CLI request outcome logging path while preserving remaining metrics/tracing gaps.
 - [x] Deployment docs now document `--action-log plain|json` as the CLI server-action audit-log path while preserving remaining external sink and hosted-staging gaps.
+- [x] Deployment docs now document `--metrics-path` as the first-pass in-memory Prometheus text metrics endpoint while preserving remaining tracing/external-sink gaps.
 - [x] Deployment docs now document `--trusted-proxy-public-origin` as the opt-in server-action trusted-proxy origin path while preserving remaining session/replay/auth gaps.
 - [x] Deployment docs now document `--trusted-proxy-client-ip-hops` as the explicit forwarded client-IP access-log trust policy while preserving remaining session/replay/auth gaps.
 - [x] Deployment docs now point to first-pass systemd, nginx, container, and env templates while preserving the missing hosted-staging proof gap.

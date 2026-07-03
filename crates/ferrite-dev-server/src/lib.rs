@@ -232,7 +232,7 @@ pub struct ProductionActionEvent {
     pub elapsed: Duration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductionActionOutcome {
     Accepted,
@@ -264,6 +264,126 @@ impl fmt::Debug for ProductionActionObserver {
         f.debug_struct("ProductionActionObserver")
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProductionMetrics {
+    inner: Arc<Mutex<ProductionMetricsSnapshot>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProductionMetricsSnapshot {
+    requests: BTreeMap<ProductionRequestMetricKey, u64>,
+    actions: BTreeMap<ProductionActionMetricKey, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProductionRequestMetricKey {
+    method: String,
+    status: u16,
+    route: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProductionActionMetricKey {
+    outcome: ProductionActionOutcome,
+    status: u16,
+    route: String,
+}
+
+impl ProductionMetrics {
+    fn record_request(&self, method: &str, status: u16, route_pattern: Option<&str>) {
+        let key = ProductionRequestMetricKey {
+            method: method.to_owned(),
+            status,
+            route: route_pattern.unwrap_or("-").to_owned(),
+        };
+        *self
+            .inner
+            .lock()
+            .expect("production metrics mutex poisoned")
+            .requests
+            .entry(key)
+            .or_insert(0) += 1;
+    }
+
+    fn record_action(
+        &self,
+        outcome: ProductionActionOutcome,
+        status: u16,
+        route_pattern: Option<&str>,
+    ) {
+        let key = ProductionActionMetricKey {
+            outcome,
+            status,
+            route: route_pattern.unwrap_or("-").to_owned(),
+        };
+        *self
+            .inner
+            .lock()
+            .expect("production metrics mutex poisoned")
+            .actions
+            .entry(key)
+            .or_insert(0) += 1;
+    }
+
+    fn render(&self) -> String {
+        let snapshot = self
+            .inner
+            .lock()
+            .expect("production metrics mutex poisoned")
+            .clone();
+        render_production_metrics(&snapshot)
+    }
+}
+
+fn render_production_metrics(snapshot: &ProductionMetricsSnapshot) -> String {
+    let mut output = String::from(
+        "# HELP ferrite_production_requests_total Production HTTP requests handled by Ferrite.\n\
+         # TYPE ferrite_production_requests_total counter\n",
+    );
+    for (key, count) in &snapshot.requests {
+        output.push_str(&format!(
+            "ferrite_production_requests_total{{method=\"{}\",status=\"{}\",route=\"{}\"}} {}\n",
+            prometheus_label_value(&key.method),
+            key.status,
+            prometheus_label_value(&key.route),
+            count
+        ));
+    }
+    output.push_str(
+        "# HELP ferrite_production_actions_total Production server-action attempts handled by Ferrite.\n\
+         # TYPE ferrite_production_actions_total counter\n",
+    );
+    for (key, count) in &snapshot.actions {
+        output.push_str(&format!(
+            "ferrite_production_actions_total{{outcome=\"{}\",status=\"{}\",route=\"{}\"}} {}\n",
+            production_action_outcome_label(key.outcome),
+            key.status,
+            prometheus_label_value(&key.route),
+            count
+        ));
+    }
+    output
+}
+
+fn production_action_outcome_label(outcome: ProductionActionOutcome) -> &'static str {
+    match outcome {
+        ProductionActionOutcome::Accepted => "accepted",
+        ProductionActionOutcome::Rejected => "rejected",
+    }
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            _ => vec![character],
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +424,8 @@ pub struct ProductionServerConfig {
     pub trusted_proxy_client_ip_hops: Option<usize>,
     pub request_observer: Option<ProductionRequestObserver>,
     pub action_observer: Option<ProductionActionObserver>,
+    pub metrics_path: Option<String>,
+    metrics: ProductionMetrics,
 }
 
 impl ProductionServerConfig {
@@ -334,6 +456,8 @@ impl ProductionServerConfig {
             trusted_proxy_client_ip_hops: None,
             request_observer: None,
             action_observer: None,
+            metrics_path: None,
+            metrics: ProductionMetrics::default(),
         }
     }
 
@@ -390,6 +514,11 @@ impl ProductionServerConfig {
         F: Fn(ProductionActionEvent) + Send + Sync + 'static,
     {
         self.action_observer = Some(ProductionActionObserver::new(observer));
+        self
+    }
+
+    pub fn with_metrics_path(mut self, path: impl Into<String>) -> Self {
+        self.metrics_path = Some(path.into());
         self
     }
 }
@@ -989,8 +1118,16 @@ impl ProductionProject {
     }
 
     fn handle_get_inner(&mut self, raw_path: &str) -> Result<DevResponse> {
-        self.ensure_ready()?;
         let path = strip_query(raw_path);
+        if self.config.metrics_path.as_deref() == Some(path) {
+            return Ok(DevResponse::ok(
+                "text/plain; version=0.0.4; charset=utf-8",
+                self.config.metrics.render(),
+            )
+            .with_cache_control("no-store"));
+        }
+
+        self.ensure_ready()?;
 
         if path.starts_with(&self.config.client_public_path) {
             return Ok(static_asset_response(
@@ -1032,10 +1169,17 @@ impl ProductionProject {
         elapsed: Duration,
         request_context: ProductionRequestContext,
     ) {
+        let method = method.into();
+        let path = path.into();
+        self.config.metrics.record_request(
+            &method,
+            response.status,
+            response.route_pattern_header.as_deref(),
+        );
         if let Some(observer) = &self.config.request_observer {
             observer.observe(ProductionRequestEvent {
-                method: method.into(),
-                path: path.into(),
+                method,
+                path,
                 status: response.status,
                 route_pattern: response.route_pattern_header.clone(),
                 client_ip: request_context.client_ip,
@@ -1063,17 +1207,21 @@ impl ProductionProject {
         elapsed: Duration,
         request_context: &ProductionRequestContext,
     ) {
+        let outcome = if response.status < 400 {
+            ProductionActionOutcome::Accepted
+        } else {
+            ProductionActionOutcome::Rejected
+        };
+        self.config
+            .metrics
+            .record_action(outcome, response.status, route_pattern.as_deref());
         if let Some(observer) = &self.config.action_observer {
             observer.observe(ProductionActionEvent {
                 action_id,
                 route_path,
                 route_pattern,
                 status: response.status,
-                outcome: if response.status < 400 {
-                    ProductionActionOutcome::Accepted
-                } else {
-                    ProductionActionOutcome::Rejected
-                },
+                outcome,
                 client_ip: request_context.client_ip.clone(),
                 elapsed,
             });
@@ -5175,6 +5323,87 @@ process.exit(1);
         assert_eq!(events[0].status, 200);
         assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
         assert!(events[0].elapsed > Duration::ZERO);
+    }
+
+    #[test]
+    fn production_metrics_endpoint_records_route_responses() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Post() {}",
+        );
+        let mut project = ProductionProject::new(
+            production_project_for(&app)
+                .config
+                .with_metrics_path("/__ferrite/metrics"),
+        );
+
+        let page = project.handle_get("/posts/abc").unwrap();
+        let missing = project.handle_get("/missing").unwrap();
+        let metrics = project.handle_get("/__ferrite/metrics").unwrap();
+
+        assert_eq!(page.status, 200);
+        assert_eq!(missing.status, 404);
+        assert_eq!(metrics.status, 200);
+        assert_eq!(
+            metrics.content_type,
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        assert_eq!(metrics.cache_control, Some("no-store"));
+        let body = metrics.body_text();
+        assert!(body.contains("# TYPE ferrite_production_requests_total counter"));
+        assert!(body.contains(
+            r#"ferrite_production_requests_total{method="GET",status="200",route="/posts/:id"} 1"#
+        ));
+        assert!(body.contains(
+            r#"ferrite_production_requests_total{method="GET",status="404",route="-"} 1"#
+        ));
+    }
+
+    #[test]
+    fn production_metrics_endpoint_records_action_outcomes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let mut project = ProductionProject::new(
+            action_production_project_for(&app, action_renderer_body())
+                .config
+                .with_metrics_path("/__ferrite/metrics"),
+        );
+
+        let success = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                &action_form_body("/posts/abc"),
+            )
+            .unwrap();
+        let rejected = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&title=Hello",
+            )
+            .unwrap();
+        let metrics = project.handle_get("/__ferrite/metrics").unwrap();
+
+        assert_eq!(success.status, 200);
+        assert_eq!(rejected.status, 400);
+        let body = metrics.body_text();
+        assert!(body.contains("# TYPE ferrite_production_actions_total counter"));
+        assert!(body.contains(
+            r#"ferrite_production_actions_total{outcome="accepted",status="200",route="/posts/:id"} 1"#
+        ));
+        assert!(body.contains(
+            r#"ferrite_production_actions_total{outcome="rejected",status="400",route="-"} 1"#
+        ));
+        assert!(!body.contains("savePost"));
+        assert!(!body.contains("Hello"));
     }
 
     #[test]
