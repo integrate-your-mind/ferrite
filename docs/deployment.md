@@ -81,7 +81,14 @@ cargo run -p ferrite-cli -- build --project /srv/app --out /srv/app/.ferrite/bui
 Start the production server:
 
 ```sh
-cargo run -p ferrite-cli -- serve --project /srv/app --host 127.0.0.1 --port 3000 --render-timeout-ms 30000
+cargo run -p ferrite-cli -- serve \
+  --project /srv/app \
+  --host 127.0.0.1 \
+  --port 3000 \
+  --render-timeout-ms 30000 \
+  --request-read-timeout-ms 5000 \
+  --max-request-bytes 16384 \
+  --max-in-flight-requests 64
 ```
 
 For a packaged binary, run the installed `ferrite` executable with the same arguments.
@@ -94,10 +101,13 @@ Use command arguments for the current runtime knobs:
 - `--host`: bind address
 - `--port`: bind port
 - `--render-timeout-ms`: maximum route render subprocess duration
+- `--request-read-timeout-ms`: maximum time to wait while reading each production HTTP request
+- `--max-request-bytes`: maximum bytes allowed for each production HTTP request header and body
+- `--max-in-flight-requests`: maximum production requests handled concurrently
 - `--once`: deterministic one-request mode for smoke tests
 - `--request-path`: request target for `--once` smoke tests
 
-The production adapter also has Rust API-level configuration for request read timeout, maximum request bytes, worker count, and observer hooks. The CLI currently exposes the render timeout but not every low-level production limit.
+The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request and render limits, but not structured log sinks, metrics exporters, or trusted-proxy settings.
 
 ## Smoke Tests
 
@@ -168,7 +178,7 @@ Until those exist, deploy server actions only for controlled beta scenarios or b
 - No npm packages are published yet.
 - No GitHub remote or remote CI proof exists in this checkout.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
-- The production CLI does not expose every low-level server limit.
+- The production CLI exposes the main request and render limits, but not structured log sinks, metrics exporters, or trusted-proxy settings.
 - There is no official container image, systemd unit, Helm chart, or managed platform adapter.
 - There is no first-class metrics exporter or tracing integration.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.

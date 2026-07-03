@@ -233,6 +233,27 @@ struct ServeArgs {
         help = "Maximum milliseconds allowed for each production page renderer subprocess"
     )]
     render_timeout_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = 5_000,
+        help = "Maximum milliseconds to wait while reading each production HTTP request"
+    )]
+    request_read_timeout_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = 16_384,
+        help = "Maximum bytes allowed for each production HTTP request header and body"
+    )]
+    max_request_bytes: usize,
+
+    #[arg(
+        long,
+        default_value_t = 64,
+        help = "Maximum production requests handled concurrently"
+    )]
+    max_in_flight_requests: usize,
 }
 
 #[derive(Debug, Args)]
@@ -513,9 +534,12 @@ fn run_cli(cli: Cli) -> Result<()> {
                     client_out.clone(),
                     args.client_public_path.clone(),
                 )
-                .with_render_timeout(Duration::from_millis(args.render_timeout_ms)),
+                .with_render_timeout(Duration::from_millis(args.render_timeout_ms))
+                .with_request_read_timeout(Duration::from_millis(args.request_read_timeout_ms))
+                .with_max_request_bytes(args.max_request_bytes)
+                .with_max_in_flight_requests(args.max_in_flight_requests),
             );
-            let render_timeout_ms = duration_millis_u64(production_project.config().render_timeout);
+            let production_limits = ServeLimitsOutput::from(production_project.config());
 
             if args.once {
                 let response = production_project.handle_get(&args.request_path)?;
@@ -528,7 +552,10 @@ fn run_cli(cli: Cli) -> Result<()> {
                         client_public_path: args.client_public_path,
                         page_renderer,
                         client_bundler,
-                        render_timeout_ms,
+                        render_timeout_ms: production_limits.render_timeout_ms,
+                        request_read_timeout_ms: production_limits.request_read_timeout_ms,
+                        max_request_bytes: production_limits.max_request_bytes,
+                        max_in_flight_requests: production_limits.max_in_flight_requests,
                         response: response.into(),
                     })?;
                 } else {
@@ -545,7 +572,10 @@ fn run_cli(cli: Cli) -> Result<()> {
                         client_public_path: &args.client_public_path,
                         page_renderer: &page_renderer,
                         client_bundler: &client_bundler,
-                        render_timeout_ms,
+                        render_timeout_ms: production_limits.render_timeout_ms,
+                        request_read_timeout_ms: production_limits.request_read_timeout_ms,
+                        max_request_bytes: production_limits.max_request_bytes,
+                        max_in_flight_requests: production_limits.max_in_flight_requests,
                         url: format!("http://{addr}"),
                     })?;
                 } else {
@@ -557,6 +587,16 @@ fn run_cli(cli: Cli) -> Result<()> {
                     eprintln!("client public path: {}", args.client_public_path);
                     eprintln!("page renderer: {}", page_renderer.display());
                     eprintln!("client bundler: {}", client_bundler.display());
+                    eprintln!("render timeout ms: {}", production_limits.render_timeout_ms);
+                    eprintln!(
+                        "request read timeout ms: {}",
+                        production_limits.request_read_timeout_ms
+                    );
+                    eprintln!("max request bytes: {}", production_limits.max_request_bytes);
+                    eprintln!(
+                        "max in-flight requests: {}",
+                        production_limits.max_in_flight_requests
+                    );
                 }
                 ferrite_dev_server::serve_production(addr, production_project)?;
             }
@@ -751,6 +791,9 @@ struct ServeOnceOutput {
     page_renderer: PathBuf,
     client_bundler: PathBuf,
     render_timeout_ms: u64,
+    request_read_timeout_ms: u64,
+    max_request_bytes: usize,
+    max_in_flight_requests: usize,
     response: DevResponseOutput,
 }
 
@@ -764,7 +807,29 @@ struct ServeStartedOutput<'a> {
     page_renderer: &'a Path,
     client_bundler: &'a Path,
     render_timeout_ms: u64,
+    request_read_timeout_ms: u64,
+    max_request_bytes: usize,
+    max_in_flight_requests: usize,
     url: String,
+}
+
+#[derive(Debug, Copy, Clone, Serialize)]
+struct ServeLimitsOutput {
+    render_timeout_ms: u64,
+    request_read_timeout_ms: u64,
+    max_request_bytes: usize,
+    max_in_flight_requests: usize,
+}
+
+impl ServeLimitsOutput {
+    fn from(config: &ProductionServerConfig) -> Self {
+        Self {
+            render_timeout_ms: duration_millis_u64(config.render_timeout),
+            request_read_timeout_ms: duration_millis_u64(config.request_read_timeout),
+            max_request_bytes: config.max_request_bytes,
+            max_in_flight_requests: config.max_in_flight_requests,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -826,5 +891,52 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(args.render_timeout_ms, 250);
+    }
+
+    #[test]
+    fn serve_accepts_production_limit_flags() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--request-read-timeout-ms",
+            "750",
+            "--max-request-bytes",
+            "4096",
+            "--max-in-flight-requests",
+            "8",
+            "--once",
+        ])
+        .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.request_read_timeout_ms, 750);
+        assert_eq!(args.max_request_bytes, 4096);
+        assert_eq!(args.max_in_flight_requests, 8);
+    }
+
+    #[test]
+    fn serve_limit_output_reports_effective_clamped_values() {
+        let config = ProductionServerConfig::new(
+            PathBuf::from("project"),
+            PathBuf::from("project/app"),
+            PathBuf::from("project/.ferrite/types/routes.d.ts"),
+            PathBuf::from("render-page.mjs"),
+            PathBuf::from("build-client.mjs"),
+            PathBuf::from("project/.ferrite/server/static"),
+            "/_ferrite/static".to_owned(),
+        )
+        .with_render_timeout(Duration::ZERO)
+        .with_request_read_timeout(Duration::ZERO)
+        .with_max_request_bytes(0)
+        .with_max_in_flight_requests(0);
+
+        let limits = ServeLimitsOutput::from(&config);
+
+        assert_eq!(limits.render_timeout_ms, 1);
+        assert_eq!(limits.request_read_timeout_ms, 1);
+        assert_eq!(limits.max_request_bytes, 1);
+        assert_eq!(limits.max_in_flight_requests, 1);
     }
 }
