@@ -5,15 +5,19 @@ import { fileURLToPath } from "node:url";
 
 import { build } from "esbuild";
 
-const [, , pageFile, outDirArg, publicPathArg, routePath = "/", propsJson = "{}", layoutsJson = "[]"] = process.argv;
+const [, , pageFile, outDirArg, publicPathArg, routePath = "/", propsJson = "{}", layoutsJson = "[]", optionsJson = "{}"] =
+  process.argv;
 
 if (!pageFile || !outDirArg || !publicPathArg) {
-  console.error("usage: build-client <page-file> <out-dir> <public-path> [route-path] [props-json] [layouts-json]");
+  console.error(
+    "usage: build-client <page-file> <out-dir> <public-path> [route-path] [props-json] [layouts-json] [options-json]",
+  );
   process.exit(2);
 }
 
 let props;
 let layoutFiles;
+let options;
 try {
   props = JSON.parse(propsJson);
 } catch (error) {
@@ -26,8 +30,18 @@ try {
   console.error(`invalid layouts JSON: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(2);
 }
+try {
+  options = JSON.parse(optionsJson);
+} catch (error) {
+  console.error(`invalid options JSON: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(2);
+}
 if (!Array.isArray(layoutFiles) || layoutFiles.some((file) => typeof file !== "string")) {
   console.error("layouts JSON must be an array of file paths");
+  process.exit(2);
+}
+if (!options || typeof options !== "object" || Array.isArray(options)) {
+  console.error("options JSON must be an object");
   process.exit(2);
 }
 
@@ -41,12 +55,17 @@ await mkdir(outDir, { recursive: true });
 if (!(await routeHasClientDirective([pageFile, ...layoutFiles]))) {
   const clientReferences = await collectClientReferences([pageFile, ...layoutFiles], projectRoot);
   const referenceBundles = await bundleClientReferences(clientReferences, projectRoot, outDir, publicPath);
+  const actionBootstrap =
+    options.actionBootstrap === true && referenceBundles.clientReferences.length === 0
+      ? await bundleActionBootstrap(entryName, projectRoot, outDir, publicPath)
+      : null;
   await writeResponse({
     script: null,
+    actionBootstrap: actionBootstrap?.script,
     styles: [],
-    outputs: referenceBundles.outputs,
-    sourcemaps: referenceBundles.sourcemaps,
-    assets: referenceBundles.assets,
+    outputs: mergeSorted(referenceBundles.outputs, actionBootstrap?.outputs ?? []),
+    sourcemaps: mergeSorted(referenceBundles.sourcemaps, actionBootstrap?.sourcemaps ?? []),
+    assets: mergeSorted(referenceBundles.assets, actionBootstrap?.assets ?? []),
     clientReferences: referenceBundles.clientReferences,
     hydration: "server",
   });
@@ -210,6 +229,58 @@ async function bundleClientReferences(clientReferences, projectRoot, outDir, pub
     sourcemaps: [...sourcemaps].sort(),
     assets: [...assets].sort(),
   };
+}
+
+async function bundleActionBootstrap(routeEntryName, projectRoot, outDir, publicPath) {
+  const tempRoot = join(projectRoot, ".ferrite", "tmp");
+  await mkdir(tempRoot, { recursive: true });
+  const tempDir = await mkdtemp(join(tempRoot, "action-bootstrap-"));
+  const entryName = `${routeEntryName}-action-bootstrap`;
+  const entryFile = join(tempDir, `${entryName}.ts`);
+
+  try {
+    await writeFile(
+      entryFile,
+      [
+        `import { bootstrapServerActionForms } from "@ferrite/runtime/dom";`,
+        `if (typeof document !== "undefined") {`,
+        `  bootstrapServerActionForms(document);`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+    const result = await build({
+      entryPoints: [entryFile],
+      bundle: true,
+      platform: "browser",
+      format: "esm",
+      target: "es2022",
+      outdir: outDir,
+      entryNames: entryName,
+      assetNames: "assets/[name]-[hash]",
+      sourcemap: true,
+      metafile: true,
+      plugins: [ferriteRuntimeAliasPlugin()],
+      loader: {
+        ".png": "file",
+        ".jpg": "file",
+        ".jpeg": "file",
+        ".gif": "file",
+        ".svg": "file",
+        ".webp": "file",
+        ".woff": "file",
+        ".woff2": "file",
+      },
+      logLevel: "silent",
+    });
+    return summarizeBuildResult(result, outDir, entryFile, publicPath);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function mergeSorted(...lists) {
+  return [...new Set(lists.flat())].sort();
 }
 
 async function bundleClientReference(clientReference, projectRoot, outDir, publicPath) {

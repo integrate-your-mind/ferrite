@@ -7,6 +7,28 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientBundleOptions {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub action_bootstrap: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClientBundleRequest<'a> {
+    pub page_file: &'a Path,
+    pub layouts: &'a [PathBuf],
+    pub route_path: &'a str,
+    pub params: &'a [(String, Value)],
+    pub out_dir: &'a Path,
+    pub public_path: &'a str,
+    pub options: ClientBundleOptions,
+}
+
 #[derive(Debug)]
 pub enum ClientBundleError {
     Io(std::io::Error),
@@ -73,19 +95,33 @@ impl ClientBundler {
         out_dir: &Path,
         public_path: &str,
     ) -> Result<ClientBundle> {
+        self.bundle_route_request(ClientBundleRequest {
+            page_file,
+            layouts,
+            route_path,
+            params,
+            out_dir,
+            public_path,
+            options: ClientBundleOptions::default(),
+        })
+    }
+
+    pub fn bundle_route_request(&self, request: ClientBundleRequest<'_>) -> Result<ClientBundle> {
         let props = ClientProps {
-            params: params.iter().cloned().collect(),
+            params: request.params.iter().cloned().collect(),
         };
         let props_json = serde_json::to_string(&props)?;
-        let layouts_json = serde_json::to_string(layouts)?;
+        let layouts_json = serde_json::to_string(request.layouts)?;
+        let options_json = serde_json::to_string(&request.options)?;
         let output = Command::new("node")
             .arg(&self.script)
-            .arg(page_file)
-            .arg(out_dir)
-            .arg(public_path)
-            .arg(route_path)
+            .arg(request.page_file)
+            .arg(request.out_dir)
+            .arg(request.public_path)
+            .arg(request.route_path)
             .arg(props_json)
             .arg(layouts_json)
+            .arg(options_json)
             .current_dir(&self.project)
             .output()?;
 
@@ -105,6 +141,12 @@ impl ClientBundler {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientBundle {
     pub script: Option<String>,
+    #[serde(
+        default,
+        rename = "actionBootstrap",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub action_bootstrap: Option<String>,
     pub styles: Vec<String>,
     pub outputs: Vec<PathBuf>,
     pub sourcemaps: Vec<PathBuf>,
@@ -157,6 +199,9 @@ pub fn fingerprint_client_bundle(
     let mut replacements = BTreeMap::new();
 
     if let Some(script) = bundle.script.as_mut() {
+        fingerprint_public_url(script, out_dir, public_path, &mut replacements)?;
+    }
+    if let Some(script) = bundle.action_bootstrap.as_mut() {
         fingerprint_public_url(script, out_dir, public_path, &mut replacements)?;
     }
     for style in &mut bundle.styles {
@@ -356,6 +401,11 @@ process.stdout.write(JSON.stringify({
         let out_dir = temp.path().join("out");
         fs::create_dir_all(&out_dir).unwrap();
         fs::write(out_dir.join("route-index.js"), "console.log('route');").unwrap();
+        fs::write(
+            out_dir.join("route-index-action-bootstrap.js"),
+            "console.log('action-bootstrap');",
+        )
+        .unwrap();
         fs::write(out_dir.join("route-index.css"), ".page{color:red}").unwrap();
         fs::write(
             out_dir.join("client-reference-app-Counter-tsx-default.js"),
@@ -369,14 +419,17 @@ process.stdout.write(JSON.stringify({
         .unwrap();
         fs::write(out_dir.join("route-index.js.map"), "{}").unwrap();
         let route_js_hash = content_hash("console.log('route');".as_bytes());
+        let action_bootstrap_hash = content_hash("console.log('action-bootstrap');".as_bytes());
         let route_css_hash = content_hash(".page{color:red}".as_bytes());
         let reference_js_hash = content_hash("console.log('counter');".as_bytes());
         let reference_css_hash = content_hash(".counter{color:blue}".as_bytes());
         let mut bundle = ClientBundle {
             script: Some("/_ferrite/static/route-index.js".to_owned()),
+            action_bootstrap: Some("/_ferrite/static/route-index-action-bootstrap.js".to_owned()),
             styles: vec!["/_ferrite/static/route-index.css".to_owned()],
             outputs: vec![
                 PathBuf::from("route-index.js"),
+                PathBuf::from("route-index-action-bootstrap.js"),
                 PathBuf::from("route-index.css"),
                 PathBuf::from("route-index.js.map"),
                 PathBuf::from("client-reference-app-Counter-tsx-default.js"),
@@ -411,6 +464,12 @@ process.stdout.write(JSON.stringify({
         );
         assert_eq!(bundle.script.as_deref(), Some(route_script.as_str()));
         assert_eq!(
+            bundle.action_bootstrap,
+            Some(format!(
+                "/_ferrite/static/route-index-action-bootstrap.{action_bootstrap_hash}.js"
+            ))
+        );
+        assert_eq!(
             bundle.styles,
             vec![format!("/_ferrite/static/route-index.{route_css_hash}.css")]
         );
@@ -433,6 +492,14 @@ process.stdout.write(JSON.stringify({
         assert!(
             out_dir
                 .join(format!(
+                    "route-index-action-bootstrap.{action_bootstrap_hash}.js"
+                ))
+                .is_file()
+        );
+        assert!(!out_dir.join("route-index-action-bootstrap.js").exists());
+        assert!(
+            out_dir
+                .join(format!(
                     "client-reference-app-Counter-tsx-default.{reference_js_hash}.js"
                 ))
                 .is_file()
@@ -442,6 +509,9 @@ process.stdout.write(JSON.stringify({
                 .outputs
                 .contains(&PathBuf::from(format!("route-index.{route_js_hash}.js")))
         );
+        assert!(bundle.outputs.contains(&PathBuf::from(format!(
+            "route-index-action-bootstrap.{action_bootstrap_hash}.js"
+        ))));
         assert!(bundle.outputs.contains(&PathBuf::from(format!(
             "client-reference-app-Counter-tsx-default.{reference_css_hash}.css"
         ))));
@@ -700,16 +770,20 @@ export default function Page() {
         .unwrap();
 
         let server_bundle = bundler
-            .bundle_route(
-                &temp.path().join("app/actions/page.tsx"),
-                &[],
-                "/actions",
-                &[],
-                &temp.path().join(".ferrite/build/_ferrite/static"),
-                "/_ferrite/static",
-            )
+            .bundle_route_request(ClientBundleRequest {
+                page_file: &temp.path().join("app/actions/page.tsx"),
+                layouts: &[],
+                route_path: "/actions",
+                params: &[],
+                out_dir: &temp.path().join(".ferrite/build/_ferrite/static"),
+                public_path: "/_ferrite/static",
+                options: ClientBundleOptions {
+                    action_bootstrap: true,
+                },
+            })
             .unwrap();
 
+        assert_eq!(server_bundle.action_bootstrap, None);
         let reference_script = server_bundle.client_references[0]
             .script
             .as_deref()
@@ -722,6 +796,45 @@ export default function Page() {
         )
         .unwrap();
         assert!(reference_js.contains("bootstrapServerActionForms"));
+
+        fs::write(
+            temp.path().join("app/actions/page.tsx"),
+            r#"
+export default function Page() {
+  return <form method="post" action="/_ferrite/action"><button>Save</button></form>;
+}
+"#,
+        )
+        .unwrap();
+
+        let action_bundle = bundler
+            .bundle_route_request(ClientBundleRequest {
+                page_file: &temp.path().join("app/actions/page.tsx"),
+                layouts: &[],
+                route_path: "/actions",
+                params: &[],
+                out_dir: &temp.path().join(".ferrite/build/_ferrite/static"),
+                public_path: "/_ferrite/static",
+                options: ClientBundleOptions {
+                    action_bootstrap: true,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(action_bundle.script, None);
+        assert!(action_bundle.client_references.is_empty());
+        let action_bootstrap = action_bundle
+            .action_bootstrap
+            .as_deref()
+            .expect("server-only action routes emit a standalone enhancer");
+        assert!(action_bootstrap.ends_with("route-actions-action-bootstrap.js"));
+        let action_js = fs::read_to_string(
+            temp.path()
+                .join(".ferrite/build/_ferrite/static")
+                .join(action_bootstrap.trim_start_matches("/_ferrite/static/")),
+        )
+        .unwrap();
+        assert!(action_js.contains("bootstrapServerActionForms"));
     }
 
     #[cfg(unix)]

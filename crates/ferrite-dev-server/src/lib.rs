@@ -13,7 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ferrite_client_bundler::{
-    ClientBundle, ClientBundleError, ClientBundler, fingerprint_client_bundle,
+    ClientBundle, ClientBundleError, ClientBundleOptions, ClientBundleRequest, ClientBundler,
+    fingerprint_client_bundle,
 };
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
@@ -530,14 +531,27 @@ impl DevProject {
                         self.config.project.clone(),
                         self.config.client_bundler.clone(),
                     );
-                    match bundler.bundle_route(
-                        &match_result.route.file,
-                        &match_result.route.layouts,
-                        &match_result.route.path,
-                        &match_result.params,
-                        &self.config.client_out_dir,
-                        &self.config.client_public_path,
-                    ) {
+                    let action_bootstrap =
+                        match route_needs_action_bootstrap(renderer, match_result, conventions) {
+                            Ok(action_bootstrap) => action_bootstrap,
+                            Err(error) => {
+                                return DevResponse::internal_error(render_render_error(
+                                    self.build_id,
+                                    path,
+                                    match_result,
+                                    &error,
+                                ));
+                            }
+                        };
+                    match bundler.bundle_route_request(ClientBundleRequest {
+                        page_file: &match_result.route.file,
+                        layouts: &match_result.route.layouts,
+                        route_path: &match_result.route.path,
+                        params: &match_result.params,
+                        out_dir: &self.config.client_out_dir,
+                        public_path: &self.config.client_public_path,
+                        options: ClientBundleOptions { action_bootstrap },
+                    }) {
                         Ok(client_bundle) => match renderer
                             .render_document_to_stream_parts_with_conventions(
                                 &match_result.route.file,
@@ -599,14 +613,28 @@ impl DevProject {
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
                         );
-                        match bundler.bundle_route(
-                            &match_result.route.file,
-                            &match_result.route.layouts,
-                            &match_result.route.path,
-                            &match_result.params,
-                            &self.config.client_out_dir,
-                            &self.config.client_public_path,
-                        ) {
+                        let action_bootstrap =
+                            match route_needs_action_bootstrap(renderer, match_result, conventions)
+                            {
+                                Ok(action_bootstrap) => action_bootstrap,
+                                Err(error) => {
+                                    return DevResponse::internal_error(render_render_error(
+                                        self.build_id,
+                                        path,
+                                        match_result,
+                                        &error,
+                                    ));
+                                }
+                            };
+                        match bundler.bundle_route_request(ClientBundleRequest {
+                            page_file: &match_result.route.file,
+                            layouts: &match_result.route.layouts,
+                            route_path: &match_result.route.path,
+                            params: &match_result.params,
+                            out_dir: &self.config.client_out_dir,
+                            public_path: &self.config.client_public_path,
+                            options: ClientBundleOptions { action_bootstrap },
+                        }) {
                             Ok(client_bundle) => {
                                 let shell = render_route_document(
                                     self.build_id,
@@ -665,14 +693,27 @@ impl DevProject {
                         self.config.project.clone(),
                         self.config.client_bundler.clone(),
                     );
-                    match bundler.bundle_route(
-                        &match_result.route.file,
-                        &match_result.route.layouts,
-                        &match_result.route.path,
-                        &match_result.params,
-                        &self.config.client_out_dir,
-                        &self.config.client_public_path,
-                    ) {
+                    let action_bootstrap =
+                        match route_needs_action_bootstrap(renderer, match_result, conventions) {
+                            Ok(action_bootstrap) => action_bootstrap,
+                            Err(error) => {
+                                return DevResponse::internal_error(render_render_error(
+                                    self.build_id,
+                                    path,
+                                    match_result,
+                                    &error,
+                                ));
+                            }
+                        };
+                    match bundler.bundle_route_request(ClientBundleRequest {
+                        page_file: &match_result.route.file,
+                        layouts: &match_result.route.layouts,
+                        route_path: &match_result.route.path,
+                        params: &match_result.params,
+                        out_dir: &self.config.client_out_dir,
+                        public_path: &self.config.client_public_path,
+                        options: ClientBundleOptions { action_bootstrap },
+                    }) {
                         Ok(client_bundle) => match renderer
                             .render_document_to_server_payload_json_with_conventions(
                                 &match_result.route.file,
@@ -973,14 +1014,29 @@ impl ProductionProject {
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
                         );
+                        let action_bootstrap =
+                            match route_needs_action_bootstrap(renderer, match_result, conventions)
+                            {
+                                Ok(action_bootstrap) => action_bootstrap,
+                                Err(error) => {
+                                    return production_render_error_response(
+                                        path,
+                                        match_result,
+                                        &error,
+                                    );
+                                }
+                            };
                         match production_client_bundle(
                             &bundler,
-                            &match_result.route.file,
-                            &match_result.route.layouts,
-                            &match_result.route.path,
-                            &match_result.params,
-                            &self.config.client_out_dir,
-                            &self.config.client_public_path,
+                            ClientBundleRequest {
+                                page_file: &match_result.route.file,
+                                layouts: &match_result.route.layouts,
+                                route_path: &match_result.route.path,
+                                params: &match_result.params,
+                                out_dir: &self.config.client_out_dir,
+                                public_path: &self.config.client_public_path,
+                                options: ClientBundleOptions { action_bootstrap },
+                            },
                         ) {
                             Ok(client_bundle) => match renderer
                                 .render_document_to_stream_parts_with_conventions(
@@ -1034,14 +1090,29 @@ impl ProductionProject {
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
                         );
+                        let action_bootstrap =
+                            match route_needs_action_bootstrap(renderer, match_result, conventions)
+                            {
+                                Ok(action_bootstrap) => action_bootstrap,
+                                Err(error) => {
+                                    return production_render_error_response(
+                                        path,
+                                        match_result,
+                                        &error,
+                                    );
+                                }
+                            };
                         match production_client_bundle(
                             &bundler,
-                            &match_result.route.file,
-                            &match_result.route.layouts,
-                            &match_result.route.path,
-                            &match_result.params,
-                            &self.config.client_out_dir,
-                            &self.config.client_public_path,
+                            ClientBundleRequest {
+                                page_file: &match_result.route.file,
+                                layouts: &match_result.route.layouts,
+                                route_path: &match_result.route.path,
+                                params: &match_result.params,
+                                out_dir: &self.config.client_out_dir,
+                                public_path: &self.config.client_public_path,
+                                options: ClientBundleOptions { action_bootstrap },
+                            },
                         ) {
                             Ok(client_bundle) => {
                                 let shell = render_production_route_document(
@@ -1090,14 +1161,29 @@ impl ProductionProject {
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
                         );
+                        let action_bootstrap =
+                            match route_needs_action_bootstrap(renderer, match_result, conventions)
+                            {
+                                Ok(action_bootstrap) => action_bootstrap,
+                                Err(error) => {
+                                    return production_render_error_response(
+                                        path,
+                                        match_result,
+                                        &error,
+                                    );
+                                }
+                            };
                         match production_client_bundle(
                             &bundler,
-                            &match_result.route.file,
-                            &match_result.route.layouts,
-                            &match_result.route.path,
-                            &match_result.params,
-                            &self.config.client_out_dir,
-                            &self.config.client_public_path,
+                            ClientBundleRequest {
+                                page_file: &match_result.route.file,
+                                layouts: &match_result.route.layouts,
+                                route_path: &match_result.route.path,
+                                params: &match_result.params,
+                                out_dir: &self.config.client_out_dir,
+                                public_path: &self.config.client_public_path,
+                                options: ClientBundleOptions { action_bootstrap },
+                            },
                         ) {
                             Ok(client_bundle) => match renderer
                                 .render_document_to_server_payload_json_with_conventions(
@@ -1490,29 +1576,40 @@ fn representative_route_params(route: &Route) -> Vec<(String, Value)> {
 
 fn production_client_bundle(
     bundler: &ClientBundler,
-    page_file: &Path,
-    layouts: &[PathBuf],
-    route_path: &str,
-    params: &[(String, Value)],
-    client_out_dir: &Path,
-    client_public_path: &str,
+    request: ClientBundleRequest<'_>,
 ) -> std::result::Result<ClientBundle, ClientBundleError> {
-    let mut client_bundle = bundler.bundle_route(
-        page_file,
-        layouts,
-        route_path,
-        params,
-        client_out_dir,
-        client_public_path,
-    )?;
-    fingerprint_client_bundle(&mut client_bundle, client_out_dir, client_public_path)?;
+    let mut client_bundle = bundler.bundle_route_request(request)?;
+    fingerprint_client_bundle(&mut client_bundle, request.out_dir, request.public_path)?;
     Ok(client_bundle)
+}
+
+fn route_needs_action_bootstrap(
+    renderer: &PageRenderer,
+    match_result: &RouteMatch,
+    conventions: &RouteConventions,
+) -> std::result::Result<bool, PageRenderError> {
+    let manifest = match renderer.collect_server_actions(
+        &match_result.route.file,
+        &match_result.route.layouts,
+        &match_result.params,
+        conventions,
+    ) {
+        Ok(manifest) => manifest,
+        // Request-time action bootstrap probing is optional; older or narrowly scoped
+        // renderer scripts may not implement the manifest mode for non-action routes.
+        Err(PageRenderError::Json(_))
+        | Err(PageRenderError::Protocol(_))
+        | Err(PageRenderError::NodeFailed { .. }) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(!manifest.actions.is_empty())
 }
 
 fn dev_document_scripts(client_bundle: &ClientBundle) -> Vec<String> {
     let mut scripts = BTreeSet::new();
     scripts.insert("/__ferrite/client.js".to_owned());
     scripts.extend(client_bundle.script.iter().cloned());
+    scripts.extend(client_bundle.action_bootstrap.iter().cloned());
     for reference in &client_bundle.client_references {
         scripts.extend(reference.script.iter().cloned());
     }
@@ -1522,6 +1619,7 @@ fn dev_document_scripts(client_bundle: &ClientBundle) -> Vec<String> {
 fn client_bundle_scripts(client_bundle: &ClientBundle) -> Vec<String> {
     let mut scripts = BTreeSet::new();
     scripts.extend(client_bundle.script.iter().cloned());
+    scripts.extend(client_bundle.action_bootstrap.iter().cloned());
     for reference in &client_bundle.client_references {
         scripts.extend(reference.script.iter().cloned());
     }
@@ -4487,6 +4585,7 @@ process.stdout.write(JSON.stringify({
     fn document_script_options_include_reload_client_and_optional_route_script() {
         let server_only = ClientBundle {
             script: None,
+            action_bootstrap: None,
             styles: Vec::new(),
             outputs: Vec::new(),
             sourcemaps: Vec::new(),
@@ -4500,6 +4599,7 @@ process.stdout.write(JSON.stringify({
 
         let client_route = ClientBundle {
             script: Some("/_ferrite/static/route-index.js".to_owned()),
+            action_bootstrap: None,
             styles: Vec::new(),
             outputs: Vec::new(),
             sourcemaps: Vec::new(),
@@ -4513,6 +4613,7 @@ process.stdout.write(JSON.stringify({
 
         let island_route = ClientBundle {
             script: None,
+            action_bootstrap: None,
             styles: Vec::new(),
             outputs: Vec::new(),
             sourcemaps: Vec::new(),
@@ -4542,6 +4643,27 @@ process.stdout.write(JSON.stringify({
         assert_eq!(
             client_bundle_styles(&island_route),
             vec!["/_ferrite/static/client-reference-app-Counter-tsx-default.css"]
+        );
+
+        let action_route = ClientBundle {
+            script: None,
+            action_bootstrap: Some("/_ferrite/static/route-index-action-bootstrap.js".to_owned()),
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+        };
+        assert_eq!(
+            dev_document_scripts(&action_route),
+            vec![
+                "/__ferrite/client.js",
+                "/_ferrite/static/route-index-action-bootstrap.js"
+            ]
+        );
+        assert_eq!(
+            client_bundle_scripts(&action_route),
+            vec!["/_ferrite/static/route-index-action-bootstrap.js"]
         );
     }
 
@@ -5166,6 +5288,63 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected non-strea
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "text/javascript; charset=utf-8");
         assert!(response.body_text().contains("console.log('client')"));
+    }
+
+    #[test]
+    fn injects_action_bootstrap_for_server_only_action_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Post() {}",
+        );
+        let mut project = project_for(&app);
+        make_script(
+            &temp.path().join("build-client.mjs"),
+            r#"
+const outDir = process.argv[3];
+const options = JSON.parse(process.argv[8] || "{}");
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+await fs.mkdir(outDir, { recursive: true });
+if (options.actionBootstrap === true) {
+  await fs.writeFile(path.join(outDir, "route-posts-id-action-bootstrap.js"), "console.log('action-bootstrap');");
+  process.stdout.write(JSON.stringify({
+    script: null,
+    actionBootstrap: "/_ferrite/static/route-posts-id-action-bootstrap.js",
+    styles: [],
+    outputs: ["route-posts-id-action-bootstrap.js"],
+    sourcemaps: [],
+    assets: []
+  }));
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: []
+}));
+"#,
+        );
+
+        let html = project.handle_get("/posts/alpha").unwrap();
+        let html_body = html.body_text();
+        assert_eq!(html.status, 200);
+        assert!(html_body.contains(
+            r#"<script type="module" src="/_ferrite/static/route-posts-id-action-bootstrap.js"></script>"#
+        ));
+        assert!(
+            !html_body.contains(r#"<script type="module" src="/_ferrite/static/route-posts-id.js"#)
+        );
+
+        let response = project
+            .handle_get("/_ferrite/static/route-posts-id-action-bootstrap.js")
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/javascript; charset=utf-8");
+        assert!(response.body_text().contains("action-bootstrap"));
     }
 
     #[test]

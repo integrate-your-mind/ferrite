@@ -121,7 +121,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Page-renderer server-action invocation and manifest tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary and explicit rendered-form manifest collection, but not automatic `"use server"` discovery or a real deployment action registry.
 - [ ] Browser runtime proof uses Node plus `happy-dom`, not Playwright/WebDriver in Chromium/WebKit/Firefox.
 - [ ] Dev/serve proof is local socket and one-shot proof, not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
-- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, and generated client-entrypoint bootstrap. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, dedicated bootstrap asset for server-only action routes, real browser proof, upload streaming, or client event action surface.
+- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, and dedicated server-only action bootstrap assets. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, real browser proof, upload streaming, or client event action surface.
 
 ## Productionization Checklist
 
@@ -131,7 +131,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Add automatic `"use server"` export discovery, deployment-stable inferred action IDs, and a persistent deployment action registry.
 - [x] Add a browser-side progressive-enhancement helper for server-action form submissions and validated action responses.
 - [x] Wire the server-action form enhancer into generated route/client-reference browser entrypoints where browser JavaScript already exists.
-- [ ] Emit a dedicated action-enhancer browser asset for server-only routes that contain server-action forms but no route/client-reference script.
+- [x] Emit a dedicated action-enhancer browser asset for server-only routes that contain server-action forms but no route/client-reference script.
 - [ ] Add real browser tests for hydration, payload navigation, streaming, popstate restoration, prefetching, and server-action form submission.
 - [ ] Add server-action security hardening: origin/CSRF policy, cookie/session integration points, replay considerations, and clearer auth guidance.
 - [ ] Add first-class production logging/tracing sinks for request observer events.

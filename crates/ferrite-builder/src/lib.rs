@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ferrite_client_bundler::{
-    ClientBundle, ClientBundleError, ClientBundler, fingerprint_client_bundle,
+    ClientBundle, ClientBundleError, ClientBundleOptions, ClientBundleRequest, ClientBundler,
+    fingerprint_client_bundle,
 };
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
@@ -179,6 +180,13 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                 fs::create_dir_all(parent)?;
             }
             let conventions = route_conventions(route);
+            let action_manifest = page_renderer.collect_server_actions(
+                &route.file,
+                &route.layouts,
+                &ordered_params,
+                &conventions,
+            )?;
+            let needs_action_bootstrap = !action_manifest.actions.is_empty();
             let (document, metadata, client_bundle) = if let Some(document_file) =
                 document_file.as_deref()
             {
@@ -191,6 +199,7 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                     &route_path,
                     &ordered_params,
                     &client_out_dir,
+                    needs_action_bootstrap,
                 )?;
                 page_renderer
                     .render_document_to_html_with_conventions(
@@ -228,6 +237,7 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                     &route_path,
                     &ordered_params,
                     &client_out_dir,
+                    needs_action_bootstrap,
                 )?;
                 (
                     render_static_document(&route_path, &page_html, &client_bundle, &metadata),
@@ -242,12 +252,6 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                 metadata,
             });
             client_bundles.push(client_bundle);
-            let action_manifest = page_renderer.collect_server_actions(
-                &route.file,
-                &route.layouts,
-                &ordered_params,
-                &conventions,
-            )?;
             if !action_manifest.actions.is_empty() {
                 server_action_manifests.push(action_manifest);
             }
@@ -291,15 +295,17 @@ fn bundle_production_route(
     route_path: &str,
     params: &[(String, Value)],
     client_out_dir: &Path,
+    action_bootstrap: bool,
 ) -> Result<ClientBundle> {
-    let mut client_bundle = client_bundler.bundle_route(
+    let mut client_bundle = client_bundler.bundle_route_request(ClientBundleRequest {
         page_file,
         layouts,
         route_path,
         params,
-        client_out_dir,
-        CLIENT_PUBLIC_PATH,
-    )?;
+        out_dir: client_out_dir,
+        public_path: CLIENT_PUBLIC_PATH,
+        options: ClientBundleOptions { action_bootstrap },
+    })?;
     fingerprint_client_bundle(&mut client_bundle, client_out_dir, CLIENT_PUBLIC_PATH)?;
     Ok(client_bundle)
 }
@@ -525,6 +531,7 @@ fn client_bundle_styles(client_bundle: &ClientBundle) -> Vec<String> {
 fn client_bundle_scripts(client_bundle: &ClientBundle) -> Vec<String> {
     let mut scripts = BTreeSet::new();
     scripts.extend(client_bundle.script.iter().cloned());
+    scripts.extend(client_bundle.action_bootstrap.iter().cloned());
     for reference in &client_bundle.client_references {
         scripts.extend(reference.script.iter().cloned());
     }
@@ -1040,6 +1047,35 @@ process.stdout.write(JSON.stringify({
         );
         let config = build_config(temp.path());
         make_script(
+            &config.client_bundler,
+            r#"
+const outDir = process.argv[3];
+const options = JSON.parse(process.argv[8] || "{}");
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+await fs.mkdir(outDir, { recursive: true });
+if (options.actionBootstrap === true) {
+  await fs.writeFile(path.join(outDir, "route-posts-alpha-action-bootstrap.js"), "console.log('action-bootstrap');");
+  process.stdout.write(JSON.stringify({
+    script: null,
+    actionBootstrap: "/_ferrite/static/route-posts-alpha-action-bootstrap.js",
+    styles: [],
+    outputs: ["route-posts-alpha-action-bootstrap.js"],
+    sourcemaps: [],
+    assets: []
+  }));
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: []
+}));
+"#,
+        );
+        make_script(
             &config.page_renderer,
             r#"
 const mode = process.argv[2];
@@ -1080,10 +1116,32 @@ process.stdout.write(JSON.stringify({
 
         assert_eq!(report.server_action_manifests.len(), 1);
         assert_eq!(report.server_action_manifests[0].route_path, "/posts/alpha");
+        assert_eq!(report.client_bundles.len(), 1);
+        assert_eq!(report.client_bundles[0].script, None);
+        let action_bootstrap = report.client_bundles[0]
+            .action_bootstrap
+            .as_deref()
+            .expect("server action route emits a standalone action bootstrap asset");
+        assert_fingerprinted_public_path(action_bootstrap, ".js");
+        let action_bootstrap_file = temp
+            .path()
+            .join(".ferrite/build/_ferrite/static")
+            .join(action_bootstrap.trim_start_matches("/_ferrite/static/"));
+        assert!(action_bootstrap_file.is_file());
+        let html =
+            fs::read_to_string(temp.path().join(".ferrite/build/posts/alpha/index.html")).unwrap();
+        assert!(html.contains(&format!(
+            r#"<script type="module" src="{action_bootstrap}"></script>"#
+        )));
+        assert!(!html.contains(r#"src="/_ferrite/static/route-posts-alpha.js"#));
         let manifest: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(config.out_dir.join("ferrite-build.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            manifest["client_bundles"][0]["actionBootstrap"].as_str(),
+            Some(action_bootstrap)
+        );
         assert_eq!(
             manifest["server_action_manifests"][0]["actions"][0]["id"].as_str(),
             Some("app/posts/[id]/page.tsx#savePost")
@@ -1632,6 +1690,10 @@ if (process.argv[2] === "--metadata") {
   console.error("metadata failed");
   process.exit(1);
 }
+if (process.argv[2] === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
+  process.exit(0);
+}
 process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
 "#,
         );
@@ -1683,6 +1745,10 @@ process.stdout.write(JSON.stringify({
             r#"
 if (process.argv[2] === "--metadata") {
   process.stdout.write("{}");
+  process.exit(0);
+}
+if (process.argv[2] === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
   process.exit(0);
 }
 if (process.argv[2] === "--document") {
@@ -1769,6 +1835,10 @@ process.exit(1);
             r#"
 if (process.argv[2] === "--metadata") {
   process.stdout.write("{}");
+  process.exit(0);
+}
+if (process.argv[2] === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
   process.exit(0);
 }
 process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
