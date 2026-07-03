@@ -119,6 +119,50 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
   );
 });
 
+test("server payload navigator falls back from malformed clicked payloads in Chromium", async (t) => {
+  if (!existsSync(chromeExecutable)) {
+    t.skip(`Chrome executable not found at ${chromeExecutable}`);
+    return;
+  }
+
+  const project = await createPayloadNavigationFixture();
+  t.after(async () => {
+    await rm(project, { recursive: true, force: true });
+  });
+
+  const { server, origin, requests } = await servePayloadNavigationFixture(join(project, "public"));
+  t.after(async () => {
+    await new Promise((resolveClose) => server.close(resolveClose));
+  });
+
+  const browser = await chromium.launch({ executablePath: chromeExecutable, headless: true });
+  t.after(async () => {
+    await browser.close();
+  });
+
+  const page = await browser.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  t.after(async () => {
+    await page.close();
+  });
+
+  const response = await page.goto(origin, { waitUntil: "networkidle" });
+  assert.equal(response?.status(), 200);
+  await page.waitForFunction(() => Boolean(globalThis.ferriteRuntimeTest));
+  await page.getByRole("heading", { name: "Old route" }).waitFor();
+
+  await page.click("#malformed-link");
+  await waitForRequest(requests, "/posts/malformed?__ferrite_payload=server");
+  await page.waitForURL(`${origin}/posts/malformed`);
+  await page.getByRole("heading", { name: "Malformed fallback route" }).waitFor();
+  assert.equal(await page.title(), "Malformed fallback title");
+  assert.deepEqual(
+    pageErrors.map((error) => error.message),
+    [],
+  );
+});
+
 async function createPayloadNavigationFixture() {
   const project = await mkdtemp(join(tmpdir(), "ferrite-browser-payload-nav-"));
   const publicDir = join(project, "public");
@@ -202,6 +246,21 @@ async function servePayloadNavigationFixture(publicDir) {
       if (url.pathname === "/posts/malformed" && url.searchParams.get("__ferrite_payload") === "server") {
         response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         response.end(JSON.stringify({ ferrite: "server-payload", version: 1, shell: ["bad"], clientReferences: [], chunks: [] }));
+        return;
+      }
+
+      if (url.pathname === "/posts/malformed" && !url.searchParams.has("__ferrite_payload")) {
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        response.end(
+          [
+            `<!doctype html>`,
+            `<html>`,
+            `<head><title>Malformed fallback title</title></head>`,
+            `<body><main><h1>Malformed fallback route</h1></main></body>`,
+            `</html>`,
+            ``,
+          ].join("\n"),
+        );
         return;
       }
 
