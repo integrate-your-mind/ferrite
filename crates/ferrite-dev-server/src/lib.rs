@@ -1374,6 +1374,19 @@ impl DevResponse {
         }
     }
 
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: 403,
+            reason: "Forbidden",
+            content_type: "text/plain; charset=utf-8",
+            body: format!("Forbidden: {}\n", message.into()).into_bytes(),
+            stream: None,
+            cache_control: None,
+            route_pattern_header: None,
+            link_headers: Vec::new(),
+        }
+    }
+
     pub fn request_timeout() -> Self {
         Self {
             status: 408,
@@ -2419,6 +2432,7 @@ fn server_action_request_from_form(
     headers: &HttpHeaders,
     body: &[u8],
 ) -> std::result::Result<ServerActionRequest, Box<DevResponse>> {
+    enforce_server_action_origin(headers)?;
     let mut form = parse_server_action_form(headers, body)
         .map_err(|message| Box::new(DevResponse::bad_request(message)))?;
     let id = remove_required_action_field(&mut form, SERVER_ACTION_ID_FIELD)?;
@@ -2434,6 +2448,47 @@ fn server_action_request_from_form(
         .map_err(|error| Box::new(DevResponse::bad_request(error.to_string())))?;
 
     Ok(request)
+}
+
+fn enforce_server_action_origin(
+    headers: &HttpHeaders,
+) -> std::result::Result<(), Box<DevResponse>> {
+    let Some(host_header) = header_value(headers, "host") else {
+        return Ok(());
+    };
+    let Some(host) = normalize_authority(host_header) else {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action Host must be a valid HTTP authority",
+        )));
+    };
+
+    if let Some(origin) = non_empty_header(headers, "origin") {
+        let Some(origin_host) = http_header_origin_authority(origin) else {
+            return Err(Box::new(DevResponse::forbidden(
+                "server action Origin must be an absolute HTTP(S) origin",
+            )));
+        };
+        if origin_host != host {
+            return Err(Box::new(DevResponse::forbidden(
+                "server action Origin does not match the request Host",
+            )));
+        }
+    }
+
+    if let Some(referer) = non_empty_header(headers, "referer") {
+        let Some(referer_host) = http_header_url_authority(referer) else {
+            return Err(Box::new(DevResponse::forbidden(
+                "server action Referer must be an absolute HTTP(S) URL",
+            )));
+        };
+        if referer_host != host {
+            return Err(Box::new(DevResponse::forbidden(
+                "server action Referer does not match the request Host",
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_server_action_form(
@@ -2465,6 +2520,48 @@ fn header_value<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
             .find(|(candidate, _value)| candidate.eq_ignore_ascii_case(name))
             .map(|(_candidate, value)| value.as_str())
     })
+}
+
+fn non_empty_header<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
+    header_value(headers, name)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn http_header_origin_authority(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let (scheme, rest) = trimmed.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    if rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return None;
+    }
+    normalize_authority(rest)
+}
+
+fn http_header_url_authority(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let (scheme, rest) = trimmed.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())?;
+    normalize_authority(authority)
+}
+
+fn normalize_authority(value: &str) -> Option<String> {
+    let authority = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(authority)
 }
 
 fn remove_required_action_field(
@@ -3544,6 +3641,13 @@ process.exit(1);
         BTreeMap::from([("content-type".to_owned(), content_type.to_owned())])
     }
 
+    fn action_headers_with_host(content_type: &str) -> HttpHeaders {
+        BTreeMap::from([
+            ("content-type".to_owned(), content_type.to_owned()),
+            ("host".to_owned(), "localhost:3000".to_owned()),
+        ])
+    }
+
     fn action_form_body(route: &str) -> Vec<u8> {
         format!(
             "__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route={}&title=Hello+Ferrite&tag=rust&tag=tsx",
@@ -3793,6 +3897,36 @@ process.exit(1);
     }
 
     #[test]
+    fn action_form_origin_guard_accepts_same_host_and_rejects_cross_origin() {
+        let mut same_origin = action_headers_with_host("application/x-www-form-urlencoded");
+        same_origin.insert("origin".to_owned(), "http://localhost:3000".to_owned());
+
+        let request =
+            server_action_request_from_form(&same_origin, &action_form_body("/posts/abc"))
+                .expect("same-origin action request should parse");
+        assert_eq!(request.route_path, "/posts/abc");
+
+        let mut cross_origin = same_origin.clone();
+        cross_origin.insert("origin".to_owned(), "https://evil.example".to_owned());
+        let response =
+            server_action_request_from_form(&cross_origin, &action_form_body("/posts/abc"))
+                .expect_err("cross-origin action request should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("Origin"));
+
+        let mut malformed_host = action_headers_with_host("application/x-www-form-urlencoded");
+        malformed_host.insert("host".to_owned(), "local host".to_owned());
+        malformed_host.insert("origin".to_owned(), "http://localhost".to_owned());
+        let response =
+            server_action_request_from_form(&malformed_host, &action_form_body("/posts/abc"))
+                .expect_err("malformed host should be rejected");
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("Host"));
+    }
+
+    #[test]
     fn dev_action_post_invokes_route_action_with_urlencoded_form() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -3834,6 +3968,30 @@ process.exit(1);
                 "hasLoading": true
             })
         );
+    }
+
+    #[test]
+    fn dev_action_post_rejects_cross_origin_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let mut project = action_project_for(&app, action_renderer_body());
+        let mut headers = action_headers_with_host("application/x-www-form-urlencoded");
+        headers.insert("origin".to_owned(), "https://evil.example".to_owned());
+
+        let response = project
+            .handle_post(
+                "/_ferrite/action",
+                &headers,
+                &action_form_body("/posts/abc"),
+            )
+            .unwrap();
+
+        assert_eq!(response.status, 403);
+        assert!(response.body_text().contains("Origin"));
     }
 
     #[test]
@@ -3922,6 +4080,30 @@ process.exit(1);
         assert_eq!(events[0].path, "/_ferrite/action");
         assert_eq!(events[0].status, 200);
         assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
+    }
+
+    #[test]
+    fn production_action_post_rejects_cross_origin_referer_on_real_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let project = action_production_project_for(&app, action_renderer_body());
+        let body = action_form_body("/posts/abc");
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nReferer: https://evil.example/form\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        let headers = response_headers(&response);
+        let body = String::from_utf8_lossy(response_body(&response));
+
+        assert!(headers.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(body.contains("Referer"));
     }
 
     #[test]

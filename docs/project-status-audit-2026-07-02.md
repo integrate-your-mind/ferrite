@@ -94,6 +94,9 @@ Evidence used:
 - [x] 065: Browser server-action form enhancement helper.
 - [x] 066: Explicit server-action reference manifests in build/dev metadata.
 - [x] 067: Idempotent generated client entrypoint server-action form bootstrap.
+- [x] 068: Dedicated server-only route action bootstrap asset.
+- [x] 069: Chromium proof for generated server-action form enhancement.
+- [x] 070: Server-action `Origin`/`Referer` same-host rejection in dev and production adapters.
 
 ## Vacuous Or Weak Test Audit
 
@@ -121,7 +124,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Page-renderer server-action invocation and manifest tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary and explicit rendered-form manifest collection, but not automatic `"use server"` discovery or a real deployment action registry.
 - [ ] Browser runtime proof now includes Chromium coverage for generated server-action form enhancement, but payload navigation, streaming, popstate restoration, prefetching, focus, pointer, and history behavior still mostly rely on Node plus `happy-dom`.
 - [ ] Dev/serve proof is local socket and one-shot proof, not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
-- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, dedicated server-only action bootstrap assets, and Chromium proof for enhanced route/island/server-only action forms. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, upload streaming, or client event action surface.
+- [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, dedicated server-only action bootstrap assets, Chromium proof for enhanced route/island/server-only action forms, and same-host rejection for browser-supplied cross-origin `Origin`/`Referer` headers. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, CSRF token/session binding, replay protection, upload streaming, or client event action surface.
 
 ## Productionization Checklist
 
@@ -133,7 +136,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Wire the server-action form enhancer into generated route/client-reference browser entrypoints where browser JavaScript already exists.
 - [x] Emit a dedicated action-enhancer browser asset for server-only routes that contain server-action forms but no route/client-reference script.
 - [ ] Add real browser tests for broader hydration behavior, payload navigation, streaming, popstate restoration, and prefetching.
-- [ ] Add server-action security hardening: origin/CSRF policy, cookie/session integration points, replay considerations, and clearer auth guidance.
+- [x] Add server-action browser header hardening: reject action POSTs when a present `Origin` or `Referer` host differs from the request `Host`.
+- [ ] Add full server-action CSRF/session/replay hardening: token/session binding, cookie guidance, trusted proxy configuration, replay considerations, and clearer auth integration guidance.
 - [ ] Add first-class production logging/tracing sinks for request observer events.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
