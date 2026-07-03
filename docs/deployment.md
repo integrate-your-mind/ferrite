@@ -98,6 +98,17 @@ cargo run -p ferrite-cli -- serve \
 
 For a packaged binary, run the installed `ferrite` executable with the same arguments.
 
+## Deployment Templates
+
+Ferrite includes first-pass deployment templates for a private-beta topology:
+
+- `deploy/systemd/ferrite.service`: process manager template for a private `127.0.0.1:3000` Ferrite service.
+- `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that owns `Host`, `X-Forwarded-Proto`, and `X-Forwarded-Host`.
+- `deploy/ferrite.env.example`: runtime environment variables for CSRF and public origin configuration.
+- `deploy/container/Dockerfile`: container template that builds the workspace, runs as a non-root runtime user, and starts `ferrite serve` with production limits, CSRF, trusted-proxy origin checks, and JSON access logs.
+
+These templates are checked by `scripts/verify-deployment-templates.test.mjs`. The container template also has a local Docker build and container smoke for the basic example route, including JSON access-log output. This is still not proof of a hosted staging deployment. Before using these templates for a paid beta, run the chosen template behind the real proxy, capture access logs, run the smoke tests below, and record rollback steps for the exact artifact version.
+
 ## Runtime Configuration
 
 Use command arguments for the current runtime knobs:
@@ -196,6 +207,6 @@ Until those exist, deploy server actions only for controlled beta scenarios or b
 - No GitHub remote or remote CI proof exists in this checkout.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
 - The production CLI exposes the main request/render limits, server-action trusted-proxy public-origin checks, and stderr access logs, but not metrics exporters or tracing sinks.
-- There is no official container image, systemd unit, Helm chart, or managed platform adapter.
+- First-pass container, systemd, and nginx templates exist with local static verification and container smoke proof, but no official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
 - There is no first-class metrics exporter or tracing integration.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.

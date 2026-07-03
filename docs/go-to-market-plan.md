@@ -38,7 +38,7 @@ Current demoable scope is the local `examples/basic` end-to-end path:
 - Server-action first transport: form-based `POST /_ferrite/action` with explicit action manifest collection and browser enhancement for route/client-reference/server-only action forms (Chromium proof).
 
 Not sellable yet as a hosted platform:
-- No npm publish in this checkout, no remote CI runs, no production deployment templates (proxy/platform process manager/container), and only local/prototype operational proof.
+- No npm publish in this checkout, no remote CI runs, no hosted staging run of the deployment templates, and only local/prototype operational proof.
 - Server-action security remains incomplete for real mutable user flows.
 
 ## Blockers To Paid Beta
@@ -53,7 +53,7 @@ Not sellable yet as a hosted platform:
 - Current clean-install smoke omits optional native package installation by design.
 
 3. Hosted deployment posture
-- Deployment docs exist and cover reverse-proxy expectations, but there is no official container, process manager, Helm, or managed-platform adapter.
+- Deployment docs and first-pass systemd/nginx/container templates exist, but there is no official published container image, Helm chart, managed-platform adapter, or hosted staging proof.
 - No public production topology benchmarked on hosted infra.
 
 4. Server-action security gaps
@@ -141,7 +141,7 @@ Launch here means paid beta availability to external teams under explicit usage 
   - Proven npm publish workflow with provenance/trusted publishing or `NPM_TOKEN`.
   - Release artifacts for `@ferrite/*` visible and reproducible; prebuild packages emitted and verified.
 - Deployment proof:
-  - One documented and reproducible deployment stack (proxy + process manager + health/smoke checks) run in staging.
+  - One documented and reproducible deployment stack (proxy + process manager or container + health/smoke checks) run in staging.
   - Rollback drill captured with artifact/version lock record.
 - Server-action security proof:
   - Session-bound CSRF token strategy implemented (or explicit alternate) and tested for rotation/replay.

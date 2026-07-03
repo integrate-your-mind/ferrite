@@ -1,0 +1,27 @@
+[Unit]
+Description=Ferrite production server
+Documentation=https://example.invalid/ferrite
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ferrite
+Group=ferrite
+WorkingDirectory=/srv/ferrite/current
+EnvironmentFile=/etc/ferrite/ferrite.env
+ExecStart=/usr/local/bin/ferrite serve --project /srv/ferrite/current --host 127.0.0.1 --port 3000 --render-timeout-ms 30000 --request-read-timeout-ms 5000 --max-request-bytes 16384 --max-in-flight-requests 64 --server-action-csrf-token-env FERRITE_ACTION_CSRF --trusted-proxy-public-origin ${FERRITE_PUBLIC_ORIGIN} --access-log json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/ferrite/current/.ferrite
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
