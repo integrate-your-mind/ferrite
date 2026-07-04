@@ -48,7 +48,7 @@ enum Commands {
     Dev(DevArgs),
 
     #[command(about = "Run the Ferrite production HTTP adapter")]
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
 
     #[command(about = "Build static Ferrite production output")]
     Build(BuildArgs),
@@ -269,6 +269,12 @@ struct ServeArgs {
         help = "Cookie name used to bind server-action CSRF POSTs to the rendered CSRF token"
     )]
     server_action_csrf_cookie_name: Option<String>,
+
+    #[arg(
+        long,
+        help = "Milliseconds that rendered production server-action replay nonces remain valid; requires --server-action-csrf-token-env"
+    )]
+    server_action_replay_ttl_ms: Option<u64>,
 
     #[arg(
         long,
@@ -587,6 +593,10 @@ fn run_cli(cli: Cli) -> Result<()> {
                 args.server_action_csrf_cookie_name.as_deref(),
                 server_action_csrf_token.as_deref(),
             )?;
+            let server_action_replay_ttl = resolve_server_action_replay_ttl(
+                args.server_action_replay_ttl_ms,
+                server_action_csrf_token.as_deref(),
+            )?;
             let trusted_proxy =
                 resolve_trusted_proxy_public_origin(args.trusted_proxy_public_origin.as_deref())?;
             let trusted_proxy_client_ip_hops = resolve_trusted_proxy_client_ip_hops(
@@ -612,6 +622,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             }
             if let Some(cookie_name) = server_action_csrf_cookie_name {
                 config = config.with_server_action_csrf_cookie_name(cookie_name);
+            }
+            if let Some(ttl) = server_action_replay_ttl {
+                config = config.with_server_action_replay_ttl(ttl);
             }
             if let Some(trusted_proxy) = trusted_proxy {
                 config = config.with_trusted_proxy(trusted_proxy);
@@ -842,6 +855,26 @@ fn resolve_server_action_csrf_cookie_name(
         ));
     }
     Ok(Some(cookie_name.to_owned()))
+}
+
+fn resolve_server_action_replay_ttl(
+    ttl_ms: Option<u64>,
+    csrf_token: Option<&str>,
+) -> Result<Option<Duration>> {
+    let Some(ttl_ms) = ttl_ms else {
+        return Ok(None);
+    };
+    if csrf_token.is_none() {
+        return Err(CliError::Config(
+            "--server-action-replay-ttl-ms requires --server-action-csrf-token-env".to_owned(),
+        ));
+    }
+    if ttl_ms == 0 {
+        return Err(CliError::Config(
+            "--server-action-replay-ttl-ms must be at least 1".to_owned(),
+        ));
+    }
+    Ok(Some(Duration::from_millis(ttl_ms)))
 }
 
 fn is_valid_cookie_name(name: &str) -> bool {
@@ -1273,6 +1306,23 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_server_action_replay_ttl_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--server-action-replay-ttl-ms",
+            "300000",
+            "--once",
+        ])
+        .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.server_action_replay_ttl_ms, Some(300_000));
+    }
+
+    #[test]
     fn serve_accepts_trusted_proxy_public_origin_flag() {
         let cli = Cli::try_parse_from([
             "ferrite",
@@ -1444,6 +1494,26 @@ mod tests {
                 .unwrap_err();
         assert!(matches!(bad_token, CliError::Config(_)));
         assert_eq!(bad_token.exit_code(), 2);
+    }
+
+    #[test]
+    fn server_action_replay_ttl_requires_token_and_positive_duration() {
+        let missing_token = resolve_server_action_replay_ttl(Some(30_000), None).unwrap_err();
+        assert!(matches!(missing_token, CliError::Config(_)));
+        assert_eq!(missing_token.exit_code(), 2);
+
+        let zero = resolve_server_action_replay_ttl(Some(0), Some("token-123")).unwrap_err();
+        assert!(matches!(zero, CliError::Config(_)));
+        assert_eq!(zero.exit_code(), 2);
+
+        assert_eq!(
+            resolve_server_action_replay_ttl(Some(30_000), Some("token-123")).unwrap(),
+            Some(Duration::from_millis(30_000))
+        );
+        assert_eq!(
+            resolve_server_action_replay_ttl(None, Some("token-123")).unwrap(),
+            None
+        );
     }
 
     #[test]

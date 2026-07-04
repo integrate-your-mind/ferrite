@@ -42,6 +42,7 @@ const SERVER_ACTION_PATH: &str = "/_ferrite/action";
 const SERVER_ACTION_ID_FIELD: &str = "__ferrite_action";
 const SERVER_ACTION_ROUTE_FIELD: &str = "__ferrite_route";
 const SERVER_ACTION_CSRF_FIELD: &str = "__ferrite_csrf";
+const SERVER_ACTION_REPLAY_NONCE_FIELD: &str = "__ferrite_nonce";
 const SERVER_ACTION_RESPONSE_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 const SERVER_ACTION_CSRF_COOKIE_ATTRIBUTES: &str = "Path=/; SameSite=Lax; HttpOnly; Secure";
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,6 +53,7 @@ const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_DEV_MAX_REQUEST_BYTES: usize = DEFAULT_PRODUCTION_MAX_REQUEST_BYTES;
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SERVER_ACTION_REPLAY_NONCE_BYTES: usize = 16;
 
 #[derive(Debug)]
 pub enum DevServerError {
@@ -386,6 +388,61 @@ fn prometheus_label_value(value: &str) -> String {
         .collect()
 }
 
+#[derive(Debug)]
+struct ProductionReplayNonces {
+    ttl: Duration,
+    entries: BTreeMap<String, Instant>,
+}
+
+impl ProductionReplayNonces {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn issue(&mut self) -> std::result::Result<String, Box<DevResponse>> {
+        self.prune_expired(Instant::now());
+        let nonce = generate_server_action_replay_nonce().map_err(|error| {
+            Box::new(
+                DevResponse::internal_error(format!(
+                    "<h1>500</h1><p>could not generate server-action replay nonce: {error}</p>"
+                ))
+                .with_cache_control("no-store"),
+            )
+        })?;
+        self.entries
+            .insert(nonce.clone(), Instant::now() + self.ttl);
+        Ok(nonce)
+    }
+
+    fn consume(&mut self, nonce: &str) -> bool {
+        self.prune_expired(Instant::now());
+        self.entries.remove(nonce).is_some()
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        self.entries.retain(|_, expires_at| *expires_at > now);
+    }
+}
+
+fn generate_server_action_replay_nonce() -> std::result::Result<String, getrandom::Error> {
+    let mut bytes = [0_u8; SERVER_ACTION_REPLAY_NONCE_BYTES];
+    getrandom::getrandom(&mut bytes)?;
+    Ok(hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionTrustedProxyConfig {
     public_origin: HttpOrigin,
@@ -425,6 +482,7 @@ pub struct ProductionServerConfig {
     pub request_observer: Option<ProductionRequestObserver>,
     pub action_observer: Option<ProductionActionObserver>,
     pub metrics_path: Option<String>,
+    pub server_action_replay_ttl: Option<Duration>,
     metrics: ProductionMetrics,
 }
 
@@ -457,6 +515,7 @@ impl ProductionServerConfig {
             request_observer: None,
             action_observer: None,
             metrics_path: None,
+            server_action_replay_ttl: None,
             metrics: ProductionMetrics::default(),
         }
     }
@@ -519,6 +578,11 @@ impl ProductionServerConfig {
 
     pub fn with_metrics_path(mut self, path: impl Into<String>) -> Self {
         self.metrics_path = Some(path.into());
+        self
+    }
+
+    pub fn with_server_action_replay_ttl(mut self, ttl: Duration) -> Self {
+        self.server_action_replay_ttl = Some(ttl.max(Duration::from_millis(1)));
         self
     }
 }
@@ -723,6 +787,7 @@ impl DevProject {
             self.config.server_action_csrf_token.as_deref(),
             None,
             None,
+            None,
         ) {
             Ok(request) => request,
             Err(response) => return Ok(*response),
@@ -814,6 +879,7 @@ impl DevProject {
                                         .config
                                         .server_action_csrf_token
                                         .clone(),
+                                    server_action_replay_nonce: None,
                                     metadata: metadata.clone(),
                                     preload_scripts: Vec::new(),
                                     styles: client_bundle_styles(&client_bundle),
@@ -980,6 +1046,7 @@ impl DevProject {
                                         .config
                                         .server_action_csrf_token
                                         .clone(),
+                                    server_action_replay_nonce: None,
                                     metadata: metadata.clone(),
                                     preload_scripts: Vec::new(),
                                     styles: client_bundle_styles(&client_bundle),
@@ -1041,13 +1108,18 @@ impl DevProject {
 pub struct ProductionProject {
     config: ProductionServerConfig,
     snapshot: Option<ProductionRouteSnapshot>,
+    replay_nonces: Option<ProductionReplayNonces>,
 }
 
 impl ProductionProject {
     pub fn new(config: ProductionServerConfig) -> Self {
+        let replay_nonces = config
+            .server_action_replay_ttl
+            .map(ProductionReplayNonces::new);
         Self {
             config,
             snapshot: None,
+            replay_nonces,
         }
     }
 
@@ -1246,14 +1318,18 @@ impl ProductionProject {
         Ok(())
     }
 
-    fn route_response(&self, path: &str, mode: RouteResponseMode) -> DevResponse {
+    fn route_response(&mut self, path: &str, mode: RouteResponseMode) -> DevResponse {
+        let replay_nonce = match self.issue_server_action_replay_nonce() {
+            Ok(replay_nonce) => replay_nonce,
+            Err(response) => return *response,
+        };
         let snapshot = self
             .snapshot
             .as_ref()
             .expect("snapshot built before response");
 
         let response = if let Some(match_result) = match_route(path, &snapshot.routes) {
-            let renderer = self.page_renderer();
+            let renderer = self.page_renderer(replay_nonce.as_deref());
             let conventions = route_conventions(&match_result.route);
             match mode {
                 RouteResponseMode::Html => self.route_stream_response(
@@ -1262,6 +1338,7 @@ impl ProductionProject {
                     &renderer,
                     snapshot.document_file.as_deref(),
                     &conventions,
+                    replay_nonce.as_deref(),
                 ),
                 RouteResponseMode::ServerPayloadJson => self.route_server_payload_response(
                     path,
@@ -1269,7 +1346,10 @@ impl ProductionProject {
                     &renderer,
                     snapshot.document_file.as_deref(),
                     &conventions,
-                    ServerPayloadResponseKind::Json,
+                    ProductionServerPayloadOptions {
+                        kind: ServerPayloadResponseKind::Json,
+                        replay_nonce: replay_nonce.as_deref(),
+                    },
                 ),
                 RouteResponseMode::ServerPayloadStream => self.route_server_payload_response(
                     path,
@@ -1277,7 +1357,10 @@ impl ProductionProject {
                     &renderer,
                     snapshot.document_file.as_deref(),
                     &conventions,
-                    ServerPayloadResponseKind::Stream,
+                    ProductionServerPayloadOptions {
+                        kind: ServerPayloadResponseKind::Stream,
+                        replay_nonce: replay_nonce.as_deref(),
+                    },
                 ),
             }
             .with_cache_control("no-store")
@@ -1287,6 +1370,15 @@ impl ProductionProject {
                 .with_cache_control("no-store")
         };
         self.with_server_action_csrf_cookie(response)
+    }
+
+    fn issue_server_action_replay_nonce(
+        &mut self,
+    ) -> std::result::Result<Option<String>, Box<DevResponse>> {
+        match &mut self.replay_nonces {
+            Some(replay_nonces) => replay_nonces.issue().map(Some),
+            None => Ok(None),
+        }
     }
 
     fn with_server_action_csrf_cookie(&self, response: DevResponse) -> DevResponse {
@@ -1302,35 +1394,35 @@ impl ProductionProject {
         }
     }
 
-    fn page_renderer(&self) -> PageRenderer {
-        let renderer = PageRenderer::new(
+    fn page_renderer(&self, replay_nonce: Option<&str>) -> PageRenderer {
+        let mut renderer = PageRenderer::new(
             self.config.project.clone(),
             self.config.page_renderer.clone(),
         )
         .with_command_timeout(self.config.render_timeout);
-        match &self.config.server_action_csrf_token {
-            Some(token) => renderer.with_server_action_csrf_token(token.clone()),
-            None => renderer,
+        if let Some(token) = &self.config.server_action_csrf_token {
+            renderer = renderer.with_server_action_csrf_token(token.clone());
         }
+        if let Some(replay_nonce) = replay_nonce {
+            renderer = renderer.with_server_action_replay_nonce(replay_nonce.to_owned());
+        }
+        renderer
     }
 
     fn action_response(
-        &self,
+        &mut self,
         headers: &HttpHeaders,
         body: &[u8],
         request_context: &ProductionRequestContext,
     ) -> Result<DevResponse> {
         let started = Instant::now();
-        let snapshot = self
-            .snapshot
-            .as_ref()
-            .expect("snapshot built before response");
         let request = match server_action_request_from_form(
             headers,
             body,
             self.config.server_action_csrf_token.as_deref(),
             self.config.server_action_csrf_cookie_name.as_deref(),
             self.config.trusted_proxy.as_ref(),
+            self.replay_nonces.as_mut(),
         ) {
             Ok(request) => request,
             Err(response) => {
@@ -1346,6 +1438,10 @@ impl ProductionProject {
                 return Ok(response);
             }
         };
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .expect("snapshot built before response");
         let action_id = request.id.clone();
         let route_path = request.route_path.clone();
         let Some(match_result) = match_route(&route_path, &snapshot.routes) else {
@@ -1362,7 +1458,7 @@ impl ProductionProject {
             );
             return Ok(response);
         };
-        let renderer = self.page_renderer();
+        let renderer = self.page_renderer(None);
         let conventions = route_conventions(&match_result.route);
         let response = match renderer.invoke_server_action(
             &match_result.route.file,
@@ -1403,6 +1499,7 @@ impl ProductionProject {
         renderer: &PageRenderer,
         document_file: Option<&Path>,
         conventions: &RouteConventions,
+        replay_nonce: Option<&str>,
     ) -> DevResponse {
         match document_file {
             Some(document_file) => {
@@ -1455,6 +1552,7 @@ impl ProductionProject {
                                             .config
                                             .server_action_csrf_token
                                             .clone(),
+                                        server_action_replay_nonce: replay_nonce.map(str::to_owned),
                                         metadata: metadata.clone(),
                                         preload_scripts: client_bundle_scripts(&client_bundle),
                                         styles: client_bundle_styles(&client_bundle),
@@ -1553,7 +1651,7 @@ impl ProductionProject {
         renderer: &PageRenderer,
         document_file: Option<&Path>,
         conventions: &RouteConventions,
-        response_kind: ServerPayloadResponseKind,
+        options: ProductionServerPayloadOptions<'_>,
     ) -> DevResponse {
         match document_file {
             Some(document_file) => {
@@ -1606,6 +1704,9 @@ impl ProductionProject {
                                             .config
                                             .server_action_csrf_token
                                             .clone(),
+                                        server_action_replay_nonce: options
+                                            .replay_nonce
+                                            .map(str::to_owned),
                                         metadata: metadata.clone(),
                                         preload_scripts: client_bundle_scripts(&client_bundle),
                                         styles: client_bundle_styles(&client_bundle),
@@ -1614,7 +1715,7 @@ impl ProductionProject {
                                     },
                                     conventions,
                                 ) {
-                                Ok(payload) => server_payload_response(payload, response_kind),
+                                Ok(payload) => server_payload_response(payload, options.kind),
                                 Err(error) => {
                                     production_render_error_response(path, match_result, &error)
                                 }
@@ -1633,7 +1734,7 @@ impl ProductionProject {
                 &match_result.params,
                 conventions,
             ) {
-                Ok(payload) => server_payload_response(payload, response_kind),
+                Ok(payload) => server_payload_response(payload, options.kind),
                 Err(error) => production_render_error_response(path, match_result, &error),
             },
         }
@@ -1982,6 +2083,12 @@ enum RouteResponseMode {
 enum ServerPayloadResponseKind {
     Json,
     Stream,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProductionServerPayloadOptions<'a> {
+    kind: ServerPayloadResponseKind,
+    replay_nonce: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2895,6 +3002,7 @@ fn server_action_request_from_form(
     expected_csrf_token: Option<&str>,
     csrf_cookie_name: Option<&str>,
     trusted_proxy: Option<&ProductionTrustedProxyConfig>,
+    replay_nonces: Option<&mut ProductionReplayNonces>,
 ) -> std::result::Result<ServerActionRequest, Box<DevResponse>> {
     enforce_server_action_origin(headers, trusted_proxy)?;
     let mut form = parse_server_action_form(headers, body)
@@ -2902,6 +3010,7 @@ fn server_action_request_from_form(
     let id = remove_required_action_field(&mut form, SERVER_ACTION_ID_FIELD)?;
     let route_path = remove_required_action_field(&mut form, SERVER_ACTION_ROUTE_FIELD)?;
     enforce_server_action_csrf_token(&mut form, headers, expected_csrf_token, csrf_cookie_name)?;
+    enforce_server_action_replay_nonce(&mut form, replay_nonces)?;
     let request = ServerActionRequest {
         ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
         version: SERVER_ACTION_REQUEST_VERSION,
@@ -2956,6 +3065,29 @@ fn enforce_server_action_csrf_token(
         }
     }
 
+    Ok(())
+}
+
+fn enforce_server_action_replay_nonce(
+    form: &mut BTreeMap<String, ServerActionFormValue>,
+    replay_nonces: Option<&mut ProductionReplayNonces>,
+) -> std::result::Result<(), Box<DevResponse>> {
+    let Some(replay_nonces) = replay_nonces else {
+        form.remove(SERVER_ACTION_REPLAY_NONCE_FIELD);
+        return Ok(());
+    };
+
+    let received_nonce = remove_required_action_field(form, SERVER_ACTION_REPLAY_NONCE_FIELD)
+        .map_err(|_| {
+            Box::new(DevResponse::forbidden(
+                "server action replay nonce is required",
+            ))
+        })?;
+    if !replay_nonces.consume(&received_nonce) {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action replay nonce is invalid or already used",
+        )));
+    }
     Ok(())
 }
 
@@ -4340,6 +4472,14 @@ process.exit(1);
         .into_bytes()
     }
 
+    fn action_form_body_with_csrf_and_nonce(route: &str, token: &str, nonce: &str) -> Vec<u8> {
+        format!(
+            "__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route={}&__ferrite_csrf={token}&__ferrite_nonce={nonce}&title=Hello+Ferrite&tag=rust&tag=tsx",
+            route.replace('/', "%2F")
+        )
+        .into_bytes()
+    }
+
     #[cfg(unix)]
     fn make_script(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -4591,6 +4731,7 @@ process.exit(1);
             None,
             None,
             None,
+            None,
         )
         .expect("same-origin action request should parse");
         assert_eq!(request.route_path, "/posts/abc");
@@ -4600,6 +4741,7 @@ process.exit(1);
         let response = server_action_request_from_form(
             &cross_origin,
             &action_form_body("/posts/abc"),
+            None,
             None,
             None,
             None,
@@ -4618,6 +4760,7 @@ process.exit(1);
             None,
             None,
             None,
+            None,
         )
         .expect_err("malformed host should be rejected");
 
@@ -4628,6 +4771,7 @@ process.exit(1);
         let response = server_action_request_from_form(
             &missing_host,
             &action_form_body("/posts/abc"),
+            None,
             None,
             None,
             None,
@@ -4662,6 +4806,7 @@ process.exit(1);
             None,
             None,
             Some(&trusted_proxy),
+            None,
         )
         .expect("trusted proxy public origin should parse");
         assert_eq!(request.route_path, "/posts/abc");
@@ -4673,6 +4818,7 @@ process.exit(1);
             None,
             None,
             Some(&trusted_proxy),
+            None,
         )
         .expect_err("origin scheme mismatch should be rejected");
 
@@ -4698,6 +4844,7 @@ process.exit(1);
             None,
             None,
             Some(&trusted_proxy),
+            None,
         )
         .expect_err("trusted proxy mode should require forwarded proto and host");
         assert_eq!(missing_forwarded.status, 403);
@@ -4711,6 +4858,7 @@ process.exit(1);
             None,
             None,
             Some(&trusted_proxy),
+            None,
         )
         .expect_err("trusted proxy mode should reject mismatched forwarded host");
 
@@ -4763,7 +4911,7 @@ process.exit(1);
         let body =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&title=Hello";
         let request =
-            server_action_request_from_form(&headers, body, Some("token-123"), None, None)
+            server_action_request_from_form(&headers, body, Some("token-123"), None, None, None)
                 .expect("matching CSRF token should parse");
 
         assert_eq!(request.route_path, "/posts/abc");
@@ -4774,9 +4922,15 @@ process.exit(1);
         );
 
         let missing = action_form_body("/posts/abc");
-        let response =
-            server_action_request_from_form(&headers, &missing, Some("token-123"), None, None)
-                .expect_err("missing CSRF token should be rejected");
+        let response = server_action_request_from_form(
+            &headers,
+            &missing,
+            Some("token-123"),
+            None,
+            None,
+            None,
+        )
+        .expect_err("missing CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("CSRF token is required"));
@@ -4784,7 +4938,7 @@ process.exit(1);
         let wrong =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=wrong";
         let response =
-            server_action_request_from_form(&headers, wrong, Some("token-123"), None, None)
+            server_action_request_from_form(&headers, wrong, Some("token-123"), None, None, None)
                 .expect_err("wrong CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
@@ -4792,9 +4946,15 @@ process.exit(1);
 
         let duplicate =
             b"__ferrite_action=app%2Fposts%2F%5Bid%5D%2Fpage.tsx%23savePost&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&__ferrite_csrf=token-123";
-        let response =
-            server_action_request_from_form(&headers, duplicate, Some("token-123"), None, None)
-                .expect_err("duplicate CSRF token should be rejected");
+        let response = server_action_request_from_form(
+            &headers,
+            duplicate,
+            Some("token-123"),
+            None,
+            None,
+            None,
+        )
+        .expect_err("duplicate CSRF token should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("CSRF token is required"));
@@ -4815,6 +4975,7 @@ process.exit(1);
             Some("token-123"),
             Some("ferrite_action_csrf"),
             None,
+            None,
         )
         .expect("matching hidden token and cookie should parse");
 
@@ -4827,6 +4988,7 @@ process.exit(1);
             body,
             Some("token-123"),
             Some("ferrite_action_csrf"),
+            None,
             None,
         )
         .expect_err("missing CSRF cookie should be rejected");
@@ -4841,11 +5003,79 @@ process.exit(1);
             Some("token-123"),
             Some("ferrite_action_csrf"),
             None,
+            None,
         )
         .expect_err("mismatched CSRF cookie should be rejected");
 
         assert_eq!(response.status, 403);
         assert!(response.body_text().contains("CSRF cookie is invalid"));
+    }
+
+    #[test]
+    fn action_form_replay_nonce_guard_consumes_once() {
+        let headers = action_headers_with_host("application/x-www-form-urlencoded");
+        let mut replay_nonces = ProductionReplayNonces::new(Duration::from_secs(30));
+        let nonce = replay_nonces.issue().unwrap();
+        let body = action_form_body_with_csrf_and_nonce("/posts/abc", "token-123", &nonce);
+
+        let request = server_action_request_from_form(
+            &headers,
+            &body,
+            Some("token-123"),
+            None,
+            None,
+            Some(&mut replay_nonces),
+        )
+        .expect("fresh nonce should parse");
+
+        assert_eq!(request.route_path, "/posts/abc");
+        assert!(!request.form.contains_key(SERVER_ACTION_REPLAY_NONCE_FIELD));
+
+        let replay = server_action_request_from_form(
+            &headers,
+            &body,
+            Some("token-123"),
+            None,
+            None,
+            Some(&mut replay_nonces),
+        )
+        .expect_err("used nonce should be rejected");
+
+        assert_eq!(replay.status, 403);
+        assert!(replay.body_text().contains("already used"));
+    }
+
+    #[test]
+    fn action_form_replay_nonce_guard_rejects_missing_and_expired_nonces() {
+        let headers = action_headers_with_host("application/x-www-form-urlencoded");
+        let mut replay_nonces = ProductionReplayNonces::new(Duration::from_millis(1));
+
+        let missing = server_action_request_from_form(
+            &headers,
+            &action_form_body_with_csrf("/posts/abc", "token-123"),
+            Some("token-123"),
+            None,
+            None,
+            Some(&mut replay_nonces),
+        )
+        .expect_err("missing nonce should be rejected");
+        assert_eq!(missing.status, 403);
+        assert!(missing.body_text().contains("replay nonce is required"));
+
+        let nonce = replay_nonces.issue().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let expired = server_action_request_from_form(
+            &headers,
+            &action_form_body_with_csrf_and_nonce("/posts/abc", "token-123", &nonce),
+            Some("token-123"),
+            None,
+            None,
+            Some(&mut replay_nonces),
+        )
+        .expect_err("expired nonce should be rejected");
+
+        assert_eq!(expired.status, 403);
+        assert!(expired.body_text().contains("invalid or already used"));
     }
 
     #[test]
@@ -5194,6 +5424,38 @@ process.exit(1);
         assert_eq!(accepted.status, 200);
         assert_eq!(accepted_body["status"], "ok");
         assert_eq!(accepted_body["data"]["routePath"], "/posts/abc");
+    }
+
+    #[test]
+    fn production_action_replay_guard_rejects_reused_nonce() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let config = action_production_project_for(&app, action_renderer_body())
+            .config
+            .with_server_action_csrf_token("token-123")
+            .with_server_action_replay_ttl(Duration::from_secs(30));
+        let mut project = ProductionProject::new(config);
+        let nonce = project.replay_nonces.as_mut().unwrap().issue().unwrap();
+        let body = action_form_body_with_csrf_and_nonce("/posts/abc", "token-123", &nonce);
+        let headers = action_headers_with_host("application/x-www-form-urlencoded");
+
+        let accepted = project
+            .handle_post("/_ferrite/action", &headers, &body)
+            .unwrap();
+        let accepted_body: Value = serde_json::from_slice(&accepted.body).unwrap();
+        assert_eq!(accepted.status, 200);
+        assert_eq!(accepted_body["status"], "ok");
+        assert_eq!(accepted_body["data"]["routePath"], "/posts/abc");
+
+        let replayed = project
+            .handle_post("/_ferrite/action", &headers, &body)
+            .unwrap();
+        assert_eq!(replayed.status, 403);
+        assert!(replayed.body_text().contains("already used"));
     }
 
     #[test]

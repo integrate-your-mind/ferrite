@@ -42,6 +42,35 @@ Not sellable yet as a hosted platform:
 - No npm publish in this checkout, no remote CI runs, no hosted staging run of the deployment templates, and only local/prototype operational proof.
 - Server-action security remains incomplete for real mutable user flows.
 
+## Fastest Path To Market
+
+The fastest credible market motion is not a public launch. It is a tightly scoped
+self-hosted private alpha for one or two trusted engineering teams building
+internal dashboards, docs portals, or content-heavy apps.
+
+Allowed alpha claims:
+- Rust-first app framework with a familiar TypeScript/TSX facade.
+- Local and browser-tested route analysis, build, serve, SSR, payload navigation, streaming, and explicit form-action flows.
+- First-pass self-hosted deployment templates with clear proxy/TLS/process assumptions.
+- Local package verification and release-shaped tarball proof.
+
+Disallowed alpha claims until proven:
+- Public production readiness.
+- Hosted platform readiness.
+- Auth-complete or mutation-safe server actions.
+- Published npm/native package availability.
+- React Flight/RSC parity or full browser-matrix support.
+- Production observability beyond stderr logs and in-memory metrics.
+
+### ASAP Alpha Launch Gate
+
+1. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
+2. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, package verification, and native prebuild dry-run.
+3. Prove one deployment template in hosted staging behind a real proxy/TLS boundary, including route smoke, payload smoke, action rejection probes, metrics scrape, logs, and rollback.
+4. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
+5. Decide the alpha distribution path: private npm scope, tarball bundle, or source checkout. Do not charge for reliability until a real npm/native publish path is proven.
+6. Keep server actions limited to controlled/internal flows unless app-owned auth and CSRF middleware have been reviewed separately.
+
 ## Blockers To Paid Beta
 
 1. Remote delivery proof gaps
@@ -59,7 +88,7 @@ Not sellable yet as a hosted platform:
 
 4. Server-action security gaps
 - Explicit form transport only, not automatic `"use server"` discovery.
-- CSRF is opt-in and static-token based with optional SameSite/HttpOnly/Secure double-submit cookie binding; no session-bound token rotation/replay defense or first-class auth middleware integration.
+- CSRF is opt-in and static-token based with optional SameSite/HttpOnly/Secure double-submit cookie binding and optional single-process one-time replay nonces; there is still no session-bound token rotation, multi-process replay coordination, or first-class auth middleware integration.
 - Trusted-proxy public-origin checks and explicit forwarded client-IP access-log policy now exist, but production topology proof is not finalized.
 - File uploads (`multipart` file parts) are intentionally rejected.
 
@@ -117,7 +146,7 @@ These are hypotheses to validate via 4–8 design-partner conversions and churn-
 
 - **R2: Server-action security incident before auth hardening**
   Impact: trust loss and legal exposure in authenticated workloads.
-  Mitigation: keep private beta scope to unauthenticated/internal workflows until session-bound CSRF/replay and proxy trust are proven.
+  Mitigation: keep private beta scope to unauthenticated/internal workflows until session-bound CSRF, replay behavior in the chosen topology, and proxy trust are proven.
 
 - **R3: Hosting mismatch/performance regressions in production topologies**
   Impact: deployment failure and unreliable latency claims.
@@ -145,7 +174,7 @@ Launch here means paid beta availability to external teams under explicit usage 
   - One documented and reproducible deployment stack (proxy + process manager or container + health/smoke checks) run in staging.
   - Rollback drill captured with artifact/version lock record.
 - Server-action security proof:
-  - Session-bound CSRF token strategy implemented (or explicit alternate beyond static double-submit cookie binding) and tested for rotation/replay.
+  - Session-bound CSRF token strategy implemented (or explicit alternate beyond static double-submit cookie binding) and tested for rotation plus replay in the chosen process topology.
   - Trusted-proxy public-origin checks and forwarded client-IP access-log policy exercised behind the chosen staging proxy with forwarded-header sanitization.
 - Operational proof:
   - CLI request access-log and server-action audit-log output captured in staging and integrated with the chosen log collector.

@@ -129,6 +129,7 @@ export type DocumentRenderOptions = {
   routePattern?: string;
   buildId?: number;
   serverActionCsrfToken?: string;
+  serverActionReplayNonce?: string;
   metadata?: Metadata;
   preloadScripts?: string[];
   styles?: string[];
@@ -167,6 +168,7 @@ export type ServerRenderOptions = {
   routePath?: string;
   routePattern?: string;
   serverActionCsrfToken?: string;
+  serverActionReplayNonce?: string;
 };
 
 export type ServerActionInvokeOptions = {
@@ -200,6 +202,7 @@ type ServerActionRenderContext = {
   routePath?: string;
   routePattern?: string;
   csrfToken?: string;
+  replayNonce?: string;
   actions: Map<string, ServerActionReference>;
 };
 
@@ -209,10 +212,12 @@ const SERVER_ACTION_URL = "/_ferrite/action";
 const SERVER_ACTION_ID_FIELD = "__ferrite_action";
 const SERVER_ACTION_ROUTE_FIELD = "__ferrite_route";
 const SERVER_ACTION_CSRF_FIELD = "__ferrite_csrf";
+const SERVER_ACTION_REPLAY_NONCE_FIELD = "__ferrite_nonce";
 const RESERVED_SERVER_ACTION_FIELDS = new Set([
   SERVER_ACTION_ID_FIELD,
   SERVER_ACTION_ROUTE_FIELD,
   SERVER_ACTION_CSRF_FIELD,
+  SERVER_ACTION_REPLAY_NONCE_FIELD,
 ]);
 const serverActionContextStorage = new AsyncLocalStorage<ServerActionRenderContext>();
 
@@ -769,11 +774,15 @@ function withServerActionRenderContext<T>(options: ServerRenderOptions, render: 
   if (options.serverActionCsrfToken !== undefined && typeof options.serverActionCsrfToken !== "string") {
     throw new TypeError("Ferrite server action CSRF token must be a string when provided.");
   }
+  if (options.serverActionReplayNonce !== undefined && typeof options.serverActionReplayNonce !== "string") {
+    throw new TypeError("Ferrite server action replay nonce must be a string when provided.");
+  }
 
   const context: ServerActionRenderContext = {
     routePath: options.routePath,
     routePattern: options.routePattern,
     csrfToken: options.serverActionCsrfToken,
+    replayNonce: options.serverActionReplayNonce,
     actions: new Map(),
   };
   return serverActionContextStorage.run(context, render);
@@ -792,6 +801,7 @@ function documentRenderOptionsToServerRenderOptions(options: DocumentRenderOptio
     routePath: options.routePath,
     routePattern: options.routePattern,
     serverActionCsrfToken: options.serverActionCsrfToken,
+    serverActionReplayNonce: options.serverActionReplayNonce,
   };
 }
 
@@ -1042,6 +1052,7 @@ function renderServerActionFormMaybe(
         actionContext.routePath as string,
         children,
         actionContext.csrfToken,
+        actionContext.replayNonce,
       ),
     );
   }
@@ -1052,6 +1063,7 @@ function renderServerActionFormMaybe(
     actionContext.routePath,
     renderedChildren,
     actionContext.csrfToken,
+    actionContext.replayNonce,
   );
 }
 
@@ -1061,6 +1073,7 @@ function createSerializedServerActionForm(
   routePath: string,
   children: SerializableNode[],
   csrfToken?: string,
+  replayNonce?: string,
 ): SerializableNode {
   assertNoReservedServerActionFields(children);
   const hiddenFields = [
@@ -1069,6 +1082,9 @@ function createSerializedServerActionForm(
   ];
   if (csrfToken !== undefined) {
     hiddenFields.push(createHiddenServerActionInput(SERVER_ACTION_CSRF_FIELD, csrfToken));
+  }
+  if (replayNonce !== undefined) {
+    hiddenFields.push(createHiddenServerActionInput(SERVER_ACTION_REPLAY_NONCE_FIELD, replayNonce));
   }
 
   return {

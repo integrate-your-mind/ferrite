@@ -87,6 +87,7 @@ pub struct PageRenderer {
     script: PathBuf,
     command_timeout: Option<Duration>,
     server_action_csrf_token: Option<String>,
+    server_action_replay_nonce: Option<String>,
 }
 
 impl PageRenderer {
@@ -96,6 +97,7 @@ impl PageRenderer {
             script,
             command_timeout: None,
             server_action_csrf_token: None,
+            server_action_replay_nonce: None,
         }
     }
 
@@ -111,6 +113,11 @@ impl PageRenderer {
 
     pub fn with_server_action_csrf_token(mut self, token: impl Into<String>) -> Self {
         self.server_action_csrf_token = Some(token.into());
+        self
+    }
+
+    pub fn with_server_action_replay_nonce(mut self, nonce: impl Into<String>) -> Self {
+        self.server_action_replay_nonce = Some(nonce.into());
         self
     }
 
@@ -661,6 +668,7 @@ impl PageRenderer {
     fn render_options_json(&self) -> Result<String> {
         Ok(serde_json::to_string(&PageRenderOptions {
             server_action_csrf_token: self.server_action_csrf_token.as_deref(),
+            server_action_replay_nonce: self.server_action_replay_nonce.as_deref(),
         })?)
     }
 
@@ -823,6 +831,8 @@ pub struct DocumentRenderOptions {
     pub build_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_action_csrf_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_action_replay_nonce: Option<String>,
     pub metadata: PageMetadata,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preload_scripts: Vec<String>,
@@ -836,6 +846,8 @@ pub struct DocumentRenderOptions {
 struct PageRenderOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     server_action_csrf_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_action_replay_nonce: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -945,6 +957,32 @@ process.stdout.write(JSON.stringify({
         let html = renderer.render_page_to_html(&page, &[], &[]).unwrap();
 
         assert_eq!(html, "<span>csrf-token-123</span>");
+    }
+
+    #[test]
+    fn passes_server_action_replay_nonce_to_page_render_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(
+            &script,
+            r#"
+const options = JSON.parse(process.argv[6]);
+process.stdout.write(JSON.stringify({
+  kind: "element",
+  tag: "span",
+  props: {},
+  children: [{ kind: "text", value: options.serverActionReplayNonce }]
+}));
+"#,
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script)
+            .with_server_action_replay_nonce("nonce-123");
+
+        let html = renderer.render_page_to_html(&page, &[], &[]).unwrap();
+
+        assert_eq!(html, "<span>nonce-123</span>");
     }
 
     #[test]
@@ -1611,6 +1649,7 @@ process.stdout.write(JSON.stringify({
                     route_pattern: None,
                     build_id: None,
                     server_action_csrf_token: None,
+                    server_action_replay_nonce: None,
                     metadata: PageMetadata {
                         title: Some("Docs".to_owned()),
                         description: None,
@@ -1670,6 +1709,7 @@ process.stdout.write(JSON.stringify({
                     route_pattern: None,
                     build_id: None,
                     server_action_csrf_token: None,
+                    server_action_replay_nonce: None,
                     metadata: PageMetadata {
                         title: Some("Docs".to_owned()),
                         description: None,
@@ -1729,6 +1769,7 @@ process.stdout.write(JSON.stringify({
                     route_pattern: None,
                     build_id: None,
                     server_action_csrf_token: None,
+                    server_action_replay_nonce: None,
                     metadata: PageMetadata::default(),
                     preload_scripts: vec![],
                     styles: vec![],
@@ -1777,6 +1818,7 @@ process.stdout.write(JSON.stringify({
                     route_pattern: None,
                     build_id: None,
                     server_action_csrf_token: None,
+                    server_action_replay_nonce: None,
                     metadata: PageMetadata::default(),
                     preload_scripts: vec![],
                     styles: vec![],
@@ -1819,6 +1861,7 @@ process.exit(1);
                     route_pattern: None,
                     build_id: None,
                     server_action_csrf_token: None,
+                    server_action_replay_nonce: None,
                     metadata: PageMetadata::default(),
                     preload_scripts: vec![],
                     styles: vec![],

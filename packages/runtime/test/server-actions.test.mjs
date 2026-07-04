@@ -237,6 +237,29 @@ test("server render serializes configured server action CSRF tokens", async () =
   });
 });
 
+test("server render serializes configured server action replay nonces", async () => {
+  const savePost = createSaveAction();
+  const page = {
+    default() {
+      return createElement("form", { action: savePost }, createElement("button", { type: "submit" }, "Save"));
+    },
+  };
+
+  const rendered = await renderPageModule(page, {}, [], {}, {
+    routePath: "/posts/abc",
+    routePattern: "/posts/[id]",
+    serverActionReplayNonce: "nonce-123",
+  });
+
+  assert.equal(rendered.kind, "element");
+  assert.equal(rendered.children[2].kind, "element");
+  assert.deepEqual(rendered.children[2].props, {
+    type: "hidden",
+    name: "__ferrite_nonce",
+    value: "nonce-123",
+  });
+});
+
 test("server action forms reject conflicting methods and reserved hidden fields", async () => {
   const savePost = createSaveAction();
 
@@ -285,6 +308,26 @@ test("server action forms reject conflicting methods and reserved hidden fields"
               "form",
               { action: savePost },
               createElement("input", { type: "hidden", name: "__ferrite_csrf", value: "fake" }),
+            );
+          },
+        },
+        {},
+        [],
+        {},
+        { routePath: "/posts/abc", routePattern: "/posts/[id]" },
+      ),
+    /reserved Ferrite server action field/,
+  );
+
+  await assert.rejects(
+    () =>
+      renderPageModule(
+        {
+          default() {
+            return createElement(
+              "form",
+              { action: savePost },
+              createElement("input", { type: "hidden", name: "__ferrite_nonce", value: "fake" }),
             );
           },
         },
