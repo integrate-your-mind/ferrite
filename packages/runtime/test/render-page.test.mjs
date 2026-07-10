@@ -160,7 +160,7 @@ test("render-page invokes a registered server action", async () => {
         `export default function Page() {`,
         `  const savePost = createServerAction({`,
         `    id: "app/posts/[id]/page.tsx#savePost",`,
-        `    routePattern: "/posts/[id]",`,
+        `    routePattern: "/posts/:id",`,
         `    async run({ form, routePath }) {`,
         `      return { title: form.title, tags: form.tag, routePath };`,
         `    },`,
@@ -223,19 +223,49 @@ test("render-page emits registered server action manifest without invoking actio
 
     assert.deepEqual(manifest, {
       routePath: "/posts/alpha",
-      routePattern: "/posts/[id]",
+      routePattern: "/posts/:id",
       actions: [
         {
           ferrite: "server-action-reference",
           version: 1,
           id: "app/posts/[id]/page.tsx#savePost",
-          routePattern: "/posts/[id]",
+          routePattern: "/posts/:id",
           url: "/_ferrite/action",
           bound: {},
         },
       ],
     });
     await assert.rejects(() => readFile(sideEffectFile, "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("render-page normalizes catch-all action route patterns and omits route groups", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/(content)/docs/[...slug]/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `import { createServerAction } from "@ferrite/runtime/server";`,
+        "",
+        `export default function Page() {`,
+        `  const saveDoc = createServerAction({`,
+        `    id: "app/(content)/docs/[...slug]/page.tsx#saveDoc",`,
+        `    async run() { return { ok: true }; },`,
+        `  });`,
+        `  return <form action={saveDoc}><button type="submit">Save</button></form>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
+    const manifest = await renderPageActionManifest(projectRoot, pageFile, {
+      params: { slug: ["guides", "install"] },
+    });
+
+    assert.equal(manifest.routePath, "/docs/guides/install");
+    assert.equal(manifest.routePattern, "/docs/*slug");
+    assert.equal(manifest.actions[0]?.routePattern, "/docs/*slug");
   });
 });
 
@@ -253,7 +283,7 @@ test("render-page rejects unknown server action ids without invoking actions", a
         `export default function Page() {`,
         `  const savePost = createServerAction({`,
         `    id: "app/posts/[id]/page.tsx#savePost",`,
-        `    routePattern: "/posts/[id]",`,
+        `    routePattern: "/posts/:id",`,
         `    async run() {`,
         `      await writeFile(${JSON.stringify(sideEffectFile)}, "ran");`,
         `      return { ok: true };`,
@@ -296,7 +326,7 @@ test("render-page returns sanitized error responses for thrown server actions", 
         `export default function Page() {`,
         `  const savePost = createServerAction({`,
         `    id: "app/posts/[id]/page.tsx#savePost",`,
-        `    routePattern: "/posts/[id]",`,
+        `    routePattern: "/posts/:id",`,
         `    async run() {`,
         `      throw new Error("Action exploded");`,
         `    },`,

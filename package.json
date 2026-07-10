@@ -10,8 +10,9 @@
     "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/protocol-wasm typecheck && pnpm --filter @ferrite/runtime typecheck && pnpm --filter @ferrite/node typecheck",
     "release:verify:npm": "node scripts/verify-npm-packages.mjs",
     "render:fixture": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && node examples/basic/render.mjs | cargo run -p ferrite-cli -- render --input -",
-    "test": "node --test scripts/*.test.mjs && cargo test --workspace && pnpm --filter @ferrite/protocol test && pnpm --filter @ferrite/protocol-wasm test && pnpm --filter @ferrite/runtime test && pnpm --filter @ferrite/node test && pnpm test:browser",
+    "test": "node --test scripts/*.test.mjs && cargo test --workspace && pnpm --filter @ferrite/protocol test && pnpm --filter @ferrite/protocol-wasm test && pnpm --filter @ferrite/runtime test && pnpm --filter @ferrite/node test && pnpm test:browser && pnpm test:example",
     "test:browser": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/protocol-wasm build && pnpm --filter @ferrite/runtime build && node --test --test-concurrency=1 test/*.test.mjs",
+    "test:example": "pnpm build:example && pnpm render:fixture && pnpm dev:once && cargo run -p ferrite-cli -- serve --project examples/basic --once --request-path /posts/abc",
     "test:release": "node --test scripts/*.test.mjs",
     "typecheck": "pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/protocol-wasm typecheck && pnpm --filter @ferrite/runtime typecheck && cargo run -p ferrite-cli -- check --project examples/basic"
   },

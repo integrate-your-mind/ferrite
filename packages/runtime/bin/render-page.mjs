@@ -413,29 +413,46 @@ function isProjectSource(file, projectRoot) {
 }
 
 function routePatternFromPageFile(pageFile, projectRoot) {
+  const routeSegments = routeSegmentsFromPageFile(pageFile, projectRoot);
+  if (!routeSegments) {
+    return undefined;
+  }
+
+  const patternSegments = routeSegments.map(routePatternSegment);
+  return patternSegments.length === 0 ? "/" : `/${patternSegments.join("/")}`;
+}
+
+function routeSegmentsFromPageFile(pageFile, projectRoot) {
   const parts = relative(projectRoot, resolve(pageFile)).split(sep);
   const appIndex = parts.lastIndexOf("app");
   if (appIndex === -1 || appIndex >= parts.length - 1) {
     return undefined;
   }
 
-  const routeSegments = parts.slice(appIndex + 1, -1).filter((segment) => !isRouteGroupSegment(segment));
-  return routeSegments.length === 0 ? "/" : `/${routeSegments.join("/")}`;
+  return parts.slice(appIndex + 1, -1).filter((segment) => !isRouteGroupSegment(segment));
+}
+
+function routePatternSegment(segment) {
+  if (segment.startsWith("[[...") && segment.endsWith("]]")) {
+    return `*${segment.slice(5, -2)}?`;
+  }
+  if (segment.startsWith("[...") && segment.endsWith("]")) {
+    return `*${segment.slice(4, -1)}`;
+  }
+  if (segment.startsWith("[") && segment.endsWith("]")) {
+    return `:${segment.slice(1, -1)}`;
+  }
+  return segment;
 }
 
 function concreteRoutePathFromPageFile(pageFile, projectRoot, params) {
-  const pattern = routePatternFromPageFile(pageFile, projectRoot);
-  if (!pattern || pattern === "/") {
+  const routeSegments = routeSegmentsFromPageFile(pageFile, projectRoot);
+  if (!routeSegments || routeSegments.length === 0) {
     return "/";
   }
 
-  const routeSegments = pattern
-    .trimStart()
-    .replace(/^\/+/, "")
-    .split("/")
-    .filter(Boolean)
-    .map((segment) => concreteRouteSegment(segment, params));
-  return `/${routeSegments.flat().join("/")}`;
+  const concreteSegments = routeSegments.map((segment) => concreteRouteSegment(segment, params));
+  return `/${concreteSegments.flat().join("/")}`;
 }
 
 function concreteRouteSegment(segment, params) {
