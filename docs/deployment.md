@@ -128,9 +128,9 @@ For a packaged binary, run the installed `ferrite` executable with the same argu
 Ferrite includes first-pass deployment templates for a private-beta topology:
 
 - `deploy/systemd/ferrite.service`: process manager template for a private `127.0.0.1:3000` Ferrite service.
-- `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that owns `Host`, `X-Forwarded-Proto`, and `X-Forwarded-Host`.
+- `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that owns `Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For`, and blocks the in-process metrics path from public proxy traffic.
 - `deploy/ferrite.env.example`: runtime environment variables for CSRF and public origin configuration.
-- `deploy/container/Dockerfile`: container template that builds the workspace, runs as a non-root runtime user, and starts `ferrite serve` with production limits, CSRF cookie binding, one-time server-action replay nonces, trusted-proxy origin checks, trusted forwarded client-IP hop count, JSON access logs, JSON action audit logs, and a Prometheus text metrics endpoint.
+- `deploy/container/Dockerfile`: container template that builds the workspace, runs as a non-root runtime user, and starts `ferrite serve` with production limits, CSRF cookie binding, one-time server-action replay nonces, trusted-proxy origin checks, trusted forwarded client-IP hop count, JSON access logs, and JSON action audit logs. Its directly exposed default does not enable the metrics endpoint.
 
 These templates are checked by `scripts/verify-deployment-templates.test.mjs`. The container template also has a local Docker build and container smoke for the basic example route, including JSON access-log output. This is still not proof of a hosted staging deployment. Before using these templates for a paid beta, run the chosen template behind the real proxy, capture access logs, run the smoke tests below, and record rollback steps for the exact artifact version.
 
@@ -141,15 +141,15 @@ Use command arguments for the current runtime knobs:
 - `--project`: app root
 - `--host`: bind address
 - `--port`: bind port
-- `--render-timeout-ms`: maximum route render subprocess duration
+- `--render-timeout-ms`: maximum duration for each production renderer or client-bundler subprocess
 - `--request-read-timeout-ms`: maximum time to wait while reading each production HTTP request
 - `--max-request-bytes`: maximum bytes allowed for each production HTTP request header and body
-- `--max-in-flight-requests`: maximum production requests handled concurrently
+- `--max-in-flight-requests`: maximum accepted production sockets across active and queued work; excess connections receive `503 Service Unavailable`
 - `--server-action-csrf-token-env`: environment variable containing the token rendered into server-action forms and required on action POSTs
 - `--server-action-csrf-cookie-name`: optional cookie name that binds action POSTs to the configured CSRF token; it requires `--server-action-csrf-token-env`, sets `Path=/; SameSite=Lax; HttpOnly; Secure` on production route responses, and rejects action POSTs without a matching cookie value
 - `--server-action-replay-ttl-ms`: optional positive TTL for one-time server-action replay nonces rendered into production forms; it requires `--server-action-csrf-token-env`, rejects missing or reused nonces, stores nonce state in the current Ferrite process, and treats a nonce as single-use for the rendered response
 - `--trusted-proxy-public-origin`: optional public HTTP(S) origin for server-action POST origin checks behind a trusted reverse proxy; when set, action POSTs require matching `X-Forwarded-Proto` and `X-Forwarded-Host`
-- `--trusted-proxy-client-ip-hops`: optional `X-Forwarded-For` trust policy for access-log `client_ip`; it requires `--trusted-proxy-public-origin` and selects the client IP before the configured number of trusted proxy hops
+- `--trusted-proxy-client-ip-hops`: optional `X-Forwarded-For` trust policy for access-log `client_ip`; it requires `--trusted-proxy-public-origin` and selects the client IP before the configured number of trusted proxy hops. The edge proxy must overwrite client-supplied `X-Forwarded-For` before any trusted internal proxy appends to it.
 - `--access-log`: optional `plain` or `json` production request outcome logs emitted to stderr
 - `--action-log`: optional `plain` or `json` production server-action audit logs emitted to stderr
 - `--metrics-path`: optional absolute path that exposes in-memory request and server-action counters in Prometheus text format; the path must not shadow `/_ferrite/action`
@@ -169,7 +169,7 @@ curl -i 'http://127.0.0.1:3000/posts/abc?__ferrite_payload=server'
 curl -i 'http://127.0.0.1:3000/posts/abc?__ferrite_payload=stream'
 curl -i -H 'Accept-Encoding: gzip' http://127.0.0.1:3000/posts/abc
 curl -i http://127.0.0.1:3000/_ferrite/static/<known-built-asset>
-curl -i http://127.0.0.1:3000/__ferrite/metrics
+curl -i http://127.0.0.1:3000/__ferrite/metrics # private upstream only
 ```
 
 For routes with server-action forms, submit a normal same-host action POST with the rendered `__ferrite_csrf` field, a missing-token rejection probe, and a cross-origin rejection probe. If `--server-action-csrf-cookie-name` is enabled, verify the route response sets the named cookie and that an action POST without that cookie is rejected. If `--server-action-replay-ttl-ms` is enabled, verify the rendered form includes `__ferrite_nonce`, the first action POST succeeds, and replaying the exact same body is rejected. If `--trusted-proxy-public-origin` is enabled, include a proxy-path smoke that proves matching `X-Forwarded-Proto` and `X-Forwarded-Host` are accepted and mismatches are rejected. Do not treat server actions as auth-complete until token rotation/session binding, auth integration, and multi-process replay coordination are implemented.
@@ -196,6 +196,8 @@ Ferrite's Rust production API can also attach server-action observer hooks that 
 - elapsed duration
 
 Applications embedding the Rust server should bridge those events into their logging, metrics, tracing, or audit stack. The CLI can expose in-memory request/action counters through `--metrics-path`; those counters intentionally label by method/status/route pattern and action outcome/status/route pattern, not request bodies, form fields, headers, CSRF tokens, or raw dynamic URL values. The CLI does not yet expose first-class external log sink configuration, trace IDs, tracing exporters, or external audit exporters.
+
+The nginx template returns `404` for the configured metrics path. A local collector should scrape the private `127.0.0.1:3000` upstream directly. The container template leaves metrics disabled by default because its `0.0.0.0:3000` listener may be published directly.
 
 The CLI can emit request outcome access logs to stderr:
 
@@ -245,6 +247,8 @@ Current production hardening is incomplete. Ferrite can require one configured h
 
 Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately. If server actions are enabled in production, set `--server-action-csrf-token-env`, prefer `--server-action-csrf-cookie-name`, and set `--server-action-replay-ttl-ms` when a single Ferrite process owns the action form and action POST path. Rotate the referenced CSRF secret as part of the deployment process. The configured token must be cookie-safe when cookie binding is enabled. If the public TLS origin differs from the upstream Ferrite bind origin, set `--trusted-proxy-public-origin` and configure the proxy to own and sanitize the forwarded proto/host headers. If access logs need public client IPs behind the proxy, set `--trusted-proxy-client-ip-hops` to the exact number of trusted proxy hops and make the edge proxy overwrite `X-Forwarded-For`.
 
+Production render and bundle failures return generic `500` or `504` HTML. Detailed subprocess errors are written to server stderr and must be treated as potentially sensitive operational logs.
+
 ## Known Gaps
 
 - No npm packages are published yet.
@@ -253,4 +257,6 @@ Until those exist, deploy server actions only for controlled beta scenarios or b
 - The production CLI exposes the main request/render limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and an in-memory Prometheus text metrics endpoint, but not tracing sinks or external audit sinks.
 - First-pass container, systemd, and nginx templates exist with local static verification and container smoke proof, but no official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
 - There is no first-class tracing integration or external metrics sink beyond the in-memory Prometheus text scrape endpoint.
+- `ferrite serve` still renders and bundles source modules at request time and serializes route handling through one shared production-project mutex. It does not yet consume a self-contained immutable `ferrite build` server artifact.
+- Production sockets have a read timeout and bounded admission, but no configurable response-write timeout yet.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.

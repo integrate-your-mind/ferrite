@@ -6,7 +6,7 @@ use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread;
@@ -53,6 +53,7 @@ const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_DEV_MAX_REQUEST_BYTES: usize = DEFAULT_PRODUCTION_MAX_REQUEST_BYTES;
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PRODUCTION_OVERLOAD_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const SERVER_ACTION_REPLAY_NONCE_BYTES: usize = 16;
 
 #[derive(Debug)]
@@ -1512,7 +1513,8 @@ impl ProductionProject {
                         let bundler = ClientBundler::new(
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
-                        );
+                        )
+                        .with_command_timeout(self.config.render_timeout);
                         let action_bootstrap =
                             match route_needs_action_bootstrap(renderer, match_result, conventions)
                             {
@@ -1570,9 +1572,9 @@ impl ProductionProject {
                                     production_render_error_response(path, match_result, &error)
                                 }
                             },
-                            Err(error) => DevResponse::internal_error(
-                                render_production_bundle_error(path, match_result, &error),
-                            ),
+                            Err(error) => {
+                                production_bundle_error_response(path, match_result, &error)
+                            }
                         }
                     }
                     Err(error) => production_render_error_response(path, match_result, &error),
@@ -1593,7 +1595,8 @@ impl ProductionProject {
                         let bundler = ClientBundler::new(
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
-                        );
+                        )
+                        .with_command_timeout(self.config.render_timeout);
                         let action_bootstrap =
                             match route_needs_action_bootstrap(renderer, match_result, conventions)
                             {
@@ -1632,9 +1635,9 @@ impl ProductionProject {
                                 )
                                 .with_modulepreload_links(client_bundle_scripts(&client_bundle))
                             }
-                            Err(error) => DevResponse::internal_error(
-                                render_production_bundle_error(path, match_result, &error),
-                            ),
+                            Err(error) => {
+                                production_bundle_error_response(path, match_result, &error)
+                            }
                         }
                     }
                     Err(error) => production_render_error_response(path, match_result, &error),
@@ -1664,7 +1667,8 @@ impl ProductionProject {
                         let bundler = ClientBundler::new(
                             self.config.project.clone(),
                             self.config.client_bundler.clone(),
-                        );
+                        )
+                        .with_command_timeout(self.config.render_timeout);
                         let action_bootstrap =
                             match route_needs_action_bootstrap(renderer, match_result, conventions)
                             {
@@ -1720,9 +1724,9 @@ impl ProductionProject {
                                     production_render_error_response(path, match_result, &error)
                                 }
                             },
-                            Err(error) => DevResponse::internal_error(
-                                render_production_bundle_error(path, match_result, &error),
-                            ),
+                            Err(error) => {
+                                production_bundle_error_response(path, match_result, &error)
+                            }
                         }
                     }
                     Err(error) => production_render_error_response(path, match_result, &error),
@@ -1940,6 +1944,20 @@ impl DevResponse {
         }
     }
 
+    pub fn service_unavailable() -> Self {
+        Self {
+            status: 503,
+            reason: "Service Unavailable",
+            content_type: "text/plain; charset=utf-8",
+            body: b"Service Unavailable\n".to_vec(),
+            stream: None,
+            cache_control: Some("no-store"),
+            route_pattern_header: None,
+            link_headers: Vec::new(),
+            set_cookie_headers: Vec::new(),
+        }
+    }
+
     pub fn gateway_timeout(body: String) -> Self {
         Self {
             status: 504,
@@ -2001,6 +2019,16 @@ impl DevResponse {
 struct ProductionWorkerPool {
     sender: mpsc::Sender<TcpStream>,
     workers: Vec<thread::JoinHandle<()>>,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: usize,
+}
+
+struct ProductionInFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for ProductionInFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ProductionWorkerPool {
@@ -2008,11 +2036,13 @@ impl ProductionWorkerPool {
         let worker_count = worker_count.max(1);
         let (sender, receiver) = mpsc::channel::<TcpStream>();
         let receiver = Arc::new(Mutex::new(receiver));
+        let in_flight = Arc::new(AtomicUsize::new(0));
         let mut workers = Vec::with_capacity(worker_count);
 
         for _ in 0..worker_count {
             let receiver = Arc::clone(&receiver);
             let project = Arc::clone(&project);
+            let in_flight = Arc::clone(&in_flight);
             workers.push(thread::spawn(move || {
                 loop {
                     let stream = {
@@ -2024,16 +2054,35 @@ impl ProductionWorkerPool {
                     let Ok(mut stream) = stream else {
                         break;
                     };
+                    let _in_flight_guard = ProductionInFlightGuard(Arc::clone(&in_flight));
                     let _ = handle_production_stream_concurrent(&mut stream, &project);
                 }
             }));
         }
 
-        Self { sender, workers }
+        Self {
+            sender,
+            workers,
+            in_flight,
+            max_in_flight: worker_count,
+        }
     }
 
-    fn send(&self, stream: TcpStream) -> Result<()> {
+    fn send(&self, mut stream: TcpStream) -> Result<()> {
+        let reserved = self
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.max_in_flight).then_some(current + 1)
+            })
+            .is_ok();
+        if !reserved {
+            let _ = stream.set_write_timeout(Some(PRODUCTION_OVERLOAD_WRITE_TIMEOUT));
+            let _ = write_response(&mut stream, &DevResponse::service_unavailable());
+            return Ok(());
+        }
+
         self.sender.send(stream).map_err(|_| {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
             DevServerError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "production worker pool is closed",
@@ -2044,6 +2093,11 @@ impl ProductionWorkerPool {
     #[cfg(test)]
     fn worker_count(&self) -> usize {
         self.workers.len()
+    }
+
+    #[cfg(test)]
+    fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
     }
 
     fn shutdown(self) {
@@ -3323,11 +3377,10 @@ fn forwarded_client_ip(headers: &HttpHeaders, trusted_hops: usize) -> Option<Str
         .collect::<std::result::Result<Vec<_>, _>>()
         .ok()?;
     let trusted_hops = trusted_hops.max(1);
-    if ips.len() <= trusted_hops {
+    if ips.len() < trusted_hops {
         return None;
     }
-    ips.get(ips.len() - trusted_hops - 1)
-        .map(|ip| ip.to_string())
+    ips.get(ips.len() - trusted_hops).map(|ip| ip.to_string())
 }
 
 fn http_header_origin(value: &str) -> Option<HttpOrigin> {
@@ -3958,25 +4011,20 @@ fn production_render_error_response(
     match_result: &RouteMatch,
     error: &PageRenderError,
 ) -> DevResponse {
+    eprintln!(
+        "Ferrite production render failed: path={path:?} pattern={:?} error={:?}",
+        match_result.route.path,
+        error.to_string()
+    );
     match error {
-        PageRenderError::TimedOut { .. } => DevResponse::gateway_timeout(
-            render_production_render_error(504, path, match_result, error),
-        ),
-        _ => DevResponse::internal_error(render_production_render_error(
-            500,
-            path,
-            match_result,
-            error,
-        )),
+        PageRenderError::TimedOut { .. } => {
+            DevResponse::gateway_timeout(render_production_render_error(504, path, match_result))
+        }
+        _ => DevResponse::internal_error(render_production_render_error(500, path, match_result)),
     }
 }
 
-fn render_production_render_error(
-    status: u16,
-    path: &str,
-    match_result: &RouteMatch,
-    error: &PageRenderError,
-) -> String {
+fn render_production_render_error(status: u16, path: &str, match_result: &RouteMatch) -> String {
     let title = if status == 504 {
         "Ferrite - Render Timeout"
     } else {
@@ -3989,8 +4037,7 @@ fn render_production_render_error(
 <body>
   <main id="ferrite-root" data-route="{path}" data-route-pattern="{pattern}">
     <h1>{status}</h1>
-    <p>Ferrite could not render <code>{pattern}</code>.</p>
-    <pre>{error}</pre>
+    <p>Ferrite could not render this route.</p>
   </main>
 </body>
 </html>"#,
@@ -3998,30 +4045,47 @@ fn render_production_render_error(
         status = status,
         path = escape_html(path),
         pattern = escape_html(&match_result.route.path),
-        error = escape_html(&error.to_string()),
     )
 }
 
-fn render_production_bundle_error(
+fn production_bundle_error_response(
     path: &str,
     match_result: &RouteMatch,
     error: &ClientBundleError,
-) -> String {
+) -> DevResponse {
+    eprintln!(
+        "Ferrite production bundle failed: path={path:?} pattern={:?} error={:?}",
+        match_result.route.path,
+        error.to_string()
+    );
+    match error {
+        ClientBundleError::TimedOut { .. } => {
+            DevResponse::gateway_timeout(render_production_bundle_error(504, path, match_result))
+        }
+        _ => DevResponse::internal_error(render_production_bundle_error(500, path, match_result)),
+    }
+}
+
+fn render_production_bundle_error(status: u16, path: &str, match_result: &RouteMatch) -> String {
+    let title = if status == 504 {
+        "Ferrite - Bundle Timeout"
+    } else {
+        "Ferrite - Bundle Error"
+    };
     format!(
         r#"<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Ferrite - Bundle Error</title></head>
+<head><meta charset="utf-8"><title>{title}</title></head>
 <body>
   <main id="ferrite-root" data-route="{path}" data-route-pattern="{pattern}">
-    <h1>500</h1>
-    <p>Ferrite could not bundle <code>{pattern}</code>.</p>
-    <pre>{error}</pre>
+    <h1>{status}</h1>
+    <p>Ferrite could not prepare this route.</p>
   </main>
 </body>
 </html>"#,
         path = escape_html(path),
         pattern = escape_html(&match_result.route.path),
-        error = escape_html(&error.to_string()),
+        status = status,
     )
 }
 
@@ -4875,7 +4939,7 @@ process.exit(1);
         let peer_ip = Some("127.0.0.1".parse::<IpAddr>().unwrap());
         let mut headers = BTreeMap::from([(
             "x-forwarded-for".to_owned(),
-            "203.0.113.10, 198.51.100.5, 127.0.0.1".to_owned(),
+            "203.0.113.10, 198.51.100.5".to_owned(),
         )]);
 
         assert_eq!(
@@ -4895,9 +4959,18 @@ process.exit(1);
             Some("203.0.113.10")
         );
 
+        headers.insert("x-forwarded-for".to_owned(), "203.0.113.10".to_owned());
+        config = production_project_for(&app)
+            .config
+            .with_trusted_proxy_client_ip_hops(1);
+        assert_eq!(
+            production_client_ip(&headers, peer_ip, &config).as_deref(),
+            Some("203.0.113.10")
+        );
+
         headers.insert(
             "x-forwarded-for".to_owned(),
-            "203.0.113.10, not-an-ip, 127.0.0.1".to_owned(),
+            "203.0.113.10, not-an-ip".to_owned(),
         );
         assert_eq!(
             production_client_ip(&headers, peer_ip, &config).as_deref(),
@@ -5702,7 +5775,7 @@ setInterval(() => {}, 1000);
         assert_eq!(response.route_pattern_header.as_deref(), Some("/"));
         let body = response.body_text();
         assert!(body.contains("<h1>504</h1>"));
-        assert!(body.contains("page renderer timed out"));
+        assert!(!body.contains("page renderer timed out"));
         assert!(body.contains(r#"id="ferrite-root""#));
     }
 
@@ -5716,6 +5789,38 @@ setInterval(() => {}, 1000);
         let pool = ProductionWorkerPool::new(0, project);
 
         assert_eq!(pool.worker_count(), 1);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn production_worker_pool_rejects_connections_over_the_configured_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = Arc::new(Mutex::new(production_project_for(&app)));
+        let pool = ProductionWorkerPool::new(1, project);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut first_client = TcpStream::connect(addr).unwrap();
+        let (first_server, _) = listener.accept().unwrap();
+        first_client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .unwrap();
+        pool.send(first_server).unwrap();
+        assert_eq!(pool.in_flight_count(), 1);
+
+        let mut overloaded_client = TcpStream::connect(addr).unwrap();
+        let (overloaded_server, _) = listener.accept().unwrap();
+        pool.send(overloaded_server).unwrap();
+        let mut response = String::new();
+        overloaded_client.read_to_string(&mut response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.contains("Cache-Control: no-store"));
+        assert_eq!(pool.in_flight_count(), 1);
+
+        drop(first_client);
         pool.shutdown();
     }
 
@@ -6657,9 +6762,67 @@ process.exit(1);
         assert_eq!(response.cache_control, Some("no-store"));
         assert_eq!(response.route_pattern_header.as_deref(), Some("/"));
         let body = response.body_text();
-        assert!(body.contains("render exploded"));
+        assert!(!body.contains("render exploded"));
         assert!(body.contains(r#"id="ferrite-root""#));
         assert!(!body.contains("data-ferrite-build-id"));
+    }
+
+    #[test]
+    fn production_client_bundle_timeout_returns_generic_gateway_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = temp.path().to_path_buf();
+        let renderer = project.join("render-page.mjs");
+        make_script(
+            &renderer,
+            r#"
+const mode = process.argv[2];
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+if (mode === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/", routePattern: "/", actions: [] }));
+  process.exit(0);
+}
+if (mode === "--stream") {
+  process.stdout.write(JSON.stringify({
+    ferrite: "render-stream",
+    version: 1,
+    shell: [0, "ok"],
+    chunks: []
+  }));
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
+"#,
+        );
+        let bundler = project.join("build-client.mjs");
+        make_script(&bundler, "setInterval(() => {}, 1000); // bundler-secret");
+        let mut project = ProductionProject::new(
+            ProductionServerConfig::new(
+                project.clone(),
+                app,
+                project.join(".ferrite/types/routes.d.ts"),
+                renderer,
+                bundler,
+                project.join(".ferrite/server/static"),
+                "/_ferrite/static".to_owned(),
+            )
+            .with_render_timeout(Duration::from_millis(20)),
+        );
+
+        let response = project.handle_get("/").unwrap();
+
+        assert_eq!(response.status, 504);
+        assert_eq!(response.reason, "Gateway Timeout");
+        assert_eq!(response.cache_control, Some("no-store"));
+        assert_eq!(response.route_pattern_header.as_deref(), Some("/"));
+        let body = response.body_text();
+        assert!(body.contains("<h1>504</h1>"));
+        assert!(!body.contains("bundler-secret"));
+        assert!(!body.contains("client bundler timed out"));
     }
 
     #[test]

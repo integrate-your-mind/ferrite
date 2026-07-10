@@ -116,6 +116,7 @@ Evidence used:
 - [x] 087: Production in-memory Prometheus text metrics endpoint for request/action counters.
 - [x] 088: Production server-action one-time replay nonces.
 - [x] 089: Private-alpha GTM gate documentation and deterministic sequential browser gate.
+- [x] 090: Dynamic action-route normalization, required example integration gate, bounded production admission, bundler deadlines, public error redaction, and safer deployment defaults.
 
 ## Vacuous Or Weak Test Audit
 
@@ -130,6 +131,8 @@ Evidence used:
 - [ ] Runtime DOM coverage now includes Chromium proof for generated server-action form enhancement, payload prefetch/navigation, stream-frame navigation, stream-mode popstate restoration, malformed programmatic payload rejection, and malformed clicked-payload fallback, but hydration mismatch paths, failed or malformed popstate fallback behavior, and many focus/pointer/history edge cases still rely on deterministic `happy-dom` coverage.
 - [x] `enhanceServerActionForms()` has focused red-to-green coverage for the normal enhanced submit path, invalid response failure path, plain-form fallback, and listener cleanup.
 - [ ] Several proof docs rely on `--once`, temp fixtures, or local generated packages. These are valid milestone checks, but they are not deployment proof.
+- [ ] Chromium action and payload tests use fixture HTTP servers with canned action responses or packets. They prove browser enhancement/navigation behavior, not browser-to-`ferrite serve` end-to-end behavior.
+- [x] `pnpm test` now runs the real example build, render fixture, dev `--once`, and production serve `--once` path after the prior gate missed a dynamic server-action route-pattern regression.
 
 No known tests were identified as deliberately fake success paths. The weak areas above should be treated as productionization backlog, not as evidence that the tested code is worthless.
 
@@ -170,6 +173,12 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Run Chromium browser test files sequentially in the repo browser gate to avoid cross-file browser-session races while preserving real browser coverage.
 - [ ] Add first-class tracing sinks and richer external audit exporters for request/action observer events.
 - [x] Expose production request-read timeout, request-byte, and in-flight request limits through the `ferrite serve` CLI.
+- [x] Make the in-flight limit count queued and active sockets and reject excess connections with `503` instead of using an unbounded work queue.
+- [x] Apply the production subprocess deadline to client bundling as well as rendering, and keep raw subprocess errors out of public production HTML.
+- [x] Make the supplied nginx edge overwrite `X-Forwarded-For`, block public metrics proxying, and exclude common env/key files from the container build context.
+- [ ] Make `ferrite build` emit the immutable server artifact consumed by `ferrite serve`; current serving still renders and bundles source modules at request time.
+- [ ] Remove the shared `ProductionProject` mutex from matched route handling and prove useful parallel request execution under load.
+- [ ] Add a configurable response-write timeout and slow-reader coverage.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
 - [ ] Decide code-signing/notarization policy for native artifacts.

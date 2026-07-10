@@ -9,3 +9,13 @@ coverage
 **/dist
 *.log
 .DS_Store
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+*.key
+*.pem
+**/*.key
+**/*.pem

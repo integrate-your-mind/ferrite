@@ -21,9 +21,10 @@ test("deployment templates keep production serve flags aligned", async () => {
     assert.match(source, /--trusted-proxy-client-ip-hops 1/);
     assert.match(source, /--access-log json/);
     assert.match(source, /--action-log json/);
-    assert.match(source, /--metrics-path \/__ferrite\/metrics/);
   }
 
+  assert.match(systemd, /--metrics-path \/__ferrite\/metrics/);
+  assert.doesNotMatch(dockerfile, /--metrics-path/);
   assert.match(systemd, /--host 127\.0\.0\.1/);
   assert.match(dockerfile, /--host 0\.0\.0\.0/);
   assert.match(env, /^FERRITE_ACTION_CSRF=/m);
@@ -37,7 +38,9 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
   assert.match(nginx, /proxy_set_header Host \$host;/);
   assert.match(nginx, /proxy_set_header X-Forwarded-Proto \$scheme;/);
   assert.match(nginx, /proxy_set_header X-Forwarded-Host \$host;/);
-  assert.match(nginx, /proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;/);
+  assert.match(nginx, /proxy_set_header X-Forwarded-For \$remote_addr;/);
+  assert.match(nginx, /location = \/__ferrite\/metrics \{\s+return 404;\s+\}/);
+  assert.doesNotMatch(nginx, /\$proxy_add_x_forwarded_for/);
   assert.match(nginx, /client_max_body_size 16k;/);
 });
 
@@ -57,4 +60,8 @@ test("container template runs as a non-root runtime user with a health check", a
   assert.match(dockerignore, /^node_modules$/m);
   assert.match(dockerignore, /^\*\*\/\.ferrite$/m);
   assert.match(dockerignore, /^\*\*\/node_modules$/m);
+  assert.match(dockerignore, /^\.env\.\*$/m);
+  assert.match(dockerignore, /^\*\*\/\.env\.\*$/m);
+  assert.match(dockerignore, /^\*\*\/\*\.key$/m);
+  assert.match(dockerignore, /^\*\*\/\*\.pem$/m);
 });

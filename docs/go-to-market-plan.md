@@ -64,35 +64,41 @@ Disallowed alpha claims until proven:
 
 ### ASAP Alpha Launch Gate
 
-1. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
-2. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, package verification, and native prebuild dry-run.
-3. Prove one deployment template in hosted staging behind a real proxy/TLS boundary, including route smoke, payload smoke, action rejection probes, metrics scrape, logs, and rollback.
-4. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
-5. Decide the alpha distribution path: private npm scope, tarball bundle, or source checkout. Do not charge for reliability until a real npm/native publish path is proven.
-6. Keep server actions limited to controlled/internal flows unless app-owned auth and CSRF middleware have been reviewed separately.
+1. Make `ferrite build` produce the immutable server artifact consumed by `ferrite serve`; remove request-time client bundling and the global route-handling mutex before presenting the server as production-ready.
+2. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
+3. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, example build/dev/serve integration, package verification, and native prebuild dry-run.
+4. Prove one deployment template in hosted staging behind a real proxy/TLS boundary, including route smoke, payload smoke, action rejection probes, private metrics scrape, logs, overload rejection, and rollback.
+5. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
+6. Decide the alpha distribution path: private npm scope, tarball bundle, or source checkout. Do not charge for reliability until a real npm/native publish path is proven.
+7. Keep server actions limited to controlled/internal flows unless app-owned auth and CSRF middleware have been reviewed separately.
 
 ## Blockers To Paid Beta
 
-1. Remote delivery proof gaps
+1. Production runtime architecture
+- `ferrite serve` still launches source renderer, metadata, action-manifest, and client-bundler subprocesses during requests instead of consuming an immutable server build artifact.
+- Matched route work is serialized through one shared `ProductionProject` mutex. Admission and subprocess lifetime are bounded, but useful parallel request execution is not proven.
+- Production sockets do not yet have a configurable response-write deadline.
+
+2. Remote delivery proof gaps
 - No GitHub remote, no push/PR, no remote CI for lint/build/test/package-verifier/prebuild workflows.
 - `release:verify:npm` exists locally but is not exercised in this repo’s real CI.
 
-2. npm publishing and native package distribution
+3. npm publishing and native package distribution
 - No real `npm publish` has been performed.
 - Native prebuild publication ordering and registry visibility are not proven.
 - Current clean-install smoke omits optional native package installation by design.
 
-3. Hosted deployment posture
+4. Hosted deployment posture
 - Deployment docs and first-pass systemd/nginx/container templates exist, but there is no official published container image, Helm chart, managed-platform adapter, or hosted staging proof.
 - No public production topology benchmarked on hosted infra.
 
-4. Server-action security gaps
+5. Server-action security gaps
 - Explicit form transport only, not automatic `"use server"` discovery.
 - CSRF is opt-in and static-token based with optional SameSite/HttpOnly/Secure double-submit cookie binding and optional single-process one-time replay nonces; there is still no session-bound token rotation, multi-process replay coordination, or first-class auth middleware integration.
 - Trusted-proxy public-origin checks and explicit forwarded client-IP access-log policy now exist, but production topology proof is not finalized.
 - File uploads (`multipart` file parts) are intentionally rejected.
 
-5. Observability + operations depth
+6. Observability + operations depth
 - Request observer and action observer hooks exist in Rust, and the CLI can emit plain or JSON request outcome access logs plus server-action audit logs to stderr.
 - The CLI can expose in-memory Prometheus-style request/action counters with `--metrics-path`, but there are still no tracing exporters or external audit sinks.
 - Some browser edge cases remain in happy-dom coverage rather than full cross-browser proof.
@@ -102,8 +108,8 @@ Disallowed alpha claims until proven:
 **Objective:** Reach a defensible private beta that is explicitly limited to trusted teams and explicit risks.
 
 ### Week 1
-- Day 1–2: finalize positioning, onboarding, and beta access policy; publish explicit "private beta terms" (no production SLA).
-- Day 3–4: harden CI proof by integrating and running full local gate set in remote CI (release lint/test/build, `release:verify:npm`, native prebuild dry-run, browser proof).
+- Day 1–2: freeze broad framework parity work and specify the immutable build-to-serve artifact plus concurrency contract.
+- Day 3–4: implement and test artifact-backed production serving without request-time client bundling or global route serialization.
 - Day 5: complete deployment hardening pass 1:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
   - publish restart/rollback runbook, CLI request/action log schemas, and metrics/tracing integration plan.
@@ -113,7 +119,8 @@ Disallowed alpha claims until proven:
   - trusted-proxy deployment test matrix, including forwarded proto/host and forwarded client-IP policy.
 
 ### Week 2
-- Day 8–10: close server-action reliability and UX:
+- Day 8: harden CI proof by running the full local gate set in remote CI (release lint/test/build, example integration, `release:verify:npm`, native prebuild dry-run, browser proof).
+- Day 9–10: close server-action reliability and UX:
   - exercise server-action production failure-path audit logs in hosted staging and decide the external sink contract,
   - validate rejection/mismatch flows in real browser automation and one negative-path test per route/action class.
 - Day 11–12: npm publishing readies:

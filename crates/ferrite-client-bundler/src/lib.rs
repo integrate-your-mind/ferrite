@@ -1,11 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+const BUNDLE_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +40,7 @@ pub enum ClientBundleError {
     Json(serde_json::Error),
     Protocol(ferrite_protocol::ProtocolError),
     NodeFailed { status: Option<i32>, stderr: String },
+    TimedOut { timeout: Duration },
 }
 
 impl fmt::Display for ClientBundleError {
@@ -49,6 +55,13 @@ impl fmt::Display for ClientBundleError {
                 }
                 None => write!(f, "client bundler was terminated: {stderr}"),
             },
+            ClientBundleError::TimedOut { timeout } => {
+                write!(
+                    f,
+                    "client bundler timed out after {} ms",
+                    timeout.as_millis()
+                )
+            }
         }
     }
 }
@@ -79,11 +92,21 @@ pub type Result<T> = std::result::Result<T, ClientBundleError>;
 pub struct ClientBundler {
     project: PathBuf,
     script: PathBuf,
+    command_timeout: Option<Duration>,
 }
 
 impl ClientBundler {
     pub fn new(project: PathBuf, script: PathBuf) -> Self {
-        Self { project, script }
+        Self {
+            project,
+            script,
+            command_timeout: None,
+        }
+    }
+
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = Some(timeout.max(Duration::from_millis(1)));
+        self
     }
 
     pub fn bundle_route(
@@ -113,7 +136,8 @@ impl ClientBundler {
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(request.layouts)?;
         let options_json = serde_json::to_string(&request.options)?;
-        let output = Command::new("node")
+        let mut command = Command::new("node");
+        command
             .arg(&self.script)
             .arg(request.page_file)
             .arg(request.out_dir)
@@ -122,8 +146,8 @@ impl ClientBundler {
             .arg(props_json)
             .arg(layouts_json)
             .arg(options_json)
-            .current_dir(&self.project)
-            .output()?;
+            .current_dir(&self.project);
+        let output = self.run_command(command)?;
 
         if !output.status.success() {
             return Err(ClientBundleError::NodeFailed {
@@ -135,6 +159,67 @@ impl ClientBundler {
         let bundle: ClientBundle = serde_json::from_slice(&output.stdout)?;
         bundle.validate()?;
         Ok(bundle)
+    }
+
+    fn run_command(&self, mut command: Command) -> Result<BundlerOutput> {
+        match self.command_timeout {
+            Some(timeout) => run_command_with_timeout(command, timeout),
+            None => {
+                let output = command.output()?;
+                Ok(BundlerOutput {
+                    status: output.status,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BundlerOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<BundlerOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().expect("bundler stdout was piped");
+    let mut stderr = child.stderr.take().expect("bundler stderr was piped");
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(BundlerOutput {
+                status,
+                stdout: stdout_reader
+                    .join()
+                    .expect("bundler stdout reader panicked")?,
+                stderr: stderr_reader
+                    .join()
+                    .expect("bundler stderr reader panicked")?,
+            });
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ClientBundleError::TimedOut { timeout });
+        }
+
+        thread::sleep(BUNDLE_TIMEOUT_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
     }
 }
 
@@ -876,6 +961,33 @@ process.exit(1);
         assert!(matches!(
             error,
             ClientBundleError::NodeFailed { stderr, .. } if stderr == "bundle failed"
+        ));
+    }
+
+    #[test]
+    fn times_out_hanging_bundlers() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        make_script(&script, "setInterval(() => {}, 1000);");
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let bundler = ClientBundler::new(temp.path().to_path_buf(), script)
+            .with_command_timeout(Duration::from_millis(20));
+
+        let error = bundler
+            .bundle_route(
+                &page,
+                &[],
+                "/",
+                &[],
+                &temp.path().join("out"),
+                "/_ferrite/static",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ClientBundleError::TimedOut { timeout } if timeout == Duration::from_millis(20)
         ));
     }
 

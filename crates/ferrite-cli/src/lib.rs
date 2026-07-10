@@ -233,7 +233,7 @@ struct ServeArgs {
     #[arg(
         long,
         default_value_t = 30_000,
-        help = "Maximum milliseconds allowed for each production page renderer subprocess"
+        help = "Maximum milliseconds allowed for each production renderer or client-bundler subprocess"
     )]
     render_timeout_ms: u64,
 
