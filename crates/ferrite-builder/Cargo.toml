@@ -1,14 +1,15 @@
 [package]
 name = "ferrite-builder"
+description = "Static build pipeline for Ferrite app-directory projects."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-ferrite-client-bundler = { path = "../ferrite-client-bundler" }
-ferrite-page-renderer = { path = "../ferrite-page-renderer" }
-ferrite-router = { path = "../ferrite-router" }
+ferrite-client-bundler = { path = "../ferrite-client-bundler", version = "0.1.0" }
+ferrite-page-renderer = { path = "../ferrite-page-renderer", version = "0.1.0" }
+ferrite-router = { path = "../ferrite-router", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

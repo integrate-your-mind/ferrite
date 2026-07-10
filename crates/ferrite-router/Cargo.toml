@@ -1,9 +1,10 @@
 [package]
 name = "ferrite-router"
+description = "App-directory route discovery and TypeScript route generation for Ferrite."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -11,4 +12,3 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-

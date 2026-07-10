@@ -67,6 +67,7 @@ pnpm --filter @ferrite/node prebuild:package
 pnpm --filter @ferrite/node prebuild:verify
 pnpm test:release
 pnpm release:verify:npm
+pnpm release:verify:cargo
 cargo run -p ferrite-cli -- check --project examples/basic
 node examples/basic/render.mjs | cargo run -p ferrite-cli -- render --input -
 cargo run -p ferrite-cli -- dev --project examples/basic --once --request-path /posts/abc

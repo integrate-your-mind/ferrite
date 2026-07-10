@@ -1,5 +1,7 @@
 # Milestone 090 Proof
 
+Status note: milestone 091 subsequently fixed the Cargo workspace packaging failure recorded below.
+
 ## Scope
 
 Production review remediation: normalize dynamic server-action route patterns, require the real example integration path in `pnpm test`, bound socket admission and client-bundler execution, redact public subprocess errors, and harden supplied proxy/container defaults.

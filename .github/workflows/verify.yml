@@ -1,0 +1,70 @@
+name: Verify
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Lint, build, test, and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm exec playwright-core install --with-deps chromium
+
+      - name: Resolve Chromium executable
+        run: node --input-type=module -e "import { chromium } from 'playwright-core'; console.log('FERRITE_BROWSER_EXECUTABLE=' + chromium.executablePath())" >> "$GITHUB_ENV"
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+      - name: Verify npm packages
+        run: pnpm release:verify:npm
+
+      - name: Verify Cargo packages
+        run: pnpm release:verify:cargo
+
+      - name: Upload package reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-verification-reports
+          path: dist/npm-packages
+          if-no-files-found: error

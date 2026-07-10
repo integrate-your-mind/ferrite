@@ -66,7 +66,7 @@ Disallowed alpha claims until proven:
 
 1. Make `ferrite build` produce the immutable server artifact consumed by `ferrite serve`; remove request-time client bundling and the global route-handling mutex before presenting the server as production-ready.
 2. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
-3. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, example build/dev/serve integration, package verification, and native prebuild dry-run.
+3. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, example build/dev/serve integration, npm and Cargo package verification, and native prebuild dry-run.
 4. Prove one deployment template in hosted staging behind a real proxy/TLS boundary, including route smoke, payload smoke, action rejection probes, private metrics scrape, logs, overload rejection, and rollback.
 5. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
 6. Decide the alpha distribution path: private npm scope, tarball bundle, or source checkout. Do not charge for reliability until a real npm/native publish path is proven.
@@ -87,6 +87,7 @@ Disallowed alpha claims until proven:
 - No real `npm publish` has been performed.
 - Native prebuild publication ordering and registry visibility are not proven.
 - Current clean-install smoke omits optional native package installation by design.
+- Cargo archives now package locally with versioned internal dependencies, but publish ordering and registry installation remain unproven.
 
 4. Hosted deployment posture
 - Deployment docs and first-pass systemd/nginx/container templates exist, but there is no official published container image, Helm chart, managed-platform adapter, or hosted staging proof.
@@ -119,7 +120,7 @@ Disallowed alpha claims until proven:
   - trusted-proxy deployment test matrix, including forwarded proto/host and forwarded client-IP policy.
 
 ### Week 2
-- Day 8: harden CI proof by running the full local gate set in remote CI (release lint/test/build, example integration, `release:verify:npm`, native prebuild dry-run, browser proof).
+- Day 8: harden CI proof by running the full local gate set in remote CI (release lint/test/build, example integration, npm/Cargo package verification, native prebuild dry-run, browser proof).
 - Day 9–10: close server-action reliability and UX:
   - exercise server-action production failure-path audit logs in hosted staging and decide the external sink contract,
   - validate rejection/mismatch flows in real browser automation and one negative-path test per route/action class.

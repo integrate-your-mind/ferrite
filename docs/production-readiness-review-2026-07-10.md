@@ -26,7 +26,7 @@ Explicitly not proven:
 - GitHub push, PR review, or remote CI; this checkout has no configured remote.
 - Hosted staging behind real TLS, proxy, process manager, CDN, or rollback automation.
 - npm or native prebuild publication and registry installation.
-- Cargo workspace publication. `cargo package --workspace --allow-dirty --no-verify` stops because internal path dependencies do not declare versions.
+- Cargo registry publication. All 11 local archives now package with versioned internal dependencies, but publish ordering and registry installation are not proven.
 - A self-contained production server artifact; `ferrite serve` still executes source renderer and bundler subprocesses at request time.
 - Parallel route execution; matched requests still lock one shared `ProductionProject`.
 - Numeric Rust/JS coverage, mutation testing, or a browser-to-real-`ferrite serve` action/payload test.
@@ -49,13 +49,13 @@ Required exit criteria:
 
 ### P0: Developers Cannot Install A Coherent Release
 
-The source npm packages remain `private: true` and `UNLICENSED`; release staging rewrites them only for local tarball proof. Cargo points at `https://example.invalid/ferrite`, the repository has no root license file, and Cargo packaging fails after the first crate because internal path dependencies omit versions. No public CLI binary, npm release, native artifact set, or container image exists.
+The source npm packages remain `private: true` and `UNLICENSED`; release staging rewrites them only for local tarball proof. Fake Cargo repository metadata has been removed, all internal path dependencies now carry versions, and all 11 crate archives package locally. The repository still has no root license file or real repository metadata, and no public CLI binary, npm release, native artifact set, or container image exists.
 
 Required exit criteria:
 
 - Owner selects repository visibility, license, package scope, and alpha distribution channel.
 - Source/release manifests use one version and one license policy with real repository metadata.
-- Cargo packages include versioned internal dependencies and package successfully.
+- Cargo packages publish in dependency order and install successfully from the selected registry; local archive creation alone is already proven.
 - Native prebuilds build and load on every advertised platform in hosted CI.
 - One clean machine installs the exact candidate artifacts and runs `check`, `build`, and `serve` without a monorepo checkout.
 

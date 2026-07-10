@@ -38,6 +38,7 @@ pnpm build
 pnpm test
 pnpm test:release
 pnpm release:verify:npm
+pnpm release:verify:cargo
 cargo test --workspace
 cargo run -p ferrite-cli -- check --project examples/basic
 cargo run -p ferrite-cli -- build --project examples/basic

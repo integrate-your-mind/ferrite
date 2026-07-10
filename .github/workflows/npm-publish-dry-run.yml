@@ -63,6 +63,9 @@ jobs:
       - name: Verify npm package tarballs and install smoke
         run: pnpm release:verify:npm
 
+      - name: Verify Cargo package manifests and archives
+        run: pnpm release:verify:cargo
+
       - name: Upload npm package verification report
         uses: actions/upload-artifact@v4
         with:

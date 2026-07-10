@@ -1,13 +1,14 @@
 [package]
 name = "ferrite-page-renderer"
+description = "Validated TypeScript page-runner bridge for Ferrite server rendering."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-ferrite-protocol = { path = "../ferrite-protocol" }
-ferrite-ssr = { path = "../ferrite-ssr" }
+ferrite-protocol = { path = "../ferrite-protocol", version = "0.1.0" }
+ferrite-ssr = { path = "../ferrite-ssr", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

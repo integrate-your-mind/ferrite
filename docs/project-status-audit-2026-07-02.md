@@ -117,6 +117,7 @@ Evidence used:
 - [x] 088: Production server-action one-time replay nonces.
 - [x] 089: Private-alpha GTM gate documentation and deterministic sequential browser gate.
 - [x] 090: Dynamic action-route normalization, required example integration gate, bounded production admission, bundler deadlines, public error redaction, and safer deployment defaults.
+- [x] 091: Versioned Cargo path dependencies, local workspace archive verification, honest package metadata, and a full-gate CI workflow definition.
 
 ## Vacuous Or Weak Test Audit
 
@@ -181,6 +182,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Add a configurable response-write timeout and slow-reader coverage.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
+- [x] Add a local Cargo workspace package gate with versioned internal path dependencies; all 11 crate archives now build with `--no-verify`.
+- [ ] Prove Cargo publish ordering and installation from a registry; local archive creation is not registry proof.
 - [ ] Decide code-signing/notarization policy for native artifacts.
 - [x] Add deployment documentation for production serve topology, TLS/proxy expectations, runtime configuration, rollback, and observability.
 - [x] Add first-pass systemd, nginx, and container deployment templates for the documented private-beta topology.

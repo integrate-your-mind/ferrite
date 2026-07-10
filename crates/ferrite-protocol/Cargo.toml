@@ -1,9 +1,10 @@
 [package]
 name = "ferrite-protocol"
+description = "Versioned render, payload, client-reference, and server-action protocols for Ferrite."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 serde = { workspace = true }
