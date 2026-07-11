@@ -1,7 +1,7 @@
 # Ferrite Go-to-Market Plan (Private Beta Readiness)
 
-**Context date:** July 3, 2026
-**Current project state:** Local checkout has strong engineering proof, but limited live-deployment proof. This plan assumes a narrow private beta only after explicit delivery gates are met.
+**Updated:** July 11, 2026
+**Current project state:** Local checkout now has an artifact-backed, source-independent build/serve path with fail-closed integrity checks and overlapping request proof, but limited remote delivery and live-deployment proof. This plan assumes a narrow private beta only after explicit delivery gates are met.
 
 ## Positioning
 
@@ -64,10 +64,10 @@ Disallowed alpha claims until proven:
 
 ### ASAP Alpha Launch Gate
 
-1. Make `ferrite build` produce the immutable server artifact consumed by `ferrite serve`; remove request-time client bundling and the global route-handling mutex before presenting the server as production-ready.
-2. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
-3. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, example build/dev/serve integration, npm and Cargo package verification, and native prebuild dry-run.
-4. Prove one deployment template in hosted staging behind a real proxy/TLS boundary, including route smoke, payload smoke, action rejection probes, private metrics scrape, logs, overload rejection, and rollback.
+1. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
+2. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, artifact-backed example integration, npm and Cargo package verification, and native prebuild dry-run.
+3. Prove the artifact-backed container or systemd template in hosted staging behind a real proxy/TLS boundary, including startup integrity rejection, dynamic route/payload/action smoke, private metrics scrape, logs, overload rejection, restart, and rollback.
+4. Add response-write deadlines and sustained load/subprocess-recovery proof; the current overlapping-request test is a concurrency regression gate, not a capacity benchmark.
 5. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
 6. Decide the alpha distribution path: private npm scope, tarball bundle, or source checkout. Do not charge for reliability until a real npm/native publish path is proven.
 7. Keep server actions limited to controlled/internal flows unless app-owned auth and CSRF middleware have been reviewed separately.
@@ -75,8 +75,8 @@ Disallowed alpha claims until proven:
 ## Blockers To Paid Beta
 
 1. Production runtime architecture
-- `ferrite serve` still launches source renderer, metadata, action-manifest, and client-bundler subprocesses during requests instead of consuming an immutable server build artifact.
-- Matched route work is serialized through one shared `ProductionProject` mutex. Admission and subprocess lifetime are bounded, but useful parallel request execution is not proven.
+- `ferrite build` now stages and installs a versioned, SHA-256-verified server artifact; `ferrite serve` retains verified bytes before startup and uses a production runner without esbuild or source access. A versioned release directory/image pointer is still required for atomic rollout.
+- Immutable route state is shared without a project-wide mutex, and a slow-request regression test proves overlap. Sustained load, capacity, subprocess recovery, and hosted multi-instance behavior remain unproven.
 - Production sockets do not yet have a configurable response-write deadline.
 
 2. Remote delivery proof gaps
@@ -109,9 +109,9 @@ Disallowed alpha claims until proven:
 **Objective:** Reach a defensible private beta that is explicitly limited to trusted teams and explicit risks.
 
 ### Week 1
-- Day 1–2: freeze broad framework parity work and specify the immutable build-to-serve artifact plus concurrency contract.
-- Day 3–4: implement and test artifact-backed production serving without request-time client bundling or global route serialization.
-- Day 5: complete deployment hardening pass 1:
+- Day 1–2: push the completed artifact/concurrency milestone through remote review and exact-commit CI.
+- Day 3–4: add response-write deadlines, slow-reader tests, and sustained overload/subprocess-recovery proof.
+- Day 5: complete hosted deployment hardening pass 1:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
   - publish restart/rollback runbook, CLI request/action log schemas, and metrics/tracing integration plan.
 - Day 6–7: security backlog pass:

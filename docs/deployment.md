@@ -1,6 +1,6 @@
 # Ferrite Deployment Guide
 
-Date: 2026-07-03
+Updated: 2026-07-11
 
 This guide describes the current production-shaped deployment path for a Ferrite app. It is an operator checklist for the existing `ferrite build` and `ferrite serve` commands, not proof that Ferrite has already been deployed behind a real CDN, TLS terminator, process manager, or npm release.
 
@@ -9,8 +9,8 @@ This guide describes the current production-shaped deployment path for a Ferrite
 Ferrite can:
 
 - typecheck an app and write generated route types with `ferrite check`
-- build route manifests, static HTML, generated client assets, and action bootstrap assets with `ferrite build`
-- serve dynamic app routes with the production HTTP adapter through `ferrite serve`
+- stage a versioned production manifest, self-contained route modules, optional static HTML, generated client assets, build-observed action metadata, and SHA-256 file records with `ferrite build`
+- validate and serve that immutable artifact with the production HTTP adapter through `ferrite serve`
 - serve generated assets under `/_ferrite/static`
 - return server-payload JSON with `?__ferrite_payload=server`
 - return line-delimited server-payload stream frames with `?__ferrite_payload=stream`
@@ -42,9 +42,9 @@ pnpm release:verify:cargo
 cargo test --workspace
 cargo run -p ferrite-cli -- check --project examples/basic
 cargo run -p ferrite-cli -- build --project examples/basic
-cargo run -p ferrite-cli -- serve --project examples/basic --once --request-path /posts/abc
-cargo run -p ferrite-cli -- serve --project examples/basic --once --request-path '/posts/abc?__ferrite_payload=server'
-cargo run -p ferrite-cli -- serve --project examples/basic --once --request-path '/posts/abc?__ferrite_payload=stream'
+cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path /posts/abc
+cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path '/posts/abc?__ferrite_payload=server'
+cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path '/posts/abc?__ferrite_payload=stream'
 ```
 
 Remote release gates are still required once a GitHub remote exists:
@@ -86,7 +86,7 @@ Run Ferrite behind a production reverse proxy or ingress that owns:
 The Ferrite production adapter is currently a direct HTTP/1.1 application server. Bind it to a private interface when a proxy is present:
 
 ```sh
-cargo run -p ferrite-cli -- serve --project /srv/app --host 127.0.0.1 --port 3000
+cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build --page-renderer /srv/app/packages/runtime/bin/render-artifact.mjs --host 127.0.0.1 --port 3000
 ```
 
 Expose only the proxy publicly. Forward `Host` unchanged unless `--trusted-proxy-public-origin` is configured. If trusted-proxy mode is enabled, the proxy must set `X-Forwarded-Proto` and `X-Forwarded-Host` to the public origin values and must strip any client-supplied copies of those headers before forwarding. Ferrite does not trust `X-Forwarded-For` by default; set `--trusted-proxy-client-ip-hops` only when the proxy owns and sanitizes the forwarded chain.
@@ -106,6 +106,8 @@ Start the production server:
 export FERRITE_ACTION_CSRF='<generated-secret-token>'
 cargo run -p ferrite-cli -- serve \
   --project /srv/app \
+  --artifact .ferrite/build \
+  --page-renderer /srv/app/packages/runtime/bin/render-artifact.mjs \
   --host 127.0.0.1 \
   --port 3000 \
   --render-timeout-ms 30000 \
@@ -131,18 +133,20 @@ Ferrite includes first-pass deployment templates for a private-beta topology:
 - `deploy/systemd/ferrite.service`: process manager template for a private `127.0.0.1:3000` Ferrite service.
 - `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that owns `Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For`, and blocks the in-process metrics path from public proxy traffic.
 - `deploy/ferrite.env.example`: runtime environment variables for CSRF and public origin configuration.
-- `deploy/container/Dockerfile`: container template that builds the workspace, runs as a non-root runtime user, and starts `ferrite serve` with production limits, CSRF cookie binding, one-time server-action replay nonces, trusted-proxy origin checks, trusted forwarded client-IP hop count, JSON access logs, and JSON action audit logs. Its directly exposed default does not enable the metrics endpoint.
+- `deploy/container/Dockerfile`: container template that builds the workspace and example artifact, then copies only the CLI, dependency-free artifact runner, and verified artifact into the final image rather than application source, workspace packages, or `node_modules`. It runs as a non-root runtime user and starts artifact-backed `ferrite serve` with production limits, CSRF cookie binding, one-time server-action replay nonces, trusted-proxy origin checks, trusted forwarded client-IP hop count, JSON access logs, and JSON action audit logs. Its directly exposed default does not enable the metrics endpoint.
 
-These templates are checked by `scripts/verify-deployment-templates.test.mjs`. The container template also has a local Docker build and container smoke for the basic example route, including JSON access-log output. This is still not proof of a hosted staging deployment. Before using these templates for a paid beta, run the chosen template behind the real proxy, capture access logs, run the smoke tests below, and record rollback steps for the exact artifact version.
+These templates are checked statically by `scripts/verify-deployment-templates.test.mjs`. The exact artifact-only container also builds locally and has a runtime smoke proving a dynamic route, fingerprinted asset, JSON access log, non-root user, and absence of workspace packages and `node_modules`. This is not hosted deployment proof. Before using these templates for a paid beta, run the chosen template behind the real proxy, capture access logs, run the smoke tests below, and record rollback steps for the exact artifact version.
 
 ## Runtime Configuration
 
 Use command arguments for the current runtime knobs:
 
 - `--project`: app root
+- `--artifact`: immutable build directory relative to `--project` unless absolute; startup fails before serving when the manifest or any declared file is missing, incompatible, unsafe, or fails size/SHA-256 validation
+- `--page-renderer`: production artifact runner path; use `packages/runtime/bin/render-artifact.mjs`, not the build/dev `render-page.mjs`
 - `--host`: bind address
 - `--port`: bind port
-- `--render-timeout-ms`: maximum duration for each production renderer or client-bundler subprocess
+- `--render-timeout-ms`: maximum duration for each production artifact-runner subprocess
 - `--request-read-timeout-ms`: maximum time to wait while reading each production HTTP request
 - `--max-request-bytes`: maximum bytes allowed for each production HTTP request header and body
 - `--max-in-flight-requests`: maximum accepted production sockets across active and queued work; excess connections receive `503 Service Unavailable`
@@ -203,11 +207,11 @@ The nginx template returns `404` for the configured metrics path. A local collec
 The CLI can emit request outcome access logs to stderr:
 
 ```sh
-cargo run -p ferrite-cli -- serve --project /srv/app --access-log plain
-cargo run -p ferrite-cli -- serve --project /srv/app --access-log json
-cargo run -p ferrite-cli -- serve --project /srv/app --action-log plain
-cargo run -p ferrite-cli -- serve --project /srv/app --action-log json
-cargo run -p ferrite-cli -- serve --project /srv/app --metrics-path /__ferrite/metrics
+cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build --access-log plain
+cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build --access-log json
+cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build --action-log plain
+cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build --action-log json
+cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build --metrics-path /__ferrite/metrics
 ```
 
 Access log events include method, path, status, route pattern when known, derived client IP when available, and elapsed milliseconds. Action log events include action id, submitted route path, matched route pattern when known, status, accepted/rejected outcome, derived client IP when available, and elapsed milliseconds. Neither CLI log path includes request headers, request bodies, form fields, CSRF tokens, or replay nonces, so server-action form data and generated secrets are not logged by the Ferrite CLI access-log or action-log paths.
@@ -248,7 +252,7 @@ Current production hardening is incomplete. Ferrite can require one configured h
 
 Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately. If server actions are enabled in production, set `--server-action-csrf-token-env`, prefer `--server-action-csrf-cookie-name`, and set `--server-action-replay-ttl-ms` when a single Ferrite process owns the action form and action POST path. Rotate the referenced CSRF secret as part of the deployment process. The configured token must be cookie-safe when cookie binding is enabled. If the public TLS origin differs from the upstream Ferrite bind origin, set `--trusted-proxy-public-origin` and configure the proxy to own and sanitize the forwarded proto/host headers. If access logs need public client IPs behind the proxy, set `--trusted-proxy-client-ip-hops` to the exact number of trusted proxy hops and make the edge proxy overwrite `X-Forwarded-For`.
 
-Production render and bundle failures return generic `500` or `504` HTML. Detailed subprocess errors are written to server stderr and must be treated as potentially sensitive operational logs.
+Production artifact-runner failures return generic `500` or `504` HTML. Detailed subprocess errors are written to server stderr and must be treated as potentially sensitive operational logs.
 
 ## Known Gaps
 
@@ -256,8 +260,9 @@ Production render and bundle failures return generic `500` or `504` HTML. Detail
 - No GitHub remote or remote CI proof exists in this checkout.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
 - The production CLI exposes the main request/render limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and an in-memory Prometheus text metrics endpoint, but not tracing sinks or external audit sinks.
-- First-pass container, systemd, and nginx templates exist with local static verification and container smoke proof, but no official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
+- First-pass container, systemd, and nginx templates exist with local static verification, and the current artifact-only container has local build/runtime smoke proof. No official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
 - There is no first-class tracing integration or external metrics sink beyond the in-memory Prometheus text scrape endpoint.
-- `ferrite serve` still renders and bundles source modules at request time and serializes route handling through one shared production-project mutex. It does not yet consume a self-contained immutable `ferrite build` server artifact.
+- Artifact-backed dynamic HTML, payload, action, asset, integrity-failure, source-removal, and overlapping-request paths have local automated proof, but sustained load, subprocess recovery, and hosted rollback behavior are not yet proven.
+- Direct replacement of an existing build directory has a brief activation window even though failed activation attempts restore the previous directory when rollback succeeds. Production rollout should build a fresh versioned directory or image and atomically switch an external release pointer.
 - Production sockets have a read timeout and bounded admission, but no configurable response-write timeout yet.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.

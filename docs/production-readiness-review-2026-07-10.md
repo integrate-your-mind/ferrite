@@ -1,10 +1,10 @@
 # Ferrite Production Readiness Review
 
-Reviewed: 2026-07-10
+Updated: 2026-07-11
 
 ## Decision
 
-Ferrite is a credible local framework prototype and a defensible source-checkout private alpha for trusted developers. It is not ready for unmanaged public production use, a reliability-priced paid beta, or registry-first onboarding.
+Ferrite is a credible local framework prototype and a defensible artifact-backed private alpha for trusted developers. It is not ready for unmanaged public production use, a reliability-priced paid beta, or registry-first onboarding.
 
 The highest-return work is no longer broad React or Next.js parity. It is the production path between `ferrite build`, `ferrite serve`, a clean developer install, remote CI, and one hosted Builder AI Lab proof workflow.
 
@@ -19,33 +19,38 @@ Locally proven on `codex/protocol-wasm-validation`:
 - Four sequential Chromium tests.
 - Real example static build, render fixture, dev one-shot, and production serve one-shot.
 - npm release-shaped tarball creation and clean local install verification for four JS-facing packages.
-- Bounded production admission, renderer and bundler deadlines, generic public production errors, trusted forwarded-IP selection, and static deployment-template checks.
+- Bounded production admission, artifact-runner deadlines, generic public production errors, trusted forwarded-IP selection, and static deployment-template checks.
+- Staged production artifact installation with activation rollback, strict version/build/path/size/SHA-256/symlink validation, self-contained server modules for every route, parameter-independent browser bundles, verified-byte dynamic HTML/payload/action serving, runtime route-action registration, and manifest-only static asset serving.
+- Independent slow artifact requests overlap without a project-wide lock.
+- The exact artifact-only container builds and serves a dynamic route and fingerprinted asset as a non-root user with JSON access logs and no runtime workspace package tree.
 
 Explicitly not proven:
 
 - GitHub push, PR review, or remote CI; this checkout has no configured remote.
-- Hosted staging behind real TLS, proxy, process manager, CDN, or rollback automation.
+- Hosted staging behind real TLS, proxy, process manager, CDN, or rollback automation; local container proof does not establish this.
 - npm or native prebuild publication and registry installation.
 - Cargo registry publication. All 11 local archives now package with versioned internal dependencies, but publish ordering and registry installation are not proven.
-- A self-contained production server artifact; `ferrite serve` still executes source renderer and bundler subprocesses at request time.
-- Parallel route execution; matched requests still lock one shared `ProductionProject`.
+- Sustained production load, response-write deadlines, artifact-runner recovery, hosted multi-instance behavior, and rollback under live traffic. The current overlap test is a regression proof, not a capacity benchmark.
+- A clean-machine install and serve of the artifact from published packages rather than this monorepo checkout.
+- Atomic release activation through a versioned directory or image pointer; direct replacement of an existing build directory has a brief activation window.
 - Numeric Rust/JS coverage, mutation testing, or a browser-to-real-`ferrite serve` action/payload test.
 - Session-bound CSRF rotation, distributed replay storage, deployment-stable action IDs, first-class auth integration, or external tracing/audit sinks.
 - A Builder AI Lab model-gateway call or shared `proof_receipt` implementation.
 
 ## Blocking Findings
 
-### P0: Production Serve Is Not Artifact-Backed
+### Resolved Locally: Production Serve Is Artifact-Backed
 
-`ferrite build` emits static output and manifests, but `ferrite serve` rescans source and invokes Node rendering, metadata, action-manifest discovery, and client bundling during requests. The production adapter also protects the entire `ProductionProject` behind one mutex. The new admission and subprocess limits prevent unbounded growth, but they do not provide production throughput or immutable-release behavior.
+`ferrite build` now stages and installs `ferrite-server.json`, one self-contained server module and parameter-independent browser bundle per route, optional prerenders, build-observed action metadata, and SHA-256/size records. Failed activation restores the prior output when rollback succeeds, but direct directory replacement is not an atomic release-pointer swap. `ferrite serve` is artifact-only outside tests, validates and retains the complete artifact before startup, and passes verified module bytes to `render-artifact.mjs`, which has no esbuild dependency. Immutable route state is shared directly; replay nonces alone use a narrow mutex. A source/artifact-removal integration test covers bundled dependencies, dynamic HTML, payloads, conditional actions, and assets, and an overlap-event test proves concurrent execution.
 
 Required exit criteria:
 
-- Build emits a versioned server manifest, prebuilt server modules, action registry, and content-addressed client assets.
-- Serve accepts a build directory or release artifact and fails closed on missing or incompatible files.
-- Ordinary requests do not invoke esbuild or rediscover action manifests.
-- Independent route requests can execute concurrently without a global project lock.
-- Load tests prove bounded queues, `503` overload behavior, subprocess/worker recovery, and response-write deadlines.
+- [x] Build emits a versioned server manifest, self-contained server modules, build-observed action metadata, and content-addressed client assets.
+- [x] Serve accepts a build directory and fails closed on missing, incompatible, unsafe, or integrity-mismatched files.
+- [x] Ordinary requests do not import esbuild, scan source, or rediscover action manifests.
+- [x] Independent route requests execute concurrently without a global project lock.
+- [ ] Sustained load tests prove capacity, bounded queues, `503` overload behavior, artifact-runner/worker recovery, and response-write deadlines.
+- [ ] A versioned release-directory or image pointer provides atomic activation without the direct-directory rename window.
 
 ### P0: Developers Cannot Install A Coherent Release
 
@@ -81,9 +86,9 @@ Committed workflows verify npm tarballs and native prebuild dry-runs, but no gen
 
 ## Fastest Developer Launch
 
-1. Freeze parity work and implement artifact-backed serving plus real concurrency.
+1. Add response-write deadlines and sustained overload/artifact-runner recovery proof.
 2. Decide license, GitHub repository, and alpha distribution; configure the remote and open a small PR stack.
-3. Add one required remote workflow for lint, typecheck, build, full tests, Chromium, example integration, npm verification, Cargo packaging, and native artifacts.
+3. Run the required remote workflow for lint, typecheck, build, full tests, Chromium, artifact-backed example integration, npm verification, Cargo packaging, and native artifacts.
 4. Ship one clean-install starter path: `create-ferrite` or `ferrite init`, a pinned toolchain matrix, and one deployable example.
 5. Add a single `/builder-lab` demo route that executes one allowlisted real tool and returns the shared Builder AI Lab `proof_receipt` once that schema is authoritative. Do not present a fixture response as model or proof-runtime integration.
 6. Deploy the exact candidate artifact to staging behind TLS and the supplied proxy policy. Capture success, malformed input, action rejection, overload, timeout, metrics, logs, restart, and rollback evidence.
@@ -93,4 +98,4 @@ Committed workflows verify npm tarballs and native prebuild dry-runs, but no gen
 
 The near-term offer is a free, support-capped private alpha for teams evaluating a Rust-first TypeScript app framework on internal docs, dashboards, or proof-oriented tools. Do not sell public-production reliability, authenticated mutation safety, React Flight compatibility, or managed hosting yet.
 
-The first paid offer becomes defensible only after clean installation, remote CI, hosted staging, artifact-backed serving, and support/rollback terms are proven on the same release candidate.
+The first paid offer becomes defensible only after clean installation, remote CI, hosted staging, load/timeout evidence, and support/rollback terms are proven on the same release candidate.

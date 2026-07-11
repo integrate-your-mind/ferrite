@@ -118,6 +118,7 @@ Evidence used:
 - [x] 089: Private-alpha GTM gate documentation and deterministic sequential browser gate.
 - [x] 090: Dynamic action-route normalization, required example integration gate, bounded production admission, bundler deadlines, public error redaction, and safer deployment defaults.
 - [x] 091: Versioned Cargo path dependencies, local workspace archive verification, honest package metadata, and a full-gate CI workflow definition.
+- [x] 092: Staged versioned production artifacts with rollback, strict integrity loading and verified-byte retention, self-contained server modules, parameter-independent client bundles, artifact-only CLI serving, source/artifact-independent dynamic route/action proof, and removal of the global production request lock.
 
 ## Vacuous Or Weak Test Audit
 
@@ -146,8 +147,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] `@ferrite/node` optional prebuild resolution is partly proven with faked package resolution and locally generated package directories, not a real registry install.
 - [ ] Page-renderer server-action invocation and manifest tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary and explicit rendered-form manifest collection, but not automatic `"use server"` discovery or a real deployment action registry.
 - [ ] Browser runtime proof now includes Chromium coverage for generated server-action form enhancement, payload prefetch consumption, browser URL/title updates, stream-frame navigation, stream-mode popstate restoration, malformed programmatic payload rejection without DOM/history mutation, and malformed clicked-payload fallback to normal document navigation. Failed or malformed popstate fallback behavior, hydration mismatch paths, and many focus/pointer/history edge cases still mostly rely on Node plus `happy-dom`.
-- [ ] Dev/serve proof is local socket and one-shot proof, not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
-- [ ] Deployment templates now have static verifier coverage for serve flags, proxy forwarded headers, trusted forwarded client-IP hop policy, non-root container runtime, health-check presence, and a local Docker container smoke for the basic example route, but they have not been run in a hosted staging environment.
+- [ ] Dev/serve proof now includes local sockets, one-shot example execution, source/dependency/artifact-removal integration, dynamic HTML/payload/conditional-action/asset checks, startup integrity rejection, and explicit overlapping runner intervals. It is still not a deployed production environment behind TLS, CDN, process manager, or container orchestration.
+- [ ] Deployment templates have static verifier coverage for serve flags, proxy forwarded headers, trusted forwarded client-IP hop policy, non-root container runtime, and health-check presence. The exact artifact-only container also has local build/runtime proof for a dynamic route, fingerprinted asset, JSON access log, and no ambient package tree, but it has not run in hosted staging.
 - [ ] Server actions are explicit form transport plus DOM form enhancement, explicit rendered-form manifests, generated client-entrypoint bootstrap, dedicated server-only action bootstrap assets, Chromium proof for enhanced route/island/server-only action forms, required action `Host`, same-host rejection for browser-supplied cross-origin `Origin`/`Referer` headers, opt-in trusted-proxy public-origin validation, explicit trusted forwarded client-IP log policy, opt-in hidden CSRF token enforcement, opt-in production double-submit CSRF cookie binding, opt-in single-process replay nonce enforcement, and production action observer/audit-log proof. There is still no automatic `"use server"` discovery, deployment-stable inferred action ID registry, session-bound CSRF token rotation, multi-process replay coordination, upload streaming, client event action surface, hosted staging proof, or external audit sink.
 
 ## Productionization Checklist
@@ -177,8 +178,10 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Make the in-flight limit count queued and active sockets and reject excess connections with `503` instead of using an unbounded work queue.
 - [x] Apply the production subprocess deadline to client bundling as well as rendering, and keep raw subprocess errors out of public production HTML.
 - [x] Make the supplied nginx edge overwrite `X-Forwarded-For`, block public metrics proxying, and exclude common env/key files from the container build context.
-- [ ] Make `ferrite build` emit the immutable server artifact consumed by `ferrite serve`; current serving still renders and bundles source modules at request time.
-- [ ] Remove the shared `ProductionProject` mutex from matched route handling and prove useful parallel request execution under load.
+- [x] Make `ferrite build` stage and install the versioned server artifact consumed by `ferrite serve`, with self-contained modules, route-level client bundles, build-observed action metadata, file integrity records, and rollback on activation failure.
+- [ ] Add a versioned release-directory or image-pointer activation path for a truly atomic production rollout; direct replacement of an existing directory has a brief activation window.
+- [x] Remove the shared `ProductionProject` mutex from matched route handling and prove two deliberately slow artifact requests overlap.
+- [ ] Run sustained load/soak and artifact-runner recovery tests; the overlap regression test is not a capacity benchmark.
 - [ ] Add a configurable response-write timeout and slow-reader coverage.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
@@ -205,6 +208,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Remote-dependent push/PR steps remain unclaimed because this checkout has no remote.
 - [x] The audit now distinguishes staged tarball manifest and clean-install proof from remaining remote-CI and publication proof.
 - [x] Deployment docs now describe the current production adapter path, proxy/TLS assumptions, smoke tests, rollback, observability hooks, and security gaps without claiming deployed proof.
+- [x] README, architecture, deployment, GTM, readiness, and status docs now distinguish source-driven development/build execution from artifact-only production execution and preserve remote/hosted/load gaps.
 - [x] `ferrite serve` now exposes the main production request and render limits documented in the deployment guide.
 - [x] Deployment docs now document `--server-action-csrf-token-env` as the opt-in server-action CSRF token path while preserving remaining session/replay/auth gaps.
 - [x] Deployment docs now document `--server-action-csrf-cookie-name` as the opt-in production double-submit cookie binding path while preserving remaining session/replay/auth gaps.
