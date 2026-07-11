@@ -119,6 +119,7 @@ Evidence used:
 - [x] 090: Dynamic action-route normalization, required example integration gate, bounded production admission, bundler deadlines, public error redaction, and safer deployment defaults.
 - [x] 091: Versioned Cargo path dependencies, local workspace archive verification, honest package metadata, and a full-gate CI workflow definition.
 - [x] 092: Staged versioned production artifacts with rollback, strict integrity loading and verified-byte retention, self-contained server modules, parameter-independent client bundles, artifact-only CLI serving, source/artifact-independent dynamic route/action proof, and removal of the global production request lock.
+- [x] 093: Configurable absolute production response-write deadlines across fixed, gzip, chunked, parse-error, overload, and shutdown-drain paths, with real stalled-reader timeout proof.
 
 ## Vacuous Or Weak Test Audit
 
@@ -182,7 +183,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Add a versioned release-directory or image-pointer activation path for a truly atomic production rollout; direct replacement of an existing directory has a brief activation window.
 - [x] Remove the shared `ProductionProject` mutex from matched route handling and prove two deliberately slow artifact requests overlap.
 - [ ] Run sustained load/soak and artifact-runner recovery tests; the overlap regression test is not a capacity benchmark.
-- [ ] Add a configurable response-write timeout and slow-reader coverage.
+- [x] Add a configurable absolute response-write timeout and real stalled-reader coverage.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
 - [x] Add a local Cargo workspace package gate with versioned internal path dependencies; all 11 crate archives now build with `--no-verify`.

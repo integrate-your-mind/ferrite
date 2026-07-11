@@ -112,6 +112,7 @@ cargo run -p ferrite-cli -- serve \
   --port 3000 \
   --render-timeout-ms 30000 \
   --request-read-timeout-ms 5000 \
+  --response-write-timeout-ms 5000 \
   --max-request-bytes 16384 \
   --max-in-flight-requests 64 \
   --server-action-csrf-token-env FERRITE_ACTION_CSRF \
@@ -148,6 +149,7 @@ Use command arguments for the current runtime knobs:
 - `--port`: bind port
 - `--render-timeout-ms`: maximum duration for each production artifact-runner subprocess
 - `--request-read-timeout-ms`: maximum time to wait while reading each production HTTP request
+- `--response-write-timeout-ms`: absolute budget across headers and all fixed, gzip, or chunked writes for one production HTTP response; the minimum effective value is 1 ms
 - `--max-request-bytes`: maximum bytes allowed for each production HTTP request header and body
 - `--max-in-flight-requests`: maximum accepted production sockets across active and queued work; excess connections receive `503 Service Unavailable`
 - `--server-action-csrf-token-env`: environment variable containing the token rendered into server-action forms and required on action POSTs
@@ -161,7 +163,9 @@ Use command arguments for the current runtime knobs:
 - `--once`: deterministic one-request mode for smoke tests
 - `--request-path`: request target for `--once` smoke tests
 
-The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request/render limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and in-memory Prometheus-style counters, but not tracing sinks or external audit sinks.
+The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request/render/write limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and in-memory Prometheus-style counters, but not tracing sinks or external audit sinks.
+
+If the response-write deadline expires before any bytes are sent, the connection closes with no response. If it expires after a header or body prefix is sent, the client receives a truncated response and the connection closes; Ferrite cannot safely replace an in-progress HTTP response with a new error document. The concurrent server emits a generic response-write deadline message to stderr. Overload `503` responses use the smaller of the configured deadline and 100 ms so rejected sockets do not hold the accept loop for the normal response budget.
 
 ## Smoke Tests
 
@@ -259,10 +263,10 @@ Production artifact-runner failures return generic `500` or `504` HTML. Detailed
 - No npm packages are published yet.
 - No GitHub remote or remote CI proof exists in this checkout.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
-- The production CLI exposes the main request/render limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and an in-memory Prometheus text metrics endpoint, but not tracing sinks or external audit sinks.
+- The production CLI exposes the main request/render/write limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and an in-memory Prometheus text metrics endpoint, but not tracing sinks or external audit sinks.
 - First-pass container, systemd, and nginx templates exist with local static verification, and the current artifact-only container has local build/runtime smoke proof. No official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
 - There is no first-class tracing integration or external metrics sink beyond the in-memory Prometheus text scrape endpoint.
 - Artifact-backed dynamic HTML, payload, action, asset, integrity-failure, source-removal, and overlapping-request paths have local automated proof, but sustained load, subprocess recovery, and hosted rollback behavior are not yet proven.
 - Direct replacement of an existing build directory has a brief activation window even though failed activation attempts restore the previous directory when rollback succeeds. Production rollout should build a fresh versioned directory or image and atomically switch an external release pointer.
-- Production sockets have a read timeout and bounded admission, but no configurable response-write timeout yet.
+- Production sockets have request-read and whole-response-write deadlines plus bounded admission, with local stalled-reader proof. Sustained slow-reader load behind the real proxy remains unproven.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.

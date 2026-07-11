@@ -23,6 +23,7 @@ Locally proven on `codex/protocol-wasm-validation`:
 - Staged production artifact installation with activation rollback, strict version/build/path/size/SHA-256/symlink validation, self-contained server modules for every route, parameter-independent browser bundles, verified-byte dynamic HTML/payload/action serving, runtime route-action registration, and manifest-only static asset serving.
 - Independent slow artifact requests overlap without a project-wide lock.
 - The exact artifact-only container builds and serves a dynamic route and fingerprinted asset as a non-root user with JSON access logs and no runtime workspace package tree.
+- Production sockets enforce a configurable absolute response-write deadline across fixed, gzip, and chunked output; parse errors, overload rejection, and shutdown drain use bounded writers, and a real stalled-reader test proves typed timeout failure.
 
 Explicitly not proven:
 
@@ -30,7 +31,7 @@ Explicitly not proven:
 - Hosted staging behind real TLS, proxy, process manager, CDN, or rollback automation; local container proof does not establish this.
 - npm or native prebuild publication and registry installation.
 - Cargo registry publication. All 11 local archives now package with versioned internal dependencies, but publish ordering and registry installation are not proven.
-- Sustained production load, response-write deadlines, artifact-runner recovery, hosted multi-instance behavior, and rollback under live traffic. The current overlap test is a regression proof, not a capacity benchmark.
+- Sustained production load, concurrent slow-reader capacity, artifact-runner recovery, hosted multi-instance behavior, and rollback under live traffic. The current overlap and response-deadline tests are regression proofs, not capacity benchmarks.
 - A clean-machine install and serve of the artifact from published packages rather than this monorepo checkout.
 - Atomic release activation through a versioned directory or image pointer; direct replacement of an existing build directory has a brief activation window.
 - Numeric Rust/JS coverage, mutation testing, or a browser-to-real-`ferrite serve` action/payload test.
@@ -49,7 +50,8 @@ Required exit criteria:
 - [x] Serve accepts a build directory and fails closed on missing, incompatible, unsafe, or integrity-mismatched files.
 - [x] Ordinary requests do not import esbuild, scan source, or rediscover action manifests.
 - [x] Independent route requests execute concurrently without a global project lock.
-- [ ] Sustained load tests prove capacity, bounded queues, `503` overload behavior, artifact-runner/worker recovery, and response-write deadlines.
+- [x] Production fixed, gzip, chunked, parse-error, overload, and shutdown-drain responses use a configurable absolute write deadline, with real stalled-reader timeout proof.
+- [ ] Sustained load tests prove capacity, bounded queues, concurrent slow-reader behavior, and artifact-runner/worker recovery.
 - [ ] A versioned release-directory or image pointer provides atomic activation without the direct-directory rename window.
 
 ### P0: Developers Cannot Install A Coherent Release
@@ -78,7 +80,7 @@ Required exit criteria:
 
 ### P1: Security Is Private-Alpha Only
 
-This review fixed unbounded socket admission, an unbounded bundler subprocess, raw production error disclosure, forged forwarded client IPs in the supplied nginx topology, public proxying of metrics, and common secret-file inclusion in Docker build context. Remaining blockers are session-bound CSRF rotation, app-owned authentication guidance, distributed replay storage, duplicate-header/request-smuggling hardening, response-write timeouts, and external audit/tracing sinks.
+This review fixed unbounded socket admission, an unbounded bundler subprocess, raw production error disclosure, forged forwarded client IPs in the supplied nginx topology, public proxying of metrics, common secret-file inclusion in Docker build context, and unbounded response writes. Remaining blockers are session-bound CSRF rotation, app-owned authentication guidance, distributed replay storage, duplicate-header/request-smuggling hardening, and external audit/tracing sinks.
 
 ### P1: Remote And Hosted Evidence Is Missing
 
@@ -86,7 +88,7 @@ Committed workflows verify npm tarballs and native prebuild dry-runs, but no gen
 
 ## Fastest Developer Launch
 
-1. Add response-write deadlines and sustained overload/artifact-runner recovery proof.
+1. Add sustained overload, concurrent slow-reader, and artifact-runner recovery proof.
 2. Decide license, GitHub repository, and alpha distribution; configure the remote and open a small PR stack.
 3. Run the required remote workflow for lint, typecheck, build, full tests, Chromium, artifact-backed example integration, npm verification, Cargo packaging, and native artifacts.
 4. Ship one clean-install starter path: `create-ferrite` or `ferrite init`, a pinned toolchain matrix, and one deployable example.
