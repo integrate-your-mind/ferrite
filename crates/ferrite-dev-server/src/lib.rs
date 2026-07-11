@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -2452,6 +2452,7 @@ impl ProductionWorkerPool {
     }
 
     fn send(&self, mut stream: TcpStream) -> Result<()> {
+        stream.set_nonblocking(false)?;
         let reserved = self
             .in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -2459,6 +2460,7 @@ impl ProductionWorkerPool {
             })
             .is_ok();
         if !reserved {
+            let _ = stream.shutdown(Shutdown::Read);
             let _ = write_response_with_options(
                 &mut stream,
                 &DevResponse::service_unavailable(),
@@ -2470,6 +2472,7 @@ impl ProductionWorkerPool {
                     ),
                 },
             );
+            let _ = stream.shutdown(Shutdown::Write);
             return Ok(());
         }
 
@@ -5153,9 +5156,65 @@ process.exit(1);
     fn request_to_addr(addr: std::net::SocketAddr, request: &[u8]) -> String {
         let mut stream = TcpStream::connect(addr).unwrap();
         stream.write_all(request).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        response
+        stream.shutdown(Shutdown::Write).unwrap();
+        String::from_utf8(read_http_response(&mut stream).unwrap()).unwrap()
+    }
+
+    fn request_to_addr_with_timeout(
+        addr: std::net::SocketAddr,
+        request: &[u8],
+        timeout: Duration,
+    ) -> String {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.write_all(request).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        String::from_utf8(read_http_response(&mut stream).unwrap()).unwrap()
+    }
+
+    fn read_http_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            if http_response_is_complete(&response) {
+                return Ok(response);
+            }
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed before the HTTP response was complete",
+                    ));
+                }
+                Ok(read) => response.extend_from_slice(&buffer[..read]),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn http_response_is_complete(response: &[u8]) -> bool {
+        let Some(header_end) = find_header_end(response) else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&response[..header_end]);
+        let body = &response[header_end + 4..];
+        for line in headers.lines().skip(1) {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                return value
+                    .trim()
+                    .parse::<usize>()
+                    .is_ok_and(|expected| body.len() >= expected);
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value.trim().eq_ignore_ascii_case("chunked")
+            {
+                return body.ends_with(b"0\r\n\r\n");
+            }
+        }
+        false
     }
 
     fn read_request_from_client(request: &[u8], max_request_bytes: usize) -> RequestReadResult {
@@ -5182,6 +5241,73 @@ process.exit(1);
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn wait_for_directory_entries(path: &Path, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let entries = fs::read_dir(path)
+                .map(|entries| entries.count())
+                .unwrap_or_default();
+            if entries >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected} entries in {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn artifact_production_project_with_runner(
+        project: &Path,
+        runner_body: &str,
+    ) -> ProductionProject {
+        let artifact_root = project.join("artifact");
+        write(
+            &artifact_root.join("server/route.mjs"),
+            "export const routePattern = '/';\n",
+        );
+        let server_file = artifact_file_record(&artifact_root, "server/route.mjs").unwrap();
+        let manifest = ProductionArtifactManifest::new(
+            "/_ferrite/static",
+            false,
+            vec![ProductionArtifactRoute {
+                path: "/".to_owned(),
+                params: Vec::new(),
+                server_module: "server/route.mjs".to_owned(),
+                client_bundle: ClientBundle {
+                    script: None,
+                    action_bootstrap: None,
+                    styles: Vec::new(),
+                    outputs: Vec::new(),
+                    sourcemaps: Vec::new(),
+                    assets: Vec::new(),
+                    client_references: Vec::new(),
+                },
+                prerendered: BTreeMap::new(),
+                observed_actions: Vec::new(),
+            }],
+            vec![server_file],
+        )
+        .unwrap();
+        fs::write(
+            artifact_root.join(FERRITE_PRODUCTION_ARTIFACT_MANIFEST),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let runner = project.join("artifact-runner.mjs");
+        make_script(&runner, runner_body);
+        let production = ProductionProject::from_artifact(ProductionServerConfig::from_artifact(
+            project.to_path_buf(),
+            artifact_root.clone(),
+            runner,
+        ))
+        .unwrap();
+        fs::remove_dir_all(artifact_root).unwrap();
+        production
     }
 
     #[test]
@@ -6352,6 +6478,164 @@ setInterval(() => {}, 1000);
     }
 
     #[test]
+    fn artifact_worker_pool_recovers_after_a_saturation_wave() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut project = artifact_production_project_with_runner(
+            temp.path(),
+            r#"
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args.shift() !== "--prebuilt-stdin") process.exit(2);
+const mode = args[0];
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+if (mode !== "--stream") process.exit(3);
+const started = new URL("./overload-started/", import.meta.url);
+const release = new URL("./overload-release", import.meta.url);
+mkdirSync(started, { recursive: true });
+writeFileSync(new URL(String(process.pid), started), "started");
+const deadline = Date.now() + 15000;
+while (!existsSync(release)) {
+  if (Date.now() >= deadline) throw new Error("overload test release never arrived");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+process.stdout.write(JSON.stringify({
+  ferrite: "render-stream",
+  version: 1,
+  shell: [2, "main", {}, [[0, "overload recovered"]]],
+  chunks: []
+}));
+"#,
+        );
+        project.config.max_in_flight_requests = 2;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (controller, signal) = ProductionShutdownController::new_pair();
+        let server = thread::spawn(move || {
+            serve_production_listener_with_shutdown(listener, project, signal).unwrap();
+        });
+
+        let mut held_clients = Vec::new();
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            held_clients.push(stream);
+        }
+        wait_for_directory_entries(&temp.path().join("overload-started"), 2);
+
+        let overload_started = Instant::now();
+        let overloaded = (0..6)
+            .map(|_| {
+                request_to_addr_with_timeout(
+                    addr,
+                    b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                    Duration::from_secs(1),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(overload_started.elapsed() < Duration::from_secs(2));
+        assert!(
+            overloaded
+                .iter()
+                .all(|response| response.starts_with("HTTP/1.1 503 Service Unavailable"))
+        );
+        assert!(
+            overloaded
+                .iter()
+                .all(|response| response.contains("Cache-Control: no-store"))
+        );
+
+        write(&temp.path().join("overload-release"), "release");
+        for mut stream in held_clients {
+            let response = String::from_utf8(read_http_response(&mut stream).unwrap()).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("overload recovered"));
+        }
+        let recovered = request_to_addr_with_timeout(
+            addr,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            Duration::from_secs(5),
+        );
+        controller.shutdown();
+        server.join().unwrap();
+
+        assert!(recovered.starts_with("HTTP/1.1 200 OK"));
+        assert!(recovered.contains("overload recovered"));
+    }
+
+    #[test]
+    fn artifact_worker_recovers_after_runner_process_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut project = artifact_production_project_with_runner(
+            temp.path(),
+            r#"
+import { existsSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args.shift() !== "--prebuilt-stdin") process.exit(2);
+const mode = args[0];
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+if (mode !== "--stream") process.exit(3);
+const failed = new URL("./runner-failed-once", import.meta.url);
+if (!existsSync(failed)) {
+  writeFileSync(failed, "failed");
+  console.error("synthetic artifact runner failure");
+  process.exit(17);
+}
+process.stdout.write(JSON.stringify({
+  ferrite: "render-stream",
+  version: 1,
+  shell: [2, "main", {}, [[0, "runner recovered"]]],
+  chunks: []
+}));
+"#,
+        );
+        project.config.max_in_flight_requests = 1;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (controller, signal) = ProductionShutdownController::new_pair();
+        let server = thread::spawn(move || {
+            serve_production_listener_with_shutdown(listener, project, signal).unwrap();
+        });
+
+        let failed = request_to_addr_with_timeout(
+            addr,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            Duration::from_secs(5),
+        );
+        let recovered = request_to_addr_with_timeout(
+            addr,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            Duration::from_secs(5),
+        );
+        controller.shutdown();
+        server.join().unwrap();
+
+        assert!(
+            failed.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "unexpected failed-runner response: {failed:?}"
+        );
+        assert!(failed.contains("Ferrite could not render this route."));
+        assert!(!failed.contains("synthetic artifact runner failure"));
+        assert!(
+            recovered.starts_with("HTTP/1.1 200 OK"),
+            "unexpected recovery response: {recovered:?}"
+        );
+        assert!(recovered.contains("runner recovered"));
+        assert!(temp.path().join("runner-failed-once").exists());
+    }
+
+    #[test]
     fn production_worker_pool_serves_multiple_requests() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -6481,7 +6765,9 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
         assert!(started.elapsed() < Duration::from_secs(5));
 
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
+        if let Err(error) = stream.read_to_end(&mut response) {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
         assert!(response.starts_with(b"HTTP/1.1 200 OK"));
         assert!(response_body(&response).len() < ASSET_BYTES);
     }
