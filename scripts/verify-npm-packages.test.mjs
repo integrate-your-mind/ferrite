@@ -10,8 +10,57 @@ import {
   validateManifestMetadata,
   validatePackFiles,
   validatePackedManifest,
+  verifyCleanDeveloperWorkflow,
   verifyNpmPackages,
 } from "./verify-npm-packages.mjs";
+
+test("clean developer workflow rejects a missing artifact before building and then serves it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-clean-workflow-"));
+  const cliSource = join(root, "source-ferrite");
+  const calls = [];
+  try {
+    await writeFile(cliSource, "candidate cli");
+    await verifyCleanDeveloperWorkflow(root, {
+      cliSource,
+      runCommand: async (command, args, options) => {
+        calls.push({ command, args, cwd: options.cwd });
+        if (args[0] === "serve" && calls.filter((call) => call.args[0] === "serve").length === 1) {
+          throw new Error("build artifact does not exist");
+        }
+        return args[0] === "serve" ? "<h1>Clean Ferrite install</h1>" : "";
+      },
+    });
+
+    assert.deepEqual(calls.map((call) => call.args[0]), ["serve", "check", "build", "serve"]);
+    assert.ok(calls.every((call) => call.cwd === root));
+    assert.ok(calls[2].args.includes(join(root, "node_modules", "@ferrite", "runtime", "bin", "render-page.mjs")));
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("clean developer workflow fails when artifact serve does not render the fixture", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-clean-workflow-failure-"));
+  const cliSource = join(root, "source-ferrite");
+  let serveCalls = 0;
+  try {
+    await writeFile(cliSource, "candidate cli");
+    await assert.rejects(
+      verifyCleanDeveloperWorkflow(root, {
+        cliSource,
+        runCommand: async (_command, args) => {
+          if (args[0] === "serve" && serveCalls++ === 0) {
+            throw new Error("build artifact does not exist");
+          }
+          return args[0] === "serve" ? "wrong page" : "";
+        },
+      }),
+      /did not render the fixture page/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
 
 test("release package set stays explicit", () => {
   assert.deepEqual(RELEASE_PACKAGE_NAMES, [

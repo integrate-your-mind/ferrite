@@ -38,7 +38,9 @@
     "dist"
   ],
   "dependencies": {
-    "@ferrite/protocol": "workspace:*"
+    "@ferrite/protocol": "workspace:*",
+    "esbuild": "0.28.1",
+    "typescript": "6.0.3"
   },
   "scripts": {
     "build": "pnpm --filter @ferrite/protocol build && tsc -p tsconfig.json",
@@ -47,8 +49,6 @@
   },
   "devDependencies": {
     "@types/node": "26.0.1",
-    "esbuild": "0.28.1",
-    "happy-dom": "20.10.6",
-    "typescript": "6.0.3"
+    "happy-dom": "20.10.6"
   }
 }

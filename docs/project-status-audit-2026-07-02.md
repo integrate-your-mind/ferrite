@@ -13,7 +13,7 @@ Evidence used:
 - `docs/milestone-001-proof.md` through `docs/milestone-089-proof.md`
 - `package.json`
 - representative tests under `packages/`, `scripts/`, and `crates/`
-- live `npm pack --json` tarball manifest inspection plus clean offline install smoke for the JS-facing packages
+- live `npm pack --json` tarball inspection plus clean external-directory candidate CLI workflow proof for the JS-facing packages
 
 ## Current External State
 
@@ -131,7 +131,7 @@ Evidence used:
 - [ ] `packages/node/test/binding-resolution.test.mjs` uses fake `require` and fake `readFileSync` helpers. These are acceptable unit tests for resolver branching, but they do not prove a package manager installed optional native packages correctly.
 - [ ] `packages/node/test/prebuild-verifier.test.mjs` uses synthetic temp prebuild package directories. This is good verifier coverage, but it is not hosted-runner proof that each supported platform artifact can be built and aggregated.
 - [x] `scripts/verify-npm-packages.test.mjs` now proves the verifier packs from staged release manifests, preserves source manifests, and rejects source-only fields in packed manifests.
-- [x] The npm package verifier now clean-installs the generated local tarballs together in an offline temp project, smoke-imports protocol/runtime/WASM-safe packages, and checks `@ferrite/node` package presence without importing unpublished native prebuilds.
+- [x] The npm package verifier installs generated local tarballs in a temp project outside the workspace, smoke-imports protocol/runtime/WASM-safe packages, and uses a copied candidate CLI plus installed runtime runners for missing-artifact rejection, TypeScript check, production build, and artifact serve. Exact-pinned external build tools resolve from npm; unpublished Ferrite native prebuild loading remains unproven.
 - [x] `packages/protocol-wasm/test/wasm.test.mjs` now proves Rust WASM validation for server-payload packets and stream frames; `test/browser-wasm-bundler.test.mjs` proves generated client bundles can import and emit the protocol WASM artifact through the configured public path.
 - [ ] Runtime DOM coverage now includes Chromium proof for generated server-action form enhancement, payload prefetch/navigation, stream-frame navigation, stream-mode popstate restoration, malformed programmatic payload rejection, and malformed clicked-payload fallback, but hydration mismatch paths, failed or malformed popstate fallback behavior, and many focus/pointer/history edge cases still rely on deterministic `happy-dom` coverage.
 - [x] `enhanceServerActionForms()` has focused red-to-green coverage for the normal enhanced submit path, invalid response failure path, plain-form fallback, and listener cleanup.
@@ -147,7 +147,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 
 - [ ] GitHub state is local-only: no remote, no push, no PR, no remote CI run.
 - [ ] Native prebuild workflow proof is local plus committed YAML; the hosted runner matrix has not run from this checkout.
-- [ ] npm package proof now includes local staged `npm pack --json` tarball manifest inspection plus clean offline install of the generated tarballs; no package was published and no remote CI run consumed the artifacts.
+- [ ] npm package proof now includes staged `npm pack --json` inspection plus clean candidate `check`/`build`/artifact-serve outside the workspace; no Ferrite package or CLI was published and no remote CI run consumed the artifacts.
 - [x] Live staged-tarball inspection now proves packed manifests omit `private: true` and rewrite Ferrite `workspace:*` dependencies to `0.1.0` in `@ferrite/protocol-wasm` and `@ferrite/runtime`.
 - [ ] `@ferrite/node` optional prebuild resolution is partly proven with faked package resolution and locally generated package directories, not a real registry install.
 - [ ] Page-renderer server-action invocation and manifest tests use generated temp scripts/pages for subprocess proof. They exercise the protocol boundary and explicit rendered-form manifest collection, but not automatic `"use server"` discovery or a real deployment action registry.

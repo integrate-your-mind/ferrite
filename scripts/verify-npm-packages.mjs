@@ -384,11 +384,9 @@ export async function installPackedPackageSet(packages, { runCommand = run } = {
       [
         "install",
         "--ignore-scripts",
-        "--omit=optional",
         "--package-lock=false",
         "--no-audit",
         "--fund=false",
-        "--offline",
         ...packages.map((pkg) => pkg.tarballPath),
       ],
       { cwd: installRoot, capture: true },
@@ -397,9 +395,62 @@ export async function installPackedPackageSet(packages, { runCommand = run } = {
       cwd: installRoot,
       capture: true,
     });
+    if (packages.some((pkg) => pkg.name === "@ferrite/runtime")) {
+      await verifyCleanDeveloperWorkflow(installRoot, { runCommand });
+    }
   } finally {
     await rm(installRoot, { force: true, recursive: true });
   }
+}
+
+export async function verifyCleanDeveloperWorkflow(
+  installRoot,
+  { runCommand = run, cliSource = join(workspaceRoot, "target", "debug", process.platform === "win32" ? "ferrite.exe" : "ferrite") } = {},
+) {
+  const cliPath = join(installRoot, process.platform === "win32" ? "ferrite.exe" : "ferrite");
+  const appDir = join(installRoot, "app");
+  const runtimeBin = join(installRoot, "node_modules", "@ferrite", "runtime", "bin");
+  await cp(cliSource, cliPath);
+  await mkdir(appDir, { recursive: true });
+  await writeFile(
+    join(installRoot, "tsconfig.json"),
+    `${JSON.stringify({ compilerOptions: { jsx: "react-jsx", jsxImportSource: "@ferrite/runtime", module: "ES2022", moduleResolution: "Bundler", strict: true, target: "ES2022" }, include: ["app/**/*.tsx", ".ferrite/types/**/*.d.ts"] }, null, 2)}\n`,
+  );
+  await writeFile(
+    join(appDir, "page.tsx"),
+    `export default function Page() { return <main><h1>Clean Ferrite install</h1></main>; }\n`,
+  );
+
+  await assertCommandFails(
+    runCommand,
+    cliPath,
+    ["serve", "--project", installRoot, "--artifact", ".ferrite/build", "--page-renderer", join(runtimeBin, "render-artifact.mjs"), "--once"],
+    { cwd: installRoot, capture: true },
+    "clean install serve must reject a missing build artifact",
+  );
+  await runCommand(cliPath, ["check", "--project", installRoot], { cwd: installRoot, capture: true });
+  await runCommand(
+    cliPath,
+    ["build", "--project", installRoot, "--page-renderer", join(runtimeBin, "render-page.mjs"), "--client-bundler", join(runtimeBin, "build-client.mjs")],
+    { cwd: installRoot, capture: true },
+  );
+  const output = await runCommand(
+    cliPath,
+    ["serve", "--project", installRoot, "--artifact", ".ferrite/build", "--page-renderer", join(runtimeBin, "render-artifact.mjs"), "--once"],
+    { cwd: installRoot, capture: true },
+  );
+  if (!output.includes("Clean Ferrite install")) {
+    throw new Error("clean install artifact serve did not render the fixture page");
+  }
+}
+
+async function assertCommandFails(runCommand, command, args, options, message) {
+  try {
+    await runCommand(command, args, options);
+  } catch {
+    return;
+  }
+  throw new Error(message);
 }
 
 function assertInstallablePackages(packages) {

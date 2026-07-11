@@ -18,7 +18,7 @@ Locally proven on `codex/protocol-wasm-validation`:
 - Full workspace tests, including real loopback HTTP tests.
 - Four sequential Chromium tests.
 - Real example static build, render fixture, dev one-shot, and production serve one-shot.
-- npm release-shaped tarball creation and clean local install verification for four JS-facing packages.
+- npm release-shaped tarball creation plus clean external-directory `check`, `build`, and artifact-serve verification for four JS-facing packages and a copied candidate CLI.
 - Bounded production admission, artifact-runner deadlines, generic public production errors, trusted forwarded-IP selection, and static deployment-template checks.
 - Staged production artifact installation with activation rollback, strict version/build/path/size/SHA-256/symlink validation, self-contained server modules for every route, parameter-independent browser bundles, verified-byte dynamic HTML/payload/action serving, runtime route-action registration, and manifest-only static asset serving.
 - Independent slow artifact requests overlap without a project-wide lock.
@@ -33,7 +33,7 @@ Explicitly not proven:
 - npm or native prebuild publication and registry installation.
 - Cargo registry publication. All 11 local archives now package with versioned internal dependencies, but publish ordering and registry installation are not proven.
 - Sustained production load/soak, concurrent slow-reader capacity, host-process supervisor recovery, hosted multi-instance behavior, and rollback under live traffic. The current overlap, saturation/recovery, subprocess-recovery, and response-deadline tests are regression proofs, not capacity benchmarks.
-- A clean-machine install and serve of the artifact from published packages rather than this monorepo checkout.
+- A clean-machine install from published packages and a publicly distributed CLI rather than locally packed candidates and a copied CLI binary.
 - Atomic release activation through a versioned directory or image pointer; direct replacement of an existing build directory has a brief activation window.
 - Workspace-wide Rust/JS branch thresholds, mutation testing, or a browser-to-real-`ferrite serve` action/payload test. A one-time local `ferrite-dev-server` coverage run reports 90.12% line, 90.20% function, and 89.58% region coverage, but it is not yet a committed CI threshold.
 - Session-bound CSRF rotation, distributed replay storage, deployment-stable action IDs, first-class auth integration, or external tracing/audit sinks.
@@ -66,11 +66,11 @@ Required exit criteria:
 - Source/release manifests use one version and one license policy with real repository metadata.
 - Cargo packages publish in dependency order and install successfully from the selected registry; local archive creation alone is already proven.
 - Native prebuilds build and load on every advertised platform in hosted CI.
-- One clean machine installs the exact candidate artifacts and runs `check`, `build`, and `serve` without a monorepo checkout.
+- One clean machine installs the exact published artifacts and public CLI; the equivalent local-candidate flow is now proven outside the monorepo.
 
 ### P1: Green Tests Overstate Some Integration Surfaces
 
-The browser action test uses a fixture HTTP server and canned action response; payload navigation uses hand-authored packets. Deployment verification mainly checks template text. Native package install smoke omits optional dependencies and does not load a registry-installed addon. Several Rust adapter tests use generated scripts that prove argument and packet plumbing, not compatibility with the shipped runner.
+The browser action test uses a fixture HTTP server and canned action response; payload navigation uses hand-authored packets. Deployment verification mainly checks template text. The npm clean install allows optional dependencies so esbuild receives its platform binary, but it does not load a registry-installed Ferrite native addon. Several Rust adapter tests use generated scripts that prove argument and packet plumbing, not compatibility with the shipped runner.
 
 Required exit criteria:
 
