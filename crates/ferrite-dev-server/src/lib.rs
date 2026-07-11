@@ -58,6 +58,8 @@ const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_DEV_MAX_REQUEST_BYTES: usize = DEFAULT_PRODUCTION_MAX_REQUEST_BYTES;
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_PRODUCTION_OVERLOAD_WORKERS: usize = 4;
+const PRODUCTION_OVERLOAD_REQUEST_DRAIN_TIMEOUT: Duration = Duration::from_millis(25);
 const PRODUCTION_OVERLOAD_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const PRODUCTION_RESPONSE_WRITE_DEADLINE_MESSAGE: &str =
     "production response write deadline exceeded";
@@ -2395,9 +2397,12 @@ impl DevResponse {
 struct ProductionWorkerPool {
     sender: mpsc::Sender<TcpStream>,
     workers: Vec<thread::JoinHandle<()>>,
+    overload_sender: mpsc::SyncSender<TcpStream>,
+    overload_workers: Vec<thread::JoinHandle<()>>,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: usize,
     response_write_timeout: Duration,
+    max_request_bytes: usize,
 }
 
 struct ProductionInFlightGuard(Arc<AtomicUsize>);
@@ -2411,11 +2416,18 @@ impl Drop for ProductionInFlightGuard {
 impl ProductionWorkerPool {
     fn new(worker_count: usize, project: Arc<ProductionProject>) -> Self {
         let worker_count = worker_count.max(1);
+        let request_read_timeout = project.config.request_read_timeout;
         let response_write_timeout = project.config.response_write_timeout;
+        let max_request_bytes = project.config.max_request_bytes;
         let (sender, receiver) = mpsc::channel::<TcpStream>();
         let receiver = Arc::new(Mutex::new(receiver));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let mut workers = Vec::with_capacity(worker_count);
+        let overload_worker_count = worker_count.min(MAX_PRODUCTION_OVERLOAD_WORKERS);
+        let (overload_sender, overload_receiver) =
+            mpsc::sync_channel::<TcpStream>(worker_count.saturating_mul(2));
+        let overload_receiver = Arc::new(Mutex::new(overload_receiver));
+        let mut overload_workers = Vec::with_capacity(overload_worker_count);
 
         for _ in 0..worker_count {
             let receiver = Arc::clone(&receiver);
@@ -2442,16 +2454,42 @@ impl ProductionWorkerPool {
             }));
         }
 
+        for _ in 0..overload_worker_count {
+            let receiver = Arc::clone(&overload_receiver);
+            overload_workers.push(thread::spawn(move || {
+                loop {
+                    let stream = {
+                        let receiver = receiver
+                            .lock()
+                            .expect("production overload receiver mutex poisoned");
+                        receiver.recv()
+                    };
+                    let Ok(stream) = stream else {
+                        break;
+                    };
+                    reject_overloaded_stream(
+                        stream,
+                        request_read_timeout,
+                        response_write_timeout,
+                        max_request_bytes,
+                    );
+                }
+            }));
+        }
+
         Self {
             sender,
             workers,
+            overload_sender,
+            overload_workers,
             in_flight,
             max_in_flight: worker_count,
             response_write_timeout,
+            max_request_bytes,
         }
     }
 
-    fn send(&self, mut stream: TcpStream) -> Result<()> {
+    fn send(&self, stream: TcpStream) -> Result<()> {
         stream.set_nonblocking(false)?;
         let reserved = self
             .in_flight
@@ -2460,20 +2498,23 @@ impl ProductionWorkerPool {
             })
             .is_ok();
         if !reserved {
-            let _ = stream.shutdown(Shutdown::Read);
-            let _ = write_response_with_options(
-                &mut stream,
-                &DevResponse::service_unavailable(),
-                ResponseWriteOptions {
-                    gzip: false,
-                    deadline: Some(
-                        self.response_write_timeout
-                            .min(PRODUCTION_OVERLOAD_WRITE_TIMEOUT),
-                    ),
-                },
-            );
-            let _ = stream.shutdown(Shutdown::Write);
-            return Ok(());
+            return match self.overload_sender.try_send(stream) {
+                Ok(()) => Ok(()),
+                Err(mpsc::TrySendError::Full(stream)) => {
+                    reject_overloaded_stream_without_wait(
+                        stream,
+                        self.response_write_timeout,
+                        self.max_request_bytes,
+                    );
+                    Ok(())
+                }
+                Err(mpsc::TrySendError::Disconnected(_stream)) => {
+                    Err(DevServerError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "production overload worker pool is closed",
+                    )))
+                }
+            };
         }
 
         self.sender.send(stream).map_err(|_| {
@@ -2491,14 +2532,124 @@ impl ProductionWorkerPool {
     }
 
     #[cfg(test)]
+    fn overload_worker_count(&self) -> usize {
+        self.overload_workers.len()
+    }
+
+    #[cfg(test)]
     fn in_flight_count(&self) -> usize {
         self.in_flight.load(Ordering::Acquire)
     }
 
     fn shutdown(self) {
-        drop(self.sender);
-        for worker in self.workers {
+        let Self {
+            sender,
+            workers,
+            overload_sender,
+            overload_workers,
+            ..
+        } = self;
+        drop(sender);
+        drop(overload_sender);
+        for worker in workers {
             let _ = worker.join();
+        }
+        for worker in overload_workers {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn reject_overloaded_stream(
+    mut stream: TcpStream,
+    request_read_timeout: Duration,
+    response_write_timeout: Duration,
+    max_request_bytes: usize,
+) {
+    let _ = write_overload_response(&mut stream, response_write_timeout);
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = drain_overload_request(
+        &mut stream,
+        request_read_timeout
+            .min(PRODUCTION_OVERLOAD_REQUEST_DRAIN_TIMEOUT)
+            .max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT),
+        max_request_bytes,
+    );
+    let _ = stream.shutdown(Shutdown::Read);
+}
+
+fn reject_overloaded_stream_without_wait(
+    mut stream: TcpStream,
+    response_write_timeout: Duration,
+    max_request_bytes: usize,
+) {
+    let _ = stream.set_nonblocking(true);
+    let _ = write_overload_response(&mut stream, response_write_timeout);
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = drain_available_overload_request(&mut stream, max_request_bytes);
+    let _ = stream.shutdown(Shutdown::Read);
+}
+
+fn write_overload_response(stream: &mut TcpStream, response_write_timeout: Duration) -> Result<()> {
+    write_response_with_options(
+        stream,
+        &DevResponse::service_unavailable(),
+        ResponseWriteOptions {
+            gzip: false,
+            deadline: Some(response_write_timeout.min(PRODUCTION_OVERLOAD_WRITE_TIMEOUT)),
+        },
+    )
+}
+
+fn drain_overload_request(
+    stream: &mut TcpStream,
+    timeout: Duration,
+    max_request_bytes: usize,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let max_request_bytes = max_request_bytes.max(1);
+    let mut drained = 0;
+    let mut buffer = [0_u8; 1024];
+    stream.set_nonblocking(true)?;
+    let result = loop {
+        let remaining = max_request_bytes.saturating_sub(drained);
+        if remaining == 0 || Instant::now() >= deadline {
+            break Ok(());
+        }
+        let read_len = remaining.min(buffer.len());
+        match stream.read(&mut buffer[..read_len]) {
+            Ok(0) => break Ok(()),
+            Ok(read) => drained += read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => break Err(error),
+        }
+    };
+    let blocking = stream.set_nonblocking(false);
+    result.and(blocking)
+}
+
+fn drain_available_overload_request(
+    stream: &mut TcpStream,
+    max_request_bytes: usize,
+) -> std::io::Result<()> {
+    let max_request_bytes = max_request_bytes.max(1);
+    let mut drained = 0;
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let remaining = max_request_bytes.saturating_sub(drained);
+        if remaining == 0 {
+            return Ok(());
+        }
+        let read_len = remaining.min(buffer.len());
+        match stream.read(&mut buffer[..read_len]) {
+            Ok(0) => return Ok(()),
+            Ok(read) => drained += read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
 }
@@ -5172,6 +5323,98 @@ process.exit(1);
         String::from_utf8(read_http_response(&mut stream).unwrap()).unwrap()
     }
 
+    fn concurrent_requests_to_addr(
+        addr: std::net::SocketAddr,
+        request: &'static [u8],
+        count: usize,
+        timeout: Duration,
+    ) -> Vec<String> {
+        let barrier = Arc::new(Barrier::new(count + 1));
+        let clients = (0..count)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    request_to_addr_with_timeout(addr, request, timeout)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect()
+    }
+
+    fn response_status(response: &str) -> u16 {
+        response
+            .split_whitespace()
+            .nth(1)
+            .expect("HTTP response status")
+            .parse()
+            .expect("numeric HTTP response status")
+    }
+
+    fn peek_response_status(stream: &TcpStream, timeout: Duration) -> std::io::Result<u16> {
+        let deadline = Instant::now() + timeout;
+        stream.set_nonblocking(true)?;
+        let result = loop {
+            let mut prefix = [0_u8; 64];
+            match stream.peek(&mut prefix) {
+                Ok(0) => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed before an HTTP status arrived",
+                    ));
+                }
+                Ok(read) => {
+                    let prefix = String::from_utf8_lossy(&prefix[..read]);
+                    if let Some(status) = prefix
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|status| status.parse::<u16>().ok())
+                    {
+                        break Ok(status);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => break Err(error),
+            }
+            if Instant::now() >= deadline {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for an HTTP status",
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        stream.set_nonblocking(false)?;
+        result
+    }
+
+    fn connect_admitted_slow_reader(
+        addr: std::net::SocketAddr,
+        request: &[u8],
+        timeout: Duration,
+    ) -> TcpStream {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(timeout)).unwrap();
+            stream.write_all(request).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            match peek_response_status(&stream, timeout).unwrap() {
+                200 => return stream,
+                503 => {
+                    assert!(Instant::now() < deadline, "slow reader was never admitted");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                408 => panic!("complete slow-reader request received a false 408"),
+                status => panic!("slow-reader admission returned unexpected status {status}"),
+            }
+        }
+    }
+
     fn read_http_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
         let mut response = Vec::new();
         let mut buffer = [0_u8; 8192];
@@ -5265,12 +5508,29 @@ process.exit(1);
         project: &Path,
         runner_body: &str,
     ) -> ProductionProject {
+        artifact_production_project_with_runner_and_asset(project, runner_body, None)
+    }
+
+    fn artifact_production_project_with_runner_and_asset(
+        project: &Path,
+        runner_body: &str,
+        asset: Option<(&str, &[u8])>,
+    ) -> ProductionProject {
         let artifact_root = project.join("artifact");
         write(
             &artifact_root.join("server/route.mjs"),
             "export const routePattern = '/';\n",
         );
-        let server_file = artifact_file_record(&artifact_root, "server/route.mjs").unwrap();
+        let mut files = vec![artifact_file_record(&artifact_root, "server/route.mjs").unwrap()];
+        if let Some((relative_path, bytes)) = asset {
+            let path = artifact_root.join("_ferrite/static").join(relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+            files.push(
+                artifact_file_record(&artifact_root, &format!("_ferrite/static/{relative_path}"))
+                    .unwrap(),
+            );
+        }
         let manifest = ProductionArtifactManifest::new(
             "/_ferrite/static",
             false,
@@ -5290,7 +5550,7 @@ process.exit(1);
                 prerendered: BTreeMap::new(),
                 observed_actions: Vec::new(),
             }],
-            vec![server_file],
+            files,
         )
         .unwrap();
         fs::write(
@@ -6442,6 +6702,24 @@ setInterval(() => {}, 1000);
         let pool = ProductionWorkerPool::new(0, project);
 
         assert_eq!(pool.worker_count(), 1);
+        assert_eq!(pool.overload_worker_count(), 1);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn production_worker_pool_bounds_overload_rejection_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = Arc::new(production_project_for(&app));
+
+        let pool = ProductionWorkerPool::new(8, project);
+
+        assert_eq!(pool.worker_count(), 8);
+        assert_eq!(
+            pool.overload_worker_count(),
+            MAX_PRODUCTION_OVERLOAD_WORKERS
+        );
         pool.shutdown();
     }
 
@@ -6475,6 +6753,118 @@ setInterval(() => {}, 1000);
 
         drop(first_client);
         pool.shutdown();
+    }
+
+    #[test]
+    fn production_worker_pool_delivers_overload_response_when_request_bytes_arrive_after_accept() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = Arc::new(production_project_for(&app));
+        let pool = Arc::new(ProductionWorkerPool::new(1, project));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let first_client = TcpStream::connect(addr).unwrap();
+        let (first_server, _) = listener.accept().unwrap();
+        pool.send(first_server).unwrap();
+        assert_eq!(pool.in_flight_count(), 1);
+
+        let mut overloaded_client = TcpStream::connect(addr).unwrap();
+        overloaded_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (overloaded_server, _) = listener.accept().unwrap();
+        pool.send(overloaded_server).unwrap();
+        overloaded_client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        overloaded_client.shutdown(Shutdown::Write).unwrap();
+        let response =
+            String::from_utf8(read_http_response(&mut overloaded_client).unwrap()).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.contains("Cache-Control: no-store"));
+        assert!(!response.contains("408 Request Timeout"));
+        assert_eq!(pool.in_flight_count(), 1);
+
+        drop(first_client);
+        Arc::try_unwrap(pool).unwrap().shutdown();
+    }
+
+    #[test]
+    fn production_worker_pool_keeps_admission_bounded_during_silent_overload() {
+        const SILENT_OVERLOAD_CLIENTS: usize = 32;
+
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = Arc::new(production_project_for(&app));
+        let pool = ProductionWorkerPool::new(1, project);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let first_client = TcpStream::connect(addr).unwrap();
+        let (first_server, _) = listener.accept().unwrap();
+        pool.send(first_server).unwrap();
+        assert_eq!(pool.in_flight_count(), 1);
+
+        let admission_started = Instant::now();
+        let mut silent_clients = Vec::new();
+        for _ in 0..SILENT_OVERLOAD_CLIENTS {
+            let client = TcpStream::connect(addr).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            pool.send(server).unwrap();
+            silent_clients.push(client);
+        }
+        assert!(admission_started.elapsed() < Duration::from_millis(500));
+
+        let mut complete_client = TcpStream::connect(addr).unwrap();
+        complete_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        complete_client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        complete_client.shutdown(Shutdown::Write).unwrap();
+        let (complete_server, _) = listener.accept().unwrap();
+        let rejection_started = Instant::now();
+        pool.send(complete_server).unwrap();
+        let response =
+            String::from_utf8(read_http_response(&mut complete_client).unwrap()).unwrap();
+
+        assert!(rejection_started.elapsed() < Duration::from_secs(1));
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(!response.contains("408 Request Timeout"));
+
+        drop(silent_clients);
+        drop(first_client);
+        pool.shutdown();
+    }
+
+    #[test]
+    fn overload_request_drain_uses_an_absolute_budget_for_trickle_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            for _ in 0..100 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let started = Instant::now();
+        drain_overload_request(&mut stream, Duration::from_millis(25), 1024).unwrap();
+        let elapsed = started.elapsed();
+        drop(stream);
+        client.join().unwrap();
+
+        assert!(elapsed >= Duration::from_millis(20));
+        assert!(elapsed < Duration::from_millis(100));
     }
 
     #[test]
@@ -6633,6 +7023,219 @@ process.stdout.write(JSON.stringify({
         );
         assert!(recovered.contains("runner recovered"));
         assert!(temp.path().join("runner-failed-once").exists());
+    }
+
+    #[test]
+    fn artifact_server_sustains_mixed_load_and_recovers_without_resource_growth() {
+        const WORKERS: usize = 4;
+        const SLOW_READER_WAVES: usize = 3;
+        const OVERLOAD_CLIENTS: usize = 8;
+        const LOAD_WAVES: usize = 10;
+        const LOAD_CLIENTS: usize = 8;
+        const SLOW_ASSET_BYTES: usize = 64 * 1024 * 1024;
+        const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+        const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        const SLOW_REQUEST: &[u8] =
+            b"GET /_ferrite/static/slow.bin HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        let temp = tempfile::tempdir().unwrap();
+        let asset = vec![b'x'; SLOW_ASSET_BYTES];
+        let mut project = artifact_production_project_with_runner_and_asset(
+            temp.path(),
+            r#"
+import { appendFileSync, existsSync, unlinkSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args.shift() !== "--prebuilt-stdin") process.exit(2);
+const mode = args[0];
+const lifecycle = new URL("./runner-lifecycle.log", import.meta.url);
+const record = (event) => appendFileSync(lifecycle, `${event}\n`);
+record(`started:${mode}`);
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  record(`completed:${mode}`);
+  process.exit(0);
+}
+if (mode !== "--stream") process.exit(3);
+await new Promise((resolve) => setTimeout(resolve, 8));
+const failNext = new URL("./fail-next-runner", import.meta.url);
+if (existsSync(failNext)) {
+  unlinkSync(failNext);
+  record(`failed:${mode}`);
+  console.error("synthetic soak runner failure");
+  process.exit(17);
+}
+process.stdout.write(JSON.stringify({
+  ferrite: "render-stream",
+  version: 1,
+  shell: [2, "main", {}, [[0, "soak recovered"]]],
+  chunks: []
+}));
+record(`completed:${mode}`);
+"#,
+            Some(("slow.bin", &asset)),
+        );
+        project.config.max_in_flight_requests = WORKERS;
+        project.config.request_read_timeout = Duration::from_millis(500);
+        project.config.response_write_timeout = RESPONSE_WRITE_TIMEOUT;
+        project.config.render_timeout = Duration::from_secs(2);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (controller, signal) = ProductionShutdownController::new_pair();
+        let soak_started = Instant::now();
+        let server = thread::spawn(move || {
+            serve_production_listener_with_shutdown(listener, project, signal).unwrap();
+        });
+
+        let warmup = request_to_addr_with_timeout(addr, REQUEST, Duration::from_secs(3));
+        assert_eq!(response_status(&warmup), 200, "warmup failed: {warmup:?}");
+
+        let mut overload_responses = 0;
+        for wave in 0..SLOW_READER_WAVES {
+            let slow_readers = (0..WORKERS)
+                .map(|_| {
+                    thread::spawn(move || {
+                        connect_admitted_slow_reader(addr, SLOW_REQUEST, Duration::from_secs(2))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|client| client.join().unwrap())
+                .collect::<Vec<_>>();
+            let all_slow_readers_admitted = Instant::now();
+
+            let overload_started = Instant::now();
+            let overloaded = concurrent_requests_to_addr(
+                addr,
+                REQUEST,
+                OVERLOAD_CLIENTS,
+                Duration::from_secs(2),
+            );
+            assert!(
+                overload_started.elapsed() < Duration::from_secs(2),
+                "overload responses exceeded their bound in wave {wave}"
+            );
+            for response in overloaded {
+                assert_eq!(
+                    response_status(&response),
+                    503,
+                    "complete overload request returned an unexpected status in wave {wave}: {response:?}"
+                );
+                assert!(response.contains("Cache-Control: no-store"));
+                overload_responses += 1;
+            }
+
+            let recovery_deadline = Instant::now() + Duration::from_secs(3);
+            let recovered = loop {
+                let response = request_to_addr_with_timeout(addr, REQUEST, Duration::from_secs(2));
+                let status = response_status(&response);
+                assert_ne!(
+                    status, 408,
+                    "complete request received a false 408 in wave {wave}"
+                );
+                if status == 200 {
+                    break response;
+                }
+                assert_eq!(status, 503, "unexpected recovery status in wave {wave}");
+                assert!(
+                    Instant::now() < recovery_deadline,
+                    "workers did not recover in wave {wave}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert!(recovered.contains("soak recovered"));
+
+            let settled_deadline =
+                all_slow_readers_admitted + RESPONSE_WRITE_TIMEOUT + Duration::from_millis(50);
+            if Instant::now() < settled_deadline {
+                thread::sleep(settled_deadline - Instant::now());
+            }
+
+            for mut stream in slow_readers {
+                let mut response = Vec::new();
+                if let Err(error) = stream.read_to_end(&mut response) {
+                    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+                assert!(
+                    response_body(&response).len() < SLOW_ASSET_BYTES,
+                    "slow reader unexpectedly received the entire asset in wave {wave}"
+                );
+            }
+        }
+        assert_eq!(overload_responses, SLOW_READER_WAVES * OVERLOAD_CLIENTS);
+
+        write(&temp.path().join("fail-next-runner"), "fail");
+        let failed = request_to_addr_with_timeout(addr, REQUEST, Duration::from_secs(3));
+        assert_eq!(
+            response_status(&failed),
+            500,
+            "post-saturation runner failure was not isolated"
+        );
+        assert!(!failed.contains("synthetic soak runner failure"));
+        let recovered = request_to_addr_with_timeout(addr, REQUEST, Duration::from_secs(3));
+        assert_eq!(
+            response_status(&recovered),
+            200,
+            "runner did not recover after saturation"
+        );
+
+        let mut successful_load_responses = 0;
+        let mut admitted_overload_responses = 0;
+        for wave in 0..LOAD_WAVES {
+            let responses =
+                concurrent_requests_to_addr(addr, REQUEST, LOAD_CLIENTS, Duration::from_secs(3));
+            let mut wave_successes = 0;
+            for response in responses {
+                match response_status(&response) {
+                    200 => {
+                        assert!(response.contains("soak recovered"));
+                        successful_load_responses += 1;
+                        wave_successes += 1;
+                    }
+                    503 => {
+                        assert!(response.contains("Cache-Control: no-store"));
+                        admitted_overload_responses += 1;
+                    }
+                    408 => panic!("complete load request received a false 408 in wave {wave}"),
+                    status => panic!("unexpected load status {status} in wave {wave}"),
+                }
+            }
+            assert!(wave_successes > 0, "load wave {wave} admitted no requests");
+        }
+        assert!(successful_load_responses >= LOAD_WAVES);
+        assert!(admitted_overload_responses > 0);
+
+        for request_index in 0..WORKERS * 2 {
+            let response = request_to_addr_with_timeout(addr, REQUEST, Duration::from_secs(3));
+            assert_eq!(
+                response_status(&response),
+                200,
+                "post-soak request {request_index} did not recover"
+            );
+        }
+
+        controller.shutdown();
+        let shutdown_started = Instant::now();
+        server.join().unwrap();
+        assert!(shutdown_started.elapsed() < Duration::from_secs(5));
+        assert!(soak_started.elapsed() < Duration::from_secs(30));
+
+        let lifecycle = fs::read_to_string(temp.path().join("runner-lifecycle.log")).unwrap();
+        let started = lifecycle
+            .lines()
+            .filter(|line| line.starts_with("started:"))
+            .count();
+        let completed = lifecycle
+            .lines()
+            .filter(|line| line.starts_with("completed:"))
+            .count();
+        let failed = lifecycle
+            .lines()
+            .filter(|line| line.starts_with("failed:"))
+            .count();
+        assert_eq!(failed, 1);
+        assert_eq!(started, completed + failed);
+        assert!(completed >= successful_load_responses * 2);
     }
 
     #[test]

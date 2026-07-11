@@ -122,6 +122,7 @@ Evidence used:
 - [x] 093: Configurable absolute production response-write deadlines across fixed, gzip, chunked, parse-error, overload, and shutdown-drain paths, with real stalled-reader timeout proof.
 - [x] 094: Native Darwin x64 prebuild CI moved from retired `macos-13` to the supported `macos-15-intel` runner label; local `actionlint` passes, while hosted execution remains unproven without a remote.
 - [x] 095: Artifact-backed controlled saturation/recovery and runner-failure/next-request proof, plus overload socket half-close handling that preserves bounded `503` responses instead of resetting clients with unread request bytes.
+- [x] 098: Bounded artifact-backed mixed-load soak with concurrent slow readers, deadline truncation, delayed-send overload `503` delivery, false-`408` rejection, post-saturation runner recovery, fixed rejection-worker and runner lifecycle cleanup, and final success.
 
 ## Vacuous Or Weak Test Audit
 
@@ -187,7 +188,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Add a versioned release-directory or image-pointer activation path for a truly atomic production rollout; direct replacement of an existing directory has a brief activation window.
 - [x] Remove the shared `ProductionProject` mutex from matched route handling and prove two deliberately slow artifact requests overlap.
 - [x] Add artifact-backed controlled saturation, recovered-capacity, and failed-runner/next-request regression proof.
-- [ ] Run sustained load/soak and concurrent slow-reader capacity tests; the overlap and controlled-wave regressions are not capacity benchmarks.
+- [x] Run bounded sustained mixed-load and concurrent slow-reader regression proof across real sockets.
+- [ ] Run hosted and long-duration capacity benchmarks with explicit throughput and latency targets.
 - [x] Add a configurable absolute response-write timeout and real stalled-reader coverage.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.
