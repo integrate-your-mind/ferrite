@@ -120,6 +120,7 @@ Evidence used:
 - [x] 091: Versioned Cargo path dependencies, local workspace archive verification, honest package metadata, and a full-gate CI workflow definition.
 - [x] 092: Staged versioned production artifacts with rollback, strict integrity loading and verified-byte retention, self-contained server modules, parameter-independent client bundles, artifact-only CLI serving, source/artifact-independent dynamic route/action proof, and removal of the global production request lock.
 - [x] 093: Configurable absolute production response-write deadlines across fixed, gzip, chunked, parse-error, overload, and shutdown-drain paths, with real stalled-reader timeout proof.
+- [x] 094: Native Darwin x64 prebuild CI moved from retired `macos-13` to the supported `macos-15-intel` runner label; local `actionlint` passes, while hosted execution remains unproven without a remote.
 
 ## Vacuous Or Weak Test Audit
 
