@@ -218,6 +218,13 @@ struct ServeArgs {
 
     #[arg(
         long,
+        default_value_t = 5_000,
+        help = "Maximum total milliseconds allowed to write each production HTTP response"
+    )]
+    response_write_timeout_ms: u64,
+
+    #[arg(
+        long,
         default_value_t = 16_384,
         help = "Maximum bytes allowed for each production HTTP request header and body"
     )]
@@ -580,6 +587,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             )
             .with_render_timeout(Duration::from_millis(args.render_timeout_ms))
             .with_request_read_timeout(Duration::from_millis(args.request_read_timeout_ms))
+            .with_response_write_timeout(Duration::from_millis(args.response_write_timeout_ms))
             .with_max_request_bytes(args.max_request_bytes)
             .with_max_in_flight_requests(args.max_in_flight_requests);
             if let Some(token) = server_action_csrf_token {
@@ -628,6 +636,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         page_renderer,
                         render_timeout_ms: production_limits.render_timeout_ms,
                         request_read_timeout_ms: production_limits.request_read_timeout_ms,
+                        response_write_timeout_ms: production_limits.response_write_timeout_ms,
                         max_request_bytes: production_limits.max_request_bytes,
                         max_in_flight_requests: production_limits.max_in_flight_requests,
                         response: response.into(),
@@ -645,6 +654,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         page_renderer: &page_renderer,
                         render_timeout_ms: production_limits.render_timeout_ms,
                         request_read_timeout_ms: production_limits.request_read_timeout_ms,
+                        response_write_timeout_ms: production_limits.response_write_timeout_ms,
                         max_request_bytes: production_limits.max_request_bytes,
                         max_in_flight_requests: production_limits.max_in_flight_requests,
                         url: format!("http://{addr}"),
@@ -659,6 +669,10 @@ fn run_cli(cli: Cli) -> Result<()> {
                     eprintln!(
                         "request read timeout ms: {}",
                         production_limits.request_read_timeout_ms
+                    );
+                    eprintln!(
+                        "response write timeout ms: {}",
+                        production_limits.response_write_timeout_ms
                     );
                     eprintln!("max request bytes: {}", production_limits.max_request_bytes);
                     eprintln!(
@@ -1050,6 +1064,7 @@ struct ServeOnceOutput {
     page_renderer: PathBuf,
     render_timeout_ms: u64,
     request_read_timeout_ms: u64,
+    response_write_timeout_ms: u64,
     max_request_bytes: usize,
     max_in_flight_requests: usize,
     response: DevResponseOutput,
@@ -1063,6 +1078,7 @@ struct ServeStartedOutput<'a> {
     page_renderer: &'a Path,
     render_timeout_ms: u64,
     request_read_timeout_ms: u64,
+    response_write_timeout_ms: u64,
     max_request_bytes: usize,
     max_in_flight_requests: usize,
     url: String,
@@ -1127,6 +1143,7 @@ fn action_outcome_str(outcome: ProductionActionOutcome) -> &'static str {
 struct ServeLimitsOutput {
     render_timeout_ms: u64,
     request_read_timeout_ms: u64,
+    response_write_timeout_ms: u64,
     max_request_bytes: usize,
     max_in_flight_requests: usize,
 }
@@ -1136,6 +1153,7 @@ impl ServeLimitsOutput {
         Self {
             render_timeout_ms: duration_millis_u64(config.render_timeout),
             request_read_timeout_ms: duration_millis_u64(config.request_read_timeout),
+            response_write_timeout_ms: duration_millis_u64(config.response_write_timeout),
             max_request_bytes: config.max_request_bytes,
             max_in_flight_requests: config.max_in_flight_requests,
         }
@@ -1259,6 +1277,8 @@ mod tests {
             "serve",
             "--request-read-timeout-ms",
             "750",
+            "--response-write-timeout-ms",
+            "900",
             "--max-request-bytes",
             "4096",
             "--max-in-flight-requests",
@@ -1271,6 +1291,7 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(args.request_read_timeout_ms, 750);
+        assert_eq!(args.response_write_timeout_ms, 900);
         assert_eq!(args.max_request_bytes, 4096);
         assert_eq!(args.max_in_flight_requests, 8);
     }
@@ -1593,6 +1614,7 @@ mod tests {
         )
         .with_render_timeout(Duration::ZERO)
         .with_request_read_timeout(Duration::ZERO)
+        .with_response_write_timeout(Duration::ZERO)
         .with_max_request_bytes(0)
         .with_max_in_flight_requests(0);
 
@@ -1600,6 +1622,7 @@ mod tests {
 
         assert_eq!(limits.render_timeout_ms, 1);
         assert_eq!(limits.request_read_timeout_ms, 1);
+        assert_eq!(limits.response_write_timeout_ms, 1);
         assert_eq!(limits.max_request_bytes, 1);
         assert_eq!(limits.max_in_flight_requests, 1);
     }

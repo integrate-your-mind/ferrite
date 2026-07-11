@@ -14,6 +14,7 @@ test("deployment templates keep production serve flags aligned", async () => {
     assert.match(source, /--artifact \.ferrite\/build/);
     assert.match(source, /render-artifact\.mjs/);
     assert.match(source, /--request-read-timeout-ms 5000/);
+    assert.match(source, /--response-write-timeout-ms 5000/);
     assert.match(source, /--max-request-bytes 16384/);
     assert.match(source, /--max-in-flight-requests 64/);
     assert.match(source, /--server-action-csrf-token-env FERRITE_ACTION_CSRF/);

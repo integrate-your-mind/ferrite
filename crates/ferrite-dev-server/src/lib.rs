@@ -50,6 +50,8 @@ const SERVER_ACTION_RESPONSE_CONTENT_TYPE: &str = "application/json; charset=utf
 const SERVER_ACTION_CSRF_COOKIE_ATTRIBUTES: &str = "Path=/; SameSite=Lax; HttpOnly; Secure";
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
+const DEFAULT_PRODUCTION_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_PRODUCTION_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -57,6 +59,8 @@ const DEFAULT_DEV_MAX_REQUEST_BYTES: usize = DEFAULT_PRODUCTION_MAX_REQUEST_BYTE
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PRODUCTION_OVERLOAD_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+const PRODUCTION_RESPONSE_WRITE_DEADLINE_MESSAGE: &str =
+    "production response write deadline exceeded";
 const SERVER_ACTION_REPLAY_NONCE_BYTES: usize = 16;
 
 #[derive(Debug)]
@@ -486,6 +490,7 @@ pub struct ProductionServerConfig {
     pub client_out_dir: PathBuf,
     pub client_public_path: String,
     pub request_read_timeout: Duration,
+    pub response_write_timeout: Duration,
     pub render_timeout: Duration,
     pub max_request_bytes: usize,
     pub max_in_flight_requests: usize,
@@ -522,6 +527,7 @@ impl ProductionServerConfig {
             client_out_dir,
             client_public_path,
             request_read_timeout: DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT,
+            response_write_timeout: DEFAULT_PRODUCTION_RESPONSE_WRITE_TIMEOUT,
             render_timeout: DEFAULT_PRODUCTION_RENDER_TIMEOUT,
             max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
             max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
@@ -549,6 +555,7 @@ impl ProductionServerConfig {
             client_out_dir: PathBuf::new(),
             client_public_path: String::new(),
             request_read_timeout: DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT,
+            response_write_timeout: DEFAULT_PRODUCTION_RESPONSE_WRITE_TIMEOUT,
             render_timeout: DEFAULT_PRODUCTION_RENDER_TIMEOUT,
             max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
             max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
@@ -566,6 +573,11 @@ impl ProductionServerConfig {
 
     pub fn with_request_read_timeout(mut self, timeout: Duration) -> Self {
         self.request_read_timeout = timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT);
+        self
+    }
+
+    pub fn with_response_write_timeout(mut self, timeout: Duration) -> Self {
+        self.response_write_timeout = timeout.max(MIN_PRODUCTION_RESPONSE_WRITE_TIMEOUT);
         self
     }
 
@@ -2385,6 +2397,7 @@ struct ProductionWorkerPool {
     workers: Vec<thread::JoinHandle<()>>,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: usize,
+    response_write_timeout: Duration,
 }
 
 struct ProductionInFlightGuard(Arc<AtomicUsize>);
@@ -2398,6 +2411,7 @@ impl Drop for ProductionInFlightGuard {
 impl ProductionWorkerPool {
     fn new(worker_count: usize, project: Arc<ProductionProject>) -> Self {
         let worker_count = worker_count.max(1);
+        let response_write_timeout = project.config.response_write_timeout;
         let (sender, receiver) = mpsc::channel::<TcpStream>();
         let receiver = Arc::new(Mutex::new(receiver));
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -2419,7 +2433,11 @@ impl ProductionWorkerPool {
                         break;
                     };
                     let _in_flight_guard = ProductionInFlightGuard(Arc::clone(&in_flight));
-                    let _ = handle_production_stream_concurrent(&mut stream, &project);
+                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project)
+                        && is_response_write_deadline_error(&error)
+                    {
+                        eprintln!("Ferrite production response write deadline exceeded");
+                    }
                 }
             }));
         }
@@ -2429,6 +2447,7 @@ impl ProductionWorkerPool {
             workers,
             in_flight,
             max_in_flight: worker_count,
+            response_write_timeout,
         }
     }
 
@@ -2440,8 +2459,17 @@ impl ProductionWorkerPool {
             })
             .is_ok();
         if !reserved {
-            let _ = stream.set_write_timeout(Some(PRODUCTION_OVERLOAD_WRITE_TIMEOUT));
-            let _ = write_response(&mut stream, &DevResponse::service_unavailable());
+            let _ = write_response_with_options(
+                &mut stream,
+                &DevResponse::service_unavailable(),
+                ResponseWriteOptions {
+                    gzip: false,
+                    deadline: Some(
+                        self.response_write_timeout
+                            .min(PRODUCTION_OVERLOAD_WRITE_TIMEOUT),
+                    ),
+                },
+            );
             return Ok(());
         }
 
@@ -2817,11 +2845,13 @@ fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()>
 
 fn handle_production_stream(stream: &mut TcpStream, project: &ProductionProject) -> Result<()> {
     let request_read_timeout = project.config.request_read_timeout;
+    let response_write_timeout = project.config.response_write_timeout;
     let max_request_bytes = project.config.max_request_bytes;
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     handle_production_stream_with_limits(
         stream,
         request_read_timeout,
+        response_write_timeout,
         max_request_bytes,
         |request| match request.method.as_str() {
             "GET" => {
@@ -2848,10 +2878,12 @@ fn handle_production_stream_concurrent(
 ) -> Result<()> {
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     let request_read_timeout = project.config.request_read_timeout;
+    let response_write_timeout = project.config.response_write_timeout;
     let max_request_bytes = project.config.max_request_bytes;
     handle_production_stream_with_limits(
         stream,
         request_read_timeout,
+        response_write_timeout,
         max_request_bytes,
         |request| match request.method.as_str() {
             "GET" => {
@@ -2875,6 +2907,7 @@ fn handle_production_stream_concurrent(
 fn handle_production_stream_with_limits<F>(
     stream: &mut TcpStream,
     request_read_timeout: Duration,
+    response_write_timeout: Duration,
     max_request_bytes: usize,
     mut handle_request: F,
 ) -> Result<()>
@@ -2884,15 +2917,24 @@ where
     stream.set_read_timeout(Some(
         request_read_timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT),
     ))?;
+    let response_write_timeout = response_write_timeout.max(MIN_PRODUCTION_RESPONSE_WRITE_TIMEOUT);
     let request = match read_http_request(stream, max_request_bytes)? {
         RequestReadResult::Request(request) => request,
         RequestReadResult::Response(response) => {
-            write_response(stream, &response)?;
+            write_response_with_options(
+                stream,
+                &response,
+                ResponseWriteOptions {
+                    gzip: false,
+                    deadline: Some(response_write_timeout),
+                },
+            )?;
             return Ok(());
         }
     };
     let write_options = ResponseWriteOptions {
         gzip: request.accepts_gzip(),
+        deadline: Some(response_write_timeout),
     };
     let response = handle_request(&request)?;
 
@@ -3105,6 +3147,7 @@ fn write_response(stream: &mut TcpStream, response: &DevResponse) -> Result<()> 
 #[derive(Debug, Default, Copy, Clone)]
 struct ResponseWriteOptions {
     gzip: bool,
+    deadline: Option<Duration>,
 }
 
 fn write_response_with_options(
@@ -3112,7 +3155,81 @@ fn write_response_with_options(
     response: &DevResponse,
     options: ResponseWriteOptions,
 ) -> Result<()> {
-    let should_gzip = options.gzip && is_gzip_eligible(response);
+    match options.deadline {
+        Some(timeout) => {
+            let mut writer = ResponseDeadlineWriter::new(stream, timeout);
+            write_response_to(&mut writer, response, options.gzip)
+        }
+        None => write_response_to(stream, response, options.gzip),
+    }
+}
+
+struct ResponseDeadlineWriter<'a> {
+    stream: &'a mut TcpStream,
+    started: Instant,
+    timeout: Duration,
+}
+
+impl<'a> ResponseDeadlineWriter<'a> {
+    fn new(stream: &'a mut TcpStream, timeout: Duration) -> Self {
+        Self {
+            stream,
+            started: Instant::now(),
+            timeout: timeout.max(MIN_PRODUCTION_RESPONSE_WRITE_TIMEOUT),
+        }
+    }
+
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(response_write_deadline_error)
+    }
+}
+
+impl Write for ResponseDeadlineWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.remaining()?;
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.write(bytes).map_err(map_response_write_error)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let remaining = self.remaining()?;
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.flush().map_err(map_response_write_error)
+    }
+}
+
+fn response_write_deadline_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        PRODUCTION_RESPONSE_WRITE_DEADLINE_MESSAGE,
+    )
+}
+
+fn is_response_write_deadline_error(error: &DevServerError) -> bool {
+    matches!(
+        error,
+        DevServerError::Io(error)
+            if error.kind() == std::io::ErrorKind::TimedOut
+                && error.to_string() == PRODUCTION_RESPONSE_WRITE_DEADLINE_MESSAGE
+    )
+}
+
+fn map_response_write_error(error: std::io::Error) -> std::io::Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        response_write_deadline_error()
+    } else {
+        error
+    }
+}
+
+fn write_response_to<W: Write>(stream: &mut W, response: &DevResponse, gzip: bool) -> Result<()> {
+    let should_gzip = gzip && is_gzip_eligible(response);
 
     if let Some(body_stream) = response.stream.as_ref() {
         write!(
@@ -3161,7 +3278,7 @@ fn write_response_with_options(
     Ok(())
 }
 
-fn write_response_compression_headers(stream: &mut TcpStream, gzip: bool) -> Result<()> {
+fn write_response_compression_headers<W: Write>(stream: &mut W, gzip: bool) -> Result<()> {
     if gzip {
         stream.write_all(b"Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")?;
     }
@@ -3285,7 +3402,7 @@ fn accept_encoding_value_allows_gzip(value: &str) -> bool {
         .is_some_and(|quality| quality > 0.0)
 }
 
-fn write_response_metadata_headers(stream: &mut TcpStream, response: &DevResponse) -> Result<()> {
+fn write_response_metadata_headers<W: Write>(stream: &mut W, response: &DevResponse) -> Result<()> {
     if let Some(cache_control) = response.cache_control {
         write!(stream, "Cache-Control: {cache_control}\r\n")?;
     }
@@ -3313,7 +3430,7 @@ fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+fn write_chunk<W: Write>(stream: &mut W, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -5995,6 +6112,10 @@ process.exit(1);
             DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT
         );
         assert_eq!(
+            project.config.response_write_timeout,
+            DEFAULT_PRODUCTION_RESPONSE_WRITE_TIMEOUT
+        );
+        assert_eq!(
             project.config.render_timeout,
             DEFAULT_PRODUCTION_RENDER_TIMEOUT
         );
@@ -6017,6 +6138,7 @@ process.exit(1);
             production_project_for(&app)
                 .config
                 .with_request_read_timeout(Duration::ZERO)
+                .with_response_write_timeout(Duration::ZERO)
                 .with_render_timeout(Duration::ZERO)
                 .with_max_request_bytes(0)
                 .with_max_in_flight_requests(0),
@@ -6025,6 +6147,10 @@ process.exit(1);
         assert_eq!(
             project.config.request_read_timeout,
             MIN_PRODUCTION_REQUEST_READ_TIMEOUT
+        );
+        assert_eq!(
+            project.config.response_write_timeout,
+            MIN_PRODUCTION_RESPONSE_WRITE_TIMEOUT
         );
         assert_eq!(project.config.render_timeout, MIN_PRODUCTION_RENDER_TIMEOUT);
         assert_eq!(project.config.max_request_bytes, 1);
@@ -6310,6 +6436,57 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
     }
 
     #[test]
+    fn production_shutdown_bounds_a_stalled_response_writer() {
+        const ASSET_BYTES: usize = 64 * 1024 * 1024;
+
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = production_project_for(&app);
+        project.config.response_write_timeout = Duration::from_millis(50);
+        project.config.max_in_flight_requests = 1;
+        project
+            .snapshot
+            .set(ProductionRouteSnapshot {
+                routes: Vec::new(),
+                document_file: None,
+                client_bundles: BTreeMap::new(),
+                server_module_sources: BTreeMap::new(),
+                verified_static_assets: Some(BTreeMap::from([(
+                    "large.bin".to_owned(),
+                    Arc::<[u8]>::from(vec![b'x'; ASSET_BYTES]),
+                )])),
+            })
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (controller, signal) = ProductionShutdownController::new_pair();
+        let server = thread::spawn(move || {
+            serve_production_listener_with_shutdown(listener, project, signal).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"GET /_ferrite/static/large.bin HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut first_byte = [0_u8; 1];
+        assert_eq!(stream.peek(&mut first_byte).unwrap(), 1);
+
+        let started = Instant::now();
+        controller.shutdown();
+        server.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(response_body(&response).len() < ASSET_BYTES);
+    }
+
+    #[test]
     fn production_adapter_rejects_oversized_request_headers() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -6355,6 +6532,73 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
         assert!(response.starts_with("HTTP/1.1 408 Request Timeout"));
         assert!(response.contains("Content-Type: text/plain; charset=utf-8"));
         assert!(response.ends_with("Request Timeout\n"));
+    }
+
+    #[test]
+    fn response_deadline_writer_uses_one_budget_across_writes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut writer = ResponseDeadlineWriter::new(&mut stream, Duration::from_millis(25));
+            writer.write_all(b"first").unwrap();
+            thread::sleep(Duration::from_millis(50));
+            writer
+                .write_all(b"second")
+                .expect_err("the deadline must not reset after a successful write")
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let error = server.join().unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            PRODUCTION_RESPONSE_WRITE_DEADLINE_MESSAGE
+        );
+        assert_eq!(response, b"first");
+    }
+
+    #[test]
+    fn production_adapter_times_out_a_stalled_response_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_production_stream_with_limits(
+                &mut stream,
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+                DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
+                |_request| {
+                    Ok(DevResponse::ok(
+                        "application/octet-stream",
+                        vec![b'x'; 64 * 1024 * 1024],
+                    ))
+                },
+            )
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let started = Instant::now();
+        let error = server
+            .join()
+            .unwrap()
+            .expect_err("a stalled reader must exhaust the response deadline");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(matches!(
+            error,
+            DevServerError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::TimedOut
+                    && error.to_string().contains("response write deadline exceeded")
+        ));
+        drop(stream);
     }
 
     #[test]
