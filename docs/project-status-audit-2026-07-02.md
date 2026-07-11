@@ -121,6 +121,7 @@ Evidence used:
 - [x] 092: Staged versioned production artifacts with rollback, strict integrity loading and verified-byte retention, self-contained server modules, parameter-independent client bundles, artifact-only CLI serving, source/artifact-independent dynamic route/action proof, and removal of the global production request lock.
 - [x] 093: Configurable absolute production response-write deadlines across fixed, gzip, chunked, parse-error, overload, and shutdown-drain paths, with real stalled-reader timeout proof.
 - [x] 094: Native Darwin x64 prebuild CI moved from retired `macos-13` to the supported `macos-15-intel` runner label; local `actionlint` passes, while hosted execution remains unproven without a remote.
+- [x] 095: Artifact-backed controlled saturation/recovery and runner-failure/next-request proof, plus overload socket half-close handling that preserves bounded `503` responses instead of resetting clients with unread request bytes.
 
 ## Vacuous Or Weak Test Audit
 
@@ -137,6 +138,8 @@ Evidence used:
 - [ ] Several proof docs rely on `--once`, temp fixtures, or local generated packages. These are valid milestone checks, but they are not deployment proof.
 - [ ] Chromium action and payload tests use fixture HTTP servers with canned action responses or packets. They prove browser enhancement/navigation behavior, not browser-to-`ferrite serve` end-to-end behavior.
 - [x] `pnpm test` now runs the real example build, render fixture, dev `--once`, and production serve `--once` path after the prior gate missed a dynamic server-action route-pattern regression.
+- [x] A local instrumented `ferrite-dev-server` run reports 90.12% line, 90.20% function, and 89.58% region coverage across 90 tests.
+- [ ] Commit workspace-wide Rust/JS branch coverage thresholds and mutation-testing policy; the one-time server measurement is not a CI gate.
 
 No known tests were identified as deliberately fake success paths. The weak areas above should be treated as productionization backlog, not as evidence that the tested code is worthless.
 
@@ -183,7 +186,8 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [x] Make `ferrite build` stage and install the versioned server artifact consumed by `ferrite serve`, with self-contained modules, route-level client bundles, build-observed action metadata, file integrity records, and rollback on activation failure.
 - [ ] Add a versioned release-directory or image-pointer activation path for a truly atomic production rollout; direct replacement of an existing directory has a brief activation window.
 - [x] Remove the shared `ProductionProject` mutex from matched route handling and prove two deliberately slow artifact requests overlap.
-- [ ] Run sustained load/soak and artifact-runner recovery tests; the overlap regression test is not a capacity benchmark.
+- [x] Add artifact-backed controlled saturation, recovered-capacity, and failed-runner/next-request regression proof.
+- [ ] Run sustained load/soak and concurrent slow-reader capacity tests; the overlap and controlled-wave regressions are not capacity benchmarks.
 - [x] Add a configurable absolute response-write timeout and real stalled-reader coverage.
 - [ ] Run the native prebuild workflow on supported hosted runners and verify aggregate artifacts from CI.
 - [ ] Add real npm publishing workflow with provenance, trusted publishing or `NPM_TOKEN`, and native prebuild publication ordering.

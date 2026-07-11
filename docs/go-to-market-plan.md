@@ -67,7 +67,7 @@ Disallowed alpha claims until proven:
 1. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
 2. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, artifact-backed example integration, npm and Cargo package verification, and native prebuild dry-run.
 3. Prove the artifact-backed container or systemd template in hosted staging behind a real proxy/TLS boundary, including startup integrity rejection, dynamic route/payload/action smoke, private metrics scrape, logs, overload rejection, restart, and rollback.
-4. Add sustained load, slow-reader concurrency, and subprocess-recovery proof; the current overlapping-request and response-deadline tests are regression gates, not capacity benchmarks.
+4. Add sustained load/soak and concurrent slow-reader capacity proof; controlled saturation recovery and artifact-runner failure recovery are now regression gates, not capacity benchmarks.
 5. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
 6. Decide the alpha distribution path: private npm scope, tarball bundle, or source checkout. Do not charge for reliability until a real npm/native publish path is proven.
 7. Keep server actions limited to controlled/internal flows unless app-owned auth and CSRF middleware have been reviewed separately.
@@ -76,7 +76,7 @@ Disallowed alpha claims until proven:
 
 1. Production runtime architecture
 - `ferrite build` now stages and installs a versioned, SHA-256-verified server artifact; `ferrite serve` retains verified bytes before startup and uses a production runner without esbuild or source access. A versioned release directory/image pointer is still required for atomic rollout.
-- Immutable route state is shared without a project-wide mutex, and a slow-request regression test proves overlap. Sustained load, capacity, subprocess recovery, and hosted multi-instance behavior remain unproven.
+- Immutable route state is shared without a project-wide mutex; local artifact-backed regressions prove overlapping requests, prompt `503`s during a controlled saturation wave, recovered capacity, and successful worker reuse after a runner subprocess failure. Sustained load/capacity, host-process supervisor recovery, and hosted multi-instance behavior remain unproven.
 - Production sockets have a configurable absolute response-write deadline with fixed, gzip, chunked, parse-error, overload, shutdown-drain, and stalled-reader regression coverage. Sustained capacity remains unproven.
 
 2. Remote delivery proof gaps
@@ -110,7 +110,7 @@ Disallowed alpha claims until proven:
 
 ### Week 1
 - Day 1–2: push the completed artifact/concurrency milestone through remote review and exact-commit CI.
-- Day 3–4: add sustained overload, slow-reader concurrency, and subprocess-recovery proof around the completed response-write deadline.
+- Day 3–4: add sustained load/soak and concurrent slow-reader capacity proof around the completed response-write, controlled-overload, and artifact-runner recovery regressions.
 - Day 5: complete hosted deployment hardening pass 1:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
   - publish restart/rollback runbook, CLI request/action log schemas, and metrics/tracing integration plan.
