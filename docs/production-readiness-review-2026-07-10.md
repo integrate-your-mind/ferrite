@@ -93,7 +93,7 @@ Committed workflows verify npm tarballs and native prebuild dry-runs, but no gen
 1. Add sustained load/soak and concurrent slow-reader capacity proof around the completed controlled-overload and artifact-runner recovery regressions.
 2. Decide license, GitHub repository, and alpha distribution; configure the remote and open a small PR stack.
 3. Run the required remote workflow for lint, typecheck, build, full tests, Chromium, artifact-backed example integration, npm verification, Cargo packaging, and native artifacts.
-4. Ship one clean-install starter path: `create-ferrite` or `ferrite init`, a pinned toolchain matrix, and one deployable example.
+4. Publish the locally proven `ferrite init` starter path with a public CLI binary and pinned toolchain matrix, then validate it on a clean machine.
 5. Add a single `/builder-lab` demo route that executes one allowlisted real tool and returns the shared Builder AI Lab `proof_receipt` once that schema is authoritative. Do not present a fixture response as model or proof-runtime integration.
 6. Deploy the exact candidate artifact to staging behind TLS and the supplied proxy policy. Capture success, malformed input, action rejection, overload, timeout, metrics, logs, restart, and rollback evidence.
 7. Onboard one or two trusted developers. Continue only if each reaches a real successful run and can inspect a corresponding failure receipt without maintainer intervention.

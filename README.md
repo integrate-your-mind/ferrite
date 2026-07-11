@@ -52,6 +52,18 @@ The safest alpha offer today is a controlled internal dashboard, docs portal, or
 
 ## Commands
 
+Create a minimal TypeScript application with a locally built or installed `ferrite` binary:
+
+```sh
+ferrite init my-app
+cd my-app
+npm install
+npm run check
+npm run dev
+```
+
+Initialization refuses non-empty directories. Generated scripts use renderer and bundler files from installed `@ferrite/runtime`; a public Ferrite CLI binary and registry packages are not yet available.
+
 ```sh
 pnpm install
 cargo fmt --all -- --check

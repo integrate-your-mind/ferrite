@@ -27,13 +27,14 @@ test("clean developer workflow rejects a missing artifact before building and th
         if (args[0] === "serve" && calls.filter((call) => call.args[0] === "serve").length === 1) {
           throw new Error("build artifact does not exist");
         }
-        return args[0] === "serve" ? "<h1>Clean Ferrite install</h1>" : "";
+        return args[0] === "serve" ? "<p>Rust-first application runtime.</p>" : "";
       },
     });
 
-    assert.deepEqual(calls.map((call) => call.args[0]), ["serve", "check", "build", "serve"]);
-    assert.ok(calls.every((call) => call.cwd === root));
-    assert.ok(calls[2].args.includes(join(root, "node_modules", "@ferrite", "runtime", "bin", "render-page.mjs")));
+    assert.deepEqual(calls.map((call) => call.args[0]), ["init", "serve", "check", "build", "serve"]);
+    assert.equal(calls[0].cwd, root);
+    assert.ok(calls.slice(1).every((call) => call.cwd === join(root, "starter")));
+    assert.ok(calls[3].args.includes(join(root, "starter", "node_modules", "@ferrite", "runtime", "bin", "render-page.mjs")));
   } finally {
     await rm(root, { force: true, recursive: true });
   }

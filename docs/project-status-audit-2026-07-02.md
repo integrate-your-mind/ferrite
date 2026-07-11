@@ -200,6 +200,7 @@ No known tests were identified as deliberately fake success paths. The weak area
 - [ ] Add Helm or managed-platform deployment templates once a target platform is chosen.
 - [x] Make the npm verifier pack release-shaped staging manifests and reject `private: true` and `workspace:*` in actual tarball manifests.
 - [x] Add package-install smoke tests that consume packed packages from a clean project.
+- [x] Add fail-closed `ferrite init` generation and make the clean candidate verifier consume the generated starter for TypeScript check, production build, and artifact serve.
 - [x] Add browser bundler integration for the WASM protocol package where appropriate.
 - [x] Add stronger protocol-WASM proof for streaming payload validation, not only basic server-payload JSON validation.
 - [ ] Add upload streaming or file-part support if server actions need file inputs; current behavior rejects file parts.

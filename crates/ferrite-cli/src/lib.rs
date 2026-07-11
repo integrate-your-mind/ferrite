@@ -1,5 +1,6 @@
 use std::env;
 use std::fmt;
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +36,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    #[command(about = "Create a minimal Ferrite TypeScript application")]
+    Init(InitArgs),
+
     #[command(about = "List file-system routes discovered under app/")]
     Routes(ProjectArgs),
 
@@ -52,6 +56,12 @@ enum Commands {
 
     #[command(about = "Build an immutable Ferrite production artifact")]
     Build(BuildArgs),
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(default_value = ".", help = "Directory to initialize")]
+    project: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -440,6 +450,16 @@ fn run_cli(cli: Cli) -> Result<()> {
     let _no_color = cli.no_color;
 
     match cli.command {
+        Commands::Init(args) => {
+            let project = initialize_project(&args.project)?;
+            if cli.json {
+                print_json(&InitOutput { project })?;
+            } else {
+                println!("Ferrite project initialized");
+                println!("project: {}", project.display());
+                println!("next: npm install && npm run dev");
+            }
+        }
         Commands::Routes(args) => {
             let project = normalize_project_path(&args.project)?;
             let app_dir = resolve_project_path(&project, &args.app);
@@ -708,6 +728,58 @@ fn run_cli(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn initialize_project(project: &Path) -> Result<PathBuf> {
+    let project = if project.is_absolute() {
+        project.to_path_buf()
+    } else {
+        env::current_dir()?.join(project)
+    };
+    if project.exists() {
+        if !project.is_dir() {
+            return Err(CliError::Config(format!(
+                "init target is not a directory: {}",
+                project.display()
+            )));
+        }
+        if fs::read_dir(&project)?.next().transpose()?.is_some() {
+            return Err(CliError::Config(format!(
+                "refusing to initialize non-empty directory: {}",
+                project.display()
+            )));
+        }
+    }
+
+    fs::create_dir_all(project.join("app"))?;
+    fs::write(project.join("package.json"), starter_package_json())?;
+    fs::write(project.join("tsconfig.json"), starter_tsconfig())?;
+    fs::write(project.join("app/page.tsx"), starter_page())?;
+    fs::write(project.join(".gitignore"), ".ferrite/\nnode_modules/\n")?;
+    Ok(project)
+}
+
+fn starter_package_json() -> String {
+    format!(
+        concat!(
+            "{{\n  \"name\": \"ferrite-app\",\n  \"private\": true,\n  \"type\": \"module\",\n",
+            "  \"scripts\": {{\n",
+            "    \"check\": \"ferrite check\",\n",
+            "    \"dev\": \"ferrite dev --page-renderer node_modules/@ferrite/runtime/bin/render-page.mjs --client-bundler node_modules/@ferrite/runtime/bin/build-client.mjs\",\n",
+            "    \"build\": \"ferrite build --page-renderer node_modules/@ferrite/runtime/bin/render-page.mjs --client-bundler node_modules/@ferrite/runtime/bin/build-client.mjs\",\n",
+            "    \"start\": \"ferrite serve --page-renderer node_modules/@ferrite/runtime/bin/render-artifact.mjs\"\n",
+            "  }},\n  \"dependencies\": {{\n    \"@ferrite/runtime\": \"{}\"\n  }}\n}}\n"
+        ),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn starter_tsconfig() -> &'static str {
+    "{\n  \"compilerOptions\": {\n    \"jsx\": \"react-jsx\",\n    \"jsxImportSource\": \"@ferrite/runtime\",\n    \"module\": \"ES2022\",\n    \"moduleResolution\": \"Bundler\",\n    \"strict\": true,\n    \"target\": \"ES2022\"\n  },\n  \"include\": [\"app/**/*.tsx\", \".ferrite/types/**/*.d.ts\"]\n}\n"
+}
+
+fn starter_page() -> &'static str {
+    "export default function Page() {\n  return (\n    <main>\n      <h1>Ferrite</h1>\n      <p>Rust-first application runtime.</p>\n    </main>\n  );\n}\n"
 }
 
 fn read_input(path: &Path) -> Result<String> {
@@ -1148,6 +1220,11 @@ struct ServeLimitsOutput {
     max_in_flight_requests: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct InitOutput {
+    project: PathBuf,
+}
+
 impl ServeLimitsOutput {
     fn from(config: &ProductionServerConfig) -> Self {
         Self {
@@ -1193,6 +1270,53 @@ enum TypecheckStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initializes_a_minimal_typescript_project() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("nested/app");
+
+        let initialized = initialize_project(&project).unwrap();
+
+        assert_eq!(initialized, project);
+        let package = fs::read_to_string(project.join("package.json")).unwrap();
+        assert!(package.contains("\"@ferrite/runtime\": \"0.1.0\""));
+        assert!(package.contains("node_modules/@ferrite/runtime/bin/render-page.mjs"));
+        assert!(project.join("tsconfig.json").is_file());
+        assert!(project.join("app/page.tsx").is_file());
+        assert_eq!(
+            fs::read_to_string(project.join(".gitignore")).unwrap(),
+            ".ferrite/\nnode_modules/\n"
+        );
+    }
+
+    #[test]
+    fn init_refuses_to_modify_a_non_empty_directory() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("owned.txt"), "keep").unwrap();
+
+        let error = initialize_project(project.path()).unwrap_err();
+
+        assert!(matches!(error, CliError::Config(_)));
+        assert!(error.to_string().contains("non-empty directory"));
+        assert_eq!(
+            fs::read_to_string(project.path().join("owned.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!project.path().join("package.json").exists());
+    }
+
+    #[test]
+    fn init_refuses_a_file_target() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("existing");
+        fs::write(&target, "keep").unwrap();
+
+        let error = initialize_project(&target).unwrap_err();
+
+        assert!(error.to_string().contains("not a directory"));
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep");
+    }
 
     #[test]
     fn resolves_relative_project_paths() {
