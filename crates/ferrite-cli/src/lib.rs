@@ -47,10 +47,10 @@ enum Commands {
     #[command(about = "Run the Ferrite development server")]
     Dev(DevArgs),
 
-    #[command(about = "Run the Ferrite production HTTP adapter")]
+    #[command(about = "Serve a validated immutable Ferrite production artifact")]
     Serve(Box<ServeArgs>),
 
-    #[command(about = "Build static Ferrite production output")]
+    #[command(about = "Build an immutable Ferrite production artifact")]
     Build(BuildArgs),
 }
 
@@ -175,17 +175,10 @@ struct ServeArgs {
 
     #[arg(
         long,
-        default_value = "app",
-        help = "App directory, relative to --project unless absolute"
+        default_value = ".ferrite/build",
+        help = "Immutable Ferrite build artifact directory, relative to --project unless absolute"
     )]
-    app: PathBuf,
-
-    #[arg(
-        long,
-        default_value = ".ferrite/types/routes.d.ts",
-        help = "Generated route types path, relative to --project unless absolute"
-    )]
-    types_out: PathBuf,
+    artifact: PathBuf,
 
     #[arg(long, default_value = "127.0.0.1", help = "Host address to bind")]
     host: String,
@@ -204,31 +197,10 @@ struct ServeArgs {
 
     #[arg(
         long,
-        default_value = ".ferrite/server/static",
-        help = "Generated client asset directory, relative to --project unless absolute"
-    )]
-    client_out: PathBuf,
-
-    #[arg(
-        long,
-        default_value = "/_ferrite/static",
-        help = "Public URL prefix for generated client assets"
-    )]
-    client_public_path: String,
-
-    #[arg(
-        long,
-        default_value = "packages/runtime/bin/render-page.mjs",
-        help = "Page renderer script path, relative to the current directory unless absolute"
+        default_value = "packages/runtime/bin/render-artifact.mjs",
+        help = "Prebuilt artifact runner path, relative to the current directory unless absolute"
     )]
     page_renderer: PathBuf,
-
-    #[arg(
-        long,
-        default_value = "packages/runtime/bin/build-client.mjs",
-        help = "Client bundler script path, relative to the current directory unless absolute"
-    )]
-    client_bundler: PathBuf,
 
     #[arg(
         long,
@@ -582,11 +554,8 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Serve(args) => {
             let project = normalize_project_path(&args.project)?;
-            let app_dir = resolve_project_path(&project, &args.app);
-            let types_out = resolve_project_path(&project, &args.types_out);
-            let client_out = resolve_project_path(&project, &args.client_out);
+            let artifact = resolve_project_path(&project, &args.artifact);
             let page_renderer = normalize_current_path(&args.page_renderer)?;
-            let client_bundler = normalize_current_path(&args.client_bundler)?;
             let server_action_csrf_token =
                 resolve_server_action_csrf_token(args.server_action_csrf_token_env.as_deref())?;
             let server_action_csrf_cookie_name = resolve_server_action_csrf_cookie_name(
@@ -604,14 +573,10 @@ fn run_cli(cli: Cli) -> Result<()> {
                 trusted_proxy.is_some(),
             )?;
             let metrics_path = resolve_metrics_path(args.metrics_path.as_deref())?;
-            let mut config = ProductionServerConfig::new(
+            let mut config = ProductionServerConfig::from_artifact(
                 project.clone(),
-                app_dir.clone(),
-                types_out.clone(),
+                artifact.clone(),
                 page_renderer.clone(),
-                client_bundler.clone(),
-                client_out.clone(),
-                args.client_public_path.clone(),
             )
             .with_render_timeout(Duration::from_millis(args.render_timeout_ms))
             .with_request_read_timeout(Duration::from_millis(args.request_read_timeout_ms))
@@ -645,20 +610,22 @@ fn run_cli(cli: Cli) -> Result<()> {
                     eprintln!("{}", format_action_log_event(&event, format));
                 });
             }
-            let mut production_project = ProductionProject::new(config);
+            let production_project = ProductionProject::from_artifact(config)?;
             let production_limits = ServeLimitsOutput::from(production_project.config());
+            let artifact_build_id = production_project
+                .config()
+                .artifact_build_id
+                .clone()
+                .expect("artifact loader records a build id");
 
             if args.once {
                 let response = production_project.handle_get(&args.request_path)?;
                 if cli.json {
                     print_json(&ServeOnceOutput {
                         project,
-                        app_dir,
-                        types_out,
-                        client_out,
-                        client_public_path: args.client_public_path,
+                        artifact,
+                        artifact_build_id,
                         page_renderer,
-                        client_bundler,
                         render_timeout_ms: production_limits.render_timeout_ms,
                         request_read_timeout_ms: production_limits.request_read_timeout_ms,
                         max_request_bytes: production_limits.max_request_bytes,
@@ -673,12 +640,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 if cli.json {
                     print_json(&ServeStartedOutput {
                         project: &project,
-                        app_dir: &app_dir,
-                        types_out: &types_out,
-                        client_out: &client_out,
-                        client_public_path: &args.client_public_path,
+                        artifact: &artifact,
+                        artifact_build_id: &artifact_build_id,
                         page_renderer: &page_renderer,
-                        client_bundler: &client_bundler,
                         render_timeout_ms: production_limits.render_timeout_ms,
                         request_read_timeout_ms: production_limits.request_read_timeout_ms,
                         max_request_bytes: production_limits.max_request_bytes,
@@ -688,12 +652,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 } else {
                     eprintln!("Ferrite production server listening on http://{addr}");
                     eprintln!("project: {}", project.display());
-                    eprintln!("app: {}", app_dir.display());
-                    eprintln!("route types: {}", types_out.display());
-                    eprintln!("client out: {}", client_out.display());
-                    eprintln!("client public path: {}", args.client_public_path);
-                    eprintln!("page renderer: {}", page_renderer.display());
-                    eprintln!("client bundler: {}", client_bundler.display());
+                    eprintln!("artifact: {}", artifact.display());
+                    eprintln!("artifact build id: {artifact_build_id}");
+                    eprintln!("artifact runner: {}", page_renderer.display());
                     eprintln!("render timeout ms: {}", production_limits.render_timeout_ms);
                     eprintln!(
                         "request read timeout ms: {}",
@@ -795,11 +756,17 @@ fn print_build_report(report: &BuildReport) {
         "server action manifests: {}",
         report.server_action_manifests.len()
     );
+    println!("server modules: {}", report.server_modules.len());
     println!(
         "skipped dynamic routes: {}",
         report.skipped_dynamic_routes.len()
     );
     println!("manifest: {}", report.manifest_file.display());
+    println!(
+        "production manifest: {}",
+        report.production_manifest_file.display()
+    );
+    println!("production build id: {}", report.production_build_id);
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -1078,12 +1045,9 @@ struct DevStartedOutput<'a> {
 #[derive(Debug, Serialize)]
 struct ServeOnceOutput {
     project: PathBuf,
-    app_dir: PathBuf,
-    types_out: PathBuf,
-    client_out: PathBuf,
-    client_public_path: String,
+    artifact: PathBuf,
+    artifact_build_id: String,
     page_renderer: PathBuf,
-    client_bundler: PathBuf,
     render_timeout_ms: u64,
     request_read_timeout_ms: u64,
     max_request_bytes: usize,
@@ -1094,12 +1058,9 @@ struct ServeOnceOutput {
 #[derive(Debug, Serialize)]
 struct ServeStartedOutput<'a> {
     project: &'a Path,
-    app_dir: &'a Path,
-    types_out: &'a Path,
-    client_out: &'a Path,
-    client_public_path: &'a str,
+    artifact: &'a Path,
+    artifact_build_id: &'a str,
     page_renderer: &'a Path,
-    client_bundler: &'a Path,
     render_timeout_ms: u64,
     request_read_timeout_ms: u64,
     max_request_bytes: usize,
@@ -1240,6 +1201,55 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(args.render_timeout_ms, 250);
+    }
+
+    #[test]
+    fn serve_accepts_only_an_immutable_artifact_input() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--artifact",
+            "release/ferrite",
+            "--once",
+        ])
+        .unwrap();
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.artifact, PathBuf::from("release/ferrite"));
+
+        assert!(Cli::try_parse_from(["ferrite", "serve", "--app", "app", "--once"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ferrite",
+                "serve",
+                "--client-bundler",
+                "build-client.mjs",
+                "--once",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn serve_fails_before_request_handling_when_the_artifact_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--project",
+            temp.path().to_str().unwrap(),
+            "--once",
+        ])
+        .unwrap();
+
+        let error = run_cli(cli).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            CliError::DevServer(ferrite_dev_server::DevServerError::Artifact(_))
+        ));
+        assert!(error.to_string().contains("artifact directory"));
     }
 
     #[test]
@@ -1576,14 +1586,10 @@ mod tests {
 
     #[test]
     fn serve_limit_output_reports_effective_clamped_values() {
-        let config = ProductionServerConfig::new(
+        let config = ProductionServerConfig::from_artifact(
             PathBuf::from("project"),
-            PathBuf::from("project/app"),
-            PathBuf::from("project/.ferrite/types/routes.d.ts"),
+            PathBuf::from("project/.ferrite/build"),
             PathBuf::from("render-page.mjs"),
-            PathBuf::from("build-client.mjs"),
-            PathBuf::from("project/.ferrite/server/static"),
-            "/_ferrite/static".to_owned(),
         )
         .with_render_timeout(Duration::ZERO)
         .with_request_read_timeout(Duration::ZERO)

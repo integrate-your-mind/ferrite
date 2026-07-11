@@ -2690,7 +2690,7 @@ test("renderDocumentModule composes head and hydration root", async () => {
     );
   }
 
-  const rendered = await renderDocumentModule({ default: Page }, {}, [], { default: Document }, {
+  const rendered = await renderDocumentModule({ default: Page }, { params: { id: "home" } }, [], { default: Document }, {
     rootId: "ferrite-root",
     routePath: "/",
     metadata: { title: "Home", description: "Home route" },
@@ -2731,7 +2731,11 @@ test("renderDocumentModule composes head and hydration root", async () => {
           {
             kind: "element",
             tag: "div",
-            props: { id: "ferrite-root", "data-route": "/" },
+            props: {
+              id: "ferrite-root",
+              "data-route": "/",
+              "data-ferrite-page-props": '{"params":{"id":"home"}}',
+            },
             children: [
               {
                 kind: "element",
@@ -2778,7 +2782,7 @@ test("renderDocumentModuleToPacket wraps document output in a render packet", as
             [
               2,
               "div",
-              { id: "ferrite-root", "data-route": "/packet" },
+              { id: "ferrite-root", "data-route": "/packet", "data-ferrite-page-props": "{}" },
               [[2, "main", {}, [[0, "Page"]]]],
             ],
           ],
@@ -2827,7 +2831,7 @@ test("renderDocumentModuleToStreamPacket streams page Suspense chunks inside the
             [
               2,
               "div",
-              { id: "ferrite-root", "data-route": "/stream" },
+              { id: "ferrite-root", "data-route": "/stream", "data-ferrite-page-props": "{}" },
               [[2, "div", { "data-ferrite-suspense-boundary": "s0" }, [[2, "span", {}, [[0, "Loading"]]]]]],
             ],
           ],

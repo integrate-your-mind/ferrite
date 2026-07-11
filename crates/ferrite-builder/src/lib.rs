@@ -1,3 +1,13 @@
+mod artifact;
+
+pub use artifact::{
+    FERRITE_PRODUCTION_ARTIFACT_FORMAT, FERRITE_PRODUCTION_ARTIFACT_MAJOR,
+    FERRITE_PRODUCTION_ARTIFACT_MANIFEST, FERRITE_PRODUCTION_ARTIFACT_MINOR,
+    LoadedProductionArtifact, ProductionArtifactError, ProductionArtifactFile,
+    ProductionArtifactFormat, ProductionArtifactManifest, ProductionArtifactRoute,
+    artifact_file_record, finalize_production_artifact_manifest, load_production_artifact,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -17,6 +27,7 @@ use serde_json::Value;
 
 #[derive(Debug)]
 pub enum BuildError {
+    Artifact(ProductionArtifactError),
     ClientBundle(ClientBundleError),
     DuplicateStaticOutput { route_path: String },
     InvalidStaticParams { route: String, reason: String },
@@ -29,6 +40,7 @@ pub enum BuildError {
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BuildError::Artifact(error) => write!(f, "{error}"),
             BuildError::ClientBundle(error) => write!(f, "{error}"),
             BuildError::DuplicateStaticOutput { route_path } => {
                 write!(f, "duplicate static output for route path `{route_path}`")
@@ -61,6 +73,12 @@ impl From<PageRenderError> for BuildError {
 impl From<ClientBundleError> for BuildError {
     fn from(error: ClientBundleError) -> Self {
         BuildError::ClientBundle(error)
+    }
+}
+
+impl From<ProductionArtifactError> for BuildError {
+    fn from(error: ProductionArtifactError) -> Self {
+        BuildError::Artifact(error)
     }
 }
 
@@ -118,6 +136,9 @@ pub struct BuildReport {
     pub page_metadata: Vec<PageMetadataEntry>,
     pub skipped_dynamic_routes: Vec<String>,
     pub manifest_file: PathBuf,
+    pub production_manifest_file: PathBuf,
+    pub production_build_id: String,
+    pub server_modules: Vec<PathBuf>,
     pub client_bundles: Vec<ClientBundle>,
     pub server_action_manifests: Vec<ServerActionManifest>,
 }
@@ -131,14 +152,36 @@ pub struct PageMetadataEntry {
 #[derive(Debug, Serialize)]
 struct BuildManifest<'a> {
     routes: &'a [Route],
-    html_files: &'a [PathBuf],
+    html_files: &'a [String],
     page_metadata: &'a [PageMetadataEntry],
     skipped_dynamic_routes: &'a [String],
     client_bundles: &'a [ClientBundle],
     server_action_manifests: &'a [ServerActionManifest],
+    production_manifest_file: &'a str,
+    production_build_id: &'a str,
+    server_modules: &'a [String],
 }
 
 pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
+    let out_parent = config.out_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(out_parent)?;
+    let staged = tempfile::Builder::new()
+        .prefix(".ferrite-build-")
+        .tempdir_in(out_parent)?;
+    let mut staged_config = config.clone();
+    staged_config.out_dir = staged.path().to_path_buf();
+    let mut report = build_project_in_place(&staged_config)?;
+    let staged_path = staged.keep();
+
+    if let Err(error) = install_staged_build(&staged_path, &config.out_dir) {
+        let _ = fs::remove_dir_all(&staged_path);
+        return Err(error.into());
+    }
+    rebase_build_report(&mut report, &staged_path, &config.out_dir)?;
+    Ok(report)
+}
+
+fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
     let routes = scan_app_dir(&config.app_dir)?;
     fs::create_dir_all(&config.out_dir)?;
     write_route_types(&routes, &config.types_out)?;
@@ -151,23 +194,59 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
     let mut skipped_dynamic_routes = Vec::new();
     let mut client_bundles = Vec::new();
     let mut server_action_manifests = Vec::new();
+    let mut production_routes = Vec::new();
+    let mut server_modules = Vec::new();
     let mut generated_route_paths = BTreeSet::new();
     let client_out_dir = config.out_dir.join("_ferrite/static");
-    if client_out_dir.exists() {
-        fs::remove_dir_all(&client_out_dir)?;
-    }
+    let server_out_dir = config.out_dir.join("server");
+    fs::create_dir_all(&server_out_dir)?;
 
-    for route in &routes {
+    for (route_index, route) in routes.iter().enumerate() {
         let static_param_sets = if route.params.is_empty() {
             vec![BTreeMap::new()]
         } else {
             let generated = page_renderer.generate_static_params(&route.file)?;
             if !generated.has_generate_static_params {
                 skipped_dynamic_routes.push(route.path.clone());
-                continue;
+                Vec::new()
+            } else {
+                generated.params
             }
-            generated.params
         };
+        let artifact_param_set = static_param_sets
+            .first()
+            .cloned()
+            .unwrap_or_else(|| placeholder_route_params(route));
+        let artifact_params = ordered_route_params(route, &artifact_param_set)?;
+        let conventions = route_conventions(route);
+        let server_module_relative = format!("server/route-{route_index:04}.mjs");
+        let server_module = config.out_dir.join(&server_module_relative);
+        page_renderer.build_server_module(
+            &route.file,
+            &route.layouts,
+            document_file.as_deref(),
+            &conventions,
+            &route.path,
+            &server_module,
+        )?;
+        server_modules.push(server_module);
+
+        let artifact_action_manifest = page_renderer.collect_server_actions(
+            &route.file,
+            &route.layouts,
+            &artifact_params,
+            &conventions,
+        )?;
+        let route_client_bundle = bundle_production_route(
+            &client_bundler,
+            &route.file,
+            &route.layouts,
+            &route.path,
+            &artifact_params,
+            &client_out_dir,
+            !artifact_action_manifest.actions.is_empty(),
+        )?;
+        let mut prerendered = BTreeMap::new();
 
         for params in static_param_sets {
             let route_path = concrete_route_path(route, &params)?;
@@ -179,28 +258,15 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
             if let Some(parent) = html_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let conventions = route_conventions(route);
             let action_manifest = page_renderer.collect_server_actions(
                 &route.file,
                 &route.layouts,
                 &ordered_params,
                 &conventions,
             )?;
-            let needs_action_bootstrap = !action_manifest.actions.is_empty();
-            let (document, metadata, client_bundle) = if let Some(document_file) =
-                document_file.as_deref()
-            {
+            let (document, metadata) = if let Some(document_file) = document_file.as_deref() {
                 let metadata =
                     page_renderer.collect_metadata(&route.file, &route.layouts, &ordered_params)?;
-                let client_bundle = bundle_production_route(
-                    &client_bundler,
-                    &route.file,
-                    &route.layouts,
-                    &route_path,
-                    &ordered_params,
-                    &client_out_dir,
-                    needs_action_bootstrap,
-                )?;
                 page_renderer
                     .render_document_to_html_with_conventions(
                         &route.file,
@@ -215,14 +281,14 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                             server_action_csrf_token: None,
                             server_action_replay_nonce: None,
                             metadata: metadata.clone(),
-                            preload_scripts: client_bundle_scripts(&client_bundle),
-                            styles: client_bundle_styles(&client_bundle),
-                            scripts: client_bundle_scripts(&client_bundle),
+                            preload_scripts: client_bundle_scripts(&route_client_bundle),
+                            styles: client_bundle_styles(&route_client_bundle),
+                            scripts: client_bundle_scripts(&route_client_bundle),
                             default_title: "Ferrite".to_owned(),
                         },
                         &conventions,
                     )
-                    .map(|document| (document, metadata, client_bundle))?
+                    .map(|document| (document, metadata))?
             } else {
                 let page_html = page_renderer.render_page_to_html_with_conventions(
                     &route.file,
@@ -232,42 +298,98 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
                 )?;
                 let metadata =
                     page_renderer.collect_metadata(&route.file, &route.layouts, &ordered_params)?;
-                let client_bundle = bundle_production_route(
-                    &client_bundler,
-                    &route.file,
-                    &route.layouts,
-                    &route_path,
-                    &ordered_params,
-                    &client_out_dir,
-                    needs_action_bootstrap,
-                )?;
                 (
-                    render_static_document(&route_path, &page_html, &client_bundle, &metadata),
+                    render_static_document(
+                        &route_path,
+                        &route.path,
+                        &ordered_params,
+                        &page_html,
+                        &route_client_bundle,
+                        &metadata,
+                    ),
                     metadata,
-                    client_bundle,
                 )
             };
             fs::write(&html_path, document)?;
+            let html_relative = artifact_relative_path(&config.out_dir, &html_path)?;
+            prerendered.insert(route_path.clone(), html_relative);
             html_files.push(html_path);
             page_metadata.push(PageMetadataEntry {
                 route_path,
                 metadata,
             });
-            client_bundles.push(client_bundle);
+            client_bundles.push(route_client_bundle.clone());
             if !action_manifest.actions.is_empty() {
                 server_action_manifests.push(action_manifest);
             }
         }
+
+        production_routes.push(ProductionArtifactRoute {
+            path: route.path.clone(),
+            params: route.params.clone(),
+            server_module: server_module_relative,
+            client_bundle: route_client_bundle,
+            prerendered,
+            observed_actions: artifact_action_manifest
+                .actions
+                .into_iter()
+                .map(|action| action.id)
+                .collect(),
+        });
     }
 
+    let mut artifact_paths = BTreeSet::new();
+    for route in &production_routes {
+        artifact_paths.insert(route.server_module.clone());
+        for output in route.client_bundle.outputs.iter().chain(
+            route
+                .client_bundle
+                .client_references
+                .iter()
+                .flat_map(|reference| reference.outputs.iter()),
+        ) {
+            artifact_paths.insert(format!(
+                "_ferrite/static/{}",
+                output.to_string_lossy().replace('\\', "/")
+            ));
+        }
+        artifact_paths.extend(route.prerendered.values().cloned());
+    }
+    let artifact_files = artifact_paths
+        .iter()
+        .map(|path| artifact_file_record(&config.out_dir, path))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let production_manifest = ProductionArtifactManifest::new(
+        CLIENT_PUBLIC_PATH,
+        document_file.is_some(),
+        production_routes,
+        artifact_files,
+    )?;
+    let production_manifest_file = config.out_dir.join(FERRITE_PRODUCTION_ARTIFACT_MANIFEST);
+    fs::write(
+        &production_manifest_file,
+        serde_json::to_string_pretty(&production_manifest)?,
+    )?;
+
     let manifest_file = config.out_dir.join("ferrite-build.json");
+    let manifest_html_files = html_files
+        .iter()
+        .map(|path| artifact_relative_path(&config.out_dir, path))
+        .collect::<Result<Vec<_>>>()?;
+    let manifest_server_modules = server_modules
+        .iter()
+        .map(|path| artifact_relative_path(&config.out_dir, path))
+        .collect::<Result<Vec<_>>>()?;
     let manifest = BuildManifest {
         routes: &routes,
-        html_files: &html_files,
+        html_files: &manifest_html_files,
         page_metadata: &page_metadata,
         skipped_dynamic_routes: &skipped_dynamic_routes,
         client_bundles: &client_bundles,
         server_action_manifests: &server_action_manifests,
+        production_manifest_file: FERRITE_PRODUCTION_ARTIFACT_MANIFEST,
+        production_build_id: &production_manifest.build_id,
+        server_modules: &manifest_server_modules,
     };
     fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
 
@@ -278,9 +400,71 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
         page_metadata,
         skipped_dynamic_routes,
         manifest_file,
+        production_manifest_file,
+        production_build_id: production_manifest.build_id,
+        server_modules,
         client_bundles,
         server_action_manifests,
     })
+}
+
+fn install_staged_build(staged: &Path, destination: &Path) -> std::io::Result<()> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let mut backup = None;
+    if destination.exists() {
+        let backup_holder = tempfile::Builder::new()
+            .prefix(".ferrite-previous-")
+            .tempdir_in(parent)?;
+        let backup_path = backup_holder.keep();
+        fs::remove_dir(&backup_path)?;
+        fs::rename(destination, &backup_path)?;
+        backup = Some(backup_path);
+    }
+
+    if let Err(error) = fs::rename(staged, destination) {
+        if let Some(backup_path) = backup.as_ref() {
+            if let Err(rollback_error) = fs::rename(backup_path, destination) {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not activate staged build: {error}; could not restore previous build from `{}`: {rollback_error}",
+                        backup_path.display()
+                    ),
+                ));
+            }
+        }
+        return Err(error);
+    }
+
+    if let Some(backup_path) = backup {
+        let _ = fs::remove_dir_all(backup_path);
+    }
+    Ok(())
+}
+
+fn rebase_build_report(report: &mut BuildReport, from: &Path, to: &Path) -> Result<()> {
+    for path in &mut report.html_files {
+        *path = rebase_build_path(path, from, to)?;
+    }
+    for path in &mut report.server_modules {
+        *path = rebase_build_path(path, from, to)?;
+    }
+    report.out_dir = to.to_path_buf();
+    report.manifest_file = rebase_build_path(&report.manifest_file, from, to)?;
+    report.production_manifest_file =
+        rebase_build_path(&report.production_manifest_file, from, to)?;
+    Ok(())
+}
+
+fn rebase_build_path(path: &Path, from: &Path, to: &Path) -> Result<PathBuf> {
+    let relative = path.strip_prefix(from).map_err(|_| {
+        BuildError::Artifact(ProductionArtifactError::Invalid(format!(
+            "staged output `{}` is outside staging root `{}`",
+            path.display(),
+            from.display()
+        )))
+    })?;
+    Ok(to.join(relative))
 }
 
 fn route_conventions(route: &Route) -> RouteConventions {
@@ -288,6 +472,41 @@ fn route_conventions(route: &Route) -> RouteConventions {
         loading: route.loading.clone(),
         error: route.error.clone(),
     }
+}
+
+fn placeholder_route_params(route: &Route) -> BTreeMap<String, Value> {
+    route
+        .params
+        .iter()
+        .filter_map(|param| match param.kind {
+            RouteParamKind::Dynamic => Some((
+                param.name.clone(),
+                Value::String("ferrite-build".to_owned()),
+            )),
+            RouteParamKind::CatchAll => Some((
+                param.name.clone(),
+                Value::Array(vec![Value::String("ferrite-build".to_owned())]),
+            )),
+            RouteParamKind::OptionalCatchAll => None,
+        })
+        .collect()
+}
+
+fn artifact_relative_path(root: &Path, path: &Path) -> Result<String> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        BuildError::Artifact(ProductionArtifactError::Invalid(format!(
+            "generated path `{}` is outside build output `{}`",
+            path.display(),
+            root.display()
+        )))
+    })?;
+    let relative = relative.to_str().ok_or_else(|| {
+        BuildError::Artifact(ProductionArtifactError::Invalid(format!(
+            "generated path `{}` is not valid UTF-8",
+            path.display()
+        )))
+    })?;
+    Ok(relative.replace('\\', "/"))
 }
 
 fn bundle_production_route(
@@ -306,7 +525,10 @@ fn bundle_production_route(
         params,
         out_dir: client_out_dir,
         public_path: CLIENT_PUBLIC_PATH,
-        options: ClientBundleOptions { action_bootstrap },
+        options: ClientBundleOptions {
+            action_bootstrap,
+            runtime_props: true,
+        },
     })?;
     fingerprint_client_bundle(&mut client_bundle, client_out_dir, CLIENT_PUBLIC_PATH)?;
     Ok(client_bundle)
@@ -484,10 +706,16 @@ fn invalid_static_params(route: &Route, reason: impl Into<String>) -> BuildError
 
 fn render_static_document(
     route_path: &str,
+    route_pattern: &str,
+    params: &[(String, Value)],
     page_html: &str,
     client_bundle: &ClientBundle,
     metadata: &PageMetadata,
 ) -> String {
+    let page_props = serde_json::to_string(&serde_json::json!({
+        "params": params.iter().cloned().collect::<BTreeMap<_, _>>()
+    }))
+    .expect("validated route params serialize to JSON");
     let metadata_tags = render_metadata_head_tags(metadata, "Ferrite");
     let scripts = client_bundle_scripts(client_bundle);
     let preloads = render_modulepreload_tags(&scripts);
@@ -509,10 +737,12 @@ fn render_static_document(
 {metadata_tags}{preloads}{styles}{scripts}
 </head>
 <body>
-  <div id="ferrite-root" data-route="{route_path}">{page_html}</div>
+  <div id="ferrite-root" data-route="{route_path}" data-route-pattern="{route_pattern}" data-ferrite-page-props="{page_props}">{page_html}</div>
 </body>
 </html>"#,
         route_path = escape_html(route_path),
+        route_pattern = escape_html(route_pattern),
+        page_props = escape_html(&page_props),
         page_html = page_html,
         metadata_tags = metadata_tags,
         preloads = preloads,
@@ -701,7 +931,7 @@ mod tests {
     fn make_script(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
 
-        write(path, body);
+        write(path, &test_script_body(path, body));
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
@@ -709,7 +939,26 @@ mod tests {
 
     #[cfg(not(unix))]
     fn make_script(path: &Path, body: &str) {
-        write(path, body);
+        write(path, &test_script_body(path, body));
+    }
+
+    fn test_script_body(path: &Path, body: &str) -> String {
+        if path.file_name().and_then(|name| name.to_str()) != Some("render-page.mjs") {
+            return body.to_owned();
+        }
+        format!(
+            r#"
+if (process.argv[2] === "--build-artifact") {{
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const output = process.argv[4];
+  await fs.mkdir(path.dirname(output), {{ recursive: true }});
+  await fs.writeFile(output, "export const pageModule = {{}}; export const layoutModules = []; export const documentModule = null; export const conventionModules = {{}}; export const routePattern = '/';\n");
+  process.exit(0);
+}}
+{body}
+"#
+        )
     }
 
     fn build_config(root: &Path) -> BuildConfig {
@@ -1822,6 +2071,46 @@ process.exit(1);
             BuildError::PageRender(PageRenderError::NodeFailed { stderr, .. })
                 if stderr == "render failed"
         ));
+    }
+
+    #[test]
+    fn failed_build_preserves_the_previous_complete_output() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("app/page.tsx"),
+            "export default function Page() {}",
+        );
+        let config = build_config(temp.path());
+        write(&config.out_dir.join("previous.txt"), "previous release");
+        make_script(
+            &config.page_renderer,
+            r#"
+console.error("intentional staged build failure");
+process.exit(1);
+"#,
+        );
+
+        assert!(build_project(&config).is_err());
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("previous.txt")).unwrap(),
+            "previous release"
+        );
+    }
+
+    #[test]
+    fn failed_staged_activation_restores_the_previous_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("build");
+        write(&destination.join("previous.txt"), "previous release");
+
+        let error = install_staged_build(&temp.path().join("missing-stage"), &destination)
+            .expect_err("missing staged directory must fail activation");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read_to_string(destination.join("previous.txt")).unwrap(),
+            "previous release"
+        );
     }
 
     #[test]

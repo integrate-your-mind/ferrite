@@ -419,6 +419,7 @@ export async function renderDocumentModule(
     const rootProps: Record<string, unknown> = {
       id: options.rootId,
       "data-route": options.routePath,
+      "data-ferrite-page-props": JSON.stringify(props),
     };
     if (options.routePattern) {
       rootProps["data-route-pattern"] = options.routePattern;
@@ -480,6 +481,7 @@ export async function renderDocumentModuleToStreamPacket(
     const rootProps: Record<string, unknown> = {
       id: options.rootId,
       "data-route": options.routePath,
+      "data-ferrite-page-props": JSON.stringify(props),
     };
     if (options.routePattern) {
       rootProps["data-route-pattern"] = options.routePattern;
@@ -528,6 +530,7 @@ export async function renderDocumentModuleToServerPayload(
     const rootProps: Record<string, unknown> = {
       id: options.rootId,
       "data-route": options.routePath,
+      "data-ferrite-page-props": JSON.stringify(props),
     };
     if (options.routePattern) {
       rootProps["data-route-pattern"] = options.routePattern;

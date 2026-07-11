@@ -11,6 +11,8 @@ test("deployment templates keep production serve flags aligned", async () => {
 
   for (const source of [dockerfile, systemd]) {
     assert.match(source, /ferrite serve/);
+    assert.match(source, /--artifact \.ferrite\/build/);
+    assert.match(source, /render-artifact\.mjs/);
     assert.match(source, /--request-read-timeout-ms 5000/);
     assert.match(source, /--max-request-bytes 16384/);
     assert.match(source, /--max-in-flight-requests 64/);
@@ -49,10 +51,14 @@ test("container template runs as a non-root runtime user with a health check", a
   const dockerignore = await text(".dockerignore");
 
   assert.match(dockerfile, /USER ferrite/);
+  assert.match(dockerfile, /ferrite build --project examples\/basic/);
+  assert.match(dockerfile, /examples\/basic\/\.ferrite\/build/);
+  assert.doesNotMatch(dockerfile, /\/workspace\/examples\/basic \.\/app/);
   assert.match(dockerfile, /chown -R ferrite:ferrite \/srv\/ferrite/);
-  assert.match(dockerfile, /\/srv\/ferrite\/app\/node_modules\/@ferrite/);
-  assert.match(dockerfile, /ln -s \/srv\/ferrite\/packages\/runtime \/srv\/ferrite\/app\/node_modules\/@ferrite\/runtime/);
-  assert.match(dockerfile, /ln -s \/srv\/ferrite\/packages\/protocol \/srv\/ferrite\/node_modules\/@ferrite\/protocol/);
+  assert.match(dockerfile, /packages\/runtime\/bin\/render-artifact\.mjs \.\/render-artifact\.mjs/);
+  assert.doesNotMatch(dockerfile, /COPY --from=builder \/workspace\/node_modules/);
+  assert.doesNotMatch(dockerfile, /COPY --from=builder \/workspace\/packages \.\/packages/);
+  assert.doesNotMatch(dockerfile, /\/srv\/ferrite\/app\/node_modules/);
   assert.match(dockerfile, /HEALTHCHECK /);
   assert.match(dockerfile, /EXPOSE 3000/);
   assert.doesNotMatch(dockerfile, /FERRITE_ACTION_CSRF=[a-zA-Z0-9_-]{24,}/);

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,6 +86,8 @@ pub struct RouteConventions {
 pub struct PageRenderer {
     project: PathBuf,
     script: PathBuf,
+    prebuilt_artifact: bool,
+    prebuilt_module_source: Option<Arc<[u8]>>,
     command_timeout: Option<Duration>,
     server_action_csrf_token: Option<String>,
     server_action_replay_nonce: Option<String>,
@@ -95,14 +98,66 @@ impl PageRenderer {
         Self {
             project,
             script,
+            prebuilt_artifact: false,
+            prebuilt_module_source: None,
             command_timeout: None,
             server_action_csrf_token: None,
             server_action_replay_nonce: None,
         }
     }
 
+    pub fn for_prebuilt_artifact(project: PathBuf, script: PathBuf) -> Self {
+        Self {
+            project,
+            script,
+            prebuilt_artifact: true,
+            prebuilt_module_source: None,
+            command_timeout: None,
+            server_action_csrf_token: None,
+            server_action_replay_nonce: None,
+        }
+    }
+
+    pub fn build_server_module(
+        &self,
+        page_file: &Path,
+        layouts: &[PathBuf],
+        document_file: Option<&Path>,
+        conventions: &RouteConventions,
+        route_pattern: &str,
+        output_file: &Path,
+    ) -> Result<()> {
+        let layouts_json = serde_json::to_string(layouts)?;
+        let document_json = serde_json::to_string(&document_file)?;
+        let conventions_json = serde_json::to_string(conventions)?;
+        let mut command = Command::new("node");
+        command
+            .arg(&self.script)
+            .arg("--build-artifact")
+            .arg(page_file)
+            .arg(output_file)
+            .arg(layouts_json)
+            .arg(document_json)
+            .arg(conventions_json)
+            .arg(route_pattern)
+            .current_dir(&self.project);
+        let output = self.run_command(command)?;
+        if !output.status.success() {
+            return Err(PageRenderError::NodeFailed {
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = Some(timeout.max(MIN_RENDER_COMMAND_TIMEOUT));
+        self
+    }
+
+    pub fn with_prebuilt_module_source(mut self, source: Arc<[u8]>) -> Self {
+        self.prebuilt_module_source = Some(source);
         self
     }
 
@@ -674,21 +729,23 @@ impl PageRenderer {
 
     fn node_command(&self) -> Command {
         let mut command = Command::new("node");
-        command.arg(&self.script).current_dir(&self.project);
+        command.arg(&self.script);
+        if self.prebuilt_artifact {
+            command.arg(if self.prebuilt_module_source.is_some() {
+                "--prebuilt-stdin"
+            } else {
+                "--prebuilt"
+            });
+        }
+        command.current_dir(&self.project);
         command
     }
 
-    fn run_command(&self, mut command: Command) -> Result<RendererOutput> {
+    fn run_command(&self, command: Command) -> Result<RendererOutput> {
+        let stdin = self.prebuilt_module_source.clone();
         match self.command_timeout {
-            Some(timeout) => run_command_with_timeout(command, timeout),
-            None => {
-                let output = command.output()?;
-                Ok(RendererOutput {
-                    status: output.status,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                })
-            }
+            Some(timeout) => run_command_with_timeout(command, timeout, stdin),
+            None => run_command_to_output(command, stdin),
         }
     }
 }
@@ -700,9 +757,43 @@ struct RendererOutput {
     stderr: Vec<u8>,
 }
 
-fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<RendererOutput> {
+fn run_command_to_output(mut command: Command, stdin: Option<Arc<[u8]>>) -> Result<RendererOutput> {
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
+    let stdin_writer = stdin.map(|input| {
+        let mut child_stdin = child.stdin.take().expect("renderer stdin was piped");
+        thread::spawn(move || child_stdin.write_all(&input))
+    });
+    let output = child.wait_with_output()?;
+    if let Some(stdin_writer) = stdin_writer {
+        stdin_writer
+            .join()
+            .expect("renderer stdin writer panicked")?;
+    }
+    Ok(RendererOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    stdin: Option<Arc<[u8]>>,
+) -> Result<RendererOutput> {
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdin_writer = stdin.map(|input| {
+        let mut child_stdin = child.stdin.take().expect("renderer stdin was piped");
+        thread::spawn(move || child_stdin.write_all(&input))
+    });
     let mut stdout = child.stdout.take().expect("renderer stdout was piped");
     let mut stderr = child.stderr.take().expect("renderer stderr was piped");
     let stdout_reader = thread::spawn(move || {
@@ -717,6 +808,11 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<R
 
     loop {
         if let Some(status) = child.try_wait()? {
+            if let Some(stdin_writer) = stdin_writer {
+                stdin_writer
+                    .join()
+                    .expect("renderer stdin writer panicked")?;
+            }
             return Ok(RendererOutput {
                 status,
                 stdout: stdout_reader
@@ -731,6 +827,9 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<R
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(stdin_writer) = stdin_writer {
+                let _ = stdin_writer.join();
+            }
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(PageRenderError::TimedOut { timeout });

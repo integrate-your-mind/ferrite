@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { pathToFileURL } from "node:url";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { isBuiltin } from "node:module";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { build } from "esbuild";
@@ -8,6 +9,19 @@ import { build } from "esbuild";
 const CLIENT_ORIGINAL_SUFFIX = "?ferrite-client-original";
 
 const args = process.argv.slice(2);
+const prebuiltArtifact = args[0] === "--prebuilt";
+if (prebuiltArtifact) {
+  args.shift();
+}
+if (args[0] === "--build-artifact") {
+  try {
+    await buildServerArtifact(args.slice(1));
+  } catch (error) {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  }
+  process.exit(0);
+}
 const knownModes = new Set([
   "--static-params",
   "--metadata",
@@ -117,72 +131,76 @@ if (mode !== "--static-params" && mode !== "--metadata") {
 }
 
 const projectRoot = await realSourcePath(await findNearestPackageRoot(resolve(pageFile)));
-const tempRoot = join(projectRoot, ".ferrite", "tmp");
-await mkdir(tempRoot, { recursive: true });
-const tempDir = await mkdtemp(join(tempRoot, "page-"));
-const entryFile = join(tempDir, "entry.mjs");
-const bundleFile = join(tempDir, "page.mjs");
-const clientReferenceExcludedFiles = new Set(
-  await Promise.all(
-    [pageFile, ...layoutFiles, documentFile, conventionFiles.loading, conventionFiles.error]
-      .filter((file) => typeof file === "string")
-      .map((file) => realSourcePath(file)),
-  ),
-);
 
-try {
-  await writeFile(
-    entryFile,
-    [
-      `import * as pageModule from ${JSON.stringify(resolve(pageFile))};`,
-      ...layoutFiles.map((file, index) => `import * as layout${index} from ${JSON.stringify(resolve(file))};`),
-      ...(documentMode ? [`import * as documentModule from ${JSON.stringify(resolve(documentFile))};`] : []),
-      ...(conventionFiles.loading
-        ? [`import * as loadingModule from ${JSON.stringify(resolve(conventionFiles.loading))};`]
-        : []),
-      ...(conventionFiles.error
-        ? [`import * as errorModule from ${JSON.stringify(resolve(conventionFiles.error))};`]
-        : []),
-      "export { pageModule };",
-      `export const layoutModules = [${layoutFiles.map((_file, index) => `layout${index}`).join(", ")}];`,
-      ...(documentMode ? ["export { documentModule };"] : []),
-      `export const conventionModules = {${[
-        conventionFiles.loading ? "loading: loadingModule" : "",
-        conventionFiles.error ? "error: errorModule" : "",
-      ]
-        .filter(Boolean)
-        .join(", ")}};`,
-      "",
-    ].join("\n"),
+if (prebuiltArtifact) {
+  try {
+    const entryModule = await import(`${pathToFileURL(resolve(pageFile)).href}?t=${Date.now()}`);
+    await executeEntryModule(entryModule, serverRuntimeFromEntry(entryModule));
+  } catch (error) {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  }
+} else {
+  const tempRoot = join(projectRoot, ".ferrite", "tmp");
+  await mkdir(tempRoot, { recursive: true });
+  const tempDir = await mkdtemp(join(tempRoot, "page-"));
+  const entryFile = join(tempDir, "entry.mjs");
+  const bundleFile = join(tempDir, "page.mjs");
+  const clientReferenceExcludedFiles = new Set(
+    await Promise.all(
+      [pageFile, ...layoutFiles, documentFile, conventionFiles.loading, conventionFiles.error]
+        .filter((file) => typeof file === "string")
+        .map((file) => realSourcePath(file)),
+    ),
   );
 
-  await build({
-    entryPoints: [entryFile],
-    outfile: bundleFile,
-    bundle: true,
-    platform: "node",
-    format: "esm",
-    target: "node22",
-    packages: "external",
-    external: ["@ferrite/runtime", "@ferrite/runtime/*"],
-    jsx: "automatic",
-    jsxImportSource: "@ferrite/runtime",
-    plugins: [
-      clientReferenceProxyPlugin({
-        projectRoot,
-        excludedFiles: clientReferenceExcludedFiles,
+  try {
+    await writeFile(
+      entryFile,
+      serverArtifactEntrySource({
+        pageFile,
+        layoutFiles,
+        documentFile: documentMode ? documentFile : undefined,
+        conventionFiles,
+        routePattern: routePatternFromPageFile(pageFile, projectRoot),
       }),
-    ],
-    loader: {
-      ".css": "empty",
-    },
-    logLevel: "silent",
-  });
+    );
 
-  const [entryModule, server] = await Promise.all([
-    import(`${pathToFileURL(bundleFile).href}?t=${Date.now()}`),
-    import("@ferrite/runtime/server"),
-  ]);
+    await bundleServerArtifact({
+      entryFile,
+      outputFile: bundleFile,
+      projectRoot,
+      excludedFiles: clientReferenceExcludedFiles,
+    });
+
+    const entryModule = await import(`${pathToFileURL(bundleFile).href}?t=${Date.now()}`);
+    await executeEntryModule(entryModule, serverRuntimeFromEntry(entryModule));
+  } catch (error) {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function serverRuntimeFromEntry(entryModule) {
+  const server = entryModule.serverRuntime;
+  if (!server || typeof server.renderPageModuleToPacket !== "function") {
+    throw new TypeError("Ferrite server artifact is missing its bundled server runtime.");
+  }
+  return server;
+}
+
+async function executeEntryModule(entryModule, server) {
+  const routePattern = entryModule.routePattern ?? routePatternFromPageFile(pageFile, projectRoot);
+  const routeRenderMode = mode === "render" || mode === "--stream" || mode === "--server-payload";
+  const effectiveRouteRenderOptions = routeRenderMode && routePattern
+    ? {
+        ...routeRenderOptions,
+        routePath: concreteRoutePathFromPattern(routePattern, props.params ?? {}),
+        routePattern,
+      }
+    : routeRenderOptions;
   if (mode === "--static-params") {
     const staticParams = await server.collectStaticParams(entryModule.pageModule);
     process.stdout.write(`${JSON.stringify(staticParams)}\n`);
@@ -195,7 +213,7 @@ try {
       props,
       entryModule.layoutModules,
       entryModule.conventionModules,
-      routeRenderOptions,
+      effectiveRouteRenderOptions,
     );
     process.stdout.write(`${JSON.stringify(stream)}\n`);
   } else if (mode === "--server-payload") {
@@ -204,7 +222,7 @@ try {
       props,
       entryModule.layoutModules,
       entryModule.conventionModules,
-      routeRenderOptions,
+      effectiveRouteRenderOptions,
     );
     process.stdout.write(`${JSON.stringify(payload)}\n`);
   } else if (mode === "--server-action") {
@@ -214,7 +232,7 @@ try {
       entryModule.layoutModules,
       entryModule.conventionModules,
       actionRequest,
-      { routePattern: routePatternFromPageFile(pageFile, projectRoot) },
+      { routePattern },
     );
     process.stdout.write(`${JSON.stringify(response)}\n`);
   } else if (mode === "--server-action-manifest") {
@@ -224,8 +242,8 @@ try {
       entryModule.layoutModules,
       entryModule.conventionModules,
       {
-        routePath: concreteRoutePathFromPageFile(pageFile, projectRoot, props.params ?? {}),
-        routePattern: routePatternFromPageFile(pageFile, projectRoot),
+        routePath: concreteRoutePathFromPattern(routePattern, props.params ?? {}),
+        routePattern,
       },
     );
     process.stdout.write(`${JSON.stringify(manifest)}\n`);
@@ -265,15 +283,138 @@ try {
       props,
       entryModule.layoutModules,
       entryModule.conventionModules,
-      routeRenderOptions,
+      effectiveRouteRenderOptions,
     );
     process.stdout.write(`${JSON.stringify(serializable)}\n`);
   }
-} catch (error) {
-  console.error(error instanceof Error ? error.stack || error.message : String(error));
-  process.exit(1);
-} finally {
-  await rm(tempDir, { recursive: true, force: true });
+}
+
+async function buildServerArtifact(buildArgs) {
+  const [sourcePageFile, outputFile, layoutsJson = "[]", documentJson = "null", conventionsJson = "{}", routePattern] =
+    buildArgs;
+  if (!sourcePageFile || !outputFile || !routePattern) {
+    throw new TypeError(
+      "usage: render-page --build-artifact <page-file> <output-file> <layouts-json> <document-json> <conventions-json> <route-pattern>",
+    );
+  }
+
+  const sourceLayouts = JSON.parse(layoutsJson);
+  const sourceDocument = JSON.parse(documentJson);
+  const sourceConventions = JSON.parse(conventionsJson);
+  if (!Array.isArray(sourceLayouts) || sourceLayouts.some((file) => typeof file !== "string")) {
+    throw new TypeError("artifact layouts JSON must be an array of file paths");
+  }
+  if (sourceDocument !== null && typeof sourceDocument !== "string") {
+    throw new TypeError("artifact document JSON must be a file path or null");
+  }
+  if (!sourceConventions || typeof sourceConventions !== "object" || Array.isArray(sourceConventions)) {
+    throw new TypeError("artifact conventions JSON must be an object");
+  }
+  for (const key of ["loading", "error"]) {
+    if (sourceConventions[key] !== undefined && typeof sourceConventions[key] !== "string") {
+      throw new TypeError(`artifact convention "${key}" must be a file path string when provided`);
+    }
+  }
+  if (!routePattern.startsWith("/") || routePattern.includes("?") || routePattern.includes("#")) {
+    throw new TypeError("artifact route pattern must be an absolute URL path pattern");
+  }
+
+  const resolvedPage = resolve(sourcePageFile);
+  const resolvedLayouts = sourceLayouts.map((file) => resolve(file));
+  const resolvedDocument = sourceDocument === null ? undefined : resolve(sourceDocument);
+  const resolvedConventions = Object.fromEntries(
+    Object.entries(sourceConventions).map(([key, file]) => [key, resolve(file)]),
+  );
+  const artifactProjectRoot = await realSourcePath(await findNearestPackageRoot(resolvedPage));
+  const excludedFiles = new Set(
+    await Promise.all(
+      [resolvedPage, ...resolvedLayouts, resolvedDocument, resolvedConventions.loading, resolvedConventions.error]
+        .filter((file) => typeof file === "string")
+        .map((file) => realSourcePath(file)),
+    ),
+  );
+  const tempRoot = join(artifactProjectRoot, ".ferrite", "tmp");
+  await mkdir(tempRoot, { recursive: true });
+  const tempDir = await mkdtemp(join(tempRoot, "server-artifact-"));
+  const entryFile = join(tempDir, "entry.mjs");
+
+  try {
+    await writeFile(
+      entryFile,
+      serverArtifactEntrySource({
+        pageFile: resolvedPage,
+        layoutFiles: resolvedLayouts,
+        documentFile: resolvedDocument,
+        conventionFiles: resolvedConventions,
+        routePattern,
+      }),
+    );
+    await mkdir(dirname(resolve(outputFile)), { recursive: true });
+    await bundleServerArtifact({
+      entryFile,
+      outputFile: resolve(outputFile),
+      projectRoot: artifactProjectRoot,
+      excludedFiles,
+    });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function serverArtifactEntrySource({ pageFile, layoutFiles, documentFile, conventionFiles, routePattern }) {
+  return [
+    `import * as serverRuntime from "@ferrite/runtime/server";`,
+    `import * as pageModule from ${JSON.stringify(resolve(pageFile))};`,
+    ...layoutFiles.map((file, index) => `import * as layout${index} from ${JSON.stringify(resolve(file))};`),
+    ...(documentFile ? [`import * as documentModuleImport from ${JSON.stringify(resolve(documentFile))};`] : []),
+    ...(conventionFiles.loading
+      ? [`import * as loadingModule from ${JSON.stringify(resolve(conventionFiles.loading))};`]
+      : []),
+    ...(conventionFiles.error
+      ? [`import * as errorModule from ${JSON.stringify(resolve(conventionFiles.error))};`]
+      : []),
+    "export { pageModule, serverRuntime };",
+    `export const layoutModules = [${layoutFiles.map((_file, index) => `layout${index}`).join(", ")}];`,
+    `export const documentModule = ${documentFile ? "documentModuleImport" : "null"};`,
+    `export const conventionModules = {${[
+      conventionFiles.loading ? "loading: loadingModule" : "",
+      conventionFiles.error ? "error: errorModule" : "",
+    ]
+      .filter(Boolean)
+      .join(", ")}};`,
+    `export const routePattern = ${JSON.stringify(routePattern ?? null)};`,
+    "",
+  ].join("\n");
+}
+
+async function bundleServerArtifact({ entryFile, outputFile, projectRoot, excludedFiles }) {
+  const result = await build({
+    entryPoints: [entryFile],
+    outfile: outputFile,
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    target: "node22",
+    jsx: "automatic",
+    jsxImportSource: "@ferrite/runtime",
+    plugins: [clientReferenceProxyPlugin({ projectRoot, excludedFiles })],
+    loader: {
+      ".css": "empty",
+    },
+    legalComments: "none",
+    minify: true,
+    metafile: true,
+    logLevel: "silent",
+  });
+  const unsupportedExternals = Object.values(result.metafile.outputs)
+    .flatMap((output) => output.imports)
+    .filter((item) => item.external && !isBuiltin(item.path))
+    .map((item) => item.path);
+  if (unsupportedExternals.length > 0) {
+    throw new TypeError(
+      `Ferrite server artifacts cannot depend on external packages: ${[...new Set(unsupportedExternals)].sort().join(", ")}`,
+    );
+  }
 }
 
 function clientReferenceProxyPlugin({ projectRoot, excludedFiles }) {
@@ -446,13 +587,44 @@ function routePatternSegment(segment) {
 }
 
 function concreteRoutePathFromPageFile(pageFile, projectRoot, params) {
-  const routeSegments = routeSegmentsFromPageFile(pageFile, projectRoot);
-  if (!routeSegments || routeSegments.length === 0) {
+  const routePattern = routePatternFromPageFile(pageFile, projectRoot);
+  return concreteRoutePathFromPattern(routePattern, params);
+}
+
+function concreteRoutePathFromPattern(routePattern, params) {
+  if (routePattern === "/") {
     return "/";
   }
-
-  const concreteSegments = routeSegments.map((segment) => concreteRouteSegment(segment, params));
+  if (typeof routePattern !== "string" || !routePattern.startsWith("/")) {
+    throw new TypeError("Ferrite route pattern is unavailable for this server artifact.");
+  }
+  const routeSegments = routePattern.slice(1).split("/");
+  const concreteSegments = routeSegments.map((segment) => concretePatternSegment(segment, params));
   return `/${concreteSegments.flat().join("/")}`;
+}
+
+function concretePatternSegment(segment, params) {
+  if (segment.startsWith(":")) {
+    const name = segment.slice(1);
+    const value = params[name];
+    if (typeof value !== "string" || value.length === 0) {
+      throw new TypeError(`Ferrite route param "${name}" must be a non-empty string for ${segment}.`);
+    }
+    return encodeRouteSegment(value);
+  }
+  if (segment.startsWith("*")) {
+    const optional = segment.endsWith("?");
+    const name = segment.slice(1, optional ? -1 : undefined);
+    const value = params[name];
+    if (optional && value === undefined) {
+      return [];
+    }
+    if (!Array.isArray(value) || (!optional && value.length === 0)) {
+      throw new TypeError(`Ferrite route param "${name}" must be ${optional ? "an array" : "a non-empty array"} for ${segment}.`);
+    }
+    return value.map(encodeRouteSegment);
+  }
+  return segment;
 }
 
 function concreteRouteSegment(segment, params) {

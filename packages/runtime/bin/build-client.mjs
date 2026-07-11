@@ -98,9 +98,18 @@ try {
       ...layoutFiles.map((file, index) => `import Layout${index} from ${JSON.stringify(resolve(file))};`),
       "",
       `const layouts = [${layoutFiles.map((_file, index) => `Layout${index}`).join(", ")}];`,
-      `const page = createElement(Page, ${JSON.stringify(props)});`,
-      `const tree = layouts.reduceRight((child, Layout) => createElement(Layout, { children: child }), page);`,
       `const root = document.getElementById("ferrite-root") || document.getElementById("ferrite-dev-root");`,
+      ...(options.runtimeProps === true
+        ? [
+            `const serializedProps = root?.getAttribute("data-ferrite-page-props");`,
+            `if (!serializedProps) {`,
+            `  throw new TypeError("Ferrite production hydration requires data-ferrite-page-props.");`,
+            `}`,
+            `const pageProps = JSON.parse(serializedProps);`,
+          ]
+        : [`const pageProps = ${JSON.stringify(props)};`]),
+      `const page = createElement(Page, pageProps);`,
+      `const tree = layouts.reduceRight((child, Layout) => createElement(Layout, { children: child }), page);`,
       `if (root) {`,
       `  hydrate(tree, root);`,
       `}`,

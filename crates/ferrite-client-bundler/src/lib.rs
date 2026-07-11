@@ -17,6 +17,8 @@ const BUNDLE_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 pub struct ClientBundleOptions {
     #[serde(default, skip_serializing_if = "is_false")]
     pub action_bootstrap: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub runtime_props: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -864,6 +866,7 @@ export default function Page() {
                 public_path: "/_ferrite/static",
                 options: ClientBundleOptions {
                     action_bootstrap: true,
+                    runtime_props: false,
                 },
             })
             .unwrap();
@@ -902,6 +905,7 @@ export default function Page() {
                 public_path: "/_ferrite/static",
                 options: ClientBundleOptions {
                     action_bootstrap: true,
+                    runtime_props: false,
                 },
             })
             .unwrap();
@@ -920,6 +924,65 @@ export default function Page() {
         )
         .unwrap();
         assert!(action_js.contains("bootstrapServerActionForms"));
+    }
+
+    #[test]
+    fn real_runner_builds_parameter_independent_production_hydration() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        fs::create_dir_all(temp.path().join("node_modules/@ferrite")).unwrap();
+        symlink_dir(
+            &repo_root.join("packages/runtime"),
+            &temp.path().join("node_modules/@ferrite/runtime"),
+        );
+        fs::create_dir_all(temp.path().join("app/posts/[id]")).unwrap();
+        fs::write(
+            temp.path().join("app/posts/[id]/page.tsx"),
+            r#"
+"use client";
+export default function Page({ params }) {
+  return <h1>{params.id}</h1>;
+}
+"#,
+        )
+        .unwrap();
+        let bundler = ClientBundler::new(
+            temp.path().to_path_buf(),
+            repo_root.join("packages/runtime/bin/build-client.mjs"),
+        );
+        let params = vec![(
+            "id".to_owned(),
+            Value::String("build-placeholder".to_owned()),
+        )];
+        let out_dir = temp.path().join(".ferrite/build/_ferrite/static");
+
+        let bundle = bundler
+            .bundle_route_request(ClientBundleRequest {
+                page_file: &temp.path().join("app/posts/[id]/page.tsx"),
+                layouts: &[],
+                route_path: "/posts/:id",
+                params: &params,
+                out_dir: &out_dir,
+                public_path: "/_ferrite/static",
+                options: ClientBundleOptions {
+                    action_bootstrap: false,
+                    runtime_props: true,
+                },
+            })
+            .unwrap();
+        let script = bundle
+            .script
+            .as_deref()
+            .unwrap()
+            .trim_start_matches("/_ferrite/static/");
+        let javascript = fs::read_to_string(out_dir.join(script)).unwrap();
+
+        assert!(javascript.contains("data-ferrite-page-props"));
+        assert!(!javascript.contains("build-placeholder"));
     }
 
     #[cfg(unix)]

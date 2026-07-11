@@ -5,13 +5,16 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use ferrite_builder::{
+    FERRITE_PRODUCTION_ARTIFACT_MANIFEST, ProductionArtifactError, load_production_artifact,
+};
 use ferrite_client_bundler::{
     ClientBundle, ClientBundleError, ClientBundleOptions, ClientBundleRequest, ClientBundler,
     fingerprint_client_bundle,
@@ -58,6 +61,7 @@ const SERVER_ACTION_REPLAY_NONCE_BYTES: usize = 16;
 
 #[derive(Debug)]
 pub enum DevServerError {
+    Artifact(ProductionArtifactError),
     Router(ferrite_router::RouterError),
     PageRender(PageRenderError),
     Io(std::io::Error),
@@ -69,6 +73,7 @@ pub enum DevServerError {
 impl fmt::Display for DevServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DevServerError::Artifact(error) => write!(f, "{error}"),
             DevServerError::Router(error) => write!(f, "{error}"),
             DevServerError::PageRender(error) => write!(f, "{error}"),
             DevServerError::Io(error) => write!(f, "{error}"),
@@ -86,6 +91,12 @@ impl std::error::Error for DevServerError {}
 impl From<ferrite_router::RouterError> for DevServerError {
     fn from(error: ferrite_router::RouterError) -> Self {
         DevServerError::Router(error)
+    }
+}
+
+impl From<ProductionArtifactError> for DevServerError {
+    fn from(error: ProductionArtifactError) -> Self {
+        DevServerError::Artifact(error)
     }
 }
 
@@ -466,6 +477,8 @@ impl ProductionTrustedProxyConfig {
 #[derive(Debug, Clone)]
 pub struct ProductionServerConfig {
     pub project: PathBuf,
+    pub artifact_root: Option<PathBuf>,
+    pub artifact_build_id: Option<String>,
     pub app_dir: PathBuf,
     pub types_out: PathBuf,
     pub page_renderer: PathBuf,
@@ -488,6 +501,7 @@ pub struct ProductionServerConfig {
 }
 
 impl ProductionServerConfig {
+    #[cfg(test)]
     pub fn new(
         project: PathBuf,
         app_dir: PathBuf,
@@ -499,12 +513,41 @@ impl ProductionServerConfig {
     ) -> Self {
         Self {
             project,
+            artifact_root: None,
+            artifact_build_id: None,
             app_dir,
             types_out,
             page_renderer,
             client_bundler,
             client_out_dir,
             client_public_path,
+            request_read_timeout: DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT,
+            render_timeout: DEFAULT_PRODUCTION_RENDER_TIMEOUT,
+            max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
+            max_in_flight_requests: DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS,
+            server_action_csrf_token: None,
+            server_action_csrf_cookie_name: None,
+            trusted_proxy: None,
+            trusted_proxy_client_ip_hops: None,
+            request_observer: None,
+            action_observer: None,
+            metrics_path: None,
+            server_action_replay_ttl: None,
+            metrics: ProductionMetrics::default(),
+        }
+    }
+
+    pub fn from_artifact(project: PathBuf, artifact_root: PathBuf, page_renderer: PathBuf) -> Self {
+        Self {
+            project,
+            artifact_root: Some(artifact_root),
+            artifact_build_id: None,
+            app_dir: PathBuf::new(),
+            types_out: PathBuf::new(),
+            page_renderer,
+            client_bundler: PathBuf::new(),
+            client_out_dir: PathBuf::new(),
+            client_public_path: String::new(),
             request_read_timeout: DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT,
             render_timeout: DEFAULT_PRODUCTION_RENDER_TIMEOUT,
             max_request_bytes: DEFAULT_PRODUCTION_MAX_REQUEST_BYTES,
@@ -863,7 +906,10 @@ impl DevProject {
                         params: &match_result.params,
                         out_dir: &self.config.client_out_dir,
                         public_path: &self.config.client_public_path,
-                        options: ClientBundleOptions { action_bootstrap },
+                        options: ClientBundleOptions {
+                            action_bootstrap,
+                            runtime_props: false,
+                        },
                     }) {
                         Ok(client_bundle) => match renderer
                             .render_document_to_stream_parts_with_conventions(
@@ -951,7 +997,10 @@ impl DevProject {
                             params: &match_result.params,
                             out_dir: &self.config.client_out_dir,
                             public_path: &self.config.client_public_path,
-                            options: ClientBundleOptions { action_bootstrap },
+                            options: ClientBundleOptions {
+                                action_bootstrap,
+                                runtime_props: false,
+                            },
                         }) {
                             Ok(client_bundle) => {
                                 let shell = render_route_document(
@@ -1030,7 +1079,10 @@ impl DevProject {
                         params: &match_result.params,
                         out_dir: &self.config.client_out_dir,
                         public_path: &self.config.client_public_path,
-                        options: ClientBundleOptions { action_bootstrap },
+                        options: ClientBundleOptions {
+                            action_bootstrap,
+                            runtime_props: false,
+                        },
                     }) {
                         Ok(client_bundle) => match renderer
                             .render_document_to_server_payload_json_with_conventions(
@@ -1101,6 +1153,7 @@ impl DevProject {
             path,
             &self.config.client_public_path,
             &self.config.client_out_dir,
+            None,
         )
     }
 }
@@ -1108,37 +1161,113 @@ impl DevProject {
 #[derive(Debug)]
 pub struct ProductionProject {
     config: ProductionServerConfig,
-    snapshot: Option<ProductionRouteSnapshot>,
-    replay_nonces: Option<ProductionReplayNonces>,
+    snapshot: OnceLock<ProductionRouteSnapshot>,
+    replay_nonces: Option<Mutex<ProductionReplayNonces>>,
 }
 
 impl ProductionProject {
+    #[cfg(test)]
     pub fn new(config: ProductionServerConfig) -> Self {
         let replay_nonces = config
             .server_action_replay_ttl
-            .map(ProductionReplayNonces::new);
+            .map(ProductionReplayNonces::new)
+            .map(Mutex::new);
         Self {
             config,
-            snapshot: None,
+            snapshot: OnceLock::new(),
             replay_nonces,
         }
+    }
+
+    pub fn from_artifact(mut config: ProductionServerConfig) -> Result<Self> {
+        let artifact_root = config.artifact_root.as_ref().ok_or_else(|| {
+            DevServerError::Artifact(ProductionArtifactError::Invalid(
+                "artifact-backed production config is missing artifactRoot".to_owned(),
+            ))
+        })?;
+        let loaded = load_production_artifact(artifact_root)?;
+        config.artifact_root = Some(loaded.root.clone());
+        config.artifact_build_id = Some(loaded.manifest.build_id.clone());
+        config.client_out_dir = loaded.root.join("_ferrite/static");
+        config.client_public_path = loaded.manifest.client_public_path.clone();
+
+        let mut verified_files = loaded.verified_files;
+        let verified_static_assets = loaded
+            .manifest
+            .files
+            .iter()
+            .filter_map(|file| {
+                let relative = file.path.strip_prefix("_ferrite/static/")?;
+                let bytes = verified_files
+                    .remove(&file.path)
+                    .expect("loaded artifact retains every verified file");
+                Some((relative.to_owned(), Arc::<[u8]>::from(bytes)))
+            })
+            .collect();
+        let mut client_bundles = BTreeMap::new();
+        let mut server_module_sources = BTreeMap::new();
+        let routes = loaded
+            .manifest
+            .routes
+            .into_iter()
+            .map(|route| {
+                client_bundles.insert(route.path.clone(), route.client_bundle);
+                let source = verified_files
+                    .remove(&route.server_module)
+                    .expect("loaded artifact retains every verified server module");
+                server_module_sources.insert(route.path.clone(), Arc::<[u8]>::from(source));
+                Route {
+                    path: route.path,
+                    file: loaded.root.join(route.server_module),
+                    layouts: Vec::new(),
+                    loading: None,
+                    error: None,
+                    params: route.params,
+                }
+            })
+            .collect();
+        let document_file = loaded
+            .manifest
+            .has_document
+            .then(|| loaded.root.join(FERRITE_PRODUCTION_ARTIFACT_MANIFEST));
+        let replay_nonces = config
+            .server_action_replay_ttl
+            .map(ProductionReplayNonces::new)
+            .map(Mutex::new);
+
+        let snapshot = OnceLock::new();
+        snapshot
+            .set(ProductionRouteSnapshot {
+                routes,
+                document_file,
+                client_bundles,
+                server_module_sources,
+                verified_static_assets: Some(verified_static_assets),
+            })
+            .expect("new production artifact snapshot is empty");
+
+        Ok(Self {
+            config,
+            snapshot,
+            replay_nonces,
+        })
     }
 
     pub fn config(&self) -> &ProductionServerConfig {
         &self.config
     }
 
-    pub fn routes(&mut self) -> Result<&[Route]> {
+    pub fn routes(&self) -> Result<&[Route]> {
         self.ensure_ready()?;
-        Ok(&self.snapshot.as_ref().expect("snapshot just built").routes)
+        Ok(&self.snapshot.get().expect("snapshot just built").routes)
     }
 
-    pub fn handle_get(&mut self, raw_path: &str) -> Result<DevResponse> {
+    pub fn handle_get(&self, raw_path: &str) -> Result<DevResponse> {
         self.handle_get_with_context(raw_path, ProductionRequestContext::default())
     }
 
     fn handle_get_with_context(
-        &mut self,
+        &self,
         raw_path: &str,
         request_context: ProductionRequestContext,
     ) -> Result<DevResponse> {
@@ -1159,7 +1288,7 @@ impl ProductionProject {
     }
 
     pub fn handle_post(
-        &mut self,
+        &self,
         raw_path: &str,
         headers: &HttpHeaders,
         body: &[u8],
@@ -1168,7 +1297,7 @@ impl ProductionProject {
     }
 
     fn handle_post_with_context(
-        &mut self,
+        &self,
         raw_path: &str,
         headers: &HttpHeaders,
         body: &[u8],
@@ -1190,7 +1319,7 @@ impl ProductionProject {
         Ok(response)
     }
 
-    fn handle_get_inner(&mut self, raw_path: &str) -> Result<DevResponse> {
+    fn handle_get_inner(&self, raw_path: &str) -> Result<DevResponse> {
         let path = strip_query(raw_path);
         if self.config.metrics_path.as_deref() == Some(path) {
             return Ok(DevResponse::ok(
@@ -1203,10 +1332,12 @@ impl ProductionProject {
         self.ensure_ready()?;
 
         if path.starts_with(&self.config.client_public_path) {
+            let snapshot = self.snapshot.get().expect("snapshot built before response");
             return Ok(static_asset_response(
                 path,
                 &self.config.client_public_path,
                 &self.config.client_out_dir,
+                snapshot.verified_static_assets.as_ref(),
             )
             .with_cache_control(static_asset_cache_control(path)));
         }
@@ -1218,7 +1349,7 @@ impl ProductionProject {
     }
 
     fn handle_post_inner(
-        &mut self,
+        &self,
         raw_path: &str,
         headers: &HttpHeaders,
         body: &[u8],
@@ -1301,8 +1432,8 @@ impl ProductionProject {
         }
     }
 
-    fn ensure_ready(&mut self) -> Result<()> {
-        if self.snapshot.is_some() {
+    fn ensure_ready(&self) -> Result<()> {
+        if self.snapshot.get().is_some() {
             return Ok(());
         }
 
@@ -1312,57 +1443,110 @@ impl ProductionProject {
             fs::remove_dir_all(&self.config.client_out_dir)?;
         }
         let document_file = find_document_file(&self.config.app_dir);
-        self.snapshot = Some(ProductionRouteSnapshot {
+        let _ = self.snapshot.set(ProductionRouteSnapshot {
             routes,
             document_file,
+            client_bundles: BTreeMap::new(),
+            server_module_sources: BTreeMap::new(),
+            verified_static_assets: None,
         });
         Ok(())
     }
 
-    fn route_response(&mut self, path: &str, mode: RouteResponseMode) -> DevResponse {
+    fn route_response(&self, path: &str, mode: RouteResponseMode) -> DevResponse {
         let replay_nonce = match self.issue_server_action_replay_nonce() {
             Ok(replay_nonce) => replay_nonce,
             Err(response) => return *response,
         };
-        let snapshot = self
-            .snapshot
-            .as_ref()
-            .expect("snapshot built before response");
+        let snapshot = self.snapshot.get().expect("snapshot built before response");
 
         let response = if let Some(match_result) = match_route(path, &snapshot.routes) {
-            let renderer = self.page_renderer(replay_nonce.as_deref());
+            let module_source = snapshot
+                .server_module_sources
+                .get(&match_result.route.path)
+                .cloned();
+            let renderer = self.page_renderer(replay_nonce.as_deref(), module_source);
             let conventions = route_conventions(&match_result.route);
+            let artifact_client_bundle = snapshot
+                .client_bundles
+                .get(&match_result.route.path)
+                .cloned();
             match mode {
-                RouteResponseMode::Html => self.route_stream_response(
-                    path,
-                    &match_result,
-                    &renderer,
-                    snapshot.document_file.as_deref(),
-                    &conventions,
-                    replay_nonce.as_deref(),
-                ),
-                RouteResponseMode::ServerPayloadJson => self.route_server_payload_response(
-                    path,
-                    &match_result,
-                    &renderer,
-                    snapshot.document_file.as_deref(),
-                    &conventions,
-                    ProductionServerPayloadOptions {
+                RouteResponseMode::Html => match artifact_client_bundle.as_ref() {
+                    Some(client_bundle) => self.artifact_route_stream_response(
+                        path,
+                        &match_result,
+                        &renderer,
+                        replay_nonce.as_deref(),
+                        ProductionArtifactRouteContext {
+                            document_file: snapshot.document_file.as_deref(),
+                            conventions: &conventions,
+                            client_bundle,
+                        },
+                    ),
+                    None => self.route_stream_response(
+                        path,
+                        &match_result,
+                        &renderer,
+                        snapshot.document_file.as_deref(),
+                        &conventions,
+                        replay_nonce.as_deref(),
+                    ),
+                },
+                RouteResponseMode::ServerPayloadJson => {
+                    let options = ProductionServerPayloadOptions {
                         kind: ServerPayloadResponseKind::Json,
                         replay_nonce: replay_nonce.as_deref(),
-                    },
-                ),
-                RouteResponseMode::ServerPayloadStream => self.route_server_payload_response(
-                    path,
-                    &match_result,
-                    &renderer,
-                    snapshot.document_file.as_deref(),
-                    &conventions,
-                    ProductionServerPayloadOptions {
+                    };
+                    match artifact_client_bundle.as_ref() {
+                        Some(client_bundle) => self.artifact_route_server_payload_response(
+                            path,
+                            &match_result,
+                            &renderer,
+                            options,
+                            ProductionArtifactRouteContext {
+                                document_file: snapshot.document_file.as_deref(),
+                                conventions: &conventions,
+                                client_bundle,
+                            },
+                        ),
+                        None => self.route_server_payload_response(
+                            path,
+                            &match_result,
+                            &renderer,
+                            snapshot.document_file.as_deref(),
+                            &conventions,
+                            options,
+                        ),
+                    }
+                }
+                RouteResponseMode::ServerPayloadStream => {
+                    let options = ProductionServerPayloadOptions {
                         kind: ServerPayloadResponseKind::Stream,
                         replay_nonce: replay_nonce.as_deref(),
-                    },
-                ),
+                    };
+                    match artifact_client_bundle.as_ref() {
+                        Some(client_bundle) => self.artifact_route_server_payload_response(
+                            path,
+                            &match_result,
+                            &renderer,
+                            options,
+                            ProductionArtifactRouteContext {
+                                document_file: snapshot.document_file.as_deref(),
+                                conventions: &conventions,
+                                client_bundle,
+                            },
+                        ),
+                        None => self.route_server_payload_response(
+                            path,
+                            &match_result,
+                            &renderer,
+                            snapshot.document_file.as_deref(),
+                            &conventions,
+                            options,
+                        ),
+                    }
+                }
             }
             .with_cache_control("no-store")
             .with_route_pattern(match_result.route.path)
@@ -1374,10 +1558,14 @@ impl ProductionProject {
     }
 
     fn issue_server_action_replay_nonce(
-        &mut self,
+        &self,
     ) -> std::result::Result<Option<String>, Box<DevResponse>> {
-        match &mut self.replay_nonces {
-            Some(replay_nonces) => replay_nonces.issue().map(Some),
+        match &self.replay_nonces {
+            Some(replay_nonces) => replay_nonces
+                .lock()
+                .expect("production replay nonce mutex poisoned")
+                .issue()
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -1395,12 +1583,26 @@ impl ProductionProject {
         }
     }
 
-    fn page_renderer(&self, replay_nonce: Option<&str>) -> PageRenderer {
-        let mut renderer = PageRenderer::new(
-            self.config.project.clone(),
-            self.config.page_renderer.clone(),
-        )
-        .with_command_timeout(self.config.render_timeout);
+    fn page_renderer(
+        &self,
+        replay_nonce: Option<&str>,
+        module_source: Option<Arc<[u8]>>,
+    ) -> PageRenderer {
+        let renderer = if self.config.artifact_root.is_some() {
+            let renderer = PageRenderer::for_prebuilt_artifact(
+                self.config.project.clone(),
+                self.config.page_renderer.clone(),
+            );
+            renderer.with_prebuilt_module_source(
+                module_source.expect("artifact route has verified server module bytes"),
+            )
+        } else {
+            PageRenderer::new(
+                self.config.project.clone(),
+                self.config.page_renderer.clone(),
+            )
+        };
+        let mut renderer = renderer.with_command_timeout(self.config.render_timeout);
         if let Some(token) = &self.config.server_action_csrf_token {
             renderer = renderer.with_server_action_csrf_token(token.clone());
         }
@@ -1411,19 +1613,24 @@ impl ProductionProject {
     }
 
     fn action_response(
-        &mut self,
+        &self,
         headers: &HttpHeaders,
         body: &[u8],
         request_context: &ProductionRequestContext,
     ) -> Result<DevResponse> {
         let started = Instant::now();
+        let mut replay_nonces = self.replay_nonces.as_ref().map(|replay_nonces| {
+            replay_nonces
+                .lock()
+                .expect("production replay nonce mutex poisoned")
+        });
         let request = match server_action_request_from_form(
             headers,
             body,
             self.config.server_action_csrf_token.as_deref(),
             self.config.server_action_csrf_cookie_name.as_deref(),
             self.config.trusted_proxy.as_ref(),
-            self.replay_nonces.as_mut(),
+            replay_nonces.as_deref_mut(),
         ) {
             Ok(request) => request,
             Err(response) => {
@@ -1439,10 +1646,8 @@ impl ProductionProject {
                 return Ok(response);
             }
         };
-        let snapshot = self
-            .snapshot
-            .as_ref()
-            .expect("snapshot built before response");
+        drop(replay_nonces);
+        let snapshot = self.snapshot.get().expect("snapshot built before response");
         let action_id = request.id.clone();
         let route_path = request.route_path.clone();
         let Some(match_result) = match_route(&route_path, &snapshot.routes) else {
@@ -1459,7 +1664,11 @@ impl ProductionProject {
             );
             return Ok(response);
         };
-        let renderer = self.page_renderer(None);
+        let module_source = snapshot
+            .server_module_sources
+            .get(&match_result.route.path)
+            .cloned();
+        let renderer = self.page_renderer(None, module_source);
         let conventions = route_conventions(&match_result.route);
         let response = match renderer.invoke_server_action(
             &match_result.route.file,
@@ -1491,6 +1700,152 @@ impl ProductionProject {
             request_context,
         );
         Ok(response)
+    }
+
+    fn artifact_route_stream_response(
+        &self,
+        path: &str,
+        match_result: &RouteMatch,
+        renderer: &PageRenderer,
+        replay_nonce: Option<&str>,
+        context: ProductionArtifactRouteContext<'_>,
+    ) -> DevResponse {
+        let ProductionArtifactRouteContext {
+            document_file,
+            conventions,
+            client_bundle,
+        } = context;
+        match document_file {
+            Some(document_file) => {
+                let metadata = match renderer.collect_metadata(
+                    &match_result.route.file,
+                    &match_result.route.layouts,
+                    &match_result.params,
+                ) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return production_render_error_response(path, match_result, &error);
+                    }
+                };
+                match renderer.render_document_to_stream_parts_with_conventions(
+                    &match_result.route.file,
+                    &match_result.route.layouts,
+                    document_file,
+                    &match_result.params,
+                    &DocumentRenderOptions {
+                        root_id: "ferrite-root".to_owned(),
+                        route_path: path.to_owned(),
+                        route_pattern: Some(match_result.route.path.clone()),
+                        build_id: None,
+                        server_action_csrf_token: self.config.server_action_csrf_token.clone(),
+                        server_action_replay_nonce: replay_nonce.map(str::to_owned),
+                        metadata,
+                        preload_scripts: client_bundle_scripts(client_bundle),
+                        styles: client_bundle_styles(client_bundle),
+                        scripts: client_bundle_scripts(client_bundle),
+                        default_title: "Ferrite".to_owned(),
+                    },
+                    conventions,
+                ) {
+                    Ok(parts) => DevResponse::streaming_html(
+                        parts.shell,
+                        parts.chunks.into_iter().map(|chunk| chunk.html).collect(),
+                    )
+                    .with_modulepreload_links(client_bundle_scripts(client_bundle)),
+                    Err(error) => production_render_error_response(path, match_result, &error),
+                }
+            }
+            None => match renderer.render_page_to_stream_parts_with_conventions(
+                &match_result.route.file,
+                &match_result.route.layouts,
+                &match_result.params,
+                conventions,
+            ) {
+                Ok(parts) => match renderer.collect_metadata(
+                    &match_result.route.file,
+                    &match_result.route.layouts,
+                    &match_result.params,
+                ) {
+                    Ok(metadata) => {
+                        let shell = render_production_route_document(
+                            path,
+                            match_result,
+                            &parts.shell,
+                            client_bundle,
+                            &metadata,
+                        );
+                        DevResponse::streaming_html(
+                            shell,
+                            parts.chunks.into_iter().map(|chunk| chunk.html).collect(),
+                        )
+                        .with_modulepreload_links(client_bundle_scripts(client_bundle))
+                    }
+                    Err(error) => production_render_error_response(path, match_result, &error),
+                },
+                Err(error) => production_render_error_response(path, match_result, &error),
+            },
+        }
+    }
+
+    fn artifact_route_server_payload_response(
+        &self,
+        path: &str,
+        match_result: &RouteMatch,
+        renderer: &PageRenderer,
+        options: ProductionServerPayloadOptions<'_>,
+        context: ProductionArtifactRouteContext<'_>,
+    ) -> DevResponse {
+        let ProductionArtifactRouteContext {
+            document_file,
+            conventions,
+            client_bundle,
+        } = context;
+        match document_file {
+            Some(document_file) => {
+                let metadata = match renderer.collect_metadata(
+                    &match_result.route.file,
+                    &match_result.route.layouts,
+                    &match_result.params,
+                ) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return production_render_error_response(path, match_result, &error);
+                    }
+                };
+                match renderer.render_document_to_server_payload_json_with_conventions(
+                    &match_result.route.file,
+                    &match_result.route.layouts,
+                    document_file,
+                    &match_result.params,
+                    &DocumentRenderOptions {
+                        root_id: "ferrite-root".to_owned(),
+                        route_path: path.to_owned(),
+                        route_pattern: Some(match_result.route.path.clone()),
+                        build_id: None,
+                        server_action_csrf_token: self.config.server_action_csrf_token.clone(),
+                        server_action_replay_nonce: options.replay_nonce.map(str::to_owned),
+                        metadata,
+                        preload_scripts: client_bundle_scripts(client_bundle),
+                        styles: client_bundle_styles(client_bundle),
+                        scripts: client_bundle_scripts(client_bundle),
+                        default_title: "Ferrite".to_owned(),
+                    },
+                    conventions,
+                ) {
+                    Ok(payload) => server_payload_response(payload, options.kind),
+                    Err(error) => production_render_error_response(path, match_result, &error),
+                }
+            }
+            None => match renderer.render_page_to_server_payload_json_with_conventions(
+                &match_result.route.file,
+                &match_result.route.layouts,
+                &match_result.params,
+                conventions,
+            ) {
+                Ok(payload) => server_payload_response(payload, options.kind),
+                Err(error) => production_render_error_response(path, match_result, &error),
+            },
+        }
     }
 
     fn route_stream_response(
@@ -1536,7 +1891,10 @@ impl ProductionProject {
                                 params: &match_result.params,
                                 out_dir: &self.config.client_out_dir,
                                 public_path: &self.config.client_public_path,
-                                options: ClientBundleOptions { action_bootstrap },
+                                options: ClientBundleOptions {
+                                    action_bootstrap,
+                                    runtime_props: false,
+                                },
                             },
                         ) {
                             Ok(client_bundle) => match renderer
@@ -1618,7 +1976,10 @@ impl ProductionProject {
                                 params: &match_result.params,
                                 out_dir: &self.config.client_out_dir,
                                 public_path: &self.config.client_public_path,
-                                options: ClientBundleOptions { action_bootstrap },
+                                options: ClientBundleOptions {
+                                    action_bootstrap,
+                                    runtime_props: false,
+                                },
                             },
                         ) {
                             Ok(client_bundle) => {
@@ -1690,7 +2051,10 @@ impl ProductionProject {
                                 params: &match_result.params,
                                 out_dir: &self.config.client_out_dir,
                                 public_path: &self.config.client_public_path,
-                                options: ClientBundleOptions { action_bootstrap },
+                                options: ClientBundleOptions {
+                                    action_bootstrap,
+                                    runtime_props: false,
+                                },
                             },
                         ) {
                             Ok(client_bundle) => match renderer
@@ -2032,7 +2396,7 @@ impl Drop for ProductionInFlightGuard {
 }
 
 impl ProductionWorkerPool {
-    fn new(worker_count: usize, project: Arc<Mutex<ProductionProject>>) -> Self {
+    fn new(worker_count: usize, project: Arc<ProductionProject>) -> Self {
         let worker_count = worker_count.max(1);
         let (sender, receiver) = mpsc::channel::<TcpStream>();
         let receiver = Arc::new(Mutex::new(receiver));
@@ -2124,6 +2488,9 @@ struct RouteSnapshot {
 struct ProductionRouteSnapshot {
     routes: Vec<Route>,
     document_file: Option<PathBuf>,
+    client_bundles: BTreeMap<String, ClientBundle>,
+    server_module_sources: BTreeMap<String, Arc<[u8]>>,
+    verified_static_assets: Option<BTreeMap<String, Arc<[u8]>>>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -2143,6 +2510,13 @@ enum ServerPayloadResponseKind {
 struct ProductionServerPayloadOptions<'a> {
     kind: ServerPayloadResponseKind,
     replay_nonce: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProductionArtifactRouteContext<'a> {
+    document_file: Option<&'a Path>,
+    conventions: &'a RouteConventions,
+    client_bundle: &'a ClientBundle,
 }
 
 #[derive(Debug, Serialize)]
@@ -2345,7 +2719,7 @@ pub fn serve<A: ToSocketAddrs>(addr: A, mut project: DevProject) -> Result<()> {
     serve_listener(listener, &mut project)
 }
 
-pub fn serve_production<A: ToSocketAddrs>(addr: A, mut project: ProductionProject) -> Result<()> {
+pub fn serve_production<A: ToSocketAddrs>(addr: A, project: ProductionProject) -> Result<()> {
     let mut addrs = addr.to_socket_addrs()?;
     let addr = addrs.next().ok_or(DevServerError::NoSocketAddress)?;
     let listener = TcpListener::bind(addr)?;
@@ -2367,10 +2741,7 @@ pub fn serve_listener_once(listener: TcpListener, project: &mut DevProject) -> R
     handle_stream(&mut stream, project)
 }
 
-pub fn serve_production_listener(
-    listener: TcpListener,
-    project: &mut ProductionProject,
-) -> Result<()> {
+pub fn serve_production_listener(listener: TcpListener, project: &ProductionProject) -> Result<()> {
     for stream in listener.incoming() {
         let mut stream = stream?;
         handle_production_stream(&mut stream, project)?;
@@ -2393,7 +2764,7 @@ pub fn serve_production_listener_with_shutdown(
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
     let worker_count = project.config.max_in_flight_requests;
-    let project = Arc::new(Mutex::new(project));
+    let project = Arc::new(project);
     let pool = ProductionWorkerPool::new(worker_count, project);
 
     while !shutdown.is_shutdown() {
@@ -2420,7 +2791,7 @@ pub fn serve_production_listener_with_shutdown(
 
 pub fn serve_production_listener_once(
     listener: TcpListener,
-    project: &mut ProductionProject,
+    project: &ProductionProject,
 ) -> Result<()> {
     let (mut stream, _addr) = listener.accept()?;
     handle_production_stream(&mut stream, project)
@@ -2444,7 +2815,7 @@ fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()>
     Ok(())
 }
 
-fn handle_production_stream(stream: &mut TcpStream, project: &mut ProductionProject) -> Result<()> {
+fn handle_production_stream(stream: &mut TcpStream, project: &ProductionProject) -> Result<()> {
     let request_read_timeout = project.config.request_read_timeout;
     let max_request_bytes = project.config.max_request_bytes;
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
@@ -2473,38 +2844,30 @@ fn handle_production_stream(stream: &mut TcpStream, project: &mut ProductionProj
 
 fn handle_production_stream_concurrent(
     stream: &mut TcpStream,
-    project: &Arc<Mutex<ProductionProject>>,
+    project: &Arc<ProductionProject>,
 ) -> Result<()> {
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
-    let (request_read_timeout, max_request_bytes) = {
-        let project = project.lock().expect("production project mutex poisoned");
-        (
-            project.config.request_read_timeout,
-            project.config.max_request_bytes,
-        )
-    };
+    let request_read_timeout = project.config.request_read_timeout;
+    let max_request_bytes = project.config.max_request_bytes;
     handle_production_stream_with_limits(
         stream,
         request_read_timeout,
         max_request_bytes,
-        |request| {
-            let mut project = project.lock().expect("production project mutex poisoned");
-            match request.method.as_str() {
-                "GET" => {
-                    let context = project.request_context(&request.headers, peer_ip);
-                    project.handle_get_with_context(&request.path, context)
-                }
-                "POST" => {
-                    let context = project.request_context(&request.headers, peer_ip);
-                    project.handle_post_with_context(
-                        &request.path,
-                        &request.headers,
-                        &request.body,
-                        context,
-                    )
-                }
-                _ => Ok(DevResponse::method_not_allowed()),
+        |request| match request.method.as_str() {
+            "GET" => {
+                let context = project.request_context(&request.headers, peer_ip);
+                project.handle_get_with_context(&request.path, context)
             }
+            "POST" => {
+                let context = project.request_context(&request.headers, peer_ip);
+                project.handle_post_with_context(
+                    &request.path,
+                    &request.headers,
+                    &request.body,
+                    context,
+                )
+            }
+            _ => Ok(DevResponse::method_not_allowed()),
         },
     )
 }
@@ -3745,16 +4108,33 @@ fn is_source_file(path: &Path) -> bool {
     )
 }
 
-fn static_asset_response(path: &str, public_path: &str, out_dir: &Path) -> DevResponse {
-    let Some(relative) = path.strip_prefix(public_path) else {
+fn static_asset_response(
+    path: &str,
+    public_path: &str,
+    out_dir: &Path,
+    verified_assets: Option<&BTreeMap<String, Arc<[u8]>>>,
+) -> DevResponse {
+    let Some(relative) = path
+        .strip_prefix(public_path)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+    else {
         return DevResponse::not_found("not found\n".to_owned());
     };
-    let relative = relative.trim_start_matches('/');
-    if relative.contains("..") {
+    if relative.is_empty()
+        || relative.contains('\\')
+        || relative
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return DevResponse::bad_request("invalid static asset path");
     }
-
     let file = out_dir.join(relative);
+    if let Some(assets) = verified_assets {
+        return match assets.get(relative) {
+            Some(bytes) => DevResponse::ok(content_type_for(&file), bytes.as_ref().to_vec()),
+            None => DevResponse::not_found("not found\n".to_owned()),
+        };
+    }
     match fs::read(&file) {
         Ok(body) => DevResponse::ok(content_type_for(&file), body),
         Err(_) => DevResponse::not_found("not found\n".to_owned()),
@@ -3836,6 +4216,14 @@ fn render_production_route_document(
     client_bundle: &ClientBundle,
     metadata: &PageMetadata,
 ) -> String {
+    let page_props = serde_json::to_string(&json!({
+        "params": match_result
+            .params
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>()
+    }))
+    .expect("validated route params serialize to JSON");
     let metadata_tags = render_metadata_head_tags(metadata, "Ferrite");
     let scripts = client_bundle_scripts(client_bundle);
     let preloads = render_modulepreload_tags(&scripts);
@@ -3866,13 +4254,14 @@ fn render_production_route_document(
 {styles}
 </head>
 <body>
-  <div id="ferrite-root" data-route="{path}"{route_pattern}>{page_html}</div>
+  <div id="ferrite-root" data-route="{path}"{route_pattern} data-ferrite-page-props="{page_props}">{page_html}</div>
 </body>
 </html>"#,
         metadata_tags = metadata_tags,
         preloads = preloads,
         path = escape_html(path),
         route_pattern = route_pattern,
+        page_props = escape_html(&page_props),
         page_html = page_html,
         styles = styles,
         scripts = render_script_tags(&scripts),
@@ -4225,10 +4614,15 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrite_protocol::ServerActionFormValue;
+    use ferrite_builder::{
+        BuildConfig, ProductionArtifactManifest, ProductionArtifactRoute, artifact_file_record,
+        build_project,
+    };
+    use ferrite_protocol::{ServerActionFormValue, ServerPayloadPacket};
     use flate2::read::GzDecoder;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::sync::Barrier;
     use std::thread;
 
     fn write(path: &Path, value: &str) {
@@ -4564,8 +4958,8 @@ process.exit(1);
         let addr = listener.local_addr().unwrap();
 
         let server = thread::spawn(move || {
-            let mut project = project;
-            serve_production_listener_once(listener, &mut project).unwrap();
+            let project = project;
+            serve_production_listener_once(listener, &project).unwrap();
         });
 
         let mut stream = TcpStream::connect(addr).unwrap();
@@ -4662,7 +5056,7 @@ process.exit(1);
     }
 
     fn wait_for_path(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !path.exists() {
             assert!(
                 Instant::now() < deadline,
@@ -5511,8 +5905,15 @@ process.exit(1);
             .config
             .with_server_action_csrf_token("token-123")
             .with_server_action_replay_ttl(Duration::from_secs(30));
-        let mut project = ProductionProject::new(config);
-        let nonce = project.replay_nonces.as_mut().unwrap().issue().unwrap();
+        let project = ProductionProject::new(config);
+        let nonce = project
+            .replay_nonces
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .issue()
+            .unwrap();
         let body = action_form_body_with_csrf_and_nonce("/posts/abc", "token-123", &nonce);
         let headers = action_headers_with_host("application/x-www-form-urlencoded");
 
@@ -5641,7 +6042,7 @@ process.exit(1);
         );
         let events = Arc::new(Mutex::new(Vec::new()));
         let observed_events = Arc::clone(&events);
-        let mut project =
+        let project =
             ProductionProject::new(production_project_for(&app).config.with_request_observer(
                 move |event| {
                     observed_events.lock().unwrap().push(event);
@@ -5669,7 +6070,7 @@ process.exit(1);
             &app.join("posts/[id]/page.tsx"),
             "export default function Post() {}",
         );
-        let mut project = ProductionProject::new(
+        let project = ProductionProject::new(
             production_project_for(&app)
                 .config
                 .with_metrics_path("/__ferrite/metrics"),
@@ -5705,7 +6106,7 @@ process.exit(1);
             &app.join("posts/[id]/page.tsx"),
             "export default function Page() {}",
         );
-        let mut project = ProductionProject::new(
+        let project = ProductionProject::new(
             action_production_project_for(&app, action_renderer_body())
                 .config
                 .with_metrics_path("/__ferrite/metrics"),
@@ -5754,7 +6155,7 @@ process.exit(1);
 setInterval(() => {}, 1000);
 "#,
         );
-        let mut project = ProductionProject::new(
+        let project = ProductionProject::new(
             ProductionServerConfig::new(
                 project.clone(),
                 app,
@@ -5784,7 +6185,7 @@ setInterval(() => {}, 1000);
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
         write(&app.join("page.tsx"), "export default function Page() {}");
-        let project = Arc::new(Mutex::new(production_project_for(&app)));
+        let project = Arc::new(production_project_for(&app));
 
         let pool = ProductionWorkerPool::new(0, project);
 
@@ -5797,7 +6198,7 @@ setInterval(() => {}, 1000);
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
         write(&app.join("page.tsx"), "export default function Page() {}");
-        let project = Arc::new(Mutex::new(production_project_for(&app)));
+        let project = Arc::new(production_project_for(&app));
         let pool = ProductionWorkerPool::new(1, project);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5940,7 +6341,7 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
         let addr = listener.local_addr().unwrap();
 
         let server = thread::spawn(move || {
-            serve_production_listener_once(listener, &mut project).unwrap();
+            serve_production_listener_once(listener, &project).unwrap();
         });
 
         let mut stream = TcpStream::connect(addr).unwrap();
@@ -6132,7 +6533,7 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
             &app.join("posts/[id]/page.tsx"),
             "export default function Post() {}",
         );
-        let mut project = production_project_for(&app);
+        let project = production_project_for(&app);
 
         let response = project
             .handle_get("/posts/abc?__ferrite_payload=server")
@@ -6157,7 +6558,7 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
             &app.join("posts/[id]/page.tsx"),
             "export default function Post() {}",
         );
-        let mut project = production_project_for(&app);
+        let project = production_project_for(&app);
 
         let response = project
             .handle_get("/posts/abc?__ferrite_payload=stream")
@@ -6447,7 +6848,7 @@ process.stdout.write(JSON.stringify({
             &app.join("posts/[id]/page.tsx"),
             "export default function Post() {}",
         );
-        let mut project = production_project_for(&app);
+        let project = production_project_for(&app);
 
         let response = project.handle_get("/posts/abc").unwrap();
 
@@ -6479,7 +6880,7 @@ process.stdout.write(JSON.stringify({
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
         write(&app.join("page.tsx"), "export default function Page() {}");
-        let mut project = production_project_for(&app);
+        let project = production_project_for(&app);
         let stale_file = project
             .config()
             .client_out_dir
@@ -6517,7 +6918,7 @@ process.stdout.write(JSON.stringify({
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
         write(&app.join("page.tsx"), "export default function Page() {}");
-        let mut project = production_project_for(&app);
+        let project = production_project_for(&app);
 
         let html = project.handle_get("/").unwrap();
         let html_body = html.body_text();
@@ -6581,8 +6982,8 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "unexpected non-strea
         let addr = listener.local_addr().unwrap();
 
         let server = thread::spawn(move || {
-            let mut project = project;
-            serve_production_listener_once(listener, &mut project).unwrap();
+            let project = project;
+            serve_production_listener_once(listener, &project).unwrap();
         });
 
         let mut stream = TcpStream::connect(addr).unwrap();
@@ -6746,7 +7147,7 @@ console.error("render exploded");
 process.exit(1);
 "#,
         );
-        let mut project = ProductionProject::new(ProductionServerConfig::new(
+        let project = ProductionProject::new(ProductionServerConfig::new(
             project.clone(),
             app,
             project.join(".ferrite/types/routes.d.ts"),
@@ -6800,7 +7201,7 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
         );
         let bundler = project.join("build-client.mjs");
         make_script(&bundler, "setInterval(() => {}, 1000); // bundler-secret");
-        let mut project = ProductionProject::new(
+        let project = ProductionProject::new(
             ProductionServerConfig::new(
                 project.clone(),
                 app,
@@ -7369,5 +7770,258 @@ process.stdout.write(JSON.stringify({
         assert!(response.contains("Content-Length:"));
         assert!(!response.contains("Transfer-Encoding: chunked"));
         assert!(response.contains("<h1>Home Page</h1>"));
+    }
+
+    #[test]
+    fn artifact_production_serves_dynamic_routes_payloads_actions_and_assets_without_source() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .to_path_buf();
+        let temp = tempfile::tempdir_in(workspace.join("examples/basic")).unwrap();
+        let project = temp.path();
+        write(
+            &project.join("package.json"),
+            r#"{"private":true,"type":"module"}"#,
+        );
+        write(
+            &project.join("node_modules/artifact-value/package.json"),
+            r#"{"name":"artifact-value","type":"module","exports":"./index.js"}"#,
+        );
+        write(
+            &project.join("node_modules/artifact-value/index.js"),
+            r#"export const artifactValue = "bundled dependency";"#,
+        );
+        write(
+            &project.join("app/posts/[id]/Client.tsx"),
+            r#"
+"use client";
+import { useState } from "@ferrite/runtime";
+export default function Client({ id }) {
+  const [count] = useState(0);
+  return <span data-client={id}>{count}</span>;
+}
+"#,
+        );
+        write(
+            &project.join("app/posts/[id]/page.tsx"),
+            r#"
+import { createServerAction } from "@ferrite/runtime/server";
+import { artifactValue } from "artifact-value";
+import Client from "./Client";
+export function generateMetadata({ params }) {
+  return { title: `Artifact ${params.id}` };
+}
+export default function Page({ params }) {
+  const actionId = params.id === "conditional"
+    ? "app/posts/[id]/page.tsx#conditional"
+    : "app/posts/[id]/page.tsx#savePost";
+  const savePost = createServerAction({
+    id: actionId,
+    routePattern: "/posts/:id",
+    run({ routePath, form }) {
+      return { routePath, title: form.title || "" };
+    }
+  });
+  return <main><h1>Artifact {params.id} {artifactValue}</h1><form action={savePost}><input name="title" /></form><Client id={params.id} /></main>;
+}
+"#,
+        );
+        let renderer = workspace.join("packages/runtime/bin/render-page.mjs");
+        let artifact_runner = workspace.join("packages/runtime/bin/render-artifact.mjs");
+        let bundler = workspace.join("packages/runtime/bin/build-client.mjs");
+        let artifact_root = project.join(".ferrite/build");
+        let report = build_project(&BuildConfig::new(
+            project.to_path_buf(),
+            project.join("app"),
+            artifact_root.clone(),
+            project.join(".ferrite/types/routes.d.ts"),
+            renderer.clone(),
+            bundler,
+        ))
+        .unwrap();
+        assert_eq!(report.skipped_dynamic_routes, vec!["/posts/:id"]);
+        assert!(report.html_files.is_empty());
+        write(
+            &artifact_root.join("_ferrite/static/undeclared.js"),
+            "console.log('not in manifest');",
+        );
+
+        fs::remove_dir_all(project.join("app")).unwrap();
+        fs::remove_dir_all(project.join("node_modules")).unwrap();
+        let temp_runtime_dir = project.join(".ferrite/tmp");
+        if temp_runtime_dir.exists() {
+            fs::remove_dir_all(&temp_runtime_dir).unwrap();
+        }
+        let production = ProductionProject::from_artifact(ProductionServerConfig::from_artifact(
+            project.to_path_buf(),
+            artifact_root.clone(),
+            artifact_runner,
+        ))
+        .unwrap();
+        fs::remove_dir_all(&artifact_root).unwrap();
+
+        let html = production.handle_get("/posts/live").unwrap();
+        let html_body = html.body_text();
+        assert_eq!(html.status, 200);
+        assert!(html_body.contains("<title>Artifact live</title>"));
+        assert!(html_body.contains("<h1>Artifact live bundled dependency</h1>"));
+        assert!(html_body.contains("data-ferrite-page-props"));
+        assert!(html_body.contains("app/posts/[id]/page.tsx#savePost"));
+        assert!(!temp_runtime_dir.exists());
+
+        let payload = production
+            .handle_get("/posts/live?__ferrite_payload=server")
+            .unwrap();
+        let packet: ServerPayloadPacket = serde_json::from_slice(&payload.body).unwrap();
+        ferrite_protocol::validate_server_payload_packet(&packet).unwrap();
+
+        let action = production
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                &action_form_body("/posts/live"),
+            )
+            .unwrap();
+        let action_body: Value = serde_json::from_slice(&action.body).unwrap();
+        assert_eq!(action.status, 200);
+        assert_eq!(action_body["data"]["routePath"], "/posts/live");
+
+        let conditional_action = String::from_utf8(action_form_body("/posts/conditional"))
+            .unwrap()
+            .replace("%23savePost", "%23conditional");
+        let conditional = production
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                conditional_action.as_bytes(),
+            )
+            .unwrap();
+        let conditional_body: Value = serde_json::from_slice(&conditional.body).unwrap();
+        assert_eq!(conditional.status, 200);
+        assert_eq!(conditional_body["data"]["routePath"], "/posts/conditional");
+
+        let unknown_action = String::from_utf8(action_form_body("/posts/live"))
+            .unwrap()
+            .replace("%23savePost", "%23missing");
+        let rejected = production
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                unknown_action.as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(rejected.status, 404);
+
+        let script = static_script_src(&html_body);
+        let asset = production.handle_get(&script).unwrap();
+        assert_eq!(asset.status, 200);
+        assert_eq!(
+            asset.cache_control,
+            Some("public, max-age=31536000, immutable")
+        );
+        let undeclared_asset = production
+            .handle_get("/_ferrite/static/undeclared.js")
+            .unwrap();
+        assert_eq!(undeclared_asset.status, 404);
+    }
+
+    #[test]
+    fn artifact_production_requests_execute_in_parallel_without_a_project_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_root = temp.path().join("artifact");
+        write(
+            &artifact_root.join("server/route.mjs"),
+            "export const routePattern = '/';\n",
+        );
+        let server_file = artifact_file_record(&artifact_root, "server/route.mjs").unwrap();
+        let manifest = ProductionArtifactManifest::new(
+            "/_ferrite/static",
+            false,
+            vec![ProductionArtifactRoute {
+                path: "/".to_owned(),
+                params: Vec::new(),
+                server_module: "server/route.mjs".to_owned(),
+                client_bundle: ClientBundle {
+                    script: None,
+                    action_bootstrap: None,
+                    styles: Vec::new(),
+                    outputs: Vec::new(),
+                    sourcemaps: Vec::new(),
+                    assets: Vec::new(),
+                    client_references: Vec::new(),
+                },
+                prerendered: BTreeMap::new(),
+                observed_actions: Vec::new(),
+            }],
+            vec![server_file],
+        )
+        .unwrap();
+        fs::write(
+            artifact_root.join(FERRITE_PRODUCTION_ARTIFACT_MANIFEST),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let runner = temp.path().join("artifact-runner.mjs");
+        make_script(
+            &runner,
+            r#"
+import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args.shift() !== "--prebuilt-stdin") process.exit(2);
+const mode = args[0];
+if (mode === "--metadata") {
+  const barrier = new URL("./runner-barrier", import.meta.url);
+  mkdirSync(barrier, { recursive: true });
+  writeFileSync(new URL(`./runner-barrier/${process.pid}`, import.meta.url), "started");
+  const deadline = Date.now() + 15000;
+  while (readdirSync(barrier).length < 2) {
+    if (Date.now() >= deadline) throw new Error("concurrent artifact runner never reached barrier");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  process.stdout.write("{}");
+} else {
+  process.stdout.write(JSON.stringify({ ferrite: "render-stream", version: 1, shell: [0, "parallel"], chunks: [] }));
+}
+"#,
+        );
+        let project = Arc::new(
+            ProductionProject::from_artifact(ProductionServerConfig::from_artifact(
+                temp.path().to_path_buf(),
+                artifact_root,
+                runner,
+            ))
+            .unwrap(),
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let project = Arc::clone(&project);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                project.handle_get("/").unwrap()
+            }));
+        }
+
+        barrier.wait();
+        let responses = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(responses.iter().all(|response| response.status == 200));
+        assert!(
+            responses
+                .iter()
+                .all(|response| response.body_text().contains("parallel"))
+        );
+        assert_eq!(
+            fs::read_dir(temp.path().join("runner-barrier"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
 }
