@@ -25,6 +25,7 @@ Locally proven on `codex/protocol-wasm-validation`:
 - The exact artifact-only container builds and serves a dynamic route and fingerprinted asset as a non-root user with JSON access logs and no runtime workspace package tree.
 - Production sockets enforce a configurable absolute response-write deadline across fixed, gzip, and chunked output; parse errors, overload rejection, and shutdown drain use bounded writers, and a real stalled-reader test proves typed timeout failure.
 - An artifact-backed real-socket saturation test holds both workers, receives six prompt `503` responses, releases the work, and proves a later request succeeds; a separate single-worker test proves a failed artifact-runner subprocess returns a generic `500` and the next request succeeds.
+- A bounded artifact-backed mixed-load soak repeats four-worker slow-reader saturation and barrier-synchronized concurrent load waves, proves write-deadline truncation, complete overload `503` delivery, no false `408` responses for complete requests, post-saturation runner failure recovery, fixed rejection-worker limits, runner lifecycle cleanup, and bounded joined shutdown.
 
 Explicitly not proven:
 
@@ -32,7 +33,7 @@ Explicitly not proven:
 - Hosted staging behind real TLS, proxy, process manager, CDN, or rollback automation; local container proof does not establish this.
 - npm or native prebuild publication and registry installation.
 - Cargo registry publication. All 11 local archives now package with versioned internal dependencies, but publish ordering and registry installation are not proven.
-- Sustained production load/soak, concurrent slow-reader capacity, host-process supervisor recovery, hosted multi-instance behavior, and rollback under live traffic. The current overlap, saturation/recovery, subprocess-recovery, and response-deadline tests are regression proofs, not capacity benchmarks.
+- Hosted capacity, long-duration soak, host-process supervisor recovery, hosted multi-instance behavior, and rollback under live traffic. The local mixed-load soak is a bounded regression proof, not a throughput or capacity benchmark.
 - A clean-machine install from published packages and a publicly distributed CLI rather than locally packed candidates and a copied CLI binary.
 - Atomic release activation through a versioned directory or image pointer; direct replacement of an existing build directory has a brief activation window.
 - Workspace-wide Rust/JS branch thresholds, mutation testing, or a browser-to-real-`ferrite serve` action/payload test. A one-time local `ferrite-dev-server` coverage run reports 90.12% line, 90.20% function, and 89.58% region coverage, but it is not yet a committed CI threshold.
@@ -53,7 +54,8 @@ Required exit criteria:
 - [x] Independent route requests execute concurrently without a global project lock.
 - [x] Production fixed, gzip, chunked, parse-error, overload, and shutdown-drain responses use a configurable absolute write deadline, with real stalled-reader timeout proof.
 - [x] Controlled saturation proves bounded `503` responses, recovered worker capacity, and successful single-worker reuse after an artifact-runner subprocess failure.
-- [ ] Sustained load/soak tests prove capacity and concurrent slow-reader behavior.
+- [x] A bounded mixed-load soak proves concurrent slow-reader deadlines, overload delivery, false-`408` absence, cleanup, and post-saturation recovery.
+- [ ] Hosted and long-duration load tests establish throughput, latency, and capacity targets.
 - [ ] A versioned release-directory or image pointer provides atomic activation without the direct-directory rename window.
 
 ### P0: Developers Cannot Install A Coherent Release
@@ -90,7 +92,7 @@ Committed workflows verify npm tarballs and native prebuild dry-runs, but no gen
 
 ## Fastest Developer Launch
 
-1. Add sustained load/soak and concurrent slow-reader capacity proof around the completed controlled-overload and artifact-runner recovery regressions.
+1. Define throughput and latency targets, then run hosted and long-duration capacity tests around the completed bounded mixed-load regression soak.
 2. Decide license, GitHub repository, and alpha distribution; configure the remote and open a small PR stack.
 3. Run the required remote workflow for lint, typecheck, build, full tests, Chromium, artifact-backed example integration, npm verification, Cargo packaging, and native artifacts.
 4. Publish the locally proven `ferrite init` starter path with a public CLI binary and pinned toolchain matrix, then validate it on a clean machine.
