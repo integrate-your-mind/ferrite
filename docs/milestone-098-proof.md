@@ -10,9 +10,9 @@ The soak exposed a race where an overloaded socket could be accepted before the 
 
 ## Soak invariants
 
-- Four admitted slow readers fill all workers across three waves.
+- Four slow-reader clients start behind one barrier, must each receive `200` without admission retries, and fill all workers across three waves.
 - Every slow response starts as `200` but is truncated by the absolute write deadline.
-- Twenty-four concurrent overload clients receive complete `503` responses with `no-store` caching.
+- Twenty-four concurrent overload clients receive complete `503` responses with `no-store` caching within 500 ms, before the one-second slow-response write deadline can release capacity.
 - Ten barrier-synchronized eight-client mixed-load waves return only `200` or `503`; complete requests never receive `408`.
 - A synthetic runner exit after the saturation waves returns a redacted `500`, and subsequent requests recover to `200`.
 - Runner lifecycle starts equal completions plus the one intentional failure.
@@ -21,7 +21,8 @@ The soak exposed a race where an overloaded socket could be accepted before the 
 ## Proof completed before the full repository gate
 
 - The integrated soak passed ten consecutive non-instrumented repetitions.
-- The final bounded-pool soak passed ten consecutive repetitions; earlier iterations also exposed and removed timing assumptions.
+- A pre-receipt repetition failed when the retry-based helper admitted a replacement slow reader after an earlier writer had already timed out; that exposed a vacuous simultaneous-saturation assumption rather than a production `503` failure.
+- The corrected bounded-pool soak removes admission retries, synchronizes all four slow readers, and passed ten consecutive exact-tree repetitions.
 - Final full-suite and coverage totals are recorded in the exact-SHA receipt.
 
 ## Boundary
