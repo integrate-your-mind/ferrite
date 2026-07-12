@@ -30,4 +30,4 @@ The nginx template now rejects unknown and mismatched canonical targets plus raw
 
 This milestone does not claim a hosted TLS/CDN deployment, hosted CI job execution, publication, deployment, or release. Local nginx 1.29.3 TLS framing parity and client-side chunked action compatibility are proven, while the exact hosted image, certificate chain, CDN, restart, and rollback behavior remain staging gates.
 
-The base parser, local CI, coverage, environment, hashes, and delivery state are recorded in `docs/proof-receipts/2026-07-12T223557Z-16aff08-local-ci.md`; that earlier receipt correctly predates live nginx proof. This follow-on proxy work requires its own supplemental receipt against the committed source SHA.
+The base parser, local CI, coverage, environment, hashes, and delivery state are recorded in `docs/proof-receipts/2026-07-12T223557Z-16aff08-local-ci.md`; that earlier receipt correctly predates live nginx proof. The follow-on exact-source-SHA nginx matrix, negative controls, updated coverage, package verification, hashes, and explicit gaps are recorded in `docs/proof-receipts/2026-07-12T233338Z-c98a0d9-nginx.md`.
