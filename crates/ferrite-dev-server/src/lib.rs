@@ -5395,26 +5395,19 @@ process.exit(1);
         result
     }
 
-    fn connect_admitted_slow_reader(
+    fn connect_slow_reader(
         addr: std::net::SocketAddr,
         request: &[u8],
         timeout: Duration,
     ) -> TcpStream {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            stream.set_read_timeout(Some(timeout)).unwrap();
-            stream.write_all(request).unwrap();
-            stream.shutdown(Shutdown::Write).unwrap();
-            match peek_response_status(&stream, timeout).unwrap() {
-                200 => return stream,
-                503 => {
-                    assert!(Instant::now() < deadline, "slow reader was never admitted");
-                    thread::sleep(Duration::from_millis(5));
-                }
-                408 => panic!("complete slow-reader request received a false 408"),
-                status => panic!("slow-reader admission returned unexpected status {status}"),
-            }
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.write_all(request).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        match peek_response_status(&stream, timeout).unwrap() {
+            200 => stream,
+            408 => panic!("complete slow-reader request received a false 408"),
+            status => panic!("slow-reader admission returned unexpected status {status}"),
         }
     }
 
@@ -7036,7 +7029,8 @@ process.stdout.write(JSON.stringify({
         const LOAD_WAVES: usize = 10;
         const LOAD_CLIENTS: usize = 8;
         const SLOW_ASSET_BYTES: usize = 64 * 1024 * 1024;
-        const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+        const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+        const OVERLOAD_RESPONSE_BOUND: Duration = Duration::from_millis(500);
         const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         const SLOW_REQUEST: &[u8] =
             b"GET /_ferrite/static/slow.bin HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -7094,13 +7088,18 @@ record(`completed:${mode}`);
 
         let mut overload_responses = 0;
         for wave in 0..SLOW_READER_WAVES {
+            let start_slow_readers = Arc::new(Barrier::new(WORKERS + 1));
             let slow_readers = (0..WORKERS)
                 .map(|_| {
+                    let start_slow_readers = Arc::clone(&start_slow_readers);
                     thread::spawn(move || {
-                        connect_admitted_slow_reader(addr, SLOW_REQUEST, Duration::from_secs(2))
+                        start_slow_readers.wait();
+                        connect_slow_reader(addr, SLOW_REQUEST, Duration::from_secs(2))
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            start_slow_readers.wait();
+            let slow_readers = slow_readers
                 .into_iter()
                 .map(|client| client.join().unwrap())
                 .collect::<Vec<_>>();
@@ -7114,7 +7113,7 @@ record(`completed:${mode}`);
                 Duration::from_secs(2),
             );
             assert!(
-                overload_started.elapsed() < Duration::from_secs(2),
+                overload_started.elapsed() < OVERLOAD_RESPONSE_BOUND,
                 "overload responses exceeded their bound in wave {wave}"
             );
             for response in overloaded {
