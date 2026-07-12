@@ -2583,7 +2583,10 @@ fn reject_overloaded_stream_without_wait(
     response_write_timeout: Duration,
     max_request_bytes: usize,
 ) {
-    let _ = stream.set_nonblocking(true);
+    if stream.set_nonblocking(true).is_err() {
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
     let _ = write_overload_response(&mut stream, response_write_timeout);
     let _ = stream.shutdown(Shutdown::Write);
     let _ = drain_available_overload_request(&mut stream, max_request_bytes);
