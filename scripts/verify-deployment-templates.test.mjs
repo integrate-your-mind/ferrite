@@ -38,6 +38,9 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
   const nginx = await text("deploy/nginx/ferrite.conf");
 
   assert.match(nginx, /proxy_pass http:\/\/127\.0\.0\.1:3000;/);
+  assert.match(nginx, /listen 443 ssl;/);
+  assert.match(nginx, /http2 on;/);
+  assert.doesNotMatch(nginx, /listen 443 ssl http2;/);
   assert.match(nginx, /proxy_http_version 1\.1;/);
   assert.match(nginx, /proxy_request_buffering on;/);
   assert.match(nginx, /proxy_set_header Host \$host;/);
@@ -46,6 +49,23 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
   assert.match(nginx, /proxy_set_header X-Forwarded-For \$remote_addr;/);
   assert.match(nginx, /proxy_set_header Connection "";/);
   assert.match(nginx, /proxy_set_header Expect "";/);
+  assert.match(
+    nginx,
+    /map \$http_host \$ferrite_authority_allowed \{\s+default 0;\s+app\.example\.com 1;\s+\}/,
+  );
+  assert.match(
+    nginx,
+    /map \$request \$ferrite_request_target_allowed \{[\s\S]+https:\/\/app\\\.example\\\.com[\s\S]+https\?:\/\//,
+  );
+  assert.match(nginx, /if \(\$host != \$server_name\) \{\s+return 421;\s+\}/);
+  assert.match(
+    nginx,
+    /if \(\$ferrite_authority_allowed = 0\) \{\s+return 421;\s+\}/,
+  );
+  assert.match(
+    nginx,
+    /if \(\$ferrite_request_target_allowed = 0\) \{\s+return 421;\s+\}/,
+  );
   assert.match(nginx, /location = \/__ferrite\/metrics \{\s+return 404;\s+\}/);
   assert.doesNotMatch(nginx, /\$proxy_add_x_forwarded_for/);
   assert.match(nginx, /client_max_body_size 16k;/);
@@ -75,4 +95,11 @@ test("container template runs as a non-root runtime user with a health check", a
   assert.match(dockerignore, /^\*\*\/\.env\.\*$/m);
   assert.match(dockerignore, /^\*\*\/\*\.key$/m);
   assert.match(dockerignore, /^\*\*\/\*\.pem$/m);
+});
+
+test("runtime proxy verifier is wired into the package scripts", async () => {
+  const packageJson = JSON.parse(await text("package.json"));
+
+  assert.equal(packageJson.scripts["test:nginx"], "node scripts/verify-nginx-runtime.mjs");
+  assert.match(await text("scripts/verify-nginx-runtime.mjs"), /nginx framing matrix passed/);
 });

@@ -24,10 +24,10 @@ The final suite covers valid requests, malformed grammar, duplicate and conflict
 
 ## Deployment contract
 
-The nginx template now explicitly enables request buffering, keeps the upstream on HTTP/1.1, owns trusted forwarding fields, clears `Connection`, and strips `Expect`. The deployment, architecture, README, and GTM documents describe the same boundary.
+The nginx template now rejects unknown and mismatched canonical targets plus raw authorities, explicitly enables request buffering, keeps the upstream on HTTP/1.1, owns trusted forwarding fields, clears `Connection`, and strips `Expect`. A reusable raw-TLS verifier passes 25/25 cases against official `nginx:1.29.3-alpine`, including client chunk de-framing, edge rejection, upstream-log smuggling canaries, trusted-header ownership, canonicalized legacy forms, and two pipelined client requests. The first live authority probes exposed that the prior template accepted unknown and mismatched absolute-form authorities; independent review then caught that `$host` normalization still accepted raw-Host and absolute-form ports. The canonical, raw-Host, and raw-target `421` guards fix those causes and the matrix locks them in.
 
 ## Boundary
 
-This milestone does not claim a live nginx runtime, TLS/CDN deployment, client-side chunked action compatibility, hosted CI job execution, publication, deployment, or release. nginx is not installed locally, the Docker daemon was unavailable, and the bounded Colima start could not write its external configuration from this workspace sandbox. Static template verification and direct Ferrite socket proof passed; real proxy framing parity remains a hosted staging gate.
+This milestone does not claim a hosted TLS/CDN deployment, hosted CI job execution, publication, deployment, or release. Local nginx 1.29.3 TLS framing parity and client-side chunked action compatibility are proven, while the exact hosted image, certificate chain, CDN, restart, and rollback behavior remain staging gates.
 
-Exact commands, coverage, environment, hashes, and delivery state are recorded in `docs/proof-receipts/2026-07-12T223557Z-16aff08-local-ci.md`.
+The base parser, local CI, coverage, environment, hashes, and delivery state are recorded in `docs/proof-receipts/2026-07-12T223557Z-16aff08-local-ci.md`; that earlier receipt correctly predates live nginx proof. This follow-on proxy work requires its own supplemental receipt against the committed source SHA.

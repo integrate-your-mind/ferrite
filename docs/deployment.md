@@ -102,7 +102,7 @@ The Rust adapter intentionally implements a narrow proxy-upstream contract rathe
 - duplicate framing or security-sensitive fields are rejected, including `Content-Length`, `Transfer-Encoding`, `Host`, `Content-Type`, `Cookie`, `Expect`, `Origin`, `Referer`, and trusted `X-Forwarded-*` fields
 - one request is processed per connection and every response closes the connection; already-buffered bytes beyond the declared request are rejected, and HTTP pipelining is unsupported
 
-The supplied nginx template keeps request buffering enabled, speaks HTTP/1.1 to Ferrite, overwrites the authority and forwarded-origin fields, clears hop-by-hop `Connection`, and strips `Expect`. The [nginx request-buffering contract](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_request_buffering) reads the complete client body before sending it upstream. Ferrite still rejects `Transfer-Encoding` at its own boundary, so action clients should send a singular `Content-Length`; client-side chunked action compatibility must be proven against the deployed proxy version rather than assumed. Do not expose Ferrite as an unmanaged Internet edge or configure a proxy that forwards raw ambiguous framing.
+The supplied nginx template keeps request buffering enabled, speaks HTTP/1.1 to Ferrite, rejects canonical targets and raw `Host` authorities outside the configured public host, overwrites the accepted authority and forwarded-origin fields, clears hop-by-hop `Connection`, and strips `Expect`. Keep both `map` entries and `server_name` aligned when changing the public host; the raw-authority and raw-target maps deliberately reject missing hosts, explicit ports, mismatched schemes, and alternate absolute-form authorities. The [nginx request-buffering contract](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_request_buffering) reads the complete client body before sending it upstream. The template requires nginx 1.25.1 or newer because it uses the non-deprecated `http2` directive. An exact local evidence run against official `nginx:1.29.3-alpine` proves that client-side chunked action bodies are dechunked into Ferrite-compatible requests in that version; rerun the matrix against the exact deployed proxy image rather than assuming all versions behave identically. Do not expose Ferrite as an unmanaged Internet edge or configure a proxy that forwards raw ambiguous framing.
 
 ## Build And Start
 
@@ -145,11 +145,11 @@ For a packaged binary, run the installed `ferrite` executable with the same argu
 Ferrite includes first-pass deployment templates for a private-beta topology:
 
 - `deploy/systemd/ferrite.service`: process manager template for a private `127.0.0.1:3000` Ferrite service.
-- `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that buffers requests, owns `Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For`, strips unsupported `Expect`, clears hop-by-hop `Connection`, and blocks the in-process metrics path from public proxy traffic.
+- `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that rejects unknown authorities, buffers requests, owns `Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For`, strips unsupported `Expect`, clears hop-by-hop `Connection`, and blocks the in-process metrics path from public proxy traffic.
 - `deploy/ferrite.env.example`: runtime environment variables for CSRF and public origin configuration.
 - `deploy/container/Dockerfile`: container template that builds the workspace and example artifact, then copies only the CLI, dependency-free artifact runner, and verified artifact into the final image rather than application source, workspace packages, or `node_modules`. It runs as a non-root runtime user and starts artifact-backed `ferrite serve` with production limits, CSRF cookie binding, one-time server-action replay nonces, trusted-proxy origin checks, trusted forwarded client-IP hop count, JSON access logs, and JSON action audit logs. Its directly exposed default does not enable the metrics endpoint.
 
-These templates are checked statically by `scripts/verify-deployment-templates.test.mjs`. The exact artifact-only container also builds locally and has a runtime smoke proving a dynamic route, fingerprinted asset, JSON access log, non-root user, and absence of workspace packages and `node_modules`. This is not hosted deployment proof. Before using these templates for a paid beta, run the chosen template behind the real proxy, capture access logs, run the smoke tests below, and record rollback steps for the exact artifact version.
+These templates are checked statically by `scripts/verify-deployment-templates.test.mjs`. `scripts/verify-nginx-runtime.mjs` sends a real raw-TLS normal/failure/odd-path matrix through a running nginx and Ferrite pair, then checks the Ferrite JSON access log to prove baseline requests reached the upstream while smuggling canaries did not. The exact artifact-only container also builds locally and has a runtime smoke proving a dynamic route, fingerprinted asset, JSON access log, non-root user, and absence of workspace packages and `node_modules`. None of this is hosted deployment proof. Before using these templates for a paid beta, run the chosen template behind the real proxy, capture access logs, run the smoke tests below, and record rollback steps for the exact artifact version.
 
 ## Runtime Configuration
 
@@ -195,6 +195,18 @@ curl -i http://127.0.0.1:3000/__ferrite/metrics # private upstream only
 ```
 
 For routes with server-action forms, submit a normal same-host action POST with the rendered `__ferrite_csrf` field, a missing-token rejection probe, and a cross-origin rejection probe. If `--server-action-csrf-cookie-name` is enabled, verify the route response sets the named cookie and that an action POST without that cookie is rejected. If `--server-action-replay-ttl-ms` is enabled, verify the rendered form includes `__ferrite_nonce`, the first action POST succeeds, and replaying the exact same body is rejected. If `--trusted-proxy-public-origin` is enabled, include a proxy-path smoke that proves matching `X-Forwarded-Proto` and `X-Forwarded-Host` are accepted and mismatches are rejected. Do not treat server actions as auth-complete until token rotation/session binding, auth integration, and multi-process replay coordination are implemented.
+
+With the `examples/basic` artifact and trusted-proxy configuration running behind the candidate TLS proxy, execute the raw framing matrix:
+
+```sh
+FERRITE_NGINX_HOST=127.0.0.1 \
+FERRITE_NGINX_PORT=8443 \
+FERRITE_NGINX_SERVER_NAME=app.example.com \
+FERRITE_NGINX_ACCESS_LOG_PATH=/absolute/path/to/ferrite-access.log \
+pnpm test:nginx
+```
+
+Start Ferrite with `--access-log json` and redirect stderr to the absolute log path passed above. The verifier reads only entries appended after it starts, requires baseline route and action records, and rejects any access-log evidence that a malformed-framing canary reached Ferrite. It validates TLS certificates by default, negotiates HTTP/1.1 explicitly, bounds each complete exchange and response size, and reports its target and TLS-verification mode. Set `FERRITE_NGINX_INSECURE=1` only for an isolated local self-signed certificate. The matrix covers normal GET/action requests, client-side chunked actions, duplicate and conflicting `Content-Length`, `Transfer-Encoding` combinations with smuggling canaries, duplicate authority/origin/referer/cookie fields, obsolete folding and whitespace, absolute-form and malformed authorities, HTTP/1.0 and bare-LF edge canonicalization, `Expect`, forwarded-header spoofing, and two pipelined client requests.
 
 ## Observability
 
@@ -277,10 +289,10 @@ Production artifact-runner failures return generic `500` or `504` HTML. Detailed
 - The GitHub remote and PR path exist, but hosted Actions has not yet produced job-level CI proof; exact-SHA local receipts remain the current executable evidence.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
 - The production CLI exposes the main request/render/write limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and an in-memory Prometheus text metrics endpoint, but not tracing sinks or external audit sinks.
-- First-pass container, systemd, and nginx templates exist with local static verification, and the current artifact-only container has local build/runtime smoke proof. No official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
+- First-pass container, systemd, and nginx templates exist with local static verification; the nginx template has a real 25-case TLS framing matrix against official nginx 1.29.3, and the current artifact-only container has local build/runtime smoke proof. No official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
 - There is no first-class tracing integration or external metrics sink beyond the in-memory Prometheus text scrape endpoint.
 - Artifact-backed dynamic HTML, payload, action, asset, integrity-failure, source-removal, strict request framing, overlapping-request, bounded sustained mixed-load, concurrent slow-reader, controlled saturation/recovery, and failed-subprocess/next-request paths have local automated proof. Long-duration hosted capacity, host-process supervisor recovery, and hosted rollback behavior are not yet proven.
 - Direct replacement of an existing build directory has a brief activation window even though failed activation attempts restore the previous directory when rollback succeeds. Production rollout should build a fresh versioned directory or image and atomically switch an external release pointer.
 - Production sockets have request-read and whole-response-write deadlines plus bounded admission, with local stalled-reader proof. Sustained slow-reader load behind the real proxy remains unproven.
-- Normal proxy configuration has static verification, but live nginx framing parity, including client-side chunked action handling, remains part of hosted staging proof.
+- Local nginx framing parity is proven for official nginx 1.29.3, including client-side chunked actions and authority rejection. The exact hosted proxy image, TLS chain, CDN behavior, restart, and rollback remain staging proof gaps.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.

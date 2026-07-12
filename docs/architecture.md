@@ -45,7 +45,7 @@ The CLI therefore treats TypeScript as an automatic project check:
 
 ## HTTP Input Boundary
 
-The socket input boundary accepts a deliberately narrow one-request HTTP/1.1 upstream contract: exact CRLF framing, origin-form targets, a valid singular `Host`, no request `Transfer-Encoding` or `Expect`, and positive request bodies only for server-action POSTs with one decimal `Content-Length`. Framing and security-sensitive duplicate headers, malformed authorities, request-target differentials, and already-buffered pipelined suffixes fail closed. Every response closes the connection. Production deployments should use the supplied buffering and header-sanitizing nginx topology rather than exposing this application server as a general-purpose HTTP edge.
+The socket input boundary accepts a deliberately narrow one-request HTTP/1.1 upstream contract: exact CRLF framing, origin-form targets, a valid singular `Host`, no request `Transfer-Encoding` or `Expect`, and positive request bodies only for server-action POSTs with one decimal `Content-Length`. Framing and security-sensitive duplicate headers, malformed authorities, request-target differentials, and already-buffered pipelined suffixes fail closed. Every response closes the connection. Production deployments should use the supplied authority-rejecting, buffering, and header-sanitizing nginx topology rather than exposing this application server as a general-purpose HTTP edge. A raw-TLS matrix against official nginx 1.29.3 proves the local normalization/rejection contract across 25 normal, failure, and odd paths.
 
 ## Route Conventions
 
