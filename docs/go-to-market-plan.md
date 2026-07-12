@@ -1,7 +1,7 @@
 # Ferrite Go-to-Market Plan (Private Beta Readiness)
 
-**Updated:** July 11, 2026
-**Current project state:** Local checkout now has an artifact-backed, source-independent build/serve path with fail-closed integrity checks and overlapping request proof, but limited remote delivery and live-deployment proof. This plan assumes a narrow private beta only after explicit delivery gates are met.
+**Updated:** July 12, 2026
+**Current project state:** The GitHub repository and PR path now exist, and the local checkout has an artifact-backed, source-independent build/serve path with fail-closed integrity, strict HTTP request-framing, concurrent execution, and bounded sustained-load proof. Hosted Actions still lacks job-level proof, and no live deployment has been proven. This plan assumes a narrow private beta only after explicit delivery gates are met.
 
 ## Positioning
 
@@ -37,9 +37,10 @@ Current demoable scope is the local `examples/basic` end-to-end path:
 - Island hydration: server-first routes, `use client` islands, route and client-reference bundles, and immutable fingerprinted assets.
 - Server-action first transport: form-based `POST /_ferrite/action` with explicit action manifest collection and browser enhancement for route/client-reference/server-only action forms (Chromium proof).
 - Production logs: request outcome access logs and first-pass server-action audit logs can be emitted to stderr in plain or JSON format.
+- Production HTTP boundary: exact HTTP/1.1 origin-form requests, fail-closed framing and authority validation, one request per closed connection, and a buffering/header-sanitizing nginx upstream template.
 
 Not sellable yet as a hosted platform:
-- No npm publish in this checkout, no remote CI runs, no hosted staging run of the deployment templates, and only local/prototype operational proof.
+- No npm publish in this checkout, no hosted CI job-level run, no hosted staging run of the deployment templates, and only local/prototype operational proof.
 - Server-action security remains incomplete for real mutable user flows.
 
 ## Fastest Path To Market
@@ -64,8 +65,8 @@ Disallowed alpha claims until proven:
 
 ### ASAP Alpha Launch Gate
 
-1. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
-2. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, artifact-backed example integration, npm and Cargo package verification, and native prebuild dry-run.
+1. Keep launch work on focused GitHub PRs and preserve exact-SHA local proof receipts while hosted Actions remains unable to start jobs.
+2. Run the full release gate on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, artifact-backed example integration, npm and Cargo package verification, and native prebuild dry-run. Prefer hosted job-level evidence when available; do not discard independent exact-SHA local receipts.
 3. Prove the artifact-backed container or systemd template in hosted staging behind a real proxy/TLS boundary, including startup integrity rejection, dynamic route/payload/action smoke, private metrics scrape, logs, overload rejection, restart, and rollback.
 4. Define throughput and latency targets and run hosted capacity tests; bounded mixed-load, concurrent slow-reader, controlled saturation, and artifact-runner recovery are now local regression gates, not capacity benchmarks.
 5. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
@@ -80,8 +81,8 @@ Disallowed alpha claims until proven:
 - Production sockets have a configurable absolute response-write deadline with fixed, gzip, chunked, parse-error, overload, shutdown-drain, concurrent slow-reader, and post-saturation regression coverage. Hosted throughput and capacity remain unproven.
 
 2. Remote delivery proof gaps
-- No GitHub remote, no push/PR, no remote CI for lint/build/test/package-verifier/prebuild workflows.
-- `release:verify:npm` exists locally but is not exercised in this repo’s real CI.
+- GitHub remote, push, PR, review, and merge proof exist, but hosted Actions currently fails before allocating jobs.
+- `release:verify:npm` has exact-revision local proof but is not yet backed by a hosted job artifact.
 
 3. npm publishing and native package distribution
 - No real `npm publish` has been performed.

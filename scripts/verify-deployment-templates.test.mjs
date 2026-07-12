@@ -38,10 +38,14 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
   const nginx = await text("deploy/nginx/ferrite.conf");
 
   assert.match(nginx, /proxy_pass http:\/\/127\.0\.0\.1:3000;/);
+  assert.match(nginx, /proxy_http_version 1\.1;/);
+  assert.match(nginx, /proxy_request_buffering on;/);
   assert.match(nginx, /proxy_set_header Host \$host;/);
   assert.match(nginx, /proxy_set_header X-Forwarded-Proto \$scheme;/);
   assert.match(nginx, /proxy_set_header X-Forwarded-Host \$host;/);
   assert.match(nginx, /proxy_set_header X-Forwarded-For \$remote_addr;/);
+  assert.match(nginx, /proxy_set_header Connection "";/);
+  assert.match(nginx, /proxy_set_header Expect "";/);
   assert.match(nginx, /location = \/__ferrite\/metrics \{\s+return 404;\s+\}/);
   assert.doesNotMatch(nginx, /\$proxy_add_x_forwarded_for/);
   assert.match(nginx, /client_max_body_size 16k;/);

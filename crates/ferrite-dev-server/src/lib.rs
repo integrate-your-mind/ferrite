@@ -57,6 +57,7 @@ const MIN_PRODUCTION_RENDER_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_DEV_MAX_REQUEST_BYTES: usize = DEFAULT_PRODUCTION_MAX_REQUEST_BYTES;
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const MAX_HTTP_REQUEST_HEADERS: usize = 100;
 const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PRODUCTION_OVERLOAD_WORKERS: usize = 4;
 const PRODUCTION_OVERLOAD_REQUEST_DRAIN_TIMEOUT: Duration = Duration::from_millis(25);
@@ -2986,6 +2987,7 @@ fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()>
     let request = match read_http_request(stream, DEFAULT_DEV_MAX_REQUEST_BYTES)? {
         RequestReadResult::Request(request) => request,
         RequestReadResult::Response(response) => {
+            let response = response.with_cache_control("no-store");
             write_response(stream, &response)?;
             return Ok(());
         }
@@ -2993,7 +2995,7 @@ fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()>
     let response = match request.method.as_str() {
         "GET" => project.handle_get(&request.path)?,
         "POST" => project.handle_post(&request.path, &request.headers, &request.body)?,
-        _ => DevResponse::method_not_allowed(),
+        _ => DevResponse::method_not_allowed().with_cache_control("no-store"),
     };
 
     write_response(stream, &response)?;
@@ -3024,7 +3026,7 @@ fn handle_production_stream(stream: &mut TcpStream, project: &ProductionProject)
                     context,
                 )
             }
-            _ => Ok(DevResponse::method_not_allowed()),
+            _ => Ok(DevResponse::method_not_allowed().with_cache_control("no-store")),
         },
     )
 }
@@ -3056,7 +3058,7 @@ fn handle_production_stream_concurrent(
                     context,
                 )
             }
-            _ => Ok(DevResponse::method_not_allowed()),
+            _ => Ok(DevResponse::method_not_allowed().with_cache_control("no-store")),
         },
     )
 }
@@ -3078,6 +3080,7 @@ where
     let request = match read_http_request(stream, max_request_bytes)? {
         RequestReadResult::Request(request) => request,
         RequestReadResult::Response(response) => {
+            let response = response.with_cache_control("no-store");
             write_response_with_options(
                 stream,
                 &response,
@@ -3170,12 +3173,17 @@ fn finish_read_http_request(
     max_request_bytes: usize,
 ) -> Result<RequestReadResult> {
     let header_bytes = header_end + 4;
-    let mut parsed = match parse_http_request_head(&request[..header_end]) {
+    let mut parsed = match parse_http_request_head(&request[..header_bytes]) {
         Ok(parsed) => parsed,
         Err(response) => return Ok(RequestReadResult::Response(*response)),
     };
 
     if !should_read_request_body(&parsed) {
+        if request.len() != header_bytes {
+            return Ok(RequestReadResult::Response(DevResponse::bad_request(
+                "unexpected bytes after HTTP request headers",
+            )));
+        }
         return Ok(RequestReadResult::Request(parsed));
     }
 
@@ -3209,6 +3217,11 @@ fn finish_read_http_request(
             Err(error) => return Err(error.into()),
         }
     }
+    if request.len() != expected_len {
+        return Ok(RequestReadResult::Response(DevResponse::bad_request(
+            "unexpected bytes after server action request body",
+        )));
+    }
     parsed.body = request[header_bytes..expected_len].to_vec();
 
     Ok(RequestReadResult::Request(parsed))
@@ -3217,33 +3230,102 @@ fn finish_read_http_request(
 fn parse_http_request_head(
     head: &[u8],
 ) -> std::result::Result<ParsedHttpRequest, Box<DevResponse>> {
+    validate_http_head_line_endings(head)?;
     let request = std::str::from_utf8(head).map_err(|_| {
         Box::new(DevResponse::bad_request(
             "HTTP request headers must be UTF-8",
         ))
     })?;
-    let Some((method, path)) = parse_request_line(request) else {
+    let request = request
+        .strip_suffix("\r\n\r\n")
+        .ok_or_else(|| Box::new(DevResponse::bad_request("incomplete HTTP request headers")))?;
+    let mut lines = request.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| Box::new(DevResponse::bad_request("invalid HTTP request line")))?;
+    let mut request_parts = request_line.split(' ');
+    let method = request_parts.next().unwrap_or_default();
+    let path = request_parts.next().unwrap_or_default();
+    let version = request_parts.next().unwrap_or_default();
+    if request_parts.next().is_some() || method.is_empty() || path.is_empty() {
         return Err(Box::new(DevResponse::bad_request(
             "invalid HTTP request line",
         )));
-    };
+    }
+    if version != "HTTP/1.1" {
+        return Err(Box::new(DevResponse::bad_request(
+            "Ferrite requires HTTP/1.1 requests",
+        )));
+    }
+    if !is_valid_http_method(method) {
+        return Err(Box::new(DevResponse::bad_request(
+            "invalid HTTP request method",
+        )));
+    }
+    if !is_valid_origin_form_target(path) {
+        return Err(Box::new(DevResponse::bad_request(
+            "Ferrite requires an origin-form HTTP request target",
+        )));
+    }
+
     let mut headers = BTreeMap::new();
-    for line in request.lines().skip(1) {
-        if line.trim().is_empty() {
-            continue;
+    for (index, line) in lines.enumerate() {
+        if index >= MAX_HTTP_REQUEST_HEADERS {
+            return Err(Box::new(DevResponse::bad_request(format!(
+                "HTTP requests may contain at most {MAX_HTTP_REQUEST_HEADERS} headers"
+            ))));
         }
         let Some((name, value)) = line.split_once(':') else {
             return Err(Box::new(DevResponse::bad_request(
                 "invalid HTTP request header",
             )));
         };
-        let name = name.trim().to_ascii_lowercase();
-        if name.is_empty() {
+        if !is_valid_http_token(name) {
             return Err(Box::new(DevResponse::bad_request(
-                "invalid HTTP request header",
+                "invalid HTTP request header name",
             )));
         }
+        if !is_valid_http_header_value(value.as_bytes()) {
+            return Err(Box::new(DevResponse::bad_request(
+                "invalid HTTP request header value",
+            )));
+        }
+        let name = name.to_ascii_lowercase();
+        if is_http_singleton_header(&name) && headers.contains_key(&name) {
+            return Err(Box::new(DevResponse::bad_request(format!(
+                "duplicate {name} request header is not allowed"
+            ))));
+        }
         headers.insert(name, value.trim().to_owned());
+    }
+
+    let Some(host) = headers.get("host") else {
+        return Err(Box::new(DevResponse::bad_request(
+            "Host is required for HTTP/1.1 requests",
+        )));
+    };
+    if normalize_authority(host).is_none() {
+        return Err(Box::new(DevResponse::bad_request(
+            "Host must be a valid HTTP authority",
+        )));
+    }
+    if headers.contains_key("transfer-encoding") {
+        return Err(Box::new(DevResponse::bad_request(
+            "Transfer-Encoding is not supported",
+        )));
+    }
+    if headers.contains_key("expect") {
+        return Err(Box::new(DevResponse::bad_request(
+            "Expect is not supported",
+        )));
+    }
+    if let Some(value) = headers.get("content-length") {
+        let content_length = parse_content_length(value)?;
+        if content_length > 0 && !(method == "POST" && strip_query(path) == SERVER_ACTION_PATH) {
+            return Err(Box::new(DevResponse::bad_request(
+                "request bodies are supported only for server action POST",
+            )));
+        }
     }
 
     Ok(ParsedHttpRequest {
@@ -3252,6 +3334,116 @@ fn parse_http_request_head(
         headers,
         body: Vec::new(),
     })
+}
+
+fn validate_http_head_line_endings(head: &[u8]) -> std::result::Result<(), Box<DevResponse>> {
+    if !head.ends_with(b"\r\n\r\n") {
+        return Err(Box::new(DevResponse::bad_request(
+            "HTTP request headers must use CRLF line endings",
+        )));
+    }
+    for (index, byte) in head.iter().enumerate() {
+        match byte {
+            b'\n' if index == 0 || head[index - 1] != b'\r' => {
+                return Err(Box::new(DevResponse::bad_request(
+                    "HTTP request headers must use CRLF line endings",
+                )));
+            }
+            b'\r' if head.get(index + 1) != Some(&b'\n') => {
+                return Err(Box::new(DevResponse::bad_request(
+                    "HTTP request headers must use CRLF line endings",
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_http_method(method: &str) -> bool {
+    is_valid_http_token(method)
+}
+
+fn is_valid_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn is_valid_origin_form_target(path: &str) -> bool {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains(['\\', '#'])
+        || strip_query(path)
+            .split('/')
+            .skip(1)
+            .any(|segment| matches!(segment, "." | ".."))
+    {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if !(0x21..=0x7e).contains(&byte) {
+            return false;
+        }
+        if byte == b'%' {
+            if bytes
+                .get(index + 1)
+                .is_none_or(|byte| !byte.is_ascii_hexdigit())
+                || bytes
+                    .get(index + 2)
+                    .is_none_or(|byte| !byte.is_ascii_hexdigit())
+            {
+                return false;
+            }
+            index += 2;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn is_valid_http_header_value(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|byte| *byte == b'\t' || *byte >= b' ' && *byte != 0x7f)
+}
+
+fn is_http_singleton_header(name: &str) -> bool {
+    matches!(
+        name,
+        "content-length"
+            | "transfer-encoding"
+            | "host"
+            | "content-type"
+            | "cookie"
+            | "expect"
+            | "origin"
+            | "referer"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+    )
 }
 
 fn find_http_header_end(request: &[u8]) -> Option<usize> {
@@ -3282,11 +3474,7 @@ fn action_content_length(
             "Content-Length is required for server action POST",
         )));
     };
-    let content_length = value.parse::<usize>().map_err(|_| {
-        Box::new(DevResponse::bad_request(
-            "Content-Length must be a non-negative integer",
-        ))
-    })?;
+    let content_length = parse_content_length(value)?;
     let total = header_bytes
         .checked_add(content_length)
         .unwrap_or(max_request_bytes.saturating_add(1));
@@ -3295,6 +3483,19 @@ fn action_content_length(
     }
 
     Ok(content_length)
+}
+
+fn parse_content_length(value: &str) -> std::result::Result<usize, Box<DevResponse>> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Box::new(DevResponse::bad_request(
+            "Content-Length must be a non-negative integer",
+        )));
+    }
+    value.parse::<usize>().map_err(|_| {
+        Box::new(DevResponse::bad_request(
+            "Content-Length exceeds this platform's supported range",
+        ))
+    })
 }
 
 fn write_response(stream: &mut TcpStream, response: &DevResponse) -> Result<()> {
@@ -3596,18 +3797,6 @@ fn write_chunk<W: Write>(stream: &mut W, bytes: &[u8]) -> Result<()> {
     stream.write_all(bytes)?;
     stream.write_all(b"\r\n")?;
     Ok(())
-}
-
-fn parse_request_line(request: &str) -> Option<(&str, &str)> {
-    let line = request.lines().next()?;
-    let mut parts = line.split_whitespace();
-    let method = parts.next()?;
-    let path = parts.next()?;
-    let version = parts.next()?;
-    if !version.starts_with("HTTP/") {
-        return None;
-    }
-    Some((method, path))
 }
 
 fn strip_query(path: &str) -> &str {
@@ -3926,7 +4115,7 @@ fn enforce_trusted_proxy_forwarded_origin(
             "server action X-Forwarded-Host is required for trusted proxy mode",
         )));
     };
-    let Some(forwarded_host) = normalize_authority(forwarded_host) else {
+    let Some(forwarded_host) = normalize_http_authority(&expected.scheme, forwarded_host) else {
         return Err(Box::new(DevResponse::forbidden(
             "server action X-Forwarded-Host must be a valid HTTP authority",
         )));
@@ -3945,7 +4134,10 @@ fn server_action_origin_matches(
     expectation: &ServerActionOriginExpectation,
 ) -> bool {
     match expectation {
-        ServerActionOriginExpectation::HostAuthority(authority) => &origin.authority == authority,
+        ServerActionOriginExpectation::HostAuthority(authority) => {
+            normalize_http_authority(&origin.scheme, authority)
+                .is_some_and(|authority| authority == origin.authority)
+        }
         ServerActionOriginExpectation::TrustedProxyOrigin(expected) => origin == expected,
     }
 }
@@ -4027,7 +4219,7 @@ fn http_header_origin(value: &str) -> Option<HttpOrigin> {
     if rest.contains('/') || rest.contains('?') || rest.contains('#') {
         return None;
     }
-    let authority = normalize_authority(rest)?;
+    let authority = normalize_http_authority(&scheme, rest)?;
     Some(HttpOrigin { scheme, authority })
 }
 
@@ -4039,7 +4231,7 @@ fn http_header_url_origin(value: &str) -> Option<HttpOrigin> {
         .split(['/', '?', '#'])
         .next()
         .filter(|authority| !authority.is_empty())?;
-    let authority = normalize_authority(authority)?;
+    let authority = normalize_http_authority(&scheme, authority)?;
     Some(HttpOrigin { scheme, authority })
 }
 
@@ -4051,15 +4243,79 @@ fn normalize_http_scheme(value: &str) -> Option<String> {
     }
 }
 
+fn normalize_http_authority(scheme: &str, value: &str) -> Option<String> {
+    let authority = normalize_authority(value)?;
+    let default_port = match scheme {
+        "http" => ":80",
+        "https" => ":443",
+        _ => return None,
+    };
+    authority
+        .strip_suffix(default_port)
+        .filter(|host| !host.is_empty())
+        .map_or(Some(authority.clone()), |host| Some(host.to_owned()))
+}
+
 fn normalize_authority(value: &str) -> Option<String> {
-    let authority = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    let authority = value.trim();
     if authority.is_empty()
-        || authority.contains('@')
-        || authority.bytes().any(|byte| byte.is_ascii_whitespace())
+        || authority.contains(['@', '/', '\\', '?', '#', ',', ';'])
+        || !authority.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
     {
         return None;
     }
-    Some(authority)
+
+    if let Some(ipv6) = authority.strip_prefix('[') {
+        let bracket = ipv6.find(']')?;
+        let address = ipv6[..bracket].parse::<std::net::Ipv6Addr>().ok()?;
+        let port = parse_authority_port(&ipv6[bracket + 1..])?;
+        return Some(format!("[{address}]{port}"));
+    }
+
+    if authority.matches(':').count() > 1 {
+        return None;
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, ""), |(host, port)| (host, port));
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty()
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return None;
+    }
+    if host
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        && host.parse::<std::net::Ipv4Addr>().is_err()
+    {
+        return None;
+    }
+    let port = if authority.contains(':') {
+        parse_authority_port(&format!(":{port}"))?
+    } else {
+        String::new()
+    };
+    Some(format!("{host}{port}"))
+}
+
+fn parse_authority_port(suffix: &str) -> Option<String> {
+    if suffix.is_empty() {
+        return Some(String::new());
+    }
+    let port = suffix.strip_prefix(':')?;
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let port = port.parse::<u16>().ok()?;
+    Some(format!(":{port}"))
 }
 
 fn remove_required_action_field(
@@ -5470,6 +5726,16 @@ process.exit(1);
         result
     }
 
+    fn finish_buffered_request(request: &[u8], max_request_bytes: usize) -> RequestReadResult {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (mut stream, _addr) = listener.accept().unwrap();
+        let header_end = find_http_header_end(request).expect("complete request headers");
+        finish_read_http_request(&mut stream, request.to_vec(), header_end, max_request_bytes)
+            .unwrap()
+    }
+
     fn wait_for_path(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !path.exists() {
@@ -5618,6 +5884,214 @@ process.exit(1);
     }
 
     #[test]
+    fn http_request_head_accepts_the_supported_http_1_1_shape() {
+        let request = parse_http_request_head(
+            b"GET /posts/hello?view=full HTTP/1.1\r\nHost: Example.COM:3000\r\nAccept-Encoding: gzip\r\n\r\n",
+        )
+        .expect("valid HTTP/1.1 origin-form request");
+
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/posts/hello?view=full");
+        assert_eq!(
+            request.headers.get("host"),
+            Some(&"Example.COM:3000".to_owned())
+        );
+        assert_eq!(
+            normalize_authority("[2001:0db8::1]:0443"),
+            Some("[2001:db8::1]:443".to_owned())
+        );
+        assert_eq!(
+            normalize_authority("Example.COM.:443"),
+            Some("example.com:443".to_owned())
+        );
+        parse_http_request_head(b"GET /posts/%68ello?q=a%20b HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("valid percent-encoded target");
+    }
+
+    #[test]
+    fn http_request_head_bounds_header_count() {
+        let mut head = String::from("GET / HTTP/1.1\r\nHost: localhost\r\n");
+        for index in 1..MAX_HTTP_REQUEST_HEADERS {
+            head.push_str(&format!("X-Test-{index}: value\r\n"));
+        }
+        head.push_str("\r\n");
+        parse_http_request_head(head.as_bytes()).expect("header limit should be accepted");
+
+        let insertion = head.len() - 2;
+        head.insert_str(insertion, "X-One-Too-Many: value\r\n");
+        let response = parse_http_request_head(head.as_bytes())
+            .expect_err("header count above the limit must be rejected");
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn http_request_head_rejects_ambiguous_framing_and_security_headers() {
+        let malformed: &[(&str, &[u8])] = &[
+            (
+                "identical Content-Length",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+            ),
+            (
+                "conflicting Content-Length",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 0\r\n\r\n",
+            ),
+            (
+                "comma-joined Content-Length",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0, 0\r\n\r\n",
+            ),
+            (
+                "Transfer-Encoding plus Content-Length",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+            ),
+            (
+                "duplicated Transfer-Encoding with empty final value",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding:\r\nContent-Length: 0\r\n\r\n",
+            ),
+            (
+                "empty Transfer-Encoding",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding:\r\nContent-Length: 0\r\n\r\n",
+            ),
+            (
+                "Expect 100-continue",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 1\r\n\r\n",
+            ),
+            (
+                "duplicate Host",
+                b"GET / HTTP/1.1\r\nHost: one.example\r\nHost: two.example\r\n\r\n",
+            ),
+            (
+                "duplicate Origin",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nOrigin: https://one.example\r\nOrigin: https://two.example\r\n\r\n",
+            ),
+            (
+                "duplicate Content-Type",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Type: multipart/form-data\r\nContent-Length: 0\r\n\r\n",
+            ),
+            (
+                "duplicate Cookie",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nCookie: session=one\r\nCookie: session=two\r\n\r\n",
+            ),
+            (
+                "duplicate Referer",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nReferer: https://one.example/a\r\nReferer: https://two.example/b\r\n\r\n",
+            ),
+            (
+                "duplicate X-Forwarded-Proto",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Proto: http\r\n\r\n",
+            ),
+            (
+                "duplicate X-Forwarded-Host",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Host: one.example\r\nX-Forwarded-Host: two.example\r\n\r\n",
+            ),
+            (
+                "duplicate X-Forwarded-For",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 192.0.2.1\r\nX-Forwarded-For: 192.0.2.2\r\n\r\n",
+            ),
+        ];
+
+        for (case, head) in malformed {
+            let response = parse_http_request_head(head).expect_err(case);
+            assert_eq!(response.status, 400, "{case}");
+        }
+    }
+
+    #[test]
+    fn http_request_head_rejects_proxy_parser_differentials() {
+        let malformed: &[(&str, &[u8])] = &[
+            (
+                "space before header colon",
+                b"GET / HTTP/1.1\r\nHost : localhost\r\n\r\n",
+            ),
+            (
+                "tab before header colon",
+                b"GET / HTTP/1.1\r\nHost\t: localhost\r\n\r\n",
+            ),
+            ("bare LF", b"GET / HTTP/1.1\nHost: localhost\n\n"),
+            (
+                "mixed line endings",
+                b"GET / HTTP/1.1\r\nHost: localhost\n\r\n",
+            ),
+            (
+                "obsolete header folding",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: one\r\n two\r\n\r\n",
+            ),
+            (
+                "NUL in header value",
+                b"GET / HTTP/1.1\r\nHost: local\0host\r\n\r\n",
+            ),
+            (
+                "extra request-line token",
+                b"GET / HTTP/1.1 extra\r\nHost: localhost\r\n\r\n",
+            ),
+            ("HTTP/1.0", b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"),
+            ("HTTP/2.0", b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n"),
+            (
+                "absolute-form target",
+                b"GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "authority-form target",
+                b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "asterisk-form target",
+                b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "network-path target",
+                b"GET //admin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "literal dot segment",
+                b"GET /public/../admin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "malformed percent escape",
+                b"GET /posts/%ZZ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "truncated percent escape",
+                b"GET /posts/%2 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "non-ASCII request target",
+                b"GET /caf\xc3\xa9 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            ("missing Host", b"GET / HTTP/1.1\r\n\r\n"),
+            ("empty Host", b"GET / HTTP/1.1\r\nHost:\r\n\r\n"),
+            (
+                "Host with non-numeric port",
+                b"GET / HTTP/1.1\r\nHost: localhost:http\r\n\r\n",
+            ),
+            (
+                "Host with out-of-range port",
+                b"GET / HTTP/1.1\r\nHost: localhost:65536\r\n\r\n",
+            ),
+            (
+                "unbracketed IPv6 Host",
+                b"GET / HTTP/1.1\r\nHost: ::1\r\n\r\n",
+            ),
+            (
+                "invalid numeric Host",
+                b"GET / HTTP/1.1\r\nHost: 999.999.999.999\r\n\r\n",
+            ),
+            (
+                "Host with path",
+                b"GET / HTTP/1.1\r\nHost: localhost/admin\r\n\r\n",
+            ),
+            (
+                "body on a non-action route",
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n",
+            ),
+        ];
+
+        for (case, head) in malformed {
+            let response = parse_http_request_head(head).expect_err(case);
+            assert_eq!(response.status, 400, "{case}");
+        }
+    }
+
+    #[test]
     fn action_post_reader_preserves_body() {
         let result = read_request_from_client(
             b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 16\r\n\r\ntitle=Hello+Rust",
@@ -5634,6 +6108,48 @@ process.exit(1);
             Some(&"application/x-www-form-urlencoded".to_owned())
         );
         assert_eq!(request.body, b"title=Hello+Rust");
+    }
+
+    #[test]
+    fn request_reader_rejects_bytes_after_non_action_headers() {
+        let result = finish_buffered_request(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\nunexpected",
+            1024,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected bytes after non-action headers to be rejected");
+        };
+        assert_eq!(response.status, 400);
+        assert!(response.body_text().contains("unexpected bytes"));
+    }
+
+    #[test]
+    fn request_reader_rejects_buffered_pipelined_request_suffix() {
+        let result = finish_buffered_request(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGET /admin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            1024,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected a pipelined request suffix to be rejected");
+        };
+        assert_eq!(response.status, 400);
+        assert!(response.body_text().contains("unexpected bytes"));
+    }
+
+    #[test]
+    fn action_post_reader_rejects_buffered_request_after_declared_body() {
+        let result = finish_buffered_request(
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\nGET /admin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            1024,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected a request after the declared action body to be rejected");
+        };
+        assert_eq!(response.status, 400);
+        assert!(response.body_text().contains("unexpected bytes"));
     }
 
     #[test]
@@ -5678,6 +6194,32 @@ process.exit(1);
     }
 
     #[test]
+    fn action_post_reader_rejects_duplicate_transfer_encoding() {
+        let result = read_request_from_client(
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding:\r\nContent-Length: 0\r\n\r\n",
+            1024,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected ambiguous request framing to be rejected");
+        };
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn action_post_reader_rejects_duplicate_content_length() {
+        let result = read_request_from_client(
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\n",
+            1024,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected duplicate Content-Length to be rejected");
+        };
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
     fn action_form_origin_guard_accepts_same_host_and_rejects_cross_origin() {
         let mut same_origin = action_headers_with_host("application/x-www-form-urlencoded");
         same_origin.insert("origin".to_owned(), "http://localhost:3000".to_owned());
@@ -5692,6 +6234,19 @@ process.exit(1);
         )
         .expect("same-origin action request should parse");
         assert_eq!(request.route_path, "/posts/abc");
+
+        let mut default_port = same_origin.clone();
+        default_port.insert("host".to_owned(), "localhost:80".to_owned());
+        default_port.insert("origin".to_owned(), "http://localhost".to_owned());
+        server_action_request_from_form(
+            &default_port,
+            &action_form_body("/posts/abc"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("default Host port should match a canonical browser Origin");
 
         let mut cross_origin = same_origin.clone();
         cross_origin.insert("origin".to_owned(), "https://evil.example".to_owned());
@@ -5767,6 +6322,22 @@ process.exit(1);
         )
         .expect("trusted proxy public origin should parse");
         assert_eq!(request.route_path, "/posts/abc");
+
+        let default_port_proxy =
+            ProductionTrustedProxyConfig::new("https://app.example.com:443").unwrap();
+        assert_eq!(
+            default_port_proxy.public_origin(),
+            "https://app.example.com"
+        );
+        server_action_request_from_form(
+            &headers,
+            &action_form_body("/posts/abc"),
+            None,
+            None,
+            Some(&default_port_proxy),
+            None,
+        )
+        .expect("default trusted proxy port should canonicalize");
 
         headers.insert("origin".to_owned(), "http://app.example.com".to_owned());
         let response = server_action_request_from_form(
@@ -7396,6 +7967,26 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
         assert!(headers.contains("Content-Type: text/plain; charset=utf-8"));
         assert!(headers.contains("Content-Length:"));
         assert_eq!(body, "Payload Too Large\n");
+    }
+
+    #[test]
+    fn production_adapter_rejects_ambiguous_request_framing_on_real_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let project = production_project_for(&app);
+
+        let response = production_http_request(
+            project,
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding:\r\nContent-Length: 0\r\n\r\n",
+        );
+        let headers = response_headers(&response);
+        let body = String::from_utf8_lossy(response_body(&response));
+
+        assert!(headers.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(headers.contains("Connection: close"));
+        assert!(headers.contains("Cache-Control: no-store"));
+        assert!(body.contains("duplicate transfer-encoding"));
     }
 
     #[test]

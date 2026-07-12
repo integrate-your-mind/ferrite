@@ -1,6 +1,6 @@
 # Ferrite Deployment Guide
 
-Updated: 2026-07-11
+Updated: 2026-07-12
 
 This guide describes the current production-shaped deployment path for a Ferrite app. It is an operator checklist for the existing `ferrite build` and `ferrite serve` commands, not proof that Ferrite has already been deployed behind a real CDN, TLS terminator, process manager, or npm release.
 
@@ -47,7 +47,7 @@ cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/b
 cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path '/posts/abc?__ferrite_payload=stream'
 ```
 
-Remote release gates are still required once a GitHub remote exists:
+Remote release gates are still required before release. The GitHub repository and PR flow now exist, but hosted Actions has not yet produced job-level proof for this codebase:
 
 - CI lint, typecheck, build, tests, and browser tests
 - npm package tarball verification in CI
@@ -91,6 +91,19 @@ cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build -
 
 Expose only the proxy publicly. Forward `Host` unchanged unless `--trusted-proxy-public-origin` is configured. If trusted-proxy mode is enabled, the proxy must set `X-Forwarded-Proto` and `X-Forwarded-Host` to the public origin values and must strip any client-supplied copies of those headers before forwarding. Ferrite does not trust `X-Forwarded-For` by default; set `--trusted-proxy-client-ip-hops` only when the proxy owns and sanitizes the forwarded chain.
 
+## HTTP Request Contract
+
+The Rust adapter intentionally implements a narrow proxy-upstream contract rather than a general-purpose public HTTP edge:
+
+- requests must use exact HTTP/1.1, CRLF line endings, an origin-form target beginning with `/`, and one valid `Host` authority
+- request heads are bounded by `--max-request-bytes` and at most 100 header fields
+- `Transfer-Encoding` and `Expect` are rejected; Ferrite does not accept chunked request bodies or emit `100 Continue`
+- positive-length request bodies are accepted only for `POST /_ferrite/action`, with one decimal `Content-Length`
+- duplicate framing or security-sensitive fields are rejected, including `Content-Length`, `Transfer-Encoding`, `Host`, `Content-Type`, `Cookie`, `Expect`, `Origin`, `Referer`, and trusted `X-Forwarded-*` fields
+- one request is processed per connection and every response closes the connection; already-buffered bytes beyond the declared request are rejected, and HTTP pipelining is unsupported
+
+The supplied nginx template keeps request buffering enabled, speaks HTTP/1.1 to Ferrite, overwrites the authority and forwarded-origin fields, clears hop-by-hop `Connection`, and strips `Expect`. The [nginx request-buffering contract](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_request_buffering) reads the complete client body before sending it upstream. Ferrite still rejects `Transfer-Encoding` at its own boundary, so action clients should send a singular `Content-Length`; client-side chunked action compatibility must be proven against the deployed proxy version rather than assumed. Do not expose Ferrite as an unmanaged Internet edge or configure a proxy that forwards raw ambiguous framing.
+
 ## Build And Start
 
 Build the app during release preparation:
@@ -132,7 +145,7 @@ For a packaged binary, run the installed `ferrite` executable with the same argu
 Ferrite includes first-pass deployment templates for a private-beta topology:
 
 - `deploy/systemd/ferrite.service`: process manager template for a private `127.0.0.1:3000` Ferrite service.
-- `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that owns `Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For`, and blocks the in-process metrics path from public proxy traffic.
+- `deploy/nginx/ferrite.conf`: TLS-terminating reverse-proxy template that buffers requests, owns `Host`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For`, strips unsupported `Expect`, clears hop-by-hop `Connection`, and blocks the in-process metrics path from public proxy traffic.
 - `deploy/ferrite.env.example`: runtime environment variables for CSRF and public origin configuration.
 - `deploy/container/Dockerfile`: container template that builds the workspace and example artifact, then copies only the CLI, dependency-free artifact runner, and verified artifact into the final image rather than application source, workspace packages, or `node_modules`. It runs as a non-root runtime user and starts artifact-backed `ferrite serve` with production limits, CSRF cookie binding, one-time server-action replay nonces, trusted-proxy origin checks, trusted forwarded client-IP hop count, JSON access logs, and JSON action audit logs. Its directly exposed default does not enable the metrics endpoint.
 
@@ -261,12 +274,13 @@ Production artifact-runner failures return generic `500` or `504` HTML. Detailed
 ## Known Gaps
 
 - No npm packages are published yet.
-- No GitHub remote or remote CI proof exists in this checkout.
+- The GitHub remote and PR path exist, but hosted Actions has not yet produced job-level CI proof; exact-SHA local receipts remain the current executable evidence.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
 - The production CLI exposes the main request/render/write limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and an in-memory Prometheus text metrics endpoint, but not tracing sinks or external audit sinks.
 - First-pass container, systemd, and nginx templates exist with local static verification, and the current artifact-only container has local build/runtime smoke proof. No official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.
 - There is no first-class tracing integration or external metrics sink beyond the in-memory Prometheus text scrape endpoint.
-- Artifact-backed dynamic HTML, payload, action, asset, integrity-failure, source-removal, overlapping-request, controlled saturation/recovery, and failed-subprocess/next-request paths have local automated proof. Sustained capacity, concurrent slow-reader load, host-process supervisor recovery, and hosted rollback behavior are not yet proven.
+- Artifact-backed dynamic HTML, payload, action, asset, integrity-failure, source-removal, strict request framing, overlapping-request, bounded sustained mixed-load, concurrent slow-reader, controlled saturation/recovery, and failed-subprocess/next-request paths have local automated proof. Long-duration hosted capacity, host-process supervisor recovery, and hosted rollback behavior are not yet proven.
 - Direct replacement of an existing build directory has a brief activation window even though failed activation attempts restore the previous directory when rollback succeeds. Production rollout should build a fresh versioned directory or image and atomically switch an external release pointer.
 - Production sockets have request-read and whole-response-write deadlines plus bounded admission, with local stalled-reader proof. Sustained slow-reader load behind the real proxy remains unproven.
+- Normal proxy configuration has static verification, but live nginx framing parity, including client-side chunked action handling, remains part of hosted staging proof.
 - The server-payload contract is Ferrite-owned and not React Flight-compatible.
