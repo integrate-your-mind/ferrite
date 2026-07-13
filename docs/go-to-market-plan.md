@@ -1,7 +1,7 @@
 # Ferrite Go-to-Market Plan (Private Beta Readiness)
 
-**Updated:** July 12, 2026
-**Current project state:** The GitHub repository and PR path now exist, and the local checkout has an artifact-backed, source-independent build/serve path with fail-closed integrity, strict HTTP request-framing, a real 25-case nginx TLS framing matrix, concurrent execution, and bounded sustained-load proof. Hosted Actions still lacks job-level proof, and no hosted deployment has been proven. This plan assumes a narrow private beta only after explicit delivery gates are met.
+**Updated:** July 13, 2026
+**Current project state:** The GitHub repository and PR path now exist, and the local checkout has an artifact-backed, source-independent build/serve path with fail-closed integrity, strict HTTP request-framing, a 37-case nginx HTTP/1 TLS verifier plus four negotiated HTTP/2 edge cases, concurrent execution, and bounded sustained-load proof. Release evidence for the proxy matrix must remain tied to a clean exact-head receipt; dirty-worktree runs are development evidence only. Hosted Actions lacks job-level proof, and no hosted deployment has been proven. This plan assumes a narrow private beta only after explicit delivery gates are met.
 
 ## Positioning
 
@@ -37,7 +37,7 @@ Current demoable scope is the local `examples/basic` end-to-end path:
 - Island hydration: server-first routes, `use client` islands, route and client-reference bundles, and immutable fingerprinted assets.
 - Server-action first transport: form-based `POST /_ferrite/action` with explicit action manifest collection and browser enhancement for route/client-reference/server-only action forms (Chromium proof).
 - Production logs: request outcome access logs and first-pass server-action audit logs can be emitted to stderr in plain or JSON format.
-- Production HTTP boundary: exact HTTP/1.1 origin-form requests, fail-closed framing and authority validation, one request per closed connection, and an authority-rejecting buffering nginx template with a reproducible raw-TLS matrix.
+- Production HTTP boundary: exact HTTP/1.1 origin-form requests, fail-closed framing and authority validation, one request per closed connection, and an authority-rejecting buffering nginx template with a self-contained, exact-source raw-TLS matrix.
 
 Not sellable yet as a hosted platform:
 - No npm publish in this checkout, no hosted CI job-level run, no hosted staging run of the deployment templates, and only local/prototype operational proof.

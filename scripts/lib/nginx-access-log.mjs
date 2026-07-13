@@ -37,10 +37,44 @@ const assertBaselineEntry = (entries, expected) => {
     Number.isSafeInteger(entry.elapsed_ms) && entry.elapsed_ms >= 0,
     `${expected.method} ${expected.path} recorded an invalid elapsed_ms`,
   );
+  return entry;
 };
 
-export const assertNginxAccessLogEvidence = (entries, smugglingCanaryPaths) => {
-  assertBaselineEntry(entries, {
+const assertActionEntry = (entries, routePath, expectedClientIp) => {
+  const entry = entries.find(
+    (candidate) =>
+      candidate.route_path === routePath &&
+      candidate.status === 200 &&
+      candidate.outcome === "accepted",
+  );
+  assert.ok(entry, `Ferrite action log omitted accepted route ${routePath}`);
+  assert.equal(
+    entry.action_id,
+    "app/posts/[id]/page.tsx#savePost",
+    `Ferrite action log recorded the wrong action id for ${routePath}`,
+  );
+  assert.equal(
+    entry.route_pattern,
+    "/posts/:id",
+    `Ferrite action log recorded the wrong route pattern for ${routePath}`,
+  );
+  assert.equal(
+    entry.client_ip,
+    expectedClientIp,
+    `Ferrite action log recorded the wrong trusted-proxy client for ${routePath}`,
+  );
+  assert.ok(
+    Number.isSafeInteger(entry.elapsed_ms) && entry.elapsed_ms >= 0,
+    `Ferrite action log recorded an invalid elapsed_ms for ${routePath}`,
+  );
+};
+
+export const assertNginxAccessLogEvidence = (
+  entries,
+  smugglingCanaryPaths,
+  { additionalAccessEntries = [], expectedActionRoutes = [], forbiddenClientIps = [] } = {},
+) => {
+  const baseline = assertBaselineEntry(entries, {
     method: "GET",
     path: "/posts/abc",
     status: 200,
@@ -52,6 +86,24 @@ export const assertNginxAccessLogEvidence = (entries, smugglingCanaryPaths) => {
     status: 200,
     routePattern: "/posts/:id",
   });
+  for (const expected of additionalAccessEntries) {
+    const entry = assertBaselineEntry(entries, expected);
+    assert.equal(
+      entry.client_ip,
+      baseline.client_ip,
+      `${expected.method} ${expected.path} recorded a different trusted-proxy client`,
+    );
+  }
+  for (const routePath of expectedActionRoutes) {
+    assertActionEntry(entries, routePath, baseline.client_ip);
+  }
+
+  for (const forbiddenClientIp of forbiddenClientIps) {
+    assert.ok(
+      !entries.some((entry) => entry.client_ip === forbiddenClientIp),
+      `untrusted forwarded client IP reached Ferrite logs: ${forbiddenClientIp}`,
+    );
+  }
 
   const paths = new Set(entries.map((entry) => entry.path));
   for (const canaryPath of smugglingCanaryPaths) {

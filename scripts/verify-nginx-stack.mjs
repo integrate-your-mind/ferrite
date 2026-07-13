@@ -27,12 +27,23 @@ export const NGINX_IMAGE =
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const verifierPath = join(repositoryRoot, "scripts/verify-nginx-runtime.mjs");
 const activeChildren = new Set();
+let activeProofAbortSignal;
 const maxCapturedBytes = 512 * 1024;
 const noSuchDockerObject = /no such (?:container|image|object)|network .* not found/i;
+const dockerCleanupRequiredMissingPolls = 3;
+const interruptedBuildRequiredMissingPolls = 41;
+const dockerCleanupExtraPolls = 6;
+const dockerCleanupPollIntervalMs = 250;
 
 const delay = (milliseconds) => new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 const captureTail = (current, chunk) =>
   `${current}${chunk.toString("utf8")}`.slice(-maxCapturedBytes);
+
+const throwIfProofAborted = () => {
+  if (activeProofAbortSignal?.aborted) {
+    throw activeProofAbortSignal.reason ?? new Error("nginx proof interrupted");
+  }
+};
 
 export class CleanupStack {
   #entries = [];
@@ -91,12 +102,57 @@ export const assertExpectedFailure = (result, label, pattern) => {
   assert.match(output, pattern, `${label} failed for an unexpected reason`);
 };
 
+export const assertProofSourceState = (sourceClean, dirtyOverride) => {
+  if (!sourceClean && !dirtyOverride) {
+    throw new Error(
+      "nginx stack proof requires a clean worktree; set FERRITE_NGINX_ALLOW_DIRTY=1 only for non-release development runs",
+    );
+  }
+};
+
+export const createProofInterruption = (children = activeChildren) => {
+  const abortController = new AbortController();
+  let signal;
+  let interruptCount = 0;
+  let cleanupStarted = false;
+
+  return {
+    get abortSignal() {
+      return abortController.signal;
+    },
+    get signal() {
+      return signal;
+    },
+    beginCleanup() {
+      cleanupStarted = true;
+    },
+    interrupt(nextSignal) {
+      signal ??= nextSignal;
+      if (cleanupStarted) return;
+
+      interruptCount += 1;
+      if (!abortController.signal.aborted) {
+        abortController.abort(new Error(`nginx proof interrupted by ${nextSignal}`));
+      }
+      const childSignal = interruptCount > 1 ? "SIGKILL" : "SIGTERM";
+      for (const child of children) child.kill(childSignal);
+    },
+  };
+};
+
 const runCommand = (
   command,
   args,
-  { cwd = repositoryRoot, env = process.env, timeoutMs = 30_000, stream = false } = {},
-) =>
-  new Promise((resolveCommand, rejectCommand) => {
+  {
+    cwd = repositoryRoot,
+    env = process.env,
+    timeoutMs = 30_000,
+    stream = false,
+    ignoreProofAbort = false,
+  } = {},
+) => {
+  if (!ignoreProofAbort) throwIfProofAborted();
+  return new Promise((resolveCommand, rejectCommand) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -140,6 +196,7 @@ const runCommand = (
       resolveCommand({ code, signal, stdout, stderr, timedOut });
     });
   });
+};
 
 const assertCommandSucceeded = (result, label) => {
   if (result.code === 0 && !result.timedOut) return result;
@@ -149,35 +206,68 @@ const assertCommandSucceeded = (result, label) => {
   throw new Error(`${label} ${reason}\n${result.stdout}\n${result.stderr}`.trim());
 };
 
-const removeDockerResource = async (kind, name) => {
-  const inspected = await runCommand("docker", [kind, "inspect", name]);
-  if (inspected.code !== 0) {
-    if (noSuchDockerObject.test(`${inspected.stdout}\n${inspected.stderr}`)) return;
-    assertCommandSucceeded(inspected, `inspect owned Docker ${kind} ${name}`);
-  }
-
+const removeDockerResource = async (
+  kind,
+  name,
+  { requiredMissingPolls = dockerCleanupRequiredMissingPolls } = {},
+) => {
   const removeArgs =
     kind === "container"
       ? ["container", "rm", "--force", name]
       : kind === "image"
         ? ["image", "rm", "--force", name]
         : ["network", "rm", name];
-  assertCommandSucceeded(
-    await runCommand("docker", removeArgs, { timeoutMs: 30_000 }),
-    `remove owned Docker ${kind} ${name}`,
-  );
+  const maxPolls = requiredMissingPolls + dockerCleanupExtraPolls;
+  let consecutiveMissing = 0;
+  for (let attempt = 0; attempt < maxPolls; attempt += 1) {
+    const inspected = await runCommand("docker", [kind, "inspect", name], {
+      ignoreProofAbort: true,
+    });
+    if (inspected.code === 0) {
+      consecutiveMissing = 0;
+      const removed = await runCommand("docker", removeArgs, {
+        timeoutMs: 30_000,
+        ignoreProofAbort: true,
+      });
+      if (
+        removed.code !== 0 &&
+        !noSuchDockerObject.test(`${removed.stdout}\n${removed.stderr}`)
+      ) {
+        assertCommandSucceeded(removed, `remove owned Docker ${kind} ${name}`);
+      }
+    } else if (noSuchDockerObject.test(`${inspected.stdout}\n${inspected.stderr}`)) {
+      consecutiveMissing += 1;
+      if (consecutiveMissing === requiredMissingPolls) return;
+    } else {
+      assertCommandSucceeded(inspected, `inspect owned Docker ${kind} ${name}`);
+    }
+    await delay(dockerCleanupPollIntervalMs);
+  }
 
-  const verified = await runCommand("docker", [kind, "inspect", name]);
-  if (verified.code === 0) {
-    throw new Error(`owned Docker ${kind} still exists after cleanup: ${name}`);
-  }
-  if (!noSuchDockerObject.test(`${verified.stdout}\n${verified.stderr}`)) {
-    assertCommandSucceeded(verified, `verify owned Docker ${kind} cleanup for ${name}`);
-  }
+  throw new Error(`owned Docker ${kind} did not remain absent after cleanup: ${name}`);
+};
+
+const removeScratchDirectory = async (path) => {
+  await rm(path, { recursive: true, force: true });
+  const stillExists = await access(path).then(
+    () => true,
+    (error) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    },
+  );
+  if (stillExists) throw new Error(`scratch directory remains: ${path}`);
 };
 
 const startDockerLogFollower = async (container, path) => {
+  throwIfProofAborted();
   const handle = await open(path, "a");
+  try {
+    throwIfProofAborted();
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
   let spawnError;
   const child = spawn("docker", ["logs", "--follow", "--since", "0s", container], {
     cwd: repositoryRoot,
@@ -196,14 +286,8 @@ const startDockerLogFollower = async (container, path) => {
     });
   });
 
-  await delay(100);
-  if (spawnError || child.exitCode !== null) {
-    await handle.close();
-    throw spawnError ?? new Error(`docker logs follower exited ${child.exitCode}`);
-  }
-
   let stopped = false;
-  return {
+  const follower = {
     child,
     async stop() {
       if (stopped) return;
@@ -220,6 +304,18 @@ const startDockerLogFollower = async (container, path) => {
       await handle.close();
     },
   };
+
+  try {
+    await delay(100);
+    throwIfProofAborted();
+    if (spawnError || child.exitCode !== null || child.signalCode !== null) {
+      throw spawnError ?? new Error(`docker logs follower exited ${child.exitCode ?? child.signalCode}`);
+    }
+    return follower;
+  } catch (error) {
+    await follower.stop();
+    throw error;
+  }
 };
 
 const waitForFerrite = async (container) => {
@@ -227,6 +323,7 @@ const waitForFerrite = async (container) => {
   const probe =
     "fetch('http://127.0.0.1:3000/posts/abc').then((response) => process.exit(response.status === 200 ? 0 : 1)).catch(() => process.exit(1))";
   while (Date.now() < deadline) {
+    throwIfProofAborted();
     const result = await runCommand("docker", ["exec", container, "node", "-e", probe], {
       timeoutMs: 5_000,
     });
@@ -247,6 +344,7 @@ const waitForNginxTls = async (port) => {
   const deadline = Date.now() + 30_000;
   let lastError;
   while (Date.now() < deadline) {
+    throwIfProofAborted();
     try {
       await new Promise((resolveTls, rejectTls) => {
         const socket = tls.connect({
@@ -267,6 +365,7 @@ const waitForNginxTls = async (port) => {
     } catch (error) {
       lastError = error;
       await delay(100);
+      throwIfProofAborted();
     }
   }
   throw new Error(`nginx TLS listener was not ready within 30 seconds: ${lastError?.message}`);
@@ -297,6 +396,7 @@ const runVerifier = (environment, options = {}) =>
   });
 
 const runStalledTlsDeadlineControl = async (environment) => {
+  throwIfProofAborted();
   const sockets = new Set();
   const server = createServer((socket) => {
     sockets.add(socket);
@@ -362,28 +462,16 @@ const main = async () => {
   const missingCertCheck = `nginx-proof-missing-cert-${suffix}`;
   const configCheck = `nginx-proof-config-${suffix}`;
   const scratchParent = join(repositoryRoot, ".ferrite");
-  await mkdir(scratchParent, { recursive: true });
-  const scratch = await mkdtemp(join(scratchParent, "nginx-proof-"));
-  const certificateDirectory = join(scratch, "certificate");
-  const missingCertificateDirectory = join(scratch, "missing-certificate");
-  const nginxConfigPath = join(scratch, "default.conf");
-  const accessLogPath = join(scratch, "ferrite.log");
-  await mkdir(certificateDirectory);
-  await mkdir(missingCertificateDirectory);
-  await writeFile(accessLogPath, "");
-
-  let interruptedSignal;
-  const interrupt = (signal) => {
-    interruptedSignal = signal;
-    for (const child of activeChildren) child.kill("SIGTERM");
-  };
-  const onSigint = () => interrupt("SIGINT");
-  const onSigterm = () => interrupt("SIGTERM");
-  process.once("SIGINT", onSigint);
-  process.once("SIGTERM", onSigterm);
+  const interruption = createProofInterruption();
+  activeProofAbortSignal = interruption.abortSignal;
+  const onSigint = () => interruption.interrupt("SIGINT");
+  const onSigterm = () => interruption.interrupt("SIGTERM");
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
 
   let primaryError;
   let proofComplete = false;
+  let candidateBuildComplete = false;
   let cleanupErrors = [];
   try {
     const commit = assertCommandSucceeded(
@@ -399,9 +487,36 @@ const main = async () => {
       "read source status",
     ).stdout;
     const sourceClean = status.length === 0;
+    const dirtyOverride = process.env.FERRITE_NGINX_ALLOW_DIRTY === "1";
+    assertProofSourceState(sourceClean, dirtyOverride);
+    if (interruption.signal) {
+      throw new Error(`nginx proof interrupted by ${interruption.signal}`);
+    }
+
+    await mkdir(scratchParent, { recursive: true });
+    const scratch = await mkdtemp(join(scratchParent, "nginx-proof-"));
+    cleanup.defer("scratch directory cleanup", () => removeScratchDirectory(scratch));
+    const certificateDirectory = join(scratch, "certificate");
+    const missingCertificateDirectory = join(scratch, "missing-certificate");
+    const nginxConfigPath = join(scratch, "default.conf");
+    const accessLogPath = join(scratch, "ferrite.log");
+    await mkdir(certificateDirectory);
+    await mkdir(missingCertificateDirectory);
+    await writeFile(accessLogPath, "");
+
     process.stdout.write(
-      `${JSON.stringify({ sourceCommit: commit, sourceTree: tree, sourceClean, scratch })}\n`,
+      `${JSON.stringify({
+        sourceCommit: commit,
+        sourceTree: tree,
+        sourceClean,
+        dirtyOverride,
+        scratch,
+      })}\n`,
     );
+
+    if (interruption.signal) {
+      throw new Error(`nginx proof interrupted by ${interruption.signal}`);
+    }
 
     assertCommandSucceeded(
       await runCommand("docker", ["version", "--format", "{{.Server.Version}}"]),
@@ -435,27 +550,35 @@ const main = async () => {
     const nginxIdentity = await ensurePinnedNginxImage();
     process.stdout.write(`${JSON.stringify({ nginxImage: NGINX_IMAGE, ...nginxIdentity })}\n`);
 
-    cleanup.defer("candidate image cleanup", () => removeDockerResource("image", imageTag));
+    cleanup.defer("candidate image cleanup", () =>
+      removeDockerResource("image", imageTag, {
+        requiredMissingPolls: candidateBuildComplete
+          ? dockerCleanupRequiredMissingPolls
+          : interruptedBuildRequiredMissingPolls,
+      }),
+    );
     process.stdout.write("Building exact Ferrite candidate image\n");
+    const candidateBuild = await runCommand(
+      "docker",
+      [
+        "build",
+        "--file",
+        "deploy/container/Dockerfile",
+        "--label",
+        `org.opencontainers.image.revision=${commit}`,
+        "--label",
+        `io.ferrite.source-clean=${sourceClean}`,
+        "--tag",
+        imageTag,
+        ".",
+      ],
+      { timeoutMs: 1_200_000, stream: true },
+    );
     assertCommandSucceeded(
-      await runCommand(
-        "docker",
-        [
-          "build",
-          "--file",
-          "deploy/container/Dockerfile",
-          "--label",
-          `org.opencontainers.image.revision=${commit}`,
-          "--label",
-          `io.ferrite.source-clean=${sourceClean}`,
-          "--tag",
-          imageTag,
-          ".",
-        ],
-        { timeoutMs: 1_200_000, stream: true },
-      ),
+      candidateBuild,
       "build Ferrite candidate image",
     );
+    candidateBuildComplete = true;
     const candidateIdentity = assertCommandSucceeded(
       await runCommand("docker", [
         "image",
@@ -611,9 +734,10 @@ const main = async () => {
     const successfulLogOffset = (await stat(accessLogPath)).size;
     const successful = assertCommandSucceeded(
       await runVerifier(environment, { stream: true }),
-      "run 25-case nginx framing matrix",
+      "run nginx framing matrices",
     );
-    assert.match(successful.stdout, /nginx framing matrix passed: 25\/25/);
+    assert.match(successful.stdout, /nginx framing matrix passed: 37\/37/);
+    assert.match(successful.stdout, /nginx HTTP\/2 matrix passed: 4\/4/);
 
     const secureEnvironment = { ...environment };
     delete secureEnvironment.FERRITE_NGINX_INSECURE;
@@ -652,7 +776,19 @@ const main = async () => {
       "/posts/nginx-smuggle-transfer-encoding-content-length",
       "/posts/nginx-smuggle-duplicate-transfer-encoding",
     ];
-    assertNginxAccessLogEvidence(successfulEntries, canaryPaths);
+    const expectedEvidence = {
+      additionalAccessEntries: [
+        {
+          method: "GET",
+          path: "/posts/h2-normal",
+          status: 200,
+          routePattern: "/posts/:id",
+        },
+      ],
+      expectedActionRoutes: ["/posts/h2-data", "/posts/h2-spoof"],
+      forbiddenClientIps: ["203.0.113.99"],
+    };
+    assertNginxAccessLogEvidence(successfulEntries, canaryPaths, expectedEvidence);
     assert.throws(
       () =>
         assertNginxAccessLogEvidence(
@@ -668,6 +804,7 @@ const main = async () => {
             },
           ],
           canaryPaths,
+          expectedEvidence,
         ),
       /smuggling canary reached Ferrite/,
     );
@@ -680,22 +817,15 @@ const main = async () => {
   } catch (error) {
     primaryError = error;
   } finally {
+    interruption.beginCleanup();
     cleanupErrors = await cleanup.run();
-    await rm(scratch, { recursive: true, force: true });
-    const scratchStillExists = await access(scratch).then(
-      () => true,
-      (error) => {
-        if (error.code === "ENOENT") return false;
-        throw error;
-      },
-    );
-    if (scratchStillExists) cleanupErrors.push(new Error(`scratch directory remains: ${scratch}`));
     process.removeListener("SIGINT", onSigint);
     process.removeListener("SIGTERM", onSigterm);
+    activeProofAbortSignal = undefined;
   }
 
-  if (interruptedSignal && !primaryError) {
-    primaryError = new Error(`nginx proof interrupted by ${interruptedSignal}`);
+  if (interruption.signal && !primaryError) {
+    primaryError = new Error(`nginx proof interrupted by ${interruption.signal}`);
   }
   if (cleanupErrors.length > 0) {
     const cleanupFailure = new AggregateError(cleanupErrors, "nginx proof cleanup failed");

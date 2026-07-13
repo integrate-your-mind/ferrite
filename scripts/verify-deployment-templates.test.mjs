@@ -53,9 +53,22 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
     nginx,
     /map \$http_host \$ferrite_authority_allowed \{\s+default 0;\s+app\.example\.com 1;\s+\}/,
   );
-  assert.match(
-    nginx,
-    /map \$request \$ferrite_request_target_allowed \{\s+default 0;\s+"~\*\^\[A-Z\]\+ \/\(\?:\[\^\/ \]\[\^ \]\*\)\? HTTP\/" 1;\s+"~\*\^\[A-Z\]\+ https:\/\/app\\\.example\\\.com/,
+  const targetMap = nginx.match(
+    /map \$request \$ferrite_request_target_allowed \{([\s\S]*?)\n\}/,
+  )?.[1];
+  assert.ok(targetMap, "nginx request-target map is missing");
+  assert.match(targetMap, /^\s*default 0;/m);
+  assert.match(targetMap, /%\(\?:2e\|2f\|5c\)/);
+  assert.match(targetMap, /\\\.\{1,2\}/);
+  assert.match(targetMap, /"~\*\^\[A-Z\]\+ \/\(\?:\[\^\/ \]\[\^ \]\*\)\? HTTP\/" 1;/);
+  assert.match(targetMap, /https:\/\/app\\\.example\\\.com\(\?:\/\|\[\?# \]\)/);
+  assert.ok(
+    targetMap.indexOf("%(?:2e|2f|5c)") < targetMap.indexOf('HTTP/" 1;'),
+    "encoded traversal rejection must run before origin-form acceptance",
+  );
+  assert.ok(
+    targetMap.indexOf("\\.{1,2}") < targetMap.indexOf('HTTP/" 1;'),
+    "literal dot-segment rejection must run before origin-form acceptance",
   );
   assert.match(nginx, /if \(\$host != \$server_name\) \{\s+return 421;\s+\}/);
   assert.match(
@@ -105,6 +118,8 @@ test("runtime proxy verifier is wired into the package scripts", async () => {
     packageJson.scripts["test:nginx:stack"],
     "node scripts/verify-nginx-stack.mjs",
   );
-  assert.match(await text("scripts/verify-nginx-runtime.mjs"), /nginx framing matrix passed/);
+  const runtimeVerifier = await text("scripts/verify-nginx-runtime.mjs");
+  assert.match(runtimeVerifier, /nginx framing matrix passed/);
+  assert.match(runtimeVerifier, /nginx HTTP\/2 matrix passed/);
   assert.match(await text("scripts/verify-nginx-stack.mjs"), /nginx stack proof passed/);
 });

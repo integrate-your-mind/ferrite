@@ -6,7 +6,9 @@ import {
 } from "./lib/nginx-access-log.mjs";
 import {
   assertExpectedFailure,
+  assertProofSourceState,
   CleanupStack,
+  createProofInterruption,
   parseDockerPublishedPort,
   renderProofNginxConfig,
 } from "./verify-nginx-stack.mjs";
@@ -59,6 +61,39 @@ test("nginx proof accepts only one loopback Docker port mapping", () => {
     /exactly one unexpected/,
   );
   assert.throws(() => parseDockerPublishedPort("127.0.0.1:0\n"), /invalid port/);
+});
+
+test("exact nginx proof rejects dirty source unless a development override is explicit", () => {
+  assert.doesNotThrow(() => assertProofSourceState(true, false));
+  assert.doesNotThrow(() => assertProofSourceState(false, true));
+  assert.throws(
+    () => assertProofSourceState(false, false),
+    /requires a clean worktree/,
+  );
+});
+
+test("proof interruption escalates workload signals without interrupting cleanup", () => {
+  const delivered = [];
+  const child = { kill: (signal) => delivered.push(signal) };
+  const interruption = createProofInterruption(new Set([child]));
+
+  interruption.interrupt("SIGTERM");
+  assert.equal(interruption.signal, "SIGTERM");
+  assert.equal(interruption.abortSignal.aborted, true);
+  assert.match(interruption.abortSignal.reason.message, /interrupted by SIGTERM/);
+  assert.deepEqual(delivered, ["SIGTERM"]);
+
+  interruption.interrupt("SIGINT");
+  assert.equal(interruption.signal, "SIGTERM", "first interrupt remains the exit reason");
+  assert.deepEqual(delivered, ["SIGTERM", "SIGKILL"]);
+
+  interruption.beginCleanup();
+  interruption.interrupt("SIGINT");
+  assert.deepEqual(
+    delivered,
+    ["SIGTERM", "SIGKILL"],
+    "cleanup commands must survive repeated process signals",
+  );
 });
 
 test("cleanup remains LIFO and continues after one cleanup failure", async () => {
@@ -135,5 +170,78 @@ test("access-log evidence requires real baseline shape and rejects upstream cana
         canaryPaths,
       ),
     /valid trusted-proxy IPv4 client address/,
+  );
+});
+
+test("access-log evidence correlates HTTP/2 paths, actions, and proxy-owned client IP", () => {
+  const entries = [
+    ...baselineEntries,
+    {
+      ...baselineEntries[0],
+      path: "/posts/h2-normal",
+    },
+    {
+      action_id: "app/posts/[id]/page.tsx#savePost",
+      route_path: "/posts/h2-data",
+      route_pattern: "/posts/:id",
+      status: 200,
+      outcome: "accepted",
+      client_ip: "192.0.2.10",
+      elapsed_ms: 4,
+    },
+    {
+      action_id: "app/posts/[id]/page.tsx#savePost",
+      route_path: "/posts/h2-spoof",
+      route_pattern: "/posts/:id",
+      status: 200,
+      outcome: "accepted",
+      client_ip: "192.0.2.10",
+      elapsed_ms: 5,
+    },
+  ];
+  const options = {
+    additionalAccessEntries: [
+      {
+        method: "GET",
+        path: "/posts/h2-normal",
+        status: 200,
+        routePattern: "/posts/:id",
+      },
+    ],
+    expectedActionRoutes: ["/posts/h2-data", "/posts/h2-spoof"],
+    forbiddenClientIps: ["203.0.113.99"],
+  };
+
+  assert.doesNotThrow(() => assertNginxAccessLogEvidence(entries, canaryPaths, options));
+  assert.throws(
+    () =>
+      assertNginxAccessLogEvidence(
+        [...entries, { ...baselineEntries[0], client_ip: "203.0.113.99" }],
+        canaryPaths,
+        options,
+      ),
+    /untrusted forwarded client IP reached Ferrite logs/,
+  );
+  assert.throws(
+    () =>
+      assertNginxAccessLogEvidence(
+        entries.filter((entry) => entry.route_path !== "/posts/h2-data"),
+        canaryPaths,
+        options,
+    ),
+    /omitted accepted route \/posts\/h2-data/,
+  );
+  assert.throws(
+    () =>
+      assertNginxAccessLogEvidence(
+        entries.map((entry) =>
+          entry.route_path === "/posts/h2-spoof"
+            ? { ...entry, action_id: "app/posts/[id]/page.tsx#other" }
+            : entry,
+        ),
+        canaryPaths,
+        options,
+      ),
+    /wrong action id for \/posts\/h2-spoof/,
   );
 });

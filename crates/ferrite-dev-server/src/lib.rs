@@ -3231,28 +3231,62 @@ fn parse_http_request_head(
     head: &[u8],
 ) -> std::result::Result<ParsedHttpRequest, Box<DevResponse>> {
     validate_http_head_line_endings(head)?;
-    let request = std::str::from_utf8(head).map_err(|_| {
-        Box::new(DevResponse::bad_request(
-            "HTTP request headers must be UTF-8",
-        ))
-    })?;
-    let request = request
-        .strip_suffix("\r\n\r\n")
-        .ok_or_else(|| Box::new(DevResponse::bad_request("incomplete HTTP request headers")))?;
-    let mut lines = request.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| Box::new(DevResponse::bad_request("invalid HTTP request line")))?;
-    let mut request_parts = request_line.split(' ');
-    let method = request_parts.next().unwrap_or_default();
-    let path = request_parts.next().unwrap_or_default();
-    let version = request_parts.next().unwrap_or_default();
-    if request_parts.next().is_some() || method.is_empty() || path.is_empty() {
+    if head.starts_with(b"\r\n") {
         return Err(Box::new(DevResponse::bad_request(
             "invalid HTTP request line",
         )));
     }
-    if version != "HTTP/1.1" {
+
+    // httparse owns HTTP wire syntax. Ferrite deliberately applies a narrower
+    // one-request upstream policy after the syntax parse succeeds.
+    let mut raw_headers = [httparse::EMPTY_HEADER; MAX_HTTP_REQUEST_HEADERS];
+    let mut request = httparse::Request::new(&mut raw_headers);
+    let parsed_bytes = match httparse::ParserConfig::default().parse_request(&mut request, head) {
+        Ok(httparse::Status::Complete(parsed_bytes)) => parsed_bytes,
+        Ok(httparse::Status::Partial) => {
+            return Err(Box::new(DevResponse::bad_request(
+                "incomplete HTTP request headers",
+            )));
+        }
+        Err(httparse::Error::TooManyHeaders) => {
+            return Err(Box::new(DevResponse::bad_request(format!(
+                "HTTP requests may contain at most {MAX_HTTP_REQUEST_HEADERS} headers"
+            ))));
+        }
+        Err(httparse::Error::HeaderName) => {
+            return Err(Box::new(DevResponse::bad_request(
+                "invalid HTTP request header name",
+            )));
+        }
+        Err(httparse::Error::HeaderValue) => {
+            return Err(Box::new(DevResponse::bad_request(
+                "invalid HTTP request header value",
+            )));
+        }
+        Err(httparse::Error::NewLine) => {
+            return Err(Box::new(DevResponse::bad_request(
+                "HTTP request headers must use CRLF line endings",
+            )));
+        }
+        Err(httparse::Error::Status | httparse::Error::Token | httparse::Error::Version) => {
+            return Err(Box::new(DevResponse::bad_request(
+                "invalid HTTP request line",
+            )));
+        }
+    };
+    if parsed_bytes != head.len() {
+        return Err(Box::new(DevResponse::bad_request(
+            "unexpected bytes after HTTP request headers",
+        )));
+    }
+
+    let method = request
+        .method
+        .ok_or_else(|| Box::new(DevResponse::bad_request("invalid HTTP request line")))?;
+    let path = request
+        .path
+        .ok_or_else(|| Box::new(DevResponse::bad_request("invalid HTTP request line")))?;
+    if request.version != Some(1) {
         return Err(Box::new(DevResponse::bad_request(
             "Ferrite requires HTTP/1.1 requests",
         )));
@@ -3268,35 +3302,37 @@ fn parse_http_request_head(
         )));
     }
 
-    let mut headers = BTreeMap::new();
-    for (index, line) in lines.enumerate() {
-        if index >= MAX_HTTP_REQUEST_HEADERS {
-            return Err(Box::new(DevResponse::bad_request(format!(
-                "HTTP requests may contain at most {MAX_HTTP_REQUEST_HEADERS} headers"
-            ))));
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(Box::new(DevResponse::bad_request(
-                "invalid HTTP request header",
-            )));
-        };
+    let mut headers: HttpHeaders = BTreeMap::new();
+    for header in request.headers.iter() {
+        let name = header.name;
         if !is_valid_http_token(name) {
             return Err(Box::new(DevResponse::bad_request(
                 "invalid HTTP request header name",
             )));
         }
-        if !is_valid_http_header_value(value.as_bytes()) {
+        if !is_valid_http_header_value(header.value) {
             return Err(Box::new(DevResponse::bad_request(
                 "invalid HTTP request header value",
             )));
         }
+        let value = std::str::from_utf8(header.value).map_err(|_| {
+            Box::new(DevResponse::bad_request(
+                "HTTP request headers must be UTF-8",
+            ))
+        })?;
         let name = name.to_ascii_lowercase();
-        if is_http_singleton_header(&name) && headers.contains_key(&name) {
-            return Err(Box::new(DevResponse::bad_request(format!(
-                "duplicate {name} request header is not allowed"
-            ))));
+        let value = value.trim();
+        if let Some(existing) = headers.get_mut(&name) {
+            if is_http_singleton_header(&name) {
+                return Err(Box::new(DevResponse::bad_request(format!(
+                    "duplicate {name} request header is not allowed"
+                ))));
+            }
+            existing.push_str(", ");
+            existing.push_str(value);
+        } else {
+            headers.insert(name, value.to_owned());
         }
-        headers.insert(name, value.trim().to_owned());
     }
 
     let Some(host) = headers.get("host") else {
@@ -3400,6 +3436,7 @@ fn is_valid_origin_form_target(path: &str) -> bool {
         return false;
     }
     let bytes = path.as_bytes();
+    let path_bytes = strip_query(path).len();
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
@@ -3407,13 +3444,14 @@ fn is_valid_origin_form_target(path: &str) -> bool {
             return false;
         }
         if byte == b'%' {
-            if bytes
-                .get(index + 1)
-                .is_none_or(|byte| !byte.is_ascii_hexdigit())
-                || bytes
-                    .get(index + 2)
-                    .is_none_or(|byte| !byte.is_ascii_hexdigit())
-            {
+            let Some(high) = bytes.get(index + 1).copied().and_then(http_hex_value) else {
+                return false;
+            };
+            let Some(low) = bytes.get(index + 2).copied().and_then(http_hex_value) else {
+                return false;
+            };
+            let decoded = high << 4 | low;
+            if index < path_bytes && matches!(decoded, b'.' | b'/' | b'\\') {
                 return false;
             }
             index += 2;
@@ -3421,6 +3459,15 @@ fn is_valid_origin_form_target(path: &str) -> bool {
         index += 1;
     }
     true
+}
+
+fn http_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn is_valid_http_header_value(value: &[u8]) -> bool {
@@ -5497,6 +5544,25 @@ process.exit(1);
 
         let mut stream = TcpStream::connect(addr).unwrap();
         stream.write_all(request).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    fn dev_http_request(project: DevProject, request: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut project = project;
+            serve_listener_once(listener, &mut project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.write_all(request).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
         server.join().unwrap();
@@ -5909,6 +5975,20 @@ process.exit(1);
         );
         parse_http_request_head(b"GET /posts/%68ello?q=a%20b HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("valid percent-encoded target");
+        parse_http_request_head(
+            b"GET /posts/abc?next=%2Fadmin&dot=%2E HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .expect("encoded query values do not change path segmentation");
+
+        let combined = parse_http_request_head(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\naccept-encoding: gzip\r\n\r\n",
+        )
+        .expect("repeatable fields should combine deterministically");
+        assert_eq!(
+            combined.headers.get("accept-encoding"),
+            Some(&"br, gzip".to_owned())
+        );
+        assert!(combined.accepts_gzip());
     }
 
     #[test]
@@ -5932,7 +6012,7 @@ process.exit(1);
         let malformed: &[(&str, &[u8])] = &[
             (
                 "identical Content-Length",
-                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n",
             ),
             (
                 "conflicting Content-Length",
@@ -5948,7 +6028,7 @@ process.exit(1);
             ),
             (
                 "duplicated Transfer-Encoding with empty final value",
-                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding:\r\nContent-Length: 0\r\n\r\n",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\ntransfer-encoding:\r\nContent-Length: 0\r\n\r\n",
             ),
             (
                 "empty Transfer-Encoding",
@@ -5960,7 +6040,7 @@ process.exit(1);
             ),
             (
                 "duplicate Host",
-                b"GET / HTTP/1.1\r\nHost: one.example\r\nHost: two.example\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: one.example\r\nhOsT: two.example\r\n\r\n",
             ),
             (
                 "duplicate Origin",
@@ -6057,6 +6137,18 @@ process.exit(1);
                 b"GET /posts/%2 HTTP/1.1\r\nHost: localhost\r\n\r\n",
             ),
             (
+                "encoded slash in path",
+                b"GET /posts/%2fadmin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "encoded dot in path",
+                b"GET /posts/%2E%2E/admin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
+                "encoded backslash in path",
+                b"GET /posts/%5Cadmin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            ),
+            (
                 "non-ASCII request target",
                 b"GET /caf\xc3\xa9 HTTP/1.1\r\nHost: localhost\r\n\r\n",
             ),
@@ -6091,6 +6183,224 @@ process.exit(1);
         for (case, head) in malformed {
             let response = parse_http_request_head(head).expect_err(case);
             assert_eq!(response.status, 400, "{case}");
+        }
+    }
+
+    #[test]
+    fn http_request_policy_is_differentially_stricter_than_httparse() {
+        let cases: &[(&str, &[u8], bool, bool)] = &[
+            (
+                "supported request",
+                b"GET /posts/abc HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                true,
+                true,
+            ),
+            (
+                "LF-only syntax accepted by the reference parser",
+                b"GET /posts/abc HTTP/1.1\nHost: localhost\n\n",
+                true,
+                false,
+            ),
+            (
+                "leading empty line accepted by the reference parser",
+                b"\r\nGET /posts/abc HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                true,
+                false,
+            ),
+            (
+                "absolute-form target",
+                b"GET https://localhost/posts/abc HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                true,
+                false,
+            ),
+            (
+                "network-path target",
+                b"GET //localhost/posts/abc HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                true,
+                false,
+            ),
+            (
+                "encoded path separator",
+                b"GET /posts/%2fadmin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                true,
+                false,
+            ),
+            (
+                "encoded query separator",
+                b"GET /posts/abc?next=%2fadmin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                true,
+                true,
+            ),
+            (
+                "missing Host",
+                b"GET /posts/abc HTTP/1.1\r\n\r\n",
+                true,
+                false,
+            ),
+            (
+                "duplicate Content-Length",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+                true,
+                false,
+            ),
+            (
+                "Transfer-Encoding plus Content-Length",
+                b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+                true,
+                false,
+            ),
+            (
+                "space before header colon",
+                b"GET / HTTP/1.1\r\nHost : localhost\r\n\r\n",
+                false,
+                false,
+            ),
+            (
+                "obsolete line folding",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: one\r\n two\r\n\r\n",
+                false,
+                false,
+            ),
+            (
+                "multiple request-line spaces",
+                b"GET  / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                false,
+                false,
+            ),
+        ];
+
+        for (name, head, reference_expected, ferrite_expected) in cases {
+            let mut headers = [httparse::EMPTY_HEADER; MAX_HTTP_REQUEST_HEADERS];
+            let mut reference = httparse::Request::new(&mut headers);
+            let reference_accepts = matches!(
+                httparse::ParserConfig::default().parse_request(&mut reference, head),
+                Ok(httparse::Status::Complete(parsed_bytes)) if parsed_bytes == head.len()
+            );
+            let ferrite_accepts = parse_http_request_head(head).is_ok();
+
+            assert_eq!(reference_accepts, *reference_expected, "reference: {name}");
+            assert_eq!(ferrite_accepts, *ferrite_expected, "Ferrite: {name}");
+            assert!(
+                !ferrite_accepts || reference_accepts,
+                "Ferrite accepted syntax rejected by httparse: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_and_production_adapters_enforce_shared_strict_http_contract_on_real_sockets() {
+        let cases: &[(&str, &[u8], &str)] = &[
+            (
+                "HTTP/1.0",
+                b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n",
+                "requires HTTP/1.1",
+            ),
+            (
+                "bare LF",
+                b"GET / HTTP/1.1\nHost: localhost\n\n",
+                "incomplete HTTP request headers",
+            ),
+            (
+                "absolute-form target",
+                b"GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "origin-form",
+            ),
+            (
+                "encoded path separator",
+                b"GET /posts/%2fadmin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "origin-form",
+            ),
+        ];
+
+        for (case, request, expected_body) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let app = temp.path().join("app");
+            write(&app.join("page.tsx"), "export default function Page() {}");
+
+            let responses = [
+                ("dev", dev_http_request(project_for(&app), request)),
+                (
+                    "production",
+                    production_http_request(production_project_for(&app), request),
+                ),
+            ];
+
+            for (adapter, response) in responses {
+                let headers = response_headers(&response);
+                let body = String::from_utf8_lossy(response_body(&response));
+
+                assert!(
+                    headers.starts_with("HTTP/1.1 400 Bad Request"),
+                    "{adapter} {case}"
+                );
+                assert!(headers.contains("Connection: close"), "{adapter} {case}");
+                assert!(
+                    headers.contains("Cache-Control: no-store"),
+                    "{adapter} {case}"
+                );
+                assert!(body.contains(expected_body), "{adapter} {case}: {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn dev_and_production_adapters_accept_shared_http_contract_on_real_sockets() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let get_request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let get_responses = [
+            ("dev", dev_http_request(project_for(&app), get_request)),
+            (
+                "production",
+                production_http_request(production_project_for(&app), get_request),
+            ),
+        ];
+
+        for (adapter, response) in get_responses {
+            let headers = response_headers(&response);
+            let body = String::from_utf8_lossy(response_body(&response));
+            assert!(headers.starts_with("HTTP/1.1 200 OK"), "{adapter} GET");
+            assert!(headers.contains("Connection: close"), "{adapter} GET");
+            assert!(body.contains("Home Page"), "{adapter} GET: {body}");
+        }
+
+        let action_temp = tempfile::tempdir().unwrap();
+        let action_app = action_temp.path().join("app");
+        write(
+            &action_app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let action_body = action_form_body("/posts/abc");
+        let action_request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            action_body.len(),
+            String::from_utf8(action_body).unwrap()
+        );
+        let action_responses = [
+            (
+                "dev",
+                dev_http_request(
+                    action_project_for(&action_app, action_renderer_body()),
+                    action_request.as_bytes(),
+                ),
+            ),
+            (
+                "production",
+                production_http_request(
+                    action_production_project_for(&action_app, action_renderer_body()),
+                    action_request.as_bytes(),
+                ),
+            ),
+        ];
+
+        for (adapter, response) in action_responses {
+            let headers = response_headers(&response);
+            let body: Value = serde_json::from_slice(response_body(&response)).unwrap();
+            assert!(headers.starts_with("HTTP/1.1 200 OK"), "{adapter} action");
+            assert!(headers.contains("Connection: close"), "{adapter} action");
+            assert_eq!(body["status"], "ok", "{adapter} action");
+            assert_eq!(body["data"]["routePath"], "/posts/abc", "{adapter} action");
         }
     }
 
@@ -6413,10 +6723,7 @@ process.exit(1);
         assert!(ambiguous_host.body_text().contains("exactly one"));
 
         headers.insert("x-forwarded-host".to_owned(), "app.example.com".to_owned());
-        headers.insert(
-            "x-forwarded-proto".to_owned(),
-            "https, http".to_owned(),
-        );
+        headers.insert("x-forwarded-proto".to_owned(), "https, http".to_owned());
         let ambiguous_proto = server_action_request_from_form(
             &headers,
             &action_form_body("/posts/abc"),
