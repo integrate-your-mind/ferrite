@@ -60,8 +60,10 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
   assert.match(targetMap, /^\s*default 0;/m);
   assert.match(targetMap, /%\(\?:2e\|2f\|5c\)/);
   assert.match(targetMap, /\\\.\{1,2\}/);
+  const rawTargetReject = '"~*^[A-Z]+ [^ ]*(?:#|\\\\x5c)[^ ]* HTTP/" 0;';
+  assert.ok(targetMap.includes(rawTargetReject));
   assert.match(targetMap, /"~\*\^\[A-Z\]\+ \/\(\?:\[\^\/ \]\[\^ \]\*\)\? HTTP\/" 1;/);
-  assert.match(targetMap, /https:\/\/app\\\.example\\\.com\(\?:\/\|\[\?# \]\)/);
+  assert.match(targetMap, /https:\/\/app\\\.example\\\.com\(\?:\/\|\[\? \]\)/);
   assert.ok(
     targetMap.indexOf("%(?:2e|2f|5c)") < targetMap.indexOf('HTTP/" 1;'),
     "encoded traversal rejection must run before origin-form acceptance",
@@ -69,6 +71,10 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
   assert.ok(
     targetMap.indexOf("\\.{1,2}") < targetMap.indexOf('HTTP/" 1;'),
     "literal dot-segment rejection must run before origin-form acceptance",
+  );
+  assert.ok(
+    targetMap.indexOf(rawTargetReject) < targetMap.indexOf('HTTP/" 1;'),
+    "raw fragment/backslash rejection must run before origin-form acceptance",
   );
   assert.match(nginx, /if \(\$host != \$server_name\) \{\s+return 421;\s+\}/);
   assert.match(

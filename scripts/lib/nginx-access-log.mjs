@@ -12,6 +12,33 @@ export const NGINX_FRAMING_PROBE_NAMES = Object.freeze([
 export const nginxFramingProbeTarget = (name) =>
   `/_ferrite/action?__ferrite_framing_probe=${encodeURIComponent(name)}`;
 
+export const nginxRequestTargetRejectionProbes = (servername) => [
+  {
+    name: "literal backslash origin-form target",
+    target: "/posts/\\admin",
+  },
+  {
+    name: "literal fragment origin-form target",
+    target: "/posts/#admin",
+  },
+  {
+    name: "literal backslash absolute-form target",
+    target: `https://${servername}/posts/\\admin`,
+  },
+  {
+    name: "literal fragment absolute-form target",
+    target: `https://${servername}/posts/#admin`,
+  },
+  {
+    name: "literal backslash slashless absolute-form target",
+    target: `https://${servername}?x\\admin`,
+  },
+  {
+    name: "literal fragment slashless absolute-form target",
+    target: `https://${servername}?x#admin`,
+  },
+];
+
 export const parseAccessLogEntries = (log) =>
   log.split(/\r?\n/).flatMap((line) => {
     try {
@@ -136,6 +163,29 @@ export const assertNginxFramingRejectedAtProxy = (
     assert.ok(
       entry.upstream_status === "-" || entry.upstream_status === "",
       `nginx framing probe ${probeName} reached Ferrite upstream with status ${entry.upstream_status}`,
+    );
+  }
+};
+
+export const assertNginxRequestTargetsRejectedAtProxy = (entries, probes) => {
+  for (const probe of probes) {
+    const request = `GET ${probe.target} HTTP/1.1`;
+    const matches = entries.filter((entry) => entry.request === request);
+    assert.equal(
+      matches.length,
+      1,
+      `nginx access log omitted request-target probe ${probe.name}`,
+    );
+
+    const [entry] = matches;
+    assert.equal(
+      entry.status,
+      421,
+      `nginx request-target probe ${probe.name} returned the wrong status`,
+    );
+    assert.ok(
+      entry.upstream_status === "-" || entry.upstream_status === "",
+      `nginx request-target probe ${probe.name} reached Ferrite upstream with status ${entry.upstream_status}`,
     );
   }
 };

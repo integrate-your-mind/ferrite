@@ -19,7 +19,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   assertNginxAccessLogEvidence,
   assertNginxFramingRejectedAtProxy,
+  assertNginxRequestTargetsRejectedAtProxy,
   NGINX_FRAMING_PROBE_NAMES,
+  nginxRequestTargetRejectionProbes,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
 
@@ -432,7 +434,7 @@ const runVerifier = (verifierPath, environment, options = {}) =>
     ...options,
   });
 
-const waitForNginxFramingEvidence = async (container) => {
+const waitForNginxProxyRejectionEvidence = async (container, requestTargetProbes) => {
   const deadline = Date.now() + 5_000;
   let lastError;
   while (Date.now() < deadline) {
@@ -444,13 +446,14 @@ const waitForNginxFramingEvidence = async (container) => {
     const entries = parseAccessLogEntries(`${logs.stdout}\n${logs.stderr}`);
     try {
       assertNginxFramingRejectedAtProxy(entries);
+      assertNginxRequestTargetsRejectedAtProxy(entries, requestTargetProbes);
       return;
     } catch (error) {
       lastError = error;
       await delay(50);
     }
   }
-  throw new Error(`nginx framing rejection evidence was incomplete: ${lastError?.message}`);
+  throw new Error(`nginx proxy rejection evidence was incomplete: ${lastError?.message}`);
 };
 
 const runStalledTlsDeadlineControl = async (verifierPath, environment) => {
@@ -810,11 +813,17 @@ const main = async () => {
       await runVerifier(proofInputs.verifier, environment, { stream: true }),
       "run nginx framing matrices",
     );
-    assert.match(successful.stdout, /nginx framing matrix passed: 37\/37/);
+    assert.match(successful.stdout, /nginx framing matrix passed: 43\/43/);
     assert.match(successful.stdout, /nginx HTTP\/2 matrix passed: 4\/4/);
-    await waitForNginxFramingEvidence(nginxContainer);
+    const requestTargetRejectionProbes = nginxRequestTargetRejectionProbes(
+      environment.FERRITE_NGINX_SERVER_NAME,
+    );
+    await waitForNginxProxyRejectionEvidence(
+      nginxContainer,
+      requestTargetRejectionProbes,
+    );
     process.stdout.write(
-      `proxy rejection evidence passed: ${NGINX_FRAMING_PROBE_NAMES.length}/${NGINX_FRAMING_PROBE_NAMES.length} probes had no upstream status\n`,
+      `proxy rejection evidence passed: ${NGINX_FRAMING_PROBE_NAMES.length}/${NGINX_FRAMING_PROBE_NAMES.length} framing and ${requestTargetRejectionProbes.length}/${requestTargetRejectionProbes.length} target probes had no upstream status\n`,
     );
 
     const secureEnvironment = { ...environment };

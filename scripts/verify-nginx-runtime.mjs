@@ -7,6 +7,7 @@ import {
   assertNginxAccessLogEvidence,
   NGINX_FRAMING_PROBE_NAMES,
   nginxFramingProbeTarget,
+  nginxRequestTargetRejectionProbes,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
 
@@ -236,6 +237,7 @@ const smugglingCanaryPaths = NGINX_FRAMING_PROBE_NAMES.map(
   (name) => `/posts/nginx-smuggle-${name}`,
 );
 const framingProbeTargets = NGINX_FRAMING_PROBE_NAMES.map(nginxFramingProbeTarget);
+const requestTargetRejectionProbes = nginxRequestTargetRejectionProbes(servername);
 const smugglingSuffix = (path) =>
   Buffer.from(
     `GET ${path} HTTP/1.1\r\nHost: ${servername}\r\nConnection: close\r\n\r\n`,
@@ -435,6 +437,11 @@ const cases = [
     payload: request({ target: "/posts/%5cadmin" }),
     statuses: [421],
   },
+  ...requestTargetRejectionProbes.map((probe) => ({
+    name: `${probe.name} rejection`,
+    payload: request({ target: probe.target }),
+    statuses: [421],
+  })),
   {
     name: "literal parent-segment target rejection",
     payload: request({ target: "/posts/../abc" }),

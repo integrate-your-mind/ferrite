@@ -7,8 +7,10 @@ import test from "node:test";
 import {
   assertNginxAccessLogEvidence,
   assertNginxFramingRejectedAtProxy,
+  assertNginxRequestTargetsRejectedAtProxy,
   NGINX_FRAMING_PROBE_NAMES,
   nginxFramingProbeTarget,
+  nginxRequestTargetRejectionProbes,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
 import {
@@ -135,6 +137,30 @@ test("framing probes must be rejected before an upstream response", () => {
   assert.throws(
     () => assertNginxFramingRejectedAtProxy(proxyRejections.slice(1)),
     /omitted framing probe duplicate-content-length/,
+  );
+});
+
+test("request-target probes must be rejected before an upstream response", () => {
+  const probes = nginxRequestTargetRejectionProbes("app.example.com");
+  const proxyRejections = probes.map((probe) => ({
+    request: `GET ${probe.target} HTTP/1.1`,
+    status: 421,
+    upstream_status: "-",
+  }));
+  assert.doesNotThrow(() =>
+    assertNginxRequestTargetsRejectedAtProxy(proxyRejections, probes),
+  );
+  assert.throws(
+    () =>
+      assertNginxRequestTargetsRejectedAtProxy(
+        [{ ...proxyRejections[0], upstream_status: "421" }, ...proxyRejections.slice(1)],
+        probes,
+      ),
+    /reached Ferrite upstream with status 421/,
+  );
+  assert.throws(
+    () => assertNginxRequestTargetsRejectedAtProxy(proxyRejections.slice(1), probes),
+    /omitted request-target probe literal backslash origin-form target/,
   );
 });
 
