@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   assertNginxAccessLogEvidence,
+  assertNginxFramingRejectedAtProxy,
+  NGINX_FRAMING_PROBE_NAMES,
+  nginxFramingProbeTarget,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
 import {
   assertExpectedFailure,
   assertProofSourceState,
   CleanupStack,
+  createCleanSourceSnapshot,
   createProofInterruption,
   parseDockerPublishedPort,
   renderProofNginxConfig,
@@ -35,10 +43,10 @@ const baselineEntries = [
 
 test("nginx proof config replaces one validated upstream without shell interpolation", () => {
   const template = "server { proxy_pass http://127.0.0.1:3000; }";
-  assert.equal(
-    renderProofNginxConfig(template),
-    "server { proxy_pass http://ferrite-upstream:3000; }",
-  );
+  const rendered = renderProofNginxConfig(template);
+  assert.match(rendered, /log_format ferrite_proof escape=json/);
+  assert.match(rendered, /access_log \/var\/log\/nginx\/access\.log ferrite_proof/);
+  assert.match(rendered, /proxy_pass http:\/\/ferrite-upstream:3000/);
   assert.throws(
     () => renderProofNginxConfig("server {}"),
     /must contain exactly one proxy_pass/,
@@ -69,6 +77,50 @@ test("exact nginx proof rejects dirty source unless a development override is ex
   assert.throws(
     () => assertProofSourceState(false, false),
     /requires a clean worktree/,
+  );
+});
+
+test("clean nginx proof snapshots one immutable Git commit", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-proof-source-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  execFileSync("git", ["init", "-q"], { cwd: root });
+  execFileSync("git", ["config", "user.email", "proof@example.invalid"], { cwd: root });
+  execFileSync("git", ["config", "user.name", "Ferrite Proof"], { cwd: root });
+  await writeFile(join(root, "source.txt"), "committed source");
+  execFileSync("git", ["add", "source.txt"], { cwd: root });
+  execFileSync("git", ["commit", "-qm", "seed"], { cwd: root });
+  const commit = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: root,
+    encoding: "utf8",
+  }).trim();
+  const scratch = join(root, "scratch");
+  await mkdir(scratch);
+
+  const snapshot = await createCleanSourceSnapshot({ sourceRoot: root, scratch, commit });
+  await writeFile(join(root, "source.txt"), "mutated after snapshot");
+
+  assert.equal(await readFile(join(snapshot, "source.txt"), "utf8"), "committed source");
+  await assert.rejects(access(join(snapshot, ".git")), (error) => error.code === "ENOENT");
+});
+
+test("framing probes must be rejected before an upstream response", () => {
+  const proxyRejections = NGINX_FRAMING_PROBE_NAMES.map((name) => ({
+    request: `POST ${nginxFramingProbeTarget(name)} HTTP/1.1`,
+    status: 400,
+    upstream_status: "-",
+  }));
+  assert.doesNotThrow(() => assertNginxFramingRejectedAtProxy(proxyRejections));
+  assert.throws(
+    () =>
+      assertNginxFramingRejectedAtProxy([
+        { ...proxyRejections[0], upstream_status: "400" },
+        ...proxyRejections.slice(1),
+      ]),
+    /reached Ferrite upstream with status 400/,
+  );
+  assert.throws(
+    () => assertNginxFramingRejectedAtProxy(proxyRejections.slice(1)),
+    /omitted framing probe duplicate-content-length/,
   );
 });
 

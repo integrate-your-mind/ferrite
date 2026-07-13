@@ -18,6 +18,8 @@ import tls from "node:tls";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   assertNginxAccessLogEvidence,
+  assertNginxFramingRejectedAtProxy,
+  NGINX_FRAMING_PROBE_NAMES,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
 
@@ -76,7 +78,16 @@ export const renderProofNginxConfig = (template, upstreamAlias = "ferrite-upstre
   if (replacements !== 1) {
     throw new Error(`nginx template must contain exactly one ${needle} directive`);
   }
-  return template.replace(needle, `proxy_pass http://${upstreamAlias}:3000;`);
+  const proofAccessLog = [
+    "log_format ferrite_proof escape=json",
+    "  '{\"request\":\"$request\",\"status\":$status,\"upstream_status\":\"$upstream_status\"}';",
+    "access_log /var/log/nginx/access.log ferrite_proof;",
+    "",
+  ].join("\n");
+  return `${proofAccessLog}${template.replace(
+    needle,
+    `proxy_pass http://${upstreamAlias}:3000;`,
+  )}`;
 };
 
 export const parseDockerPublishedPort = (output) => {
@@ -204,6 +215,27 @@ const assertCommandSucceeded = (result, label) => {
     ? "timed out"
     : `exited ${result.code ?? `from ${result.signal}`}`;
   throw new Error(`${label} ${reason}\n${result.stdout}\n${result.stderr}`.trim());
+};
+
+export const createCleanSourceSnapshot = async ({ sourceRoot, scratch, commit }) => {
+  const archive = join(scratch, "source.tar");
+  const context = join(scratch, "source");
+  await mkdir(context);
+  assertCommandSucceeded(
+    await runCommand("git", ["archive", "--format=tar", `--output=${archive}`, commit], {
+      cwd: sourceRoot,
+    }),
+    "archive exact source commit",
+  );
+  try {
+    assertCommandSucceeded(
+      await runCommand("tar", ["-xf", archive, "-C", context]),
+      "extract exact source archive",
+    );
+  } finally {
+    await rm(archive, { force: true });
+  }
+  return context;
 };
 
 const removeDockerResource = async (
@@ -395,6 +427,27 @@ const runVerifier = (environment, options = {}) =>
     ...options,
   });
 
+const waitForNginxFramingEvidence = async (container) => {
+  const deadline = Date.now() + 5_000;
+  let lastError;
+  while (Date.now() < deadline) {
+    throwIfProofAborted();
+    const logs = assertCommandSucceeded(
+      await runCommand("docker", ["logs", container]),
+      "read nginx proof access log",
+    );
+    const entries = parseAccessLogEntries(`${logs.stdout}\n${logs.stderr}`);
+    try {
+      assertNginxFramingRejectedAtProxy(entries);
+      return;
+    } catch (error) {
+      lastError = error;
+      await delay(50);
+    }
+  }
+  throw new Error(`nginx framing rejection evidence was incomplete: ${lastError?.message}`);
+};
+
 const runStalledTlsDeadlineControl = async (environment) => {
   throwIfProofAborted();
   const sockets = new Set();
@@ -503,6 +556,10 @@ const main = async () => {
     await mkdir(certificateDirectory);
     await mkdir(missingCertificateDirectory);
     await writeFile(accessLogPath, "");
+    const buildContext = sourceClean
+      ? await createCleanSourceSnapshot({ sourceRoot: repositoryRoot, scratch, commit })
+      : repositoryRoot;
+    const buildContextMode = sourceClean ? "git-archive" : "dirty-worktree";
 
     process.stdout.write(
       `${JSON.stringify({
@@ -510,6 +567,7 @@ const main = async () => {
         sourceTree: tree,
         sourceClean,
         dirtyOverride,
+        buildContextMode,
         scratch,
       })}\n`,
     );
@@ -567,10 +625,12 @@ const main = async () => {
         "--label",
         `org.opencontainers.image.revision=${commit}`,
         "--label",
+        `io.ferrite.source-tree=${tree}`,
+        "--label",
         `io.ferrite.source-clean=${sourceClean}`,
         "--tag",
         imageTag,
-        ".",
+        buildContext,
       ],
       { timeoutMs: 1_200_000, stream: true },
     );
@@ -584,16 +644,24 @@ const main = async () => {
         "image",
         "inspect",
         "--format",
-        '{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}|{{index .Config.Labels "io.ferrite.source-clean"}}',
+        '{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}|{{index .Config.Labels "io.ferrite.source-tree"}}|{{index .Config.Labels "io.ferrite.source-clean"}}',
         imageTag,
       ]),
       "inspect Ferrite candidate image",
     ).stdout.trim();
-    const [candidateImageId, candidateRevision, candidateClean] = candidateIdentity.split("|");
+    const [candidateImageId, candidateRevision, candidateTree, candidateClean] =
+      candidateIdentity.split("|");
     assert.equal(candidateRevision, commit, "candidate image revision label did not match HEAD");
+    assert.equal(candidateTree, tree, "candidate image source-tree label did not match HEAD");
     assert.equal(candidateClean, String(sourceClean), "candidate image clean-state label was wrong");
     process.stdout.write(
-      `${JSON.stringify({ candidateImageId, candidateRevision, candidateClean })}\n`,
+      `${JSON.stringify({
+        candidateImageId,
+        candidateRevision,
+        candidateTree,
+        candidateClean,
+        buildContextMode,
+      })}\n`,
     );
 
     cleanup.defer("proof network cleanup", () => removeDockerResource("network", networkName));
@@ -738,6 +806,10 @@ const main = async () => {
     );
     assert.match(successful.stdout, /nginx framing matrix passed: 37\/37/);
     assert.match(successful.stdout, /nginx HTTP\/2 matrix passed: 4\/4/);
+    await waitForNginxFramingEvidence(nginxContainer);
+    process.stdout.write(
+      `proxy rejection evidence passed: ${NGINX_FRAMING_PROBE_NAMES.length}/${NGINX_FRAMING_PROBE_NAMES.length} probes had no upstream status\n`,
+    );
 
     const secureEnvironment = { ...environment };
     delete secureEnvironment.FERRITE_NGINX_INSECURE;
@@ -769,13 +841,9 @@ const main = async () => {
 
     const successfulLog = (await readFile(accessLogPath)).subarray(successfulLogOffset).toString("utf8");
     const successfulEntries = parseAccessLogEntries(successfulLog);
-    const canaryPaths = [
-      "/posts/nginx-smuggle-duplicate-content-length",
-      "/posts/nginx-smuggle-conflicting-content-length",
-      "/posts/nginx-smuggle-comma-content-length",
-      "/posts/nginx-smuggle-transfer-encoding-content-length",
-      "/posts/nginx-smuggle-duplicate-transfer-encoding",
-    ];
+    const canaryPaths = NGINX_FRAMING_PROBE_NAMES.map(
+      (name) => `/posts/nginx-smuggle-${name}`,
+    );
     const expectedEvidence = {
       additionalAccessEntries: [
         {

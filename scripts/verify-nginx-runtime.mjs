@@ -5,6 +5,8 @@ import tls from "node:tls";
 import { URLSearchParams } from "node:url";
 import {
   assertNginxAccessLogEvidence,
+  NGINX_FRAMING_PROBE_NAMES,
+  nginxFramingProbeTarget,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
 
@@ -230,13 +232,10 @@ const chunkedActionBody = Buffer.concat([
   actionBody,
   Buffer.from("\r\n0\r\n\r\n"),
 ]);
-const smugglingCanaryPaths = [
-  "/posts/nginx-smuggle-duplicate-content-length",
-  "/posts/nginx-smuggle-conflicting-content-length",
-  "/posts/nginx-smuggle-comma-content-length",
-  "/posts/nginx-smuggle-transfer-encoding-content-length",
-  "/posts/nginx-smuggle-duplicate-transfer-encoding",
-];
+const smugglingCanaryPaths = NGINX_FRAMING_PROBE_NAMES.map(
+  (name) => `/posts/nginx-smuggle-${name}`,
+);
+const framingProbeTargets = NGINX_FRAMING_PROBE_NAMES.map(nginxFramingProbeTarget);
 const smugglingSuffix = (path) =>
   Buffer.from(
     `GET ${path} HTTP/1.1\r\nHost: ${servername}\r\nConnection: close\r\n\r\n`,
@@ -271,7 +270,7 @@ const cases = [
     payload: Buffer.concat([
       request({
         method: "POST",
-        target: "/_ferrite/action",
+        target: framingProbeTargets[0],
         headers: [
           ...actionHeaders,
           `Content-Length: ${actionBody.length}`,
@@ -289,7 +288,7 @@ const cases = [
     payload: Buffer.concat([
       request({
         method: "POST",
-        target: "/_ferrite/action",
+        target: framingProbeTargets[1],
         headers: [...actionHeaders, "Content-Length: 1", `Content-Length: ${actionBody.length}`],
         body: actionBody,
         connection: "keep-alive",
@@ -303,7 +302,7 @@ const cases = [
     payload: Buffer.concat([
       request({
         method: "POST",
-        target: "/_ferrite/action",
+        target: framingProbeTargets[2],
         headers: [
           ...actionHeaders,
           `Content-Length: ${actionBody.length}, ${actionBody.length}`,
@@ -320,7 +319,7 @@ const cases = [
     payload: Buffer.concat([
       request({
         method: "POST",
-        target: "/_ferrite/action",
+        target: framingProbeTargets[3],
         headers: [
           ...actionHeaders,
           "Transfer-Encoding: chunked",
@@ -338,7 +337,7 @@ const cases = [
     payload: Buffer.concat([
       request({
         method: "POST",
-        target: "/_ferrite/action",
+        target: framingProbeTargets[4],
         headers: [
           ...actionHeaders,
           "Transfer-Encoding: chunked",

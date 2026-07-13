@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import { isIP } from "node:net";
 
+export const NGINX_FRAMING_PROBE_NAMES = Object.freeze([
+  "duplicate-content-length",
+  "conflicting-content-length",
+  "comma-content-length",
+  "transfer-encoding-content-length",
+  "duplicate-transfer-encoding",
+]);
+
+export const nginxFramingProbeTarget = (name) =>
+  `/_ferrite/action?__ferrite_framing_probe=${encodeURIComponent(name)}`;
+
 export const parseAccessLogEntries = (log) =>
   log.split(/\r?\n/).flatMap((line) => {
     try {
@@ -108,5 +119,23 @@ export const assertNginxAccessLogEvidence = (
   const paths = new Set(entries.map((entry) => entry.path));
   for (const canaryPath of smugglingCanaryPaths) {
     assert.ok(!paths.has(canaryPath), `smuggling canary reached Ferrite: ${canaryPath}`);
+  }
+};
+
+export const assertNginxFramingRejectedAtProxy = (
+  entries,
+  probeNames = NGINX_FRAMING_PROBE_NAMES,
+) => {
+  for (const probeName of probeNames) {
+    const request = `POST ${nginxFramingProbeTarget(probeName)} HTTP/1.1`;
+    const matches = entries.filter((entry) => entry.request === request);
+    assert.equal(matches.length, 1, `nginx access log omitted framing probe ${probeName}`);
+
+    const [entry] = matches;
+    assert.equal(entry.status, 400, `nginx framing probe ${probeName} returned the wrong status`);
+    assert.ok(
+      entry.upstream_status === "-" || entry.upstream_status === "",
+      `nginx framing probe ${probeName} reached Ferrite upstream with status ${entry.upstream_status}`,
+    );
   }
 };
