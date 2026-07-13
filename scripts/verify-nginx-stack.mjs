@@ -27,7 +27,6 @@ export const NGINX_IMAGE =
   "nginx@sha256:b3c656d55d7ad751196f21b7fd2e8d4da9cb430e32f646adcf92441b72f82b14";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const verifierPath = join(repositoryRoot, "scripts/verify-nginx-runtime.mjs");
 const activeChildren = new Set();
 let activeProofAbortSignal;
 const maxCapturedBytes = 512 * 1024;
@@ -238,6 +237,12 @@ export const createCleanSourceSnapshot = async ({ sourceRoot, scratch, commit })
   return context;
 };
 
+export const resolveProofInputPaths = (sourceRoot) => ({
+  dockerfile: join(sourceRoot, "deploy/container/Dockerfile"),
+  nginxTemplate: join(sourceRoot, "deploy/nginx/ferrite.conf"),
+  verifier: join(sourceRoot, "scripts/verify-nginx-runtime.mjs"),
+});
+
 const removeDockerResource = async (
   kind,
   name,
@@ -420,7 +425,7 @@ const verifierEnvironment = ({ port, accessLogPath }) => {
   };
 };
 
-const runVerifier = (environment, options = {}) =>
+const runVerifier = (verifierPath, environment, options = {}) =>
   runCommand(process.execPath, [verifierPath], {
     env: environment,
     timeoutMs: 120_000,
@@ -448,7 +453,7 @@ const waitForNginxFramingEvidence = async (container) => {
   throw new Error(`nginx framing rejection evidence was incomplete: ${lastError?.message}`);
 };
 
-const runStalledTlsDeadlineControl = async (environment) => {
+const runStalledTlsDeadlineControl = async (verifierPath, environment) => {
   throwIfProofAborted();
   const sockets = new Set();
   const server = createServer((socket) => {
@@ -462,7 +467,7 @@ const runStalledTlsDeadlineControl = async (environment) => {
   try {
     const address = server.address();
     assert.ok(address && typeof address === "object");
-    const result = await runVerifier({
+    const result = await runVerifier(verifierPath, {
       ...environment,
       FERRITE_NGINX_PORT: String(address.port),
       FERRITE_NGINX_TIMEOUT_MS: "50",
@@ -532,7 +537,7 @@ const main = async () => {
       "read source commit",
     ).stdout.trim();
     const tree = assertCommandSucceeded(
-      await runCommand("git", ["rev-parse", "HEAD^{tree}"]),
+      await runCommand("git", ["rev-parse", `${commit}^{tree}`]),
       "read source tree",
     ).stdout.trim();
     const status = assertCommandSucceeded(
@@ -560,6 +565,7 @@ const main = async () => {
       ? await createCleanSourceSnapshot({ sourceRoot: repositoryRoot, scratch, commit })
       : repositoryRoot;
     const buildContextMode = sourceClean ? "git-archive" : "dirty-worktree";
+    const proofInputs = resolveProofInputPaths(buildContext);
 
     process.stdout.write(
       `${JSON.stringify({
@@ -581,7 +587,7 @@ const main = async () => {
       "connect to Docker daemon",
     );
 
-    const template = await readFile(join(repositoryRoot, "deploy/nginx/ferrite.conf"), "utf8");
+    const template = await readFile(proofInputs.nginxTemplate, "utf8");
     await writeFile(nginxConfigPath, renderProofNginxConfig(template));
     assertCommandSucceeded(
       await runCommand("openssl", [
@@ -621,7 +627,7 @@ const main = async () => {
       [
         "build",
         "--file",
-        "deploy/container/Dockerfile",
+        proofInputs.dockerfile,
         "--label",
         `org.opencontainers.image.revision=${commit}`,
         "--label",
@@ -801,7 +807,7 @@ const main = async () => {
     const environment = verifierEnvironment({ port: publishedPort, accessLogPath });
     const successfulLogOffset = (await stat(accessLogPath)).size;
     const successful = assertCommandSucceeded(
-      await runVerifier(environment, { stream: true }),
+      await runVerifier(proofInputs.verifier, environment, { stream: true }),
       "run nginx framing matrices",
     );
     assert.match(successful.stdout, /nginx framing matrix passed: 37\/37/);
@@ -814,7 +820,7 @@ const main = async () => {
     const secureEnvironment = { ...environment };
     delete secureEnvironment.FERRITE_NGINX_INSECURE;
     assertExpectedFailure(
-      await runVerifier(secureEnvironment),
+      await runVerifier(proofInputs.verifier, secureEnvironment),
       "self-signed TLS verification control",
       /self[- ]signed|certificate|DEPTH_ZERO_SELF_SIGNED_CERT/i,
     );
@@ -823,20 +829,23 @@ const main = async () => {
     const missingLogEnvironment = { ...environment };
     delete missingLogEnvironment.FERRITE_NGINX_ACCESS_LOG_PATH;
     assertExpectedFailure(
-      await runVerifier(missingLogEnvironment),
+      await runVerifier(proofInputs.verifier, missingLogEnvironment),
       "missing access-log control",
       /must point to the running Ferrite --access-log json output/,
     );
     process.stdout.write("negative control passed: access-log evidence is mandatory\n");
 
     assertExpectedFailure(
-      await runVerifier({ ...environment, FERRITE_NGINX_MAX_RESPONSE_BYTES: "100" }),
+      await runVerifier(proofInputs.verifier, {
+        ...environment,
+        FERRITE_NGINX_MAX_RESPONSE_BYTES: "100",
+      }),
       "response-size control",
       /response exceeded 100 bytes/,
     );
     process.stdout.write("negative control passed: verifier response cap fails closed\n");
 
-    await runStalledTlsDeadlineControl(environment);
+    await runStalledTlsDeadlineControl(proofInputs.verifier, environment);
     process.stdout.write("negative control passed: verifier deadline aborts a stalled TLS peer\n");
 
     const successfulLog = (await readFile(accessLogPath)).subarray(successfulLogOffset).toString("utf8");

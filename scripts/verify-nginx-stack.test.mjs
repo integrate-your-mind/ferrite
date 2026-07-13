@@ -19,6 +19,7 @@ import {
   createProofInterruption,
   parseDockerPublishedPort,
   renderProofNginxConfig,
+  resolveProofInputPaths,
 } from "./verify-nginx-stack.mjs";
 
 const canaryPaths = ["/posts/nginx-smuggle-duplicate-content-length"];
@@ -80,14 +81,20 @@ test("exact nginx proof rejects dirty source unless a development override is ex
   );
 });
 
-test("clean nginx proof snapshots one immutable Git commit", async (t) => {
+test("clean nginx proof snapshots every tracked proof input from one immutable Git commit", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-proof-source-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   execFileSync("git", ["init", "-q"], { cwd: root });
   execFileSync("git", ["config", "user.email", "proof@example.invalid"], { cwd: root });
   execFileSync("git", ["config", "user.name", "Ferrite Proof"], { cwd: root });
+  await mkdir(join(root, "deploy/container"), { recursive: true });
+  await mkdir(join(root, "deploy/nginx"), { recursive: true });
+  await mkdir(join(root, "scripts"), { recursive: true });
   await writeFile(join(root, "source.txt"), "committed source");
-  execFileSync("git", ["add", "source.txt"], { cwd: root });
+  await writeFile(join(root, "deploy/container/Dockerfile"), "committed Dockerfile");
+  await writeFile(join(root, "deploy/nginx/ferrite.conf"), "committed nginx template");
+  await writeFile(join(root, "scripts/verify-nginx-runtime.mjs"), "committed verifier");
+  execFileSync("git", ["add", "."], { cwd: root });
   execFileSync("git", ["commit", "-qm", "seed"], { cwd: root });
   const commit = execFileSync("git", ["rev-parse", "HEAD"], {
     cwd: root,
@@ -98,8 +105,15 @@ test("clean nginx proof snapshots one immutable Git commit", async (t) => {
 
   const snapshot = await createCleanSourceSnapshot({ sourceRoot: root, scratch, commit });
   await writeFile(join(root, "source.txt"), "mutated after snapshot");
+  await writeFile(join(root, "deploy/container/Dockerfile"), "mutated Dockerfile");
+  await writeFile(join(root, "deploy/nginx/ferrite.conf"), "mutated nginx template");
+  await writeFile(join(root, "scripts/verify-nginx-runtime.mjs"), "mutated verifier");
+  const proofInputs = resolveProofInputPaths(snapshot);
 
   assert.equal(await readFile(join(snapshot, "source.txt"), "utf8"), "committed source");
+  assert.equal(await readFile(proofInputs.dockerfile, "utf8"), "committed Dockerfile");
+  assert.equal(await readFile(proofInputs.nginxTemplate, "utf8"), "committed nginx template");
+  assert.equal(await readFile(proofInputs.verifier, "utf8"), "committed verifier");
   await assert.rejects(access(join(snapshot, ".git")), (error) => error.code === "ENOENT");
 });
 
