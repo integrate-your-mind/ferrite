@@ -15,6 +15,7 @@
     "test:browser": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/protocol-wasm build && pnpm --filter @ferrite/runtime build && node --test --test-concurrency=1 test/*.test.mjs",
     "test:example": "pnpm build:example && pnpm render:fixture && pnpm dev:once && cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path /posts/abc",
     "test:nginx": "node scripts/verify-nginx-runtime.mjs",
+    "test:nginx:stack": "node scripts/verify-nginx-stack.mjs",
     "test:release": "node --test scripts/*.test.mjs",
     "typecheck": "pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/protocol-wasm typecheck && pnpm --filter @ferrite/runtime typecheck && cargo run -p ferrite-cli -- check --project examples/basic"
   },

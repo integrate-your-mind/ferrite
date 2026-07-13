@@ -55,7 +55,7 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
   );
   assert.match(
     nginx,
-    /map \$request \$ferrite_request_target_allowed \{[\s\S]+https:\/\/app\\\.example\\\.com[\s\S]+https\?:\/\//,
+    /map \$request \$ferrite_request_target_allowed \{\s+default 0;\s+"~\*\^\[A-Z\]\+ \/\(\?:\[\^\/ \]\[\^ \]\*\)\? HTTP\/" 1;\s+"~\*\^\[A-Z\]\+ https:\/\/app\\\.example\\\.com/,
   );
   assert.match(nginx, /if \(\$host != \$server_name\) \{\s+return 421;\s+\}/);
   assert.match(
@@ -101,5 +101,10 @@ test("runtime proxy verifier is wired into the package scripts", async () => {
   const packageJson = JSON.parse(await text("package.json"));
 
   assert.equal(packageJson.scripts["test:nginx"], "node scripts/verify-nginx-runtime.mjs");
+  assert.equal(
+    packageJson.scripts["test:nginx:stack"],
+    "node scripts/verify-nginx-stack.mjs",
+  );
   assert.match(await text("scripts/verify-nginx-runtime.mjs"), /nginx framing matrix passed/);
+  assert.match(await text("scripts/verify-nginx-stack.mjs"), /nginx stack proof passed/);
 });

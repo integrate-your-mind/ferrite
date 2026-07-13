@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import tls from "node:tls";
 import { URLSearchParams } from "node:url";
+import {
+  assertNginxAccessLogEvidence,
+  parseAccessLogEntries,
+} from "./lib/nginx-access-log.mjs";
 
 const host = process.env.FERRITE_NGINX_HOST ?? "127.0.0.1";
 const port = Number.parseInt(process.env.FERRITE_NGINX_PORT ?? "8443", 10);
@@ -311,6 +315,36 @@ const cases = [
     includes: ["Post abc"],
   },
   {
+    name: "FTP absolute-form target rejection",
+    payload: request({ target: `ftp://${servername}/posts/abc` }),
+    statuses: [421],
+  },
+  {
+    name: "WebSocket absolute-form target rejection",
+    payload: request({ target: `ws://${servername}/posts/abc` }),
+    statuses: [421],
+  },
+  {
+    name: "Gopher absolute-form target rejection",
+    payload: request({ target: `gopher://${servername}/posts/abc` }),
+    statuses: [421],
+  },
+  {
+    name: "network-path target rejection",
+    payload: request({ target: "//evil.example/posts/abc" }),
+    statuses: [421],
+  },
+  {
+    name: "bare authority target rejection",
+    payload: request({ target: "evil.example/posts/abc" }),
+    statuses: [400],
+  },
+  {
+    name: "mixed-case absolute-form authority mismatch",
+    payload: request({ target: "HtTpS://evil.example/posts/abc" }),
+    statuses: [421],
+  },
+  {
     name: "absolute-form authority mismatch",
     payload: request({ target: "https://evil.example/posts/abc" }),
     statuses: [421],
@@ -401,15 +435,6 @@ for (const testCase of cases) {
   );
 }
 
-const parseAccessLogEntries = (log) =>
-  log.split(/\r?\n/).flatMap((line) => {
-    try {
-      const entry = JSON.parse(line);
-      return entry && typeof entry === "object" ? [entry] : [];
-    } catch {
-      return [];
-    }
-  });
 const waitForAccessLog = async () => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -424,20 +449,6 @@ const waitForAccessLog = async () => {
   throw new Error(`Ferrite access log did not record baseline requests within ${timeoutMs} ms`);
 };
 const accessLogEntries = await waitForAccessLog();
-const accessLogPaths = new Set(accessLogEntries.map((entry) => entry.path));
-assert.ok(accessLogPaths.has("/posts/abc"), "Ferrite access log omitted the baseline route");
-assert.ok(accessLogPaths.has("/_ferrite/action"), "Ferrite access log omitted the baseline action");
-assert.ok(
-  accessLogEntries.some(
-    (entry) => entry.path === "/_ferrite/action" && typeof entry.client_ip === "string",
-  ),
-  "Ferrite access log did not prove trusted-proxy client-IP policy",
-);
-for (const canaryPath of smugglingCanaryPaths) {
-  assert.ok(
-    !accessLogPaths.has(canaryPath),
-    `smuggling canary reached Ferrite: ${canaryPath}`,
-  );
-}
+assertNginxAccessLogEvidence(accessLogEntries, smugglingCanaryPaths);
 
 process.stdout.write(`nginx framing matrix passed: ${cases.length}/${cases.length}\n`);

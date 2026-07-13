@@ -68,3 +68,15 @@ jobs:
           name: package-verification-reports
           path: dist/npm-packages
           if-no-files-found: error
+
+  nginx-stack:
+    name: Pinned nginx integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify production image behind pinned nginx
+        run: node scripts/verify-nginx-stack.mjs

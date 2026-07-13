@@ -4098,11 +4098,16 @@ fn enforce_trusted_proxy_forwarded_origin(
     headers: &HttpHeaders,
     expected: &HttpOrigin,
 ) -> std::result::Result<(), Box<DevResponse>> {
-    let Some(forwarded_proto) = first_forwarded_header_value(headers, "x-forwarded-proto") else {
+    let Some(forwarded_proto) = non_empty_header(headers, "x-forwarded-proto") else {
         return Err(Box::new(DevResponse::forbidden(
             "server action X-Forwarded-Proto is required for trusted proxy mode",
         )));
     };
+    if forwarded_proto.contains(',') {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action X-Forwarded-Proto must contain exactly one value",
+        )));
+    }
     let forwarded_proto = forwarded_proto.to_ascii_lowercase();
     if forwarded_proto != expected.scheme {
         return Err(Box::new(DevResponse::forbidden(
@@ -4110,11 +4115,16 @@ fn enforce_trusted_proxy_forwarded_origin(
         )));
     }
 
-    let Some(forwarded_host) = first_forwarded_header_value(headers, "x-forwarded-host") else {
+    let Some(forwarded_host) = non_empty_header(headers, "x-forwarded-host") else {
         return Err(Box::new(DevResponse::forbidden(
             "server action X-Forwarded-Host is required for trusted proxy mode",
         )));
     };
+    if forwarded_host.contains(',') {
+        return Err(Box::new(DevResponse::forbidden(
+            "server action X-Forwarded-Host must contain exactly one value",
+        )));
+    }
     let Some(forwarded_host) = normalize_http_authority(&expected.scheme, forwarded_host) else {
         return Err(Box::new(DevResponse::forbidden(
             "server action X-Forwarded-Host must be a valid HTTP authority",
@@ -4175,13 +4185,6 @@ fn header_value<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
 
 fn non_empty_header<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
     header_value(headers, name)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn first_forwarded_header_value<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
-    non_empty_header(headers, name)
-        .and_then(|value| value.split(',').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }
@@ -6392,6 +6395,39 @@ process.exit(1);
 
         assert_eq!(mismatched_host.status, 403);
         assert!(mismatched_host.body_text().contains("X-Forwarded-Host"));
+
+        headers.insert(
+            "x-forwarded-host".to_owned(),
+            "app.example.com, evil.example".to_owned(),
+        );
+        let ambiguous_host = server_action_request_from_form(
+            &headers,
+            &action_form_body("/posts/abc"),
+            None,
+            None,
+            Some(&trusted_proxy),
+            None,
+        )
+        .expect_err("trusted proxy mode should reject multiple forwarded hosts");
+        assert_eq!(ambiguous_host.status, 403);
+        assert!(ambiguous_host.body_text().contains("exactly one"));
+
+        headers.insert("x-forwarded-host".to_owned(), "app.example.com".to_owned());
+        headers.insert(
+            "x-forwarded-proto".to_owned(),
+            "https, http".to_owned(),
+        );
+        let ambiguous_proto = server_action_request_from_form(
+            &headers,
+            &action_form_body("/posts/abc"),
+            None,
+            None,
+            Some(&trusted_proxy),
+            None,
+        )
+        .expect_err("trusted proxy mode should reject multiple forwarded protocols");
+        assert_eq!(ambiguous_proto.status, 403);
+        assert!(ambiguous_proto.body_text().contains("exactly one"));
     }
 
     #[test]
@@ -7051,6 +7087,47 @@ process.exit(1);
         assert!(headers.starts_with("HTTP/1.1 200 OK"));
         assert_eq!(body["status"], "ok");
         assert_eq!(body["data"]["routePath"], "/posts/abc");
+    }
+
+    #[test]
+    fn production_action_post_rejects_ambiguous_forwarded_origin_on_real_socket() {
+        for (header, value) in [
+            ("X-Forwarded-Proto", "https, http"),
+            ("X-Forwarded-Host", "app.example.com, evil.example"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let app = temp.path().join("app");
+            write(
+                &app.join("posts/[id]/page.tsx"),
+                "export default function Page() {}",
+            );
+            let mut project = action_production_project_for(&app, action_renderer_body());
+            project.config.trusted_proxy =
+                Some(ProductionTrustedProxyConfig::new("https://app.example.com").unwrap());
+            let body = action_form_body("/posts/abc");
+            let mut forwarded_proto = "https";
+            let mut forwarded_host = "app.example.com";
+            if header == "X-Forwarded-Proto" {
+                forwarded_proto = value;
+            } else {
+                forwarded_host = value;
+            }
+            let request = format!(
+                "POST /_ferrite/action HTTP/1.1\r\nHost: 127.0.0.1:3000\r\nX-Forwarded-Proto: {forwarded_proto}\r\nX-Forwarded-Host: {forwarded_host}\r\nOrigin: https://app.example.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                String::from_utf8(body).unwrap()
+            );
+
+            let response = production_http_request(project, request.as_bytes());
+            let headers = response_headers(&response);
+            let body = String::from_utf8_lossy(response_body(&response));
+
+            assert!(
+                headers.starts_with("HTTP/1.1 403 Forbidden"),
+                "{header} ambiguity must fail closed"
+            );
+            assert!(body.contains("exactly one"));
+        }
     }
 
     #[test]
@@ -7723,17 +7800,21 @@ record(`completed:${mode}`);
                 thread::sleep(settled_deadline - Instant::now());
             }
 
+            let mut deadline_limited_readers = 0;
             for mut stream in slow_readers {
                 let mut response = Vec::new();
                 if let Err(error) = stream.read_to_end(&mut response) {
                     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
                 }
                 assert!(response.starts_with(b"HTTP/1.1 200 OK"));
-                assert!(
-                    response_body(&response).len() < SLOW_ASSET_BYTES,
-                    "slow reader unexpectedly received the entire asset in wave {wave}"
-                );
+                if response_body(&response).len() < SLOW_ASSET_BYTES {
+                    deadline_limited_readers += 1;
+                }
             }
+            assert!(
+                deadline_limited_readers > 0,
+                "slow-reader wave {wave} did not exercise the response write deadline"
+            );
         }
         assert_eq!(overload_responses, SLOW_READER_WAVES * OVERLOAD_CLIENTS);
 

@@ -97,7 +97,7 @@ Disallowed alpha claims until proven:
 5. Server-action security gaps
 - Explicit form transport only, not automatic `"use server"` discovery.
 - CSRF is opt-in and static-token based with optional SameSite/HttpOnly/Secure double-submit cookie binding and optional single-process one-time replay nonces; there is still no session-bound token rotation, multi-process replay coordination, or first-class auth middleware integration.
-- Trusted-proxy public-origin checks and explicit forwarded client-IP access-log policy now exist, but production topology proof is not finalized.
+- Trusted-proxy public-origin checks and explicit forwarded client-IP access-log policy now exist. The pinned-nginx candidate-image harness proves the local topology; hosted ingress/CDN topology is not finalized.
 - File uploads (`multipart` file parts) are intentionally rejected.
 
 6. Observability + operations depth
@@ -110,7 +110,7 @@ Disallowed alpha claims until proven:
 **Objective:** Reach a defensible private beta that is explicitly limited to trusted teams and explicit risks.
 
 ### Week 1
-- Day 1–2: push the completed artifact/concurrency milestone through remote review and exact-commit CI.
+- Day 1–2: finish PR #2's exact-head candidate-image/nginx proof packet, obtain distinct review, and resolve the GitHub Actions startup failure without bypassing checks.
 - Day 3–4: define service-level targets and run hosted capacity and long-duration tests around the completed response-write, mixed-load, controlled-overload, and artifact-runner recovery regressions.
 - Day 5: complete hosted deployment hardening pass 1:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
@@ -121,7 +121,7 @@ Disallowed alpha claims until proven:
   - trusted-proxy deployment test matrix, including forwarded proto/host and forwarded client-IP policy.
 
 ### Week 2
-- Day 8: harden CI proof by running the full local gate set in remote CI (release lint/test/build, example integration, npm/Cargo package verification, native prebuild dry-run, browser proof).
+- Day 8: harden CI proof by running the full local gate set in remote CI (release lint/test/build, example integration, pinned-nginx candidate-image proof, npm/Cargo package verification, native prebuild dry-run, browser proof).
 - Day 9–10: close server-action reliability and UX:
   - exercise server-action production failure-path audit logs in hosted staging and decide the external sink contract,
   - validate rejection/mismatch flows in real browser automation and one negative-path test per route/action class.
