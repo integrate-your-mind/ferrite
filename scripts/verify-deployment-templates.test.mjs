@@ -38,10 +38,53 @@ test("proxy template owns the forwarded headers trusted by Ferrite", async () =>
   const nginx = await text("deploy/nginx/ferrite.conf");
 
   assert.match(nginx, /proxy_pass http:\/\/127\.0\.0\.1:3000;/);
+  assert.match(nginx, /listen 443 ssl;/);
+  assert.match(nginx, /http2 on;/);
+  assert.doesNotMatch(nginx, /listen 443 ssl http2;/);
+  assert.match(nginx, /proxy_http_version 1\.1;/);
+  assert.match(nginx, /proxy_request_buffering on;/);
   assert.match(nginx, /proxy_set_header Host \$host;/);
   assert.match(nginx, /proxy_set_header X-Forwarded-Proto \$scheme;/);
   assert.match(nginx, /proxy_set_header X-Forwarded-Host \$host;/);
   assert.match(nginx, /proxy_set_header X-Forwarded-For \$remote_addr;/);
+  assert.match(nginx, /proxy_set_header Connection "";/);
+  assert.match(nginx, /proxy_set_header Expect "";/);
+  assert.match(
+    nginx,
+    /map \$http_host \$ferrite_authority_allowed \{\s+default 0;\s+app\.example\.com 1;\s+\}/,
+  );
+  const targetMap = nginx.match(
+    /map \$request \$ferrite_request_target_allowed \{([\s\S]*?)\n\}/,
+  )?.[1];
+  assert.ok(targetMap, "nginx request-target map is missing");
+  assert.match(targetMap, /^\s*default 0;/m);
+  assert.match(targetMap, /%\(\?:2e\|2f\|5c\)/);
+  assert.match(targetMap, /\\\.\{1,2\}/);
+  const rawTargetReject = '"~*^[A-Z]+ [^ ]*(?:#|\\\\x5c)[^ ]* HTTP/" 0;';
+  assert.ok(targetMap.includes(rawTargetReject));
+  assert.match(targetMap, /"~\*\^\[A-Z\]\+ \/\(\?:\[\^\/ \]\[\^ \]\*\)\? HTTP\/" 1;/);
+  assert.match(targetMap, /https:\/\/app\\\.example\\\.com\(\?:\/\|\[\? \]\)/);
+  assert.ok(
+    targetMap.indexOf("%(?:2e|2f|5c)") < targetMap.indexOf('HTTP/" 1;'),
+    "encoded traversal rejection must run before origin-form acceptance",
+  );
+  assert.ok(
+    targetMap.indexOf("\\.{1,2}") < targetMap.indexOf('HTTP/" 1;'),
+    "literal dot-segment rejection must run before origin-form acceptance",
+  );
+  assert.ok(
+    targetMap.indexOf(rawTargetReject) < targetMap.indexOf('HTTP/" 1;'),
+    "raw fragment/backslash rejection must run before origin-form acceptance",
+  );
+  assert.match(nginx, /if \(\$host != \$server_name\) \{\s+return 421;\s+\}/);
+  assert.match(
+    nginx,
+    /if \(\$ferrite_authority_allowed = 0\) \{\s+return 421;\s+\}/,
+  );
+  assert.match(
+    nginx,
+    /if \(\$ferrite_request_target_allowed = 0\) \{\s+return 421;\s+\}/,
+  );
   assert.match(nginx, /location = \/__ferrite\/metrics \{\s+return 404;\s+\}/);
   assert.doesNotMatch(nginx, /\$proxy_add_x_forwarded_for/);
   assert.match(nginx, /client_max_body_size 16k;/);
@@ -71,4 +114,18 @@ test("container template runs as a non-root runtime user with a health check", a
   assert.match(dockerignore, /^\*\*\/\.env\.\*$/m);
   assert.match(dockerignore, /^\*\*\/\*\.key$/m);
   assert.match(dockerignore, /^\*\*\/\*\.pem$/m);
+});
+
+test("runtime proxy verifier is wired into the package scripts", async () => {
+  const packageJson = JSON.parse(await text("package.json"));
+
+  assert.equal(packageJson.scripts["test:nginx"], "node scripts/verify-nginx-runtime.mjs");
+  assert.equal(
+    packageJson.scripts["test:nginx:stack"],
+    "node scripts/verify-nginx-stack.mjs",
+  );
+  const runtimeVerifier = await text("scripts/verify-nginx-runtime.mjs");
+  assert.match(runtimeVerifier, /nginx framing matrix passed/);
+  assert.match(runtimeVerifier, /nginx HTTP\/2 matrix passed/);
+  assert.match(await text("scripts/verify-nginx-stack.mjs"), /nginx stack proof passed/);
 });

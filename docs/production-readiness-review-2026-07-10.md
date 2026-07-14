@@ -1,6 +1,6 @@
 # Ferrite Production Readiness Review
 
-Updated: 2026-07-11
+Updated: 2026-07-13
 
 ## Decision
 
@@ -10,7 +10,7 @@ The highest-return work is no longer broad React or Next.js parity. It is the pr
 
 ## Current Evidence
 
-Locally proven on `codex/protocol-wasm-validation`:
+Locally proven through the current `codex/http-framing-hardening` PR branch:
 
 - Rust formatting and clippy with warnings denied.
 - TypeScript package checks and example app typechecking.
@@ -23,13 +23,14 @@ Locally proven on `codex/protocol-wasm-validation`:
 - Staged production artifact installation with activation rollback, strict version/build/path/size/SHA-256/symlink validation, self-contained server modules for every route, parameter-independent browser bundles, verified-byte dynamic HTML/payload/action serving, runtime route-action registration, and manifest-only static asset serving.
 - Independent slow artifact requests overlap without a project-wide lock.
 - The exact artifact-only container builds and serves a dynamic route and fingerprinted asset as a non-root user with JSON access logs and no runtime workspace package tree.
+- A self-contained harness exports a clean exact Git commit into an immutable context, labels the resulting production image with the revision/tree, and runs it behind official nginx 1.29.3 selected by immutable multi-platform index digest on an isolated Docker network. It exercises 43 raw HTTP/1 cases, seven negotiated HTTP/2 cases, five proxy-level no-upstream framing checks, nine proxy-level no-upstream malformed-target checks, five fail-closed controls, and handled-path cleanup.
 - Production sockets enforce a configurable absolute response-write deadline across fixed, gzip, and chunked output; parse errors, overload rejection, and shutdown drain use bounded writers, and a real stalled-reader test proves typed timeout failure.
 - An artifact-backed real-socket saturation test holds both workers, receives six prompt `503` responses, releases the work, and proves a later request succeeds; a separate single-worker test proves a failed artifact-runner subprocess returns a generic `500` and the next request succeeds.
 - A bounded artifact-backed mixed-load soak repeats four-worker slow-reader saturation and barrier-synchronized concurrent load waves, proves write-deadline truncation, complete overload `503` delivery, no false `408` responses for complete requests, post-saturation runner failure recovery, fixed rejection-worker limits, runner lifecycle cleanup, and bounded joined shutdown.
 
 Explicitly not proven:
 
-- GitHub push, PR review, or remote CI; this checkout has no configured remote.
+- GitHub-hosted job execution or a distinct external approval. The remote and PR #2 exist, but exact-head Actions runs end in `startup_failure` with zero allocated jobs and no status checks.
 - Hosted staging behind real TLS, proxy, process manager, CDN, or rollback automation; local container proof does not establish this.
 - npm or native prebuild publication and registry installation.
 - Cargo registry publication. All 11 local archives now package with versioned internal dependencies, but publish ordering and registry installation are not proven.
@@ -78,23 +79,23 @@ Required exit criteria:
 
 - Browser tests launch a real `ferrite serve` process for HTML, payload, stream, and server-action success/failure paths.
 - CI fails when the required browser is absent rather than silently skipping proof.
-- Container/proxy smoke runs automatically against the candidate image.
+- The candidate-image proxy smoke remains green locally and is committed to the Verify workflow; the hosted job must actually execute before this exit criterion is complete.
 - Numeric branch coverage is reported, with thresholds focused on protocol, routing, action security, and production serving.
 - Published native optional packages are installed and loaded on each supported target.
 
 ### P1: Security Is Private-Alpha Only
 
-This review fixed unbounded socket admission, an unbounded bundler subprocess, raw production error disclosure, forged forwarded client IPs in the supplied nginx topology, public proxying of metrics, common secret-file inclusion in Docker build context, and unbounded response writes. Remaining blockers are session-bound CSRF rotation, app-owned authentication guidance, distributed replay storage, duplicate-header/request-smuggling hardening, and external audit/tracing sinks.
+This review and PR #2 fixed unbounded socket admission, an unbounded bundler subprocess, raw production error disclosure, forged forwarded client IPs in the supplied nginx topology, public proxying of metrics, common secret-file inclusion in Docker build context, unbounded response writes, and ambiguous duplicate-header/request-framing behavior. Remaining blockers are session-bound CSRF rotation, app-owned authentication guidance, distributed replay storage, deployment-stable action IDs, and external audit/tracing sinks.
 
 ### P1: Remote And Hosted Evidence Is Missing
 
-Committed workflows verify npm tarballs and native prebuild dry-runs, but no general full-gate workflow has run remotely and there is no PR or hosted deployment. Local green commands cannot substitute for exact-commit CI, registry, or staging evidence.
+PR #2 and the general Verify workflow now exist, including the candidate-image nginx harness, but every exact-head Actions attempt has failed before job allocation. There is no hosted deployment. Local exact-commit proof cannot substitute for real hosted CI, registry, or staging evidence.
 
 ## Fastest Developer Launch
 
 1. Define throughput and latency targets, then run hosted and long-duration capacity tests around the completed bounded mixed-load regression soak.
-2. Decide license, GitHub repository, and alpha distribution; configure the remote and open a small PR stack.
-3. Run the required remote workflow for lint, typecheck, build, full tests, Chromium, artifact-backed example integration, npm verification, Cargo packaging, and native artifacts.
+2. Resolve the GitHub Actions startup/allocation blocker and obtain a distinct review of PR #2 without bypassing checks or repository policy.
+3. Run the required remote workflow for lint, typecheck, build, full tests, Chromium, artifact-backed example integration, pinned-nginx candidate-image proof, npm verification, Cargo packaging, and native artifacts.
 4. Publish the locally proven `ferrite init` starter path with a public CLI binary and pinned toolchain matrix, then validate it on a clean machine.
 5. Add a single `/builder-lab` demo route that executes one allowlisted real tool and returns the shared Builder AI Lab `proof_receipt` once that schema is authoritative. Do not present a fixture response as model or proof-runtime integration.
 6. Deploy the exact candidate artifact to staging behind TLS and the supplied proxy policy. Capture success, malformed input, action rejection, overload, timeout, metrics, logs, restart, and rollback evidence.

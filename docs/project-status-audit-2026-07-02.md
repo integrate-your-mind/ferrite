@@ -1,5 +1,7 @@
 # Project Status Audit: 2026-07-02
 
+> Historical snapshot: this audit records the repository state on 2026-07-02. As of 2026-07-13, `origin` is configured, GitHub PR #2 is open, and exact-head local build/test/package/nginx receipts exist. Hosted Actions still ends in `startup_failure` before allocating jobs, so remote CI remains unproven. Current delivery state is tracked in PR #2 and the newer proof receipts; unchecked remote/PR items below describe the original audit date rather than current absence.
+
 This audit records the current local state of the Ferrite framework on branch
 `codex/protocol-wasm-validation`.
 

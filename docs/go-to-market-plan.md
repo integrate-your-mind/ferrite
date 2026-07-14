@@ -1,7 +1,7 @@
 # Ferrite Go-to-Market Plan (Private Beta Readiness)
 
-**Updated:** July 11, 2026
-**Current project state:** Local checkout now has an artifact-backed, source-independent build/serve path with fail-closed integrity checks and overlapping request proof, but limited remote delivery and live-deployment proof. This plan assumes a narrow private beta only after explicit delivery gates are met.
+**Updated:** July 13, 2026
+**Current project state:** The GitHub repository and PR path now exist, and the local checkout has an artifact-backed, source-independent build/serve path with fail-closed integrity, strict HTTP request-framing, a 43-case nginx HTTP/1 TLS verifier plus seven negotiated HTTP/2 edge cases, concurrent execution, and bounded sustained-load proof. Clean proxy evidence is built from an immutable exact Git archive and requires five ambiguous framing probes plus nine raw-target probes to show no upstream status; dirty-worktree runs are development evidence only. Hosted Actions lacks job-level proof, and no hosted deployment has been proven. This plan assumes a narrow private beta only after explicit delivery gates are met.
 
 ## Positioning
 
@@ -37,9 +37,10 @@ Current demoable scope is the local `examples/basic` end-to-end path:
 - Island hydration: server-first routes, `use client` islands, route and client-reference bundles, and immutable fingerprinted assets.
 - Server-action first transport: form-based `POST /_ferrite/action` with explicit action manifest collection and browser enhancement for route/client-reference/server-only action forms (Chromium proof).
 - Production logs: request outcome access logs and first-pass server-action audit logs can be emitted to stderr in plain or JSON format.
+- Production HTTP boundary: exact HTTP/1.1 origin-form requests, fail-closed framing and authority validation, one request per closed connection, and an authority-rejecting buffering nginx template with a self-contained, exact-source raw-TLS matrix.
 
 Not sellable yet as a hosted platform:
-- No npm publish in this checkout, no remote CI runs, no hosted staging run of the deployment templates, and only local/prototype operational proof.
+- No npm publish in this checkout, no hosted CI job-level run, no hosted staging run of the deployment templates, and only local/prototype operational proof.
 - Server-action security remains incomplete for real mutable user flows.
 
 ## Fastest Path To Market
@@ -64,8 +65,8 @@ Disallowed alpha claims until proven:
 
 ### ASAP Alpha Launch Gate
 
-1. Configure a GitHub remote, push this branch, and open a small PR stack so review and CI are real artifacts, not local claims.
-2. Run the full release gate in remote CI on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, artifact-backed example integration, npm and Cargo package verification, and native prebuild dry-run.
+1. Keep launch work on focused GitHub PRs and preserve exact-SHA local proof receipts while hosted Actions remains unable to start jobs.
+2. Run the full release gate on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, artifact-backed example integration, npm and Cargo package verification, and native prebuild dry-run. Prefer hosted job-level evidence when available; do not discard independent exact-SHA local receipts.
 3. Prove the artifact-backed container or systemd template in hosted staging behind a real proxy/TLS boundary, including startup integrity rejection, dynamic route/payload/action smoke, private metrics scrape, logs, overload rejection, restart, and rollback.
 4. Define throughput and latency targets and run hosted capacity tests; bounded mixed-load, concurrent slow-reader, controlled saturation, and artifact-runner recovery are now local regression gates, not capacity benchmarks.
 5. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
@@ -80,8 +81,8 @@ Disallowed alpha claims until proven:
 - Production sockets have a configurable absolute response-write deadline with fixed, gzip, chunked, parse-error, overload, shutdown-drain, concurrent slow-reader, and post-saturation regression coverage. Hosted throughput and capacity remain unproven.
 
 2. Remote delivery proof gaps
-- No GitHub remote, no push/PR, no remote CI for lint/build/test/package-verifier/prebuild workflows.
-- `release:verify:npm` exists locally but is not exercised in this repo’s real CI.
+- GitHub remote, push, PR, review, and merge proof exist, but hosted Actions currently fails before allocating jobs.
+- `release:verify:npm` has exact-revision local proof but is not yet backed by a hosted job artifact.
 
 3. npm publishing and native package distribution
 - No real `npm publish` has been performed.
@@ -96,7 +97,7 @@ Disallowed alpha claims until proven:
 5. Server-action security gaps
 - Explicit form transport only, not automatic `"use server"` discovery.
 - CSRF is opt-in and static-token based with optional SameSite/HttpOnly/Secure double-submit cookie binding and optional single-process one-time replay nonces; there is still no session-bound token rotation, multi-process replay coordination, or first-class auth middleware integration.
-- Trusted-proxy public-origin checks and explicit forwarded client-IP access-log policy now exist, but production topology proof is not finalized.
+- Trusted-proxy public-origin checks and explicit forwarded client-IP access-log policy now exist. The pinned-nginx candidate-image harness proves the local topology; hosted ingress/CDN topology is not finalized.
 - File uploads (`multipart` file parts) are intentionally rejected.
 
 6. Observability + operations depth
@@ -109,7 +110,7 @@ Disallowed alpha claims until proven:
 **Objective:** Reach a defensible private beta that is explicitly limited to trusted teams and explicit risks.
 
 ### Week 1
-- Day 1–2: push the completed artifact/concurrency milestone through remote review and exact-commit CI.
+- Day 1–2: finish PR #2's exact-head candidate-image/nginx proof packet, obtain distinct review, and resolve the GitHub Actions startup failure without bypassing checks.
 - Day 3–4: define service-level targets and run hosted capacity and long-duration tests around the completed response-write, mixed-load, controlled-overload, and artifact-runner recovery regressions.
 - Day 5: complete hosted deployment hardening pass 1:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
@@ -120,7 +121,7 @@ Disallowed alpha claims until proven:
   - trusted-proxy deployment test matrix, including forwarded proto/host and forwarded client-IP policy.
 
 ### Week 2
-- Day 8: harden CI proof by running the full local gate set in remote CI (release lint/test/build, example integration, npm/Cargo package verification, native prebuild dry-run, browser proof).
+- Day 8: harden CI proof by running the full local gate set in remote CI (release lint/test/build, example integration, pinned-nginx candidate-image proof, npm/Cargo package verification, native prebuild dry-run, browser proof).
 - Day 9–10: close server-action reliability and UX:
   - exercise server-action production failure-path audit logs in hosted staging and decide the external sink contract,
   - validate rejection/mismatch flows in real browser automation and one negative-path test per route/action class.

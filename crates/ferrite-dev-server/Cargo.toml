@@ -14,6 +14,7 @@ ferrite-protocol = { path = "../ferrite-protocol", version = "0.1.0" }
 ferrite-router = { path = "../ferrite-router", version = "0.1.0" }
 flate2 = { workspace = true }
 getrandom = { workspace = true }
+httparse = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
