@@ -63,9 +63,10 @@ const fileLoaders = {
 };
 await mkdir(outDir, { recursive: true });
 
+const moduleGraph = await collectClientReferences([pageFile, ...layoutFiles], projectRoot);
+
 if (!(await routeHasClientDirective([pageFile, ...layoutFiles]))) {
-  const clientReferences = await collectClientReferences([pageFile, ...layoutFiles], projectRoot);
-  const referenceBundles = await bundleClientReferences(clientReferences, projectRoot, outDir, publicPath);
+  const referenceBundles = await bundleClientReferences(moduleGraph.references, projectRoot, outDir, publicPath);
   const actionBootstrap =
     options.actionBootstrap === true && referenceBundles.clientReferences.length === 0
       ? await bundleActionBootstrap(entryName, projectRoot, outDir, publicPath)
@@ -78,6 +79,7 @@ if (!(await routeHasClientDirective([pageFile, ...layoutFiles]))) {
     sourcemaps: mergeSorted(referenceBundles.sourcemaps, actionBootstrap?.sourcemaps ?? []),
     assets: mergeSorted(referenceBundles.assets, actionBootstrap?.assets ?? []),
     clientReferences: referenceBundles.clientReferences,
+    moduleGraph: moduleGraph.nodes,
     hydration: "server",
   });
   process.exit(0);
@@ -148,6 +150,7 @@ try {
     sourcemaps: summary.sourcemaps,
     assets: summary.assets,
     clientReferences: [],
+    moduleGraph: moduleGraph.nodes,
   };
 
   await writeResponse(response);
@@ -395,48 +398,80 @@ function summarizeBuildResult(result, outDir, entryFile, publicPath) {
 
 async function collectClientReferences(entryFiles, projectRoot) {
   const references = new Map();
+  const graph = new Map();
+  const visiting = [];
   const visited = new Set();
 
-  for (const entryFile of entryFiles) {
+  for (const entryFile of [...entryFiles].sort(compareDeterministicStrings)) {
     const resolved = await resolveSourceFile(resolve(entryFile));
     if (resolved) {
-      await scanServerFileForClientReferences(resolved, projectRoot, visited, references);
+      await scanServerFileForClientReferences(resolved, projectRoot, graph, visiting, visited, references);
     }
   }
 
-  return [...references.values()].sort((left, right) => left.id.localeCompare(right.id));
+  return {
+    references: [...references.values()].sort((left, right) => left.id.localeCompare(right.id)),
+    nodes: [...graph.entries()]
+      .map(([file, imports]) => ({
+        file: relative(projectRoot, file).split(sep).join("/"),
+        imports: imports.map((entry) => relative(projectRoot, entry).split(sep).join("/")),
+      }))
+      .sort((left, right) => compareDeterministicStrings(left.file, right.file)),
+  };
 }
 
-async function scanServerFileForClientReferences(file, projectRoot, visited, references) {
+async function scanServerFileForClientReferences(file, projectRoot, graph, visiting, visited, references) {
   const resolvedFile = resolve(file);
+  const cycleStart = visiting.indexOf(resolvedFile);
+  if (cycleStart !== -1) {
+    const cycle = [...visiting.slice(cycleStart), resolvedFile]
+      .map((entry) => relative(projectRoot, entry).split(sep).join("/"))
+      .join(" -> ");
+    throw new Error(`Ferrite module graph cycle: ${cycle}`);
+  }
   if (visited.has(resolvedFile)) {
     return;
   }
-  visited.add(resolvedFile);
+  visiting.push(resolvedFile);
 
   const source = await readFile(resolvedFile, "utf8");
-  if (startsWithDirective(source, "use client")) {
-    return;
-  }
-
-  for (const importRecord of parseRelativeImportRecords(source)) {
+  const isClientModule = startsWithDirective(source, "use client");
+  const imports = [];
+  for (const importRecord of parseRelativeImportRecords(source).sort((left, right) => compareDeterministicStrings(left.specifier, right.specifier))) {
     const importedFile = await resolveSourceFile(resolve(dirname(resolvedFile), importRecord.specifier));
     if (!importedFile) {
-      continue;
+      const owner = relative(projectRoot, resolvedFile).split(sep).join("/");
+      throw new Error(`Ferrite module graph could not resolve ${JSON.stringify(importRecord.specifier)} from ${owner}`);
     }
+    if (!isProjectModule(importedFile, projectRoot)) {
+      const owner = relative(projectRoot, resolvedFile).split(sep).join("/");
+      throw new Error(`Ferrite module graph import escapes the project root: ${JSON.stringify(importRecord.specifier)} from ${owner}`);
+    }
+    imports.push(importedFile);
 
     const importedSource = await readFile(importedFile, "utf8");
-    if (startsWithDirective(importedSource, "use client")) {
+    if (!isClientModule && startsWithDirective(importedSource, "use client")) {
       for (const exportName of importRecord.exportNames) {
         const module = relative(projectRoot, importedFile).split(sep).join("/");
         const id = `${module}#${exportName}`;
         references.set(id, { id, module, exportName, file: importedFile });
       }
-      continue;
     }
 
-    await scanServerFileForClientReferences(importedFile, projectRoot, visited, references);
+    await scanServerFileForClientReferences(importedFile, projectRoot, graph, visiting, visited, references);
   }
+  graph.set(resolvedFile, [...new Set(imports)].sort(compareDeterministicStrings));
+  visiting.pop();
+  visited.add(resolvedFile);
+}
+
+function compareDeterministicStrings(left, right) {
+  return Buffer.from(left).compare(Buffer.from(right));
+}
+
+function isProjectModule(file, projectRoot) {
+  const projectRelative = relative(projectRoot, file);
+  return projectRelative !== ".." && !projectRelative.startsWith(`..${sep}`);
 }
 
 function parseRelativeImportRecords(source) {
@@ -453,6 +488,13 @@ function parseRelativeImportRecords(source) {
   }
 
   for (const match of source.matchAll(/\bimport\s+["']([^"']+)["']/g)) {
+    records.push({
+      specifier: match[1],
+      exportNames: [],
+    });
+  }
+
+  for (const match of source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) {
     records.push({
       specifier: match[1],
       exportNames: [],

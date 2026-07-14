@@ -5877,6 +5877,7 @@ process.exit(1);
                     sourcemaps: Vec::new(),
                     assets: Vec::new(),
                     client_references: Vec::new(),
+                    module_graph: Vec::new(),
                 },
                 prerendered: BTreeMap::new(),
                 observed_actions: Vec::new(),
@@ -8877,6 +8878,7 @@ process.stdout.write(JSON.stringify({
             sourcemaps: Vec::new(),
             assets: Vec::new(),
             client_references: Vec::new(),
+            module_graph: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&server_only),
@@ -8891,6 +8893,7 @@ process.stdout.write(JSON.stringify({
             sourcemaps: Vec::new(),
             assets: Vec::new(),
             client_references: Vec::new(),
+            module_graph: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&client_route),
@@ -8918,6 +8921,7 @@ process.stdout.write(JSON.stringify({
                 sourcemaps: Vec::new(),
                 assets: Vec::new(),
             }],
+            module_graph: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&island_route),
@@ -8939,6 +8943,7 @@ process.stdout.write(JSON.stringify({
             sourcemaps: Vec::new(),
             assets: Vec::new(),
             client_references: Vec::new(),
+            module_graph: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&action_route),
@@ -10065,6 +10070,7 @@ export default function Page({ params }) {
                     sourcemaps: Vec::new(),
                     assets: Vec::new(),
                     client_references: Vec::new(),
+                    module_graph: Vec::new(),
                 },
                 prerendered: BTreeMap::new(),
                 observed_actions: Vec::new(),

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { platform } from "node:process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import { createServerActionRequest, validateServerActionResponse } from "../dist
 
 const execFileAsync = promisify(execFile);
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const buildClientScript = join(workspaceRoot, "packages/runtime/bin/build-client.mjs");
 const renderPageScript = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const runtimePackage = join(workspaceRoot, "packages/runtime");
 
@@ -77,6 +78,92 @@ async function renderPageActionManifest(projectRoot, pageFile, props = {}) {
   );
   return JSON.parse(stdout);
 }
+
+async function buildClient(projectRoot, pageFile) {
+  const outDir = join(projectRoot, "out");
+  const { stdout } = await execFileAsync(
+    "node",
+    [buildClientScript, pageFile, outDir, "/_ferrite/static"],
+    { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+  );
+  return JSON.parse(stdout);
+}
+
+test("build-client reports deterministic module-graph cycles and unresolved imports", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `import "./a"; export default function Page() { return null; }\n`);
+    await writeFile(join(projectRoot, "app/a.ts"), `import "./b"; export const a = 1;\n`);
+    await writeFile(join(projectRoot, "app/b.ts"), `import "./a"; export const b = 1;\n`);
+
+    await assert.rejects(
+      buildClient(projectRoot, pageFile),
+      /Ferrite module graph cycle: app\/a\.ts -> app\/b\.ts -> app\/a\.ts/,
+    );
+
+    await writeFile(join(projectRoot, "app/a.ts"), `import "./missing"; export const a = 1;\n`);
+    await assert.rejects(
+      buildClient(projectRoot, pageFile),
+      /Ferrite module graph could not resolve "\.\/missing" from app\/a\.ts/,
+    );
+
+    const outsideFile = `${projectRoot}-outside.ts`;
+    try {
+      await writeFile(outsideFile, `export const outside = true;\n`);
+      await writeFile(
+        join(projectRoot, "app/a.ts"),
+        `import ${JSON.stringify(relative(join(projectRoot, "app"), outsideFile))}; export const a = 1;\n`,
+      );
+      await assert.rejects(
+        buildClient(projectRoot, pageFile),
+        /Ferrite module graph import escapes the project root: "(?:\.\.\/)+ferrite-render-page-/,
+      );
+    } finally {
+      await rm(outsideFile, { force: true });
+    }
+  });
+});
+
+test("build-client emits a complete module graph and refreshes it after dependency changes", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const sharedFile = join(projectRoot, "app/shared.ts");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `import "./shared"; export default function Page() { return null; }\n`);
+    await writeFile(sharedFile, `import Counter from "./Counter"; void import("./Lazy"); export { Counter };\n`);
+    await writeFile(
+      join(projectRoot, "app/Counter.tsx"),
+      `"use client"; import Button from "./Button"; export default function Counter() { return <Button />; }\n`,
+    );
+    await writeFile(join(projectRoot, "app/Button.tsx"), `export default function Button() { return <button>One</button>; }\n`);
+    await writeFile(join(projectRoot, "app/Lazy.ts"), `export const lazy = true;\n`);
+
+    const first = await buildClient(projectRoot, pageFile);
+    assert.deepEqual(first.moduleGraph, [
+      { file: "app/Button.tsx", imports: [] },
+      { file: "app/Counter.tsx", imports: ["app/Button.tsx"] },
+      { file: "app/Lazy.ts", imports: [] },
+      { file: "app/page.tsx", imports: ["app/shared.ts"] },
+      { file: "app/shared.ts", imports: ["app/Counter.tsx", "app/Lazy.ts"] },
+    ]);
+    assert.deepEqual(first.clientReferences.map((reference) => reference.id), ["app/Counter.tsx#default"]);
+
+    await writeFile(sharedFile, `import Counter from "./CounterTwo"; export { Counter };\n`);
+    await writeFile(
+      join(projectRoot, "app/CounterTwo.tsx"),
+      `"use client"; export default function Counter() { return <button>Two</button>; }\n`,
+    );
+
+    const second = await buildClient(projectRoot, pageFile);
+    assert.deepEqual(second.moduleGraph, [
+      { file: "app/CounterTwo.tsx", imports: [] },
+      { file: "app/page.tsx", imports: ["app/shared.ts"] },
+      { file: "app/shared.ts", imports: ["app/CounterTwo.tsx"] },
+    ]);
+    assert.deepEqual(second.clientReferences.map((reference) => reference.id), ["app/CounterTwo.tsx#default"]);
+  });
+});
 
 test("render-page proxies nested use client imports into client reference markers", async () => {
   await withTempProject(async (projectRoot) => {

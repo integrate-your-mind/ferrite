@@ -41,6 +41,7 @@ pub enum ClientBundleError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Protocol(ferrite_protocol::ProtocolError),
+    InvalidModuleGraph { reason: String },
     NodeFailed { status: Option<i32>, stderr: String },
     TimedOut { timeout: Duration },
 }
@@ -51,6 +52,9 @@ impl fmt::Display for ClientBundleError {
             ClientBundleError::Io(error) => write!(f, "{error}"),
             ClientBundleError::Json(error) => write!(f, "{error}"),
             ClientBundleError::Protocol(error) => write!(f, "{error}"),
+            ClientBundleError::InvalidModuleGraph { reason } => {
+                write!(f, "invalid client module graph: {reason}")
+            }
             ClientBundleError::NodeFailed { status, stderr } => match status {
                 Some(status) => {
                     write!(f, "client bundler failed with exit code {status}: {stderr}")
@@ -244,6 +248,16 @@ pub struct ClientBundle {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub client_references: Vec<ClientReference>,
+    #[serde(default, rename = "moduleGraph", skip_serializing_if = "Vec::is_empty")]
+    pub module_graph: Vec<ModuleGraphNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleGraphNode {
+    pub file: String,
+    #[serde(default)]
+    pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,8 +288,47 @@ impl ClientBundle {
             )?;
         }
 
+        for node in &self.module_graph {
+            if !is_valid_module_graph_path(&node.file) {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "contains an invalid file path".to_owned(),
+                });
+            }
+            if node
+                .imports
+                .iter()
+                .any(|import| !is_valid_module_graph_path(import))
+            {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "contains an invalid import path".to_owned(),
+                });
+            }
+            if node.imports.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "imports must be sorted and unique".to_owned(),
+                });
+            }
+        }
+        if self
+            .module_graph
+            .windows(2)
+            .any(|pair| pair[0].file >= pair[1].file)
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "nodes must be sorted and unique".to_owned(),
+            });
+        }
+
         Ok(())
     }
+}
+
+fn is_valid_module_graph_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
 pub fn fingerprint_client_bundle(
@@ -445,7 +498,11 @@ process.stdout.write(JSON.stringify({
   outputs: ["app.js", "app.css"],
   sourcemaps: ["app.js.map"],
   assets: ["assets/logo.svg"],
-  clientReferences: [{ id: "app/Counter.tsx#default", module: "app/Counter.tsx", exportName: "default" }]
+  clientReferences: [{ id: "app/Counter.tsx#default", module: "app/Counter.tsx", exportName: "default" }],
+  moduleGraph: [
+    { file: "app/Counter.tsx", imports: [] },
+    { file: "app/page.tsx", imports: ["app/Counter.tsx"] }
+  ]
 }));
 "#,
         );
@@ -468,6 +525,19 @@ process.stdout.write(JSON.stringify({
         assert_eq!(bundle.styles, vec!["/_ferrite/static/app.css"]);
         assert_eq!(bundle.sourcemaps, vec![PathBuf::from("app.js.map")]);
         assert_eq!(
+            bundle.module_graph,
+            vec![
+                ModuleGraphNode {
+                    file: "app/Counter.tsx".to_owned(),
+                    imports: Vec::new(),
+                },
+                ModuleGraphNode {
+                    file: "app/page.tsx".to_owned(),
+                    imports: vec!["app/Counter.tsx".to_owned()],
+                },
+            ]
+        );
+        assert_eq!(
             bundle.client_references,
             vec![ClientReference {
                 id: "app/Counter.tsx#default".to_owned(),
@@ -479,6 +549,34 @@ process.stdout.write(JSON.stringify({
                 sourcemaps: Vec::new(),
                 assets: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_module_graphs() {
+        let bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: vec![
+                ModuleGraphNode {
+                    file: "app/z.ts".to_owned(),
+                    imports: vec!["app/b.ts".to_owned(), "app/a.ts".to_owned()],
+                },
+                ModuleGraphNode {
+                    file: "app/a.ts".to_owned(),
+                    imports: vec!["../outside.ts".to_owned()],
+                },
+            ],
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: imports must be sorted and unique"
         );
     }
 
@@ -541,6 +639,7 @@ process.stdout.write(JSON.stringify({
                 sourcemaps: Vec::new(),
                 assets: Vec::new(),
             }],
+            module_graph: Vec::new(),
         };
 
         fingerprint_client_bundle(&mut bundle, &out_dir, "/_ferrite/static").unwrap();

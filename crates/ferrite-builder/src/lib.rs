@@ -1229,6 +1229,10 @@ process.stdout.write(JSON.stringify({
         "client-reference-app-Counter-tsx-default.js"
       ]
     }
+  ],
+  moduleGraph: [
+    { file: "app/Counter.tsx", imports: [] },
+    { file: "app/page.tsx", imports: ["app/Counter.tsx"] }
   ]
 }));
 "#,
@@ -1244,6 +1248,13 @@ process.stdout.write(JSON.stringify({
         assert_eq!(reference["id"].as_str(), Some("app/Counter.tsx#default"));
         assert_eq!(reference["module"].as_str(), Some("app/Counter.tsx"));
         assert_eq!(reference["exportName"].as_str(), Some("default"));
+        assert_eq!(
+            manifest["client_bundles"][0]["moduleGraph"],
+            serde_json::json!([
+                { "file": "app/Counter.tsx", "imports": [] },
+                { "file": "app/page.tsx", "imports": ["app/Counter.tsx"] },
+            ])
+        );
         let script = reference["script"]
             .as_str()
             .expect("client reference script");
