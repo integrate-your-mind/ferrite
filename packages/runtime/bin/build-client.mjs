@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { build } from "esbuild";
+import ts from "typescript";
 
 const [, , pageFile, outDirArg, publicPathArg, routePath = "/", propsJson = "{}", layoutsJson = "[]", optionsJson = "{}"] =
   process.argv;
@@ -45,7 +46,7 @@ if (!options || typeof options !== "object" || Array.isArray(options)) {
   process.exit(2);
 }
 
-const projectRoot = await findNearestPackageRoot(resolve(pageFile));
+const projectRoot = await realpath(await findNearestPackageRoot(resolve(pageFile)));
 const runtimeSrcRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "src");
 const outDir = resolve(outDirArg);
 const publicPath = publicPathArg.replace(/\/$/, "");
@@ -405,6 +406,9 @@ async function collectClientReferences(entryFiles, projectRoot) {
   for (const entryFile of [...entryFiles].sort(compareDeterministicStrings)) {
     const resolved = await resolveSourceFile(resolve(entryFile));
     if (resolved) {
+      if (!isProjectModule(resolved, projectRoot)) {
+        throw new Error(`Ferrite module graph entry escapes the project root: ${relative(projectRoot, resolved).split(sep).join("/")}`);
+      }
       await scanServerFileForClientReferences(resolved, projectRoot, graph, visiting, visited, references);
     }
   }
@@ -476,93 +480,62 @@ function isProjectModule(file, projectRoot) {
 
 function parseRelativeImportRecords(source) {
   const records = [];
+  const sourceFile = ts.createSourceFile("ferrite-module.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 
-  for (const match of source.matchAll(/\bimport\s+(type\s+)?([\s\S]*?)\s+from\s+["']([^"']+)["']/g)) {
-    if (match[1]) {
-      continue;
+  const addRecord = (specifier, exportNames) => {
+    if (isRelativeSpecifier(specifier) && isSourceSpecifier(specifier)) {
+      records.push({ specifier, exportNames });
     }
-    records.push({
-      specifier: match[3],
-      exportNames: parseImportedExportNames(match[2]),
-    });
-  }
+  };
 
-  for (const match of source.matchAll(/\bimport\s+["']([^"']+)["']/g)) {
-    records.push({
-      specifier: match[1],
-      exportNames: [],
-    });
-  }
-
-  for (const match of source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) {
-    records.push({
-      specifier: match[1],
-      exportNames: [],
-    });
-  }
-
-  for (const match of source.matchAll(/\bexport\s+(type\s+)?\{([\s\S]*?)\}\s+from\s+["']([^"']+)["']/g)) {
-    if (match[1]) {
-      continue;
+  const visit = (node) => {
+    if (ts.isImportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier) && !node.importClause?.isTypeOnly) {
+      addRecord(node.moduleSpecifier.text, importedExportNames(node.importClause));
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier) && !node.isTypeOnly) {
+      addRecord(node.moduleSpecifier.text, exportedNames(node.exportClause));
+    } else if (
+      ts.isCallExpression(node)
+      && node.expression.kind === ts.SyntaxKind.ImportKeyword
+      && node.arguments.length === 1
+      && node.arguments[0]
+      && ts.isStringLiteralLike(node.arguments[0])
+    ) {
+      addRecord(node.arguments[0].text, []);
     }
-    records.push({
-      specifier: match[3],
-      exportNames: parseNamedExportNames(match[2]),
-    });
-  }
+    ts.forEachChild(node, visit);
+  };
 
-  for (const match of source.matchAll(/\bexport\s+\*\s+from\s+["']([^"']+)["']/g)) {
-    records.push({
-      specifier: match[1],
-      exportNames: ["*"],
-    });
-  }
-
-  return records.filter((record) => isRelativeSpecifier(record.specifier) && isSourceSpecifier(record.specifier));
+  visit(sourceFile);
+  return records;
 }
 
-function parseImportedExportNames(clause) {
+function importedExportNames(importClause) {
   const names = [];
-  const trimmed = clause.trim();
-  if (!trimmed) {
-    return names;
-  }
-
-  if (trimmed.startsWith("*")) {
-    return ["*"];
-  }
-
-  if (!trimmed.startsWith("{")) {
+  if (importClause?.name) {
     names.push("default");
   }
-
-  const namedStart = trimmed.indexOf("{");
-  const namedEnd = trimmed.lastIndexOf("}");
-  if (namedStart !== -1 && namedEnd !== -1 && namedEnd > namedStart) {
-    names.push(...parseNamedExportNames(trimmed.slice(namedStart + 1, namedEnd)));
+  if (importClause?.namedBindings) {
+    if (ts.isNamespaceImport(importClause.namedBindings)) {
+      names.push("*");
+    } else {
+      names.push(...importClause.namedBindings.elements.map((element) => (element.propertyName ?? element.name).text));
+    }
   }
-
-  return [...new Set(names)];
+  return names;
 }
 
-function parseNamedExportNames(namedClause) {
-  return namedClause
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .flatMap((part) => {
-      const withoutType = part.replace(/^type\s+/, "").trim();
-      if (!withoutType || part.startsWith("type ")) {
-        return [];
-      }
-      const [exportName] = withoutType.split(/\s+as\s+/);
-      return exportName ? [exportName.trim()] : [];
-    });
+function exportedNames(exportClause) {
+  if (!exportClause || ts.isNamespaceExport(exportClause)) {
+    return ["*"];
+  }
+  return exportClause.elements
+    .filter((element) => !element.isTypeOnly)
+    .map((element) => (element.propertyName ?? element.name).text);
 }
 
 function isSourceSpecifier(specifier) {
   const extension = extname(specifier);
-  return !extension || [".tsx", ".ts", ".jsx", ".js"].includes(extension);
+  return !extension || [".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"].includes(extension);
 }
 
 function isRelativeSpecifier(specifier) {
@@ -573,14 +546,14 @@ async function resolveSourceFile(path) {
   const candidates = extname(path)
     ? [path]
     : [
-        ...[".tsx", ".ts", ".jsx", ".js"].map((extension) => `${path}${extension}`),
-        ...[".tsx", ".ts", ".jsx", ".js"].map((extension) => join(path, `index${extension}`)),
+        ...[".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"].map((extension) => `${path}${extension}`),
+        ...[".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"].map((extension) => join(path, `index${extension}`)),
       ];
 
   for (const candidate of candidates) {
     try {
       await access(candidate);
-      return resolve(candidate);
+      return await realpath(candidate);
     } catch (_error) {
       // Try the next source-file candidate.
     }

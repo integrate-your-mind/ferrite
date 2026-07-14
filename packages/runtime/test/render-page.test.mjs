@@ -119,6 +119,13 @@ test("build-client reports deterministic module-graph cycles and unresolved impo
         buildClient(projectRoot, pageFile),
         /Ferrite module graph import escapes the project root: "(?:\.\.\/)+ferrite-render-page-/,
       );
+
+      await symlink(outsideFile, join(projectRoot, "app/linked.ts"));
+      await writeFile(join(projectRoot, "app/a.ts"), `import "./linked"; export const a = 1;\n`);
+      await assert.rejects(
+        buildClient(projectRoot, pageFile),
+        /Ferrite module graph import escapes the project root: "\.\/linked" from app\/a\.ts/,
+      );
     } finally {
       await rm(outsideFile, { force: true });
     }
@@ -130,22 +137,22 @@ test("build-client emits a complete module graph and refreshes it after dependen
     const pageFile = join(projectRoot, "app/page.tsx");
     const sharedFile = join(projectRoot, "app/shared.ts");
     await mkdir(dirname(pageFile), { recursive: true });
-    await writeFile(pageFile, `import "./shared"; export default function Page() { return null; }\n`);
+    await writeFile(pageFile, `// import "./missing"\nimport "./shared"; export default function Page() { return null; }\n`);
     await writeFile(sharedFile, `import Counter from "./Counter"; void import("./Lazy"); export { Counter };\n`);
     await writeFile(
       join(projectRoot, "app/Counter.tsx"),
       `"use client"; import Button from "./Button"; export default function Counter() { return <Button />; }\n`,
     );
     await writeFile(join(projectRoot, "app/Button.tsx"), `export default function Button() { return <button>One</button>; }\n`);
-    await writeFile(join(projectRoot, "app/Lazy.ts"), `export const lazy = true;\n`);
+    await writeFile(join(projectRoot, "app/Lazy.mts"), `export const lazy = true;\n`);
 
     const first = await buildClient(projectRoot, pageFile);
     assert.deepEqual(first.moduleGraph, [
       { file: "app/Button.tsx", imports: [] },
       { file: "app/Counter.tsx", imports: ["app/Button.tsx"] },
-      { file: "app/Lazy.ts", imports: [] },
+      { file: "app/Lazy.mts", imports: [] },
       { file: "app/page.tsx", imports: ["app/shared.ts"] },
-      { file: "app/shared.ts", imports: ["app/Counter.tsx", "app/Lazy.ts"] },
+      { file: "app/shared.ts", imports: ["app/Counter.tsx", "app/Lazy.mts"] },
     ]);
     assert.deepEqual(first.clientReferences.map((reference) => reference.id), ["app/Counter.tsx#default"]);
 

@@ -318,9 +318,66 @@ impl ClientBundle {
                 reason: "nodes must be sorted and unique".to_owned(),
             });
         }
+        let module_files = self
+            .module_graph
+            .iter()
+            .map(|node| node.file.as_str())
+            .collect::<BTreeSet<_>>();
+        if self
+            .module_graph
+            .iter()
+            .flat_map(|node| node.imports.iter())
+            .any(|import| !module_files.contains(import.as_str()))
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "contains an import that is not a graph node".to_owned(),
+            });
+        }
+        let graph = self
+            .module_graph
+            .iter()
+            .map(|node| {
+                (
+                    node.file.as_str(),
+                    node.imports.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect::<BTreeMap<_, Vec<_>>>();
+        let mut active = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        if graph
+            .keys()
+            .any(|file| module_graph_has_cycle(file, &graph, &mut active, &mut visited))
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "contains a cycle".to_owned(),
+            });
+        }
 
         Ok(())
     }
+}
+
+fn module_graph_has_cycle<'a>(
+    file: &'a str,
+    graph: &BTreeMap<&'a str, Vec<&'a str>>,
+    active: &mut BTreeSet<&'a str>,
+    visited: &mut BTreeSet<&'a str>,
+) -> bool {
+    if active.contains(file) {
+        return true;
+    }
+    if visited.contains(file) {
+        return false;
+    }
+
+    active.insert(file);
+    let has_cycle = graph[file]
+        .iter()
+        .any(|import| module_graph_has_cycle(import, graph, active, visited));
+    active.remove(file);
+    visited.insert(file);
+    has_cycle
 }
 
 fn is_valid_module_graph_path(path: &str) -> bool {
@@ -577,6 +634,43 @@ process.stdout.write(JSON.stringify({
         assert_eq!(
             bundle.validate().unwrap_err().to_string(),
             "invalid client module graph: imports must be sorted and unique"
+        );
+    }
+
+    #[test]
+    fn rejects_module_graphs_with_missing_edges_or_cycles() {
+        let mut bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: vec![ModuleGraphNode {
+                file: "app/page.tsx".to_owned(),
+                imports: vec!["app/missing.ts".to_owned()],
+            }],
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an import that is not a graph node"
+        );
+
+        bundle.module_graph = vec![
+            ModuleGraphNode {
+                file: "app/a.ts".to_owned(),
+                imports: vec!["app/b.ts".to_owned()],
+            },
+            ModuleGraphNode {
+                file: "app/b.ts".to_owned(),
+                imports: vec!["app/a.ts".to_owned()],
+            },
+        ];
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains a cycle"
         );
     }
 
