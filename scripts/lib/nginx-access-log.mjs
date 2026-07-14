@@ -39,6 +39,24 @@ export const nginxRequestTargetRejectionProbes = (servername) => [
   },
 ];
 
+export const nginxHttp2RequestTargetRejectionProbes = Object.freeze([
+  {
+    name: "HTTP/2 encoded slash target",
+    target: "/posts/%2fadmin",
+    httpVersion: "HTTP/2.0",
+  },
+  {
+    name: "HTTP/2 encoded dot-segment target",
+    target: "/posts/%2e%2e/admin",
+    httpVersion: "HTTP/2.0",
+  },
+  {
+    name: "HTTP/2 network-path target",
+    target: "//evil.example/posts/abc",
+    httpVersion: "HTTP/2.0",
+  },
+]);
+
 export const parseAccessLogEntries = (log) =>
   log.split(/\r?\n/).flatMap((line) => {
     try {
@@ -169,7 +187,7 @@ export const assertNginxFramingRejectedAtProxy = (
 
 export const assertNginxRequestTargetsRejectedAtProxy = (entries, probes) => {
   for (const probe of probes) {
-    const request = `GET ${probe.target} HTTP/1.1`;
+    const request = `GET ${probe.target} ${probe.httpVersion ?? "HTTP/1.1"}`;
     const matches = entries.filter((entry) => entry.request === request);
     assert.equal(
       matches.length,

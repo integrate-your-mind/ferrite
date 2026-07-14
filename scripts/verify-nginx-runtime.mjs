@@ -7,6 +7,7 @@ import {
   assertNginxAccessLogEvidence,
   NGINX_FRAMING_PROBE_NAMES,
   nginxFramingProbeTarget,
+  nginxHttp2RequestTargetRejectionProbes,
   nginxRequestTargetRejectionProbes,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
@@ -584,6 +585,11 @@ const http2Cases = [
     request: { authority: "evil.example" },
     status: 421,
   },
+  ...nginxHttp2RequestTargetRejectionProbes.map((probe) => ({
+    name: probe.name,
+    request: { path: probe.target },
+    status: 421,
+  })),
   {
     name: "HTTP/2 forwarded-header spoof overwrite",
     request: {

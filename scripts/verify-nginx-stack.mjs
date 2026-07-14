@@ -21,6 +21,7 @@ import {
   assertNginxFramingRejectedAtProxy,
   assertNginxRequestTargetsRejectedAtProxy,
   NGINX_FRAMING_PROBE_NAMES,
+  nginxHttp2RequestTargetRejectionProbes,
   nginxRequestTargetRejectionProbes,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
@@ -814,10 +815,11 @@ const main = async () => {
       "run nginx framing matrices",
     );
     assert.match(successful.stdout, /nginx framing matrix passed: 43\/43/);
-    assert.match(successful.stdout, /nginx HTTP\/2 matrix passed: 4\/4/);
-    const requestTargetRejectionProbes = nginxRequestTargetRejectionProbes(
-      environment.FERRITE_NGINX_SERVER_NAME,
-    );
+    assert.match(successful.stdout, /nginx HTTP\/2 matrix passed: 7\/7/);
+    const requestTargetRejectionProbes = [
+      ...nginxRequestTargetRejectionProbes(environment.FERRITE_NGINX_SERVER_NAME),
+      ...nginxHttp2RequestTargetRejectionProbes,
+    ];
     await waitForNginxProxyRejectionEvidence(
       nginxContainer,
       requestTargetRejectionProbes,

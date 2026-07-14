@@ -10,6 +10,7 @@ import {
   assertNginxRequestTargetsRejectedAtProxy,
   NGINX_FRAMING_PROBE_NAMES,
   nginxFramingProbeTarget,
+  nginxHttp2RequestTargetRejectionProbes,
   nginxRequestTargetRejectionProbes,
   parseAccessLogEntries,
 } from "./lib/nginx-access-log.mjs";
@@ -141,9 +142,12 @@ test("framing probes must be rejected before an upstream response", () => {
 });
 
 test("request-target probes must be rejected before an upstream response", () => {
-  const probes = nginxRequestTargetRejectionProbes("app.example.com");
+  const probes = [
+    ...nginxRequestTargetRejectionProbes("app.example.com"),
+    ...nginxHttp2RequestTargetRejectionProbes,
+  ];
   const proxyRejections = probes.map((probe) => ({
-    request: `GET ${probe.target} HTTP/1.1`,
+    request: `GET ${probe.target} ${probe.httpVersion ?? "HTTP/1.1"}`,
     status: 421,
     upstream_status: "-",
   }));
