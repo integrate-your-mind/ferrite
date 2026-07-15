@@ -17,7 +17,7 @@ use ferrite_builder::{
 };
 use ferrite_client_bundler::{
     ClientBundle, ClientBundleError, ClientBundleOptions, ClientBundleRequest, ClientBundler,
-    fingerprint_client_bundle,
+    ModuleGraphNode, fingerprint_client_bundle,
 };
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
@@ -33,6 +33,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const SERVER_PAYLOAD_CONTENT_TYPE: &str =
     "application/vnd.ferrite.server-payload+json; charset=utf-8";
@@ -722,18 +723,38 @@ impl DevProject {
 
     fn ensure_fresh(&mut self) -> Result<()> {
         let fingerprint = fingerprint_app_dir(&self.config.app_dir)?;
+        let mut module_graphs = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.module_graphs.clone())
+            .unwrap_or_default();
+        let mut module_graph_changed = false;
+        for watched in module_graphs.values_mut() {
+            let fingerprint = fingerprint_module_graph(&self.config.project, &watched.files)?;
+            if watched.fingerprint != fingerprint {
+                watched.fingerprint = fingerprint;
+                module_graph_changed = true;
+            }
+        }
         let changed = self
             .snapshot
             .as_ref()
-            .is_none_or(|snapshot| snapshot.fingerprint != fingerprint);
+            .is_none_or(|snapshot| snapshot.fingerprint != fingerprint)
+            || module_graph_changed;
 
         if changed {
             let routes = scan_app_dir(&self.config.app_dir)?;
             write_route_types(&routes, &self.config.types_out)?;
+            let route_paths = routes
+                .iter()
+                .map(|route| route.path.as_str())
+                .collect::<BTreeSet<_>>();
+            module_graphs.retain(|route_path, _watched| route_paths.contains(route_path.as_str()));
             self.build_id += 1;
             self.snapshot = Some(RouteSnapshot {
                 fingerprint,
                 routes,
+                module_graphs,
             });
         }
 
@@ -791,13 +812,13 @@ impl DevProject {
         Ok(DevResponse::ok("application/json; charset=utf-8", body))
     }
 
-    fn route_response(&self, path: &str, mode: RouteResponseMode) -> DevResponse {
-        let snapshot = self
+    fn route_response(&mut self, path: &str, mode: RouteResponseMode) -> DevResponse {
+        let match_result = self
             .snapshot
             .as_ref()
-            .expect("snapshot built before response");
+            .and_then(|snapshot| match_route(path, &snapshot.routes));
 
-        if let Some(match_result) = match_route(path, &snapshot.routes) {
+        if let Some(match_result) = match_result {
             let renderer = self.page_renderer();
             let conventions = route_conventions(&match_result.route);
             match mode {
@@ -820,7 +841,12 @@ impl DevProject {
                 ),
             }
         } else {
-            DevResponse::not_found(render_not_found(self.build_id, path, &snapshot.routes))
+            let routes = &self
+                .snapshot
+                .as_ref()
+                .expect("snapshot built before response")
+                .routes;
+            DevResponse::not_found(render_not_found(self.build_id, path, routes))
         }
     }
 
@@ -885,7 +911,7 @@ impl DevProject {
     }
 
     fn route_stream_response(
-        &self,
+        &mut self,
         path: &str,
         match_result: &RouteMatch,
         renderer: &PageRenderer,
@@ -898,10 +924,6 @@ impl DevProject {
                 &match_result.params,
             ) {
                 Ok(metadata) => {
-                    let bundler = ClientBundler::new(
-                        self.config.project.clone(),
-                        self.config.client_bundler.clone(),
-                    );
                     let action_bootstrap =
                         match route_needs_action_bootstrap(renderer, match_result, conventions) {
                             Ok(action_bootstrap) => action_bootstrap,
@@ -914,18 +936,7 @@ impl DevProject {
                                 ));
                             }
                         };
-                    match bundler.bundle_route_request(ClientBundleRequest {
-                        page_file: &match_result.route.file,
-                        layouts: &match_result.route.layouts,
-                        route_path: &match_result.route.path,
-                        params: &match_result.params,
-                        out_dir: &self.config.client_out_dir,
-                        public_path: &self.config.client_public_path,
-                        options: ClientBundleOptions {
-                            action_bootstrap,
-                            runtime_props: false,
-                        },
-                    }) {
+                    match self.bundle_dev_route(match_result, action_bootstrap) {
                         Ok(client_bundle) => match renderer
                             .render_document_to_stream_parts_with_conventions(
                                 &match_result.route.file,
@@ -988,10 +999,6 @@ impl DevProject {
                     &match_result.params,
                 ) {
                     Ok(metadata) => {
-                        let bundler = ClientBundler::new(
-                            self.config.project.clone(),
-                            self.config.client_bundler.clone(),
-                        );
                         let action_bootstrap =
                             match route_needs_action_bootstrap(renderer, match_result, conventions)
                             {
@@ -1005,18 +1012,7 @@ impl DevProject {
                                     ));
                                 }
                             };
-                        match bundler.bundle_route_request(ClientBundleRequest {
-                            page_file: &match_result.route.file,
-                            layouts: &match_result.route.layouts,
-                            route_path: &match_result.route.path,
-                            params: &match_result.params,
-                            out_dir: &self.config.client_out_dir,
-                            public_path: &self.config.client_public_path,
-                            options: ClientBundleOptions {
-                                action_bootstrap,
-                                runtime_props: false,
-                            },
-                        }) {
+                        match self.bundle_dev_route(match_result, action_bootstrap) {
                             Ok(client_bundle) => {
                                 let shell = render_route_document(
                                     self.build_id,
@@ -1057,7 +1053,7 @@ impl DevProject {
     }
 
     fn route_server_payload_response(
-        &self,
+        &mut self,
         path: &str,
         match_result: &RouteMatch,
         renderer: &PageRenderer,
@@ -1071,10 +1067,6 @@ impl DevProject {
                 &match_result.params,
             ) {
                 Ok(metadata) => {
-                    let bundler = ClientBundler::new(
-                        self.config.project.clone(),
-                        self.config.client_bundler.clone(),
-                    );
                     let action_bootstrap =
                         match route_needs_action_bootstrap(renderer, match_result, conventions) {
                             Ok(action_bootstrap) => action_bootstrap,
@@ -1087,18 +1079,7 @@ impl DevProject {
                                 ));
                             }
                         };
-                    match bundler.bundle_route_request(ClientBundleRequest {
-                        page_file: &match_result.route.file,
-                        layouts: &match_result.route.layouts,
-                        route_path: &match_result.route.path,
-                        params: &match_result.params,
-                        out_dir: &self.config.client_out_dir,
-                        public_path: &self.config.client_public_path,
-                        options: ClientBundleOptions {
-                            action_bootstrap,
-                            runtime_props: false,
-                        },
-                    }) {
+                    match self.bundle_dev_route(match_result, action_bootstrap) {
                         Ok(client_bundle) => match renderer
                             .render_document_to_server_payload_json_with_conventions(
                                 &match_result.route.file,
@@ -1161,6 +1142,58 @@ impl DevProject {
                 )),
             },
         }
+    }
+
+    fn bundle_dev_route(
+        &mut self,
+        match_result: &RouteMatch,
+        action_bootstrap: bool,
+    ) -> std::result::Result<ClientBundle, ClientBundleError> {
+        let bundler = ClientBundler::new(
+            self.config.project.clone(),
+            self.config.client_bundler.clone(),
+        );
+        let client_bundle = bundler.bundle_route_request(ClientBundleRequest {
+            page_file: &match_result.route.file,
+            layouts: &match_result.route.layouts,
+            route_path: &match_result.route.path,
+            params: &match_result.params,
+            out_dir: &self.config.client_out_dir,
+            public_path: &self.config.client_public_path,
+            options: ClientBundleOptions {
+                action_bootstrap,
+                runtime_props: false,
+            },
+        })?;
+        self.record_module_graph(&match_result.route.path, &client_bundle.module_graph)
+            .map_err(ClientBundleError::Io)?;
+        Ok(client_bundle)
+    }
+
+    fn record_module_graph(
+        &mut self,
+        route_path: &str,
+        module_graph: &[ModuleGraphNode],
+    ) -> std::io::Result<()> {
+        let snapshot = self
+            .snapshot
+            .as_mut()
+            .expect("snapshot built before client bundle");
+        if module_graph.is_empty() {
+            snapshot.module_graphs.remove(route_path);
+            return Ok(());
+        }
+
+        let files = module_graph
+            .iter()
+            .map(|node| node.file.clone())
+            .collect::<Vec<_>>();
+        let fingerprint = fingerprint_module_graph(&self.config.project, &files)?;
+        snapshot.module_graphs.insert(
+            route_path.to_owned(),
+            WatchedModuleGraph { files, fingerprint },
+        );
+        Ok(())
     }
 
     fn static_asset_response(&self, path: &str) -> DevResponse {
@@ -2668,6 +2701,13 @@ pub struct RouteMatch {
 struct RouteSnapshot {
     fingerprint: String,
     routes: Vec<Route>,
+    module_graphs: BTreeMap<String, WatchedModuleGraph>,
+}
+
+#[derive(Debug, Clone)]
+struct WatchedModuleGraph {
+    files: Vec<String>,
+    fingerprint: String,
 }
 
 #[derive(Debug)]
@@ -4644,6 +4684,24 @@ fn fingerprint_app_dir(app_dir: &Path) -> Result<String> {
     Ok(entries.join("\n"))
 }
 
+fn fingerprint_module_graph(project: &Path, files: &[String]) -> std::io::Result<String> {
+    let project = fs::canonicalize(project)?;
+    let mut entries = Vec::with_capacity(files.len());
+    for file in files {
+        let requested = project.join(file);
+        let digest = match fs::canonicalize(&requested) {
+            Ok(resolved) if resolved.starts_with(&project) && resolved.is_file() => {
+                sha256_hex(&fs::read(resolved)?)
+            }
+            Ok(_resolved) => "outside-project-or-not-file".to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_owned(),
+            Err(error) => return Err(error),
+        };
+        entries.push(format!("{file}|{digest}"));
+    }
+    Ok(entries.join("\n"))
+}
+
 fn collect_app_files(root: &Path, current: &Path, entries: &mut Vec<String>) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
@@ -4667,6 +4725,16 @@ fn collect_app_files(root: &Path, current: &Path, entries: &mut Vec<String>) -> 
     Ok(())
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 fn is_source_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -4677,6 +4745,10 @@ fn is_source_file(path: &Path) -> bool {
                 | "jpg"
                 | "js"
                 | "jsx"
+                | "cjs"
+                | "cts"
+                | "mjs"
+                | "mts"
                 | "png"
                 | "svg"
                 | "ts"
@@ -9366,6 +9438,115 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
         assert!(about.body_text().contains("<h1>Home Page</h1>"));
         assert!(project.build_id().unwrap() > first_build);
         assert!(temp.path().join(".ferrite/types/routes.d.ts").is_file());
+    }
+
+    #[test]
+    fn rebuilds_when_a_compiler_module_graph_dependency_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("page.tsx"),
+            "import '../shared.mts'; export default function Page() {}",
+        );
+        write(
+            &temp.path().join("shared.mts"),
+            "export const value = 'first';",
+        );
+        let mut project = project_for(&app);
+        make_script(
+            &project.config.client_bundler,
+            r#"
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  clientReferences: [],
+  moduleGraph: [
+    { file: "app/page.tsx", imports: ["shared.mts"] },
+    { file: "shared.mts", imports: [] }
+  ]
+}));
+"#,
+        );
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+        assert_eq!(project.build_id().unwrap(), first_build);
+
+        write(
+            &temp.path().join("shared.mts"),
+            "export const value = 'other';",
+        );
+
+        let changed_build = project.build_id().unwrap();
+        assert!(changed_build > first_build);
+
+        fs::remove_file(temp.path().join("shared.mts")).unwrap();
+
+        let deleted_build = project.build_id().unwrap();
+        assert!(deleted_build > changed_build);
+
+        write(
+            &temp.path().join("shared.mts"),
+            "export const value = 'restored';",
+        );
+
+        assert!(project.build_id().unwrap() > deleted_build);
+    }
+
+    #[test]
+    fn real_compiler_module_graph_drives_dev_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("page.tsx"),
+            "import '../shared.js'; export default function Page() {}",
+        );
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'first';",
+        );
+        write(
+            &temp.path().join("shared.js"),
+            "export const value = 'runtime';",
+        );
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'other';",
+        );
+
+        assert_eq!(project.build_id().unwrap(), first_build);
+
+        write(
+            &temp.path().join("shared.js"),
+            "export const value = 'changed';",
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn rebuilds_when_an_app_module_with_an_emitted_js_extension_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(&app.join("state.mts"), "export const value = 'first';");
+        let mut project = project_for(&app);
+        let first_build = project.build_id().unwrap();
+
+        write(&app.join("state.mts"), "export const value = 'other';");
+
+        assert!(project.build_id().unwrap() > first_build);
     }
 
     #[test]

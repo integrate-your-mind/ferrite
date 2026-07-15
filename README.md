@@ -16,10 +16,10 @@ The safest alpha offer today is a controlled internal dashboard, docs portal, or
 - Rust server-side HTML rendering with escaping and void-element checks.
 - A Rust file-system route scanner for `app/page.tsx` style applications.
 - A Rust CLI with `routes`, `check`, `render`, and `dev` commands.
-- A Rust dev server that serves discovered app routes and rebuilds its route manifest after app file changes.
+- A Rust dev server that serves discovered app routes, consumes each successful compiler-owned module graph, and advances its reload build id after app files or previously observed project-local dependencies change or disappear.
 - A Rust production build command that stages and installs a versioned `ferrite-server.json` artifact containing verified self-contained server modules, route-level browser bundles, build-observed action metadata, prerendered HTML, and SHA-256 file records.
 - A JS page executor used by Rust dev/build paths to compile TSX page modules and emit versioned compact render packets for Rust SSR.
-- A JS browser bundler used by Rust dev/build paths to emit route client modules, CSS, source maps, and imported assets, including WASM assets imported by browser-capable packages.
+- A JS browser bundler used by Rust dev/build paths to emit route client modules, CSS, source maps, imported assets, and deterministic emitted-runtime TypeScript/JavaScript dependency graphs, including WASM assets imported by browser-capable packages.
 - A Rust `ferrite-protocol` crate that owns render-packet, render-stream, client-reference, server-payload, and server-payload stream-frame markers, versioning, packet shapes, and validation.
 - A Rust `ferrite-protocol-wasm` crate and `@ferrite/protocol-wasm` TypeScript package that expose Rust server-payload packet and stream-frame validation to browser-capable WASM consumers; generated browser bundles can emit and reference its `.wasm` artifact through the configured static public path.
 - A native Node package, `@ferrite/node`, that exposes Rust SSR to JavaScript consumers through a Node-API addon, can resolve local source builds or optional platform prebuild packages, and has a dry-run native prebuild workflow that verifies generated package artifacts without publishing.
