@@ -138,7 +138,7 @@ test("build-client emits a complete module graph and refreshes it after dependen
     const sharedFile = join(projectRoot, "app/shared.ts");
     await mkdir(dirname(pageFile), { recursive: true });
     await writeFile(pageFile, `// import "./missing"\nimport "./shared"; export default function Page() { return null; }\n`);
-    await writeFile(sharedFile, `import Counter from "./Counter"; void import("./Lazy"); export { Counter };\n`);
+    await writeFile(sharedFile, `import Counter from "./Counter"; void import("./Lazy.mjs"); export { Counter };\n`);
     await writeFile(
       join(projectRoot, "app/Counter.tsx"),
       `"use client"; import Button from "./Button"; export default function Counter() { return <Button />; }\n`,
@@ -170,6 +170,26 @@ test("build-client emits a complete module graph and refreshes it after dependen
     ]);
     assert.deepEqual(second.clientReferences.map((reference) => reference.id), ["app/CounterTwo.tsx#default"]);
   });
+});
+
+test("build-client rejects extensionless module candidates that esbuild does not resolve", async () => {
+  for (const extension of [".mts", ".cts", ".mjs", ".cjs"]) {
+    for (const dependencyPath of [`dependency${extension}`, join("dependency", `index${extension}`)]) {
+      await withTempProject(async (projectRoot) => {
+        const pageFile = join(projectRoot, "app/page.tsx");
+        const dependencyFile = join(projectRoot, "app", dependencyPath);
+        await mkdir(dirname(pageFile), { recursive: true });
+        await mkdir(dirname(dependencyFile), { recursive: true });
+        await writeFile(pageFile, `import "./dependency"; export default function Page() { return null; }\n`);
+        await writeFile(dependencyFile, `export const value = 1;\n`);
+
+        await assert.rejects(
+          buildClient(projectRoot, pageFile),
+          /Ferrite module graph could not resolve "\.\/dependency" from app\/page\.tsx/,
+        );
+      });
+    }
+  }
 });
 
 test("build-client preserves runtime-file precedence with TypeScript source fallbacks", async () => {

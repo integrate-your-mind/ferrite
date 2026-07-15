@@ -62,7 +62,8 @@ const fileLoaders = {
   ".woff2": "file",
   ".wasm": "file",
 };
-const sourceExtensions = [".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"];
+const extensionlessSourceExtensions = [".tsx", ".ts", ".jsx", ".js"];
+const sourceExtensions = [...extensionlessSourceExtensions, ".mts", ".cts", ".mjs", ".cjs"];
 const emittedSourceSubstitutions = new Map([
   [".js", [".ts", ".tsx"]],
   [".jsx", [".tsx"]],
@@ -661,8 +662,8 @@ async function resolveSourceFile(path) {
         ),
       ]
     : [
-        ...sourceExtensions.map((extension) => `${path}${extension}`),
-        ...sourceExtensions.map((extension) => join(path, `index${extension}`)),
+        ...extensionlessSourceExtensions.map((extension) => `${path}${extension}`),
+        ...extensionlessSourceExtensions.map((extension) => join(path, `index${extension}`)),
       ];
 
   for (const candidate of candidates) {
