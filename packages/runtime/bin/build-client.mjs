@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import ts from "typescript";
 
+import { isPathInsideRoot } from "./project-path.mjs";
+
 const [, , pageFile, outDirArg, publicPathArg, routePath = "/", propsJson = "{}", layoutsJson = "[]", optionsJson = "{}"] =
   process.argv;
 
@@ -501,8 +503,7 @@ function compareDeterministicStrings(left, right) {
 }
 
 function isProjectModule(file, projectRoot) {
-  const projectRelative = relative(projectRoot, file);
-  return projectRelative !== ".." && !projectRelative.startsWith(`..${sep}`);
+  return isPathInsideRoot(projectRoot, file);
 }
 
 function parseRelativeImportRecords(source, fileName) {
