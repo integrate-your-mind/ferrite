@@ -172,6 +172,126 @@ test("build-client emits a complete module graph and refreshes it after dependen
   });
 });
 
+test("build-client preserves runtime-file precedence with TypeScript source fallbacks", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `"use client";`,
+        `import "./server.js";`,
+        `import "./view.jsx";`,
+        `import "./modern.mjs";`,
+        `import "./legacy.cjs";`,
+        `export default function Page() { return null; }`,
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(projectRoot, "app/server.js"),
+      `globalThis.__ferriteExtensionSource = "FERRITE_JS_RUNTIME_SELECTED";\n`,
+    );
+    await writeFile(
+      join(projectRoot, "app/server.ts"),
+      `globalThis.__ferriteExtensionSource = "FERRITE_TS_SOURCE_SELECTED";\n`,
+    );
+    await writeFile(join(projectRoot, "app/view.tsx"), `export const view = "tsx";\n`);
+    await writeFile(join(projectRoot, "app/modern.mts"), `export const mode = "esm";\n`);
+    await writeFile(join(projectRoot, "app/legacy.cts"), `export const mode = "commonjs";\n`);
+
+    const bundle = await buildClient(projectRoot, pageFile);
+
+    assert.deepEqual(bundle.moduleGraph, [
+      { file: "app/legacy.cts", imports: [] },
+      { file: "app/modern.mts", imports: [] },
+      {
+        file: "app/page.tsx",
+        imports: ["app/legacy.cts", "app/modern.mts", "app/server.js", "app/view.tsx"],
+      },
+      { file: "app/server.js", imports: [] },
+      { file: "app/view.tsx", imports: [] },
+    ]);
+    const scriptOutput = bundle.outputs.find((output) => output.endsWith(".js"));
+    assert.ok(scriptOutput, "client route should emit a JavaScript bundle");
+    const script = await readFile(join(projectRoot, "out", scriptOutput), "utf8");
+    assert.match(script, /FERRITE_JS_RUNTIME_SELECTED/);
+    assert.doesNotMatch(script, /FERRITE_TS_SOURCE_SELECTED/);
+  });
+});
+
+test("build-client excludes emit-erased type-only imports from the runtime module graph", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `import "./server"; export default function Page() { return null; }\n`);
+    await writeFile(
+      join(projectRoot, "app/server.ts"),
+      [
+        `import { type ClientProps, LegacyProps, Widget } from "./Client";`,
+        `import { type GhostProps } from "./GhostClient";`,
+        `export { type ReexportedProps } from "./ReexportClient";`,
+        `type LegacyAlias = LegacyProps;`,
+        `export { Widget };`,
+        `export type { ClientProps, GhostProps, LegacyAlias };`,
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(projectRoot, "app/Client.tsx"),
+      `"use client"; export type ClientProps = {}; export type LegacyProps = {}; export function Widget() { return null; }\n`,
+    );
+    await writeFile(
+      join(projectRoot, "app/GhostClient.tsx"),
+      `"use client"; export type GhostProps = {}; export function Ghost() { return null; }\n`,
+    );
+    await writeFile(
+      join(projectRoot, "app/ReexportClient.tsx"),
+      `"use client"; export type ReexportedProps = {}; export function Reexported() { return null; }\n`,
+    );
+
+    const bundle = await buildClient(projectRoot, pageFile);
+
+    assert.deepEqual(bundle.moduleGraph, [
+      { file: "app/Client.tsx", imports: [] },
+      { file: "app/page.tsx", imports: ["app/server.ts"] },
+      { file: "app/server.ts", imports: ["app/Client.tsx"] },
+    ]);
+    assert.deepEqual(bundle.clientReferences.map((reference) => reference.id), ["app/Client.tsx#Widget"]);
+  });
+});
+
+test("build-client includes static CommonJS and TypeScript import-equals dependencies", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `import "./server"; export default function Page() { return null; }\n`);
+    await writeFile(
+      join(projectRoot, "app/server.ts"),
+      `import legacy = require("./legacy.cjs"); export const value = legacy;\n`,
+    );
+    await writeFile(
+      join(projectRoot, "app/legacy.cjs"),
+      [
+        `function load(require) { return require("./missing.cjs"); }`,
+        `const nested = require("./nested.cjs");`,
+        `module.exports = { load, nested };`,
+        "",
+      ].join("\n"),
+    );
+    await writeFile(join(projectRoot, "app/nested.cjs"), `module.exports = "nested";\n`);
+
+    const bundle = await buildClient(projectRoot, pageFile);
+
+    assert.deepEqual(bundle.moduleGraph, [
+      { file: "app/legacy.cjs", imports: ["app/nested.cjs"] },
+      { file: "app/nested.cjs", imports: [] },
+      { file: "app/page.tsx", imports: ["app/server.ts"] },
+      { file: "app/server.ts", imports: ["app/legacy.cjs"] },
+    ]);
+  });
+});
+
 test("render-page proxies nested use client imports into client reference markers", async () => {
   await withTempProject(async (projectRoot) => {
     const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");

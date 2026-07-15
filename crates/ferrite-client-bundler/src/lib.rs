@@ -323,6 +323,16 @@ impl ClientBundle {
             .iter()
             .map(|node| node.file.as_str())
             .collect::<BTreeSet<_>>();
+        if !module_files.is_empty()
+            && self
+                .client_references
+                .iter()
+                .any(|reference| !module_files.contains(reference.module.as_str()))
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "contains a client reference that is not a graph node".to_owned(),
+            });
+        }
         if self
             .module_graph
             .iter()
@@ -383,6 +393,8 @@ fn module_graph_has_cycle<'a>(
 fn is_valid_module_graph_path(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
         && !path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
@@ -671,6 +683,59 @@ process.stdout.write(JSON.stringify({
         assert_eq!(
             bundle.validate().unwrap_err().to_string(),
             "invalid client module graph: contains a cycle"
+        );
+    }
+
+    #[test]
+    fn rejects_nonportable_module_graph_paths() {
+        let bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: vec![ModuleGraphNode {
+                file: "C:\\app\\page.tsx".to_owned(),
+                imports: Vec::new(),
+            }],
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an invalid file path"
+        );
+    }
+
+    #[test]
+    fn rejects_client_references_missing_from_a_nonempty_module_graph() {
+        let bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: vec![ClientReference {
+                id: "app/Counter.tsx#default".to_owned(),
+                module: "app/Counter.tsx".to_owned(),
+                export_name: "default".to_owned(),
+                script: None,
+                styles: Vec::new(),
+                outputs: Vec::new(),
+                sourcemaps: Vec::new(),
+                assets: Vec::new(),
+            }],
+            module_graph: vec![ModuleGraphNode {
+                file: "app/page.tsx".to_owned(),
+                imports: Vec::new(),
+            }],
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains a client reference that is not a graph node"
         );
     }
 

@@ -62,6 +62,13 @@ const fileLoaders = {
   ".woff2": "file",
   ".wasm": "file",
 };
+const sourceExtensions = [".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"];
+const emittedSourceSubstitutions = new Map([
+  [".js", [".ts", ".tsx"]],
+  [".jsx", [".tsx"]],
+  [".mjs", [".mts"]],
+  [".cjs", [".cts"]],
+]);
 await mkdir(outDir, { recursive: true });
 
 const moduleGraph = await collectClientReferences([pageFile, ...layoutFiles], projectRoot);
@@ -441,7 +448,7 @@ async function scanServerFileForClientReferences(file, projectRoot, graph, visit
   const source = await readFile(resolvedFile, "utf8");
   const isClientModule = startsWithDirective(source, "use client");
   const imports = [];
-  for (const importRecord of parseRelativeImportRecords(source).sort((left, right) => compareDeterministicStrings(left.specifier, right.specifier))) {
+  for (const importRecord of parseRelativeImportRecords(source, resolvedFile).sort((left, right) => compareDeterministicStrings(left.specifier, right.specifier))) {
     const importedFile = await resolveSourceFile(resolve(dirname(resolvedFile), importRecord.specifier));
     if (!importedFile) {
       const owner = relative(projectRoot, resolvedFile).split(sep).join("/");
@@ -478,9 +485,30 @@ function isProjectModule(file, projectRoot) {
   return projectRelative !== ".." && !projectRelative.startsWith(`..${sep}`);
 }
 
-function parseRelativeImportRecords(source) {
+function parseRelativeImportRecords(source, fileName) {
   const records = [];
-  const sourceFile = ts.createSourceFile("ferrite-module.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const runtimeSource = ts.transpileModule(source, {
+    compilerOptions: {
+      jsx: ts.JsxEmit.Preserve,
+      module: ts.ModuleKind.Preserve,
+      target: ts.ScriptTarget.Latest,
+    },
+    fileName,
+  }).outputText;
+  const sourceFile = ts.createSourceFile(fileName, runtimeSource, ts.ScriptTarget.Latest, true);
+  let sourceBound = false;
+
+  const requireIsUnbound = (identifier) => {
+    if (!sourceBound) {
+      ts.bindSourceFile(sourceFile, {
+        allowJs: true,
+        module: ts.ModuleKind.Preserve,
+        target: ts.ScriptTarget.Latest,
+      });
+      sourceBound = true;
+    }
+    return isUnboundRequire(identifier);
+  };
 
   const addRecord = (specifier, exportNames) => {
     if (isRelativeSpecifier(specifier) && isSourceSpecifier(specifier)) {
@@ -489,13 +517,39 @@ function parseRelativeImportRecords(source) {
   };
 
   const visit = (node) => {
-    if (ts.isImportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier) && !node.importClause?.isTypeOnly) {
+    if (
+      ts.isImportDeclaration(node)
+      && node.moduleSpecifier
+      && ts.isStringLiteralLike(node.moduleSpecifier)
+      && importDeclarationHasRuntimeEffect(node.importClause)
+    ) {
       addRecord(node.moduleSpecifier.text, importedExportNames(node.importClause));
+    } else if (
+      ts.isImportEqualsDeclaration(node)
+      && !node.isTypeOnly
+      && ts.isExternalModuleReference(node.moduleReference)
+      && node.moduleReference.expression
+      && ts.isStringLiteralLike(node.moduleReference.expression)
+    ) {
+      addRecord(node.moduleReference.expression.text, []);
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier) && !node.isTypeOnly) {
-      addRecord(node.moduleSpecifier.text, exportedNames(node.exportClause));
+      const exportNames = exportedNames(node.exportClause);
+      if (exportDeclarationHasRuntimeEffect(node.exportClause, exportNames)) {
+        addRecord(node.moduleSpecifier.text, exportNames);
+      }
     } else if (
       ts.isCallExpression(node)
       && node.expression.kind === ts.SyntaxKind.ImportKeyword
+      && node.arguments.length === 1
+      && node.arguments[0]
+      && ts.isStringLiteralLike(node.arguments[0])
+    ) {
+      addRecord(node.arguments[0].text, []);
+    } else if (
+      ts.isCallExpression(node)
+      && ts.isIdentifier(node.expression)
+      && node.expression.text === "require"
+      && requireIsUnbound(node.expression)
       && node.arguments.length === 1
       && node.arguments[0]
       && ts.isStringLiteralLike(node.arguments[0])
@@ -509,6 +563,17 @@ function parseRelativeImportRecords(source) {
   return records;
 }
 
+function isUnboundRequire(identifier) {
+  let current = identifier.parent;
+  while (current) {
+    if (current.locals?.has("require")) {
+      return false;
+    }
+    current = current.parent;
+  }
+  return true;
+}
+
 function importedExportNames(importClause) {
   const names = [];
   if (importClause?.name) {
@@ -518,10 +583,28 @@ function importedExportNames(importClause) {
     if (ts.isNamespaceImport(importClause.namedBindings)) {
       names.push("*");
     } else {
-      names.push(...importClause.namedBindings.elements.map((element) => (element.propertyName ?? element.name).text));
+      names.push(
+        ...importClause.namedBindings.elements
+          .filter((element) => !element.isTypeOnly)
+          .map((element) => (element.propertyName ?? element.name).text),
+      );
     }
   }
   return names;
+}
+
+function importDeclarationHasRuntimeEffect(importClause) {
+  if (!importClause) {
+    return true;
+  }
+  if (importClause.isTypeOnly) {
+    return false;
+  }
+  if (importClause.name || !importClause.namedBindings || ts.isNamespaceImport(importClause.namedBindings)) {
+    return true;
+  }
+  return importClause.namedBindings.elements.length === 0
+    || importClause.namedBindings.elements.some((element) => !element.isTypeOnly);
 }
 
 function exportedNames(exportClause) {
@@ -533,9 +616,16 @@ function exportedNames(exportClause) {
     .map((element) => (element.propertyName ?? element.name).text);
 }
 
+function exportDeclarationHasRuntimeEffect(exportClause, exportNames) {
+  return !exportClause
+    || ts.isNamespaceExport(exportClause)
+    || exportClause.elements.length === 0
+    || exportNames.length > 0;
+}
+
 function isSourceSpecifier(specifier) {
   const extension = extname(specifier);
-  return !extension || [".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"].includes(extension);
+  return !extension || sourceExtensions.includes(extension);
 }
 
 function isRelativeSpecifier(specifier) {
@@ -543,11 +633,17 @@ function isRelativeSpecifier(specifier) {
 }
 
 async function resolveSourceFile(path) {
-  const candidates = extname(path)
-    ? [path]
+  const extension = extname(path);
+  const candidates = extension
+    ? [
+        path,
+        ...(emittedSourceSubstitutions.get(extension) ?? []).map(
+          (candidateExtension) => `${path.slice(0, -extension.length)}${candidateExtension}`,
+        ),
+      ]
     : [
-        ...[".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"].map((extension) => `${path}${extension}`),
-        ...[".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"].map((extension) => join(path, `index${extension}`)),
+        ...sourceExtensions.map((extension) => `${path}${extension}`),
+        ...sourceExtensions.map((extension) => join(path, `index${extension}`)),
       ];
 
   for (const candidate of candidates) {
