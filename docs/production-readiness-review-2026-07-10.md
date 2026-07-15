@@ -1,12 +1,22 @@
 # Ferrite Production Readiness Review
 
-Updated: 2026-07-13
+Updated: 2026-07-14
 
 ## Decision
 
 Ferrite is a credible local framework prototype and a defensible artifact-backed private alpha for trusted developers. It is not ready for unmanaged public production use, a reliability-priced paid beta, or registry-first onboarding.
 
 The highest-return work is no longer broad React or Next.js parity. It is the production path between `ferrite build`, `ferrite serve`, a clean developer install, remote CI, and one hosted Builder AI Lab proof workflow.
+
+## Current Delivery Contract
+
+- Delivery unit: draft PR #4 on `codex/module-graph-hardening`.
+- Owner: the current Ferrite module-graph task; no second mutable owner may edit the same branch or PR evidence.
+- Disposition target: `READY` or `FIX`, based on deterministic module-graph construction, runtime-edge discovery, cycle diagnostics, and invalidation behavior proven at the exact head.
+- Required evidence: normal, failure, odd, backward-compatibility, and cleanup paths; lint, typecheck, build, tests, focused coverage, package verification, applicable runtime/browser proof, hosted-check state, and an independent current-head review before any `READY` claim.
+- Allowed actions: inspect, edit, test, commit, push the existing branch, and update evidence on the existing PR.
+- Reserved actions: merge, deploy, release, publish, repository settings, credentials, billing, and recreation of the removed `ferrite-proof` VM. Generic instructions to continue, finish, or unblock do not authorize a reserved action; Romy must authorize that action explicitly.
+- Draft rule: PR #4 remains draft until every required local gate passes, the exact remote head and proof receipt agree, and no actionable review finding remains. Missing hosted execution or independent review keeps the disposition at `FIX` rather than implying readiness.
 
 ## Current Evidence
 
