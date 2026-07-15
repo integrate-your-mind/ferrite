@@ -431,7 +431,15 @@ async function collectClientReferences(entryFiles, projectRoot) {
   };
 }
 
-async function scanServerFileForClientReferences(file, projectRoot, graph, visiting, visited, references) {
+async function scanServerFileForClientReferences(
+  file,
+  projectRoot,
+  graph,
+  visiting,
+  visited,
+  references,
+  inheritedClientSubtree = false,
+) {
   const resolvedFile = resolve(file);
   const cycleStart = visiting.indexOf(resolvedFile);
   if (cycleStart !== -1) {
@@ -440,13 +448,15 @@ async function scanServerFileForClientReferences(file, projectRoot, graph, visit
       .join(" -> ");
     throw new Error(`Ferrite module graph cycle: ${cycle}`);
   }
-  if (visited.has(resolvedFile)) {
+
+  const source = await readFile(resolvedFile, "utf8");
+  const clientSubtree = inheritedClientSubtree || startsWithDirective(source, "use client");
+  const visitKey = `${clientSubtree ? "client" : "server"}\0${resolvedFile}`;
+  if (visited.has(visitKey)) {
     return;
   }
   visiting.push(resolvedFile);
 
-  const source = await readFile(resolvedFile, "utf8");
-  const isClientModule = startsWithDirective(source, "use client");
   const imports = [];
   for (const importRecord of parseRelativeImportRecords(source, resolvedFile).sort((left, right) => compareDeterministicStrings(left.specifier, right.specifier))) {
     const importedFile = await resolveSourceFile(resolve(dirname(resolvedFile), importRecord.specifier));
@@ -461,7 +471,8 @@ async function scanServerFileForClientReferences(file, projectRoot, graph, visit
     imports.push(importedFile);
 
     const importedSource = await readFile(importedFile, "utf8");
-    if (!isClientModule && startsWithDirective(importedSource, "use client")) {
+    const importedIsClientModule = startsWithDirective(importedSource, "use client");
+    if (!clientSubtree && importedIsClientModule) {
       for (const exportName of importRecord.exportNames) {
         const module = relative(projectRoot, importedFile).split(sep).join("/");
         const id = `${module}#${exportName}`;
@@ -469,11 +480,19 @@ async function scanServerFileForClientReferences(file, projectRoot, graph, visit
       }
     }
 
-    await scanServerFileForClientReferences(importedFile, projectRoot, graph, visiting, visited, references);
+    await scanServerFileForClientReferences(
+      importedFile,
+      projectRoot,
+      graph,
+      visiting,
+      visited,
+      references,
+      clientSubtree || importedIsClientModule,
+    );
   }
   graph.set(resolvedFile, [...new Set(imports)].sort(compareDeterministicStrings));
   visiting.pop();
-  visited.add(resolvedFile);
+  visited.add(visitKey);
 }
 
 function compareDeterministicStrings(left, right) {

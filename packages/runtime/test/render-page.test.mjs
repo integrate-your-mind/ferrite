@@ -230,10 +230,11 @@ test("build-client excludes emit-erased type-only imports from the runtime modul
       [
         `import { type ClientProps, LegacyProps, Widget } from "./Client";`,
         `import { type GhostProps } from "./GhostClient";`,
+        `import { type DeclarationOnlyProps } from "./declarations";`,
         `export { type ReexportedProps } from "./ReexportClient";`,
         `type LegacyAlias = LegacyProps;`,
         `export { Widget };`,
-        `export type { ClientProps, GhostProps, LegacyAlias };`,
+        `export type { ClientProps, DeclarationOnlyProps, GhostProps, LegacyAlias };`,
         "",
       ].join("\n"),
     );
@@ -249,6 +250,10 @@ test("build-client excludes emit-erased type-only imports from the runtime modul
       join(projectRoot, "app/ReexportClient.tsx"),
       `"use client"; export type ReexportedProps = {}; export function Reexported() { return null; }\n`,
     );
+    await writeFile(
+      join(projectRoot, "app/declarations.d.ts"),
+      `export interface DeclarationOnlyProps { value: string; }\n`,
+    );
 
     const bundle = await buildClient(projectRoot, pageFile);
 
@@ -258,6 +263,50 @@ test("build-client excludes emit-erased type-only imports from the runtime modul
       { file: "app/server.ts", imports: ["app/Client.tsx"] },
     ]);
     assert.deepEqual(bundle.clientReferences.map((reference) => reference.id), ["app/Client.tsx#Widget"]);
+  });
+});
+
+test("build-client preserves server boundaries across shared client-subtree helpers", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      `import RootClient from "./RootClient"; export default function Page() { return <RootClient />; }\n`,
+    );
+    await writeFile(
+      join(projectRoot, "app/RootClient.tsx"),
+      `"use client"; import { helper } from "./helper"; export default function RootClient() { return helper; }\n`,
+    );
+    await writeFile(
+      join(projectRoot, "app/helper.ts"),
+      `import NestedClient from "./NestedClient"; export const helper = NestedClient;\n`,
+    );
+    await writeFile(
+      join(projectRoot, "app/NestedClient.tsx"),
+      `"use client"; export default function NestedClient() { return null; }\n`,
+    );
+
+    const clientOnly = await buildClient(projectRoot, pageFile);
+    assert.deepEqual(
+      clientOnly.clientReferences.map((reference) => reference.id),
+      ["app/RootClient.tsx#default"],
+    );
+
+    await writeFile(
+      pageFile,
+      [
+        `import RootClient from "./RootClient";`,
+        `import { helper } from "./helper";`,
+        `export default function Page() { void helper; return <RootClient />; }`,
+        "",
+      ].join("\n"),
+    );
+    const sharedWithServer = await buildClient(projectRoot, pageFile);
+    assert.deepEqual(
+      sharedWithServer.clientReferences.map((reference) => reference.id),
+      ["app/NestedClient.tsx#default", "app/RootClient.tsx#default"],
+    );
   });
 });
 
