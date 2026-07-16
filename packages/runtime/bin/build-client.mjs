@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,15 +75,42 @@ const emittedSourceSubstitutions = new Map([
 ]);
 await mkdir(outDir, { recursive: true });
 
-const moduleGraph = await collectClientReferences([pageFile, ...layoutFiles], projectRoot);
+const routeFiles = [pageFile, ...layoutFiles];
+const maxStableBuildAttempts = 2;
+let response;
 
-if (!(await routeHasClientDirective([pageFile, ...layoutFiles]))) {
+for (let attempt = 1; attempt <= maxStableBuildAttempts; attempt += 1) {
+  const graphCompiler = await loadGraphCompilerOptions(projectRoot);
+  const moduleGraph = await collectClientReferences(
+    routeFiles,
+    projectRoot,
+    graphCompiler.options,
+    graphCompiler.sources,
+  );
+  response = (await routeHasClientDirective(routeFiles))
+    ? await bundleClientRoute(moduleGraph)
+    : await bundleServerRoute(moduleGraph);
+
+  if (await moduleGraphSnapshotIsCurrent(moduleGraph.snapshot, projectRoot)) {
+    break;
+  }
+  response = undefined;
+}
+
+if (!response) {
+  throw new Error(
+    `Ferrite module graph inputs changed during ${maxStableBuildAttempts} consecutive client builds; retry after the source tree is stable.`,
+  );
+}
+await writeResponse(response);
+
+async function bundleServerRoute(moduleGraph) {
   const referenceBundles = await bundleClientReferences(moduleGraph.references, projectRoot, outDir, publicPath);
   const actionBootstrap =
     options.actionBootstrap === true && referenceBundles.clientReferences.length === 0
       ? await bundleActionBootstrap(entryName, projectRoot, outDir, publicPath)
       : null;
-  await writeResponse({
+  return {
     script: null,
     actionBootstrap: actionBootstrap?.script,
     styles: [],
@@ -92,84 +120,78 @@ if (!(await routeHasClientDirective([pageFile, ...layoutFiles]))) {
     clientReferences: referenceBundles.clientReferences,
     moduleGraph: moduleGraph.nodes,
     hydration: "server",
-  });
-  process.exit(0);
+  };
 }
 
-const tempRoot = join(projectRoot, ".ferrite", "tmp");
-await mkdir(tempRoot, { recursive: true });
-const tempDir = await mkdtemp(join(tempRoot, "client-"));
-const entryFile = join(tempDir, `${entryName}.tsx`);
+async function bundleClientRoute(moduleGraph) {
+  const tempRoot = join(projectRoot, ".ferrite", "tmp");
+  await mkdir(tempRoot, { recursive: true });
+  const tempDir = await mkdtemp(join(tempRoot, "client-"));
+  const entryFile = join(tempDir, `${entryName}.tsx`);
 
-try {
-  await writeFile(
-    entryFile,
-    [
-      `import { createElement } from "@ferrite/runtime";`,
-      `import { bootstrapServerActionForms, hydrate } from "@ferrite/runtime/dom";`,
-      `import Page from ${JSON.stringify(resolve(pageFile))};`,
-      ...layoutFiles.map((file, index) => `import Layout${index} from ${JSON.stringify(resolve(file))};`),
-      "",
-      `const layouts = [${layoutFiles.map((_file, index) => `Layout${index}`).join(", ")}];`,
-      `const root = document.getElementById("ferrite-root") || document.getElementById("ferrite-dev-root");`,
-      ...(options.runtimeProps === true
-        ? [
-            `const serializedProps = root?.getAttribute("data-ferrite-page-props");`,
-            `if (!serializedProps) {`,
-            `  throw new TypeError("Ferrite production hydration requires data-ferrite-page-props.");`,
-            `}`,
-            `const pageProps = JSON.parse(serializedProps);`,
-          ]
-        : [`const pageProps = ${JSON.stringify(props)};`]),
-      `const page = createElement(Page, pageProps);`,
-      `const tree = layouts.reduceRight((child, Layout) => createElement(Layout, { children: child }), page);`,
-      `if (root) {`,
-      `  hydrate(tree, root);`,
-      `}`,
-      `if (typeof document !== "undefined") {`,
-      `  bootstrapServerActionForms(document);`,
-      `}`,
-      "",
-    ].join("\n"),
-  );
+  try {
+    await writeFile(
+      entryFile,
+      [
+        `import { createElement } from "@ferrite/runtime";`,
+        `import { bootstrapServerActionForms, hydrate } from "@ferrite/runtime/dom";`,
+        `import Page from ${JSON.stringify(resolve(pageFile))};`,
+        ...layoutFiles.map((file, index) => `import Layout${index} from ${JSON.stringify(resolve(file))};`),
+        "",
+        `const layouts = [${layoutFiles.map((_file, index) => `Layout${index}`).join(", ")}];`,
+        `const root = document.getElementById("ferrite-root") || document.getElementById("ferrite-dev-root");`,
+        ...(options.runtimeProps === true
+          ? [
+              `const serializedProps = root?.getAttribute("data-ferrite-page-props");`,
+              `if (!serializedProps) {`,
+              `  throw new TypeError("Ferrite production hydration requires data-ferrite-page-props.");`,
+              `}`,
+              `const pageProps = JSON.parse(serializedProps);`,
+            ]
+          : [`const pageProps = ${JSON.stringify(props)};`]),
+        `const page = createElement(Page, pageProps);`,
+        `const tree = layouts.reduceRight((child, Layout) => createElement(Layout, { children: child }), page);`,
+        `if (root) {`,
+        `  hydrate(tree, root);`,
+        `}`,
+        `if (typeof document !== "undefined") {`,
+        `  bootstrapServerActionForms(document);`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
 
-  const result = await build({
-    entryPoints: [entryFile],
-    bundle: true,
-    platform: "browser",
-    format: "esm",
-    target: "es2022",
-    outdir: outDir,
-    entryNames: entryName,
-    assetNames: "assets/[name]-[hash]",
-    publicPath,
-    sourcemap: true,
-    metafile: true,
-    jsx: "automatic",
-    jsxImportSource: "@ferrite/runtime",
-    plugins: [ferriteRuntimeAliasPlugin()],
-    loader: fileLoaders,
-    logLevel: "silent",
-  });
-
-  const summary = summarizeBuildResult(result, outDir, entryFile, publicPath);
-
-  const response = {
-    script: summary.script,
-    styles: summary.styles,
-    outputs: summary.outputs,
-    sourcemaps: summary.sourcemaps,
-    assets: summary.assets,
-    clientReferences: [],
-    moduleGraph: moduleGraph.nodes,
-  };
-
-  await writeResponse(response);
-} catch (error) {
-  console.error(error instanceof Error ? error.stack || error.message : String(error));
-  process.exit(1);
-} finally {
-  await rm(tempDir, { recursive: true, force: true });
+    const result = await build({
+      entryPoints: [entryFile],
+      bundle: true,
+      platform: "browser",
+      format: "esm",
+      target: "es2022",
+      outdir: outDir,
+      entryNames: entryName,
+      assetNames: "assets/[name]-[hash]",
+      publicPath,
+      sourcemap: true,
+      metafile: true,
+      jsx: "automatic",
+      jsxImportSource: "@ferrite/runtime",
+      plugins: [ferriteRuntimeAliasPlugin()],
+      loader: fileLoaders,
+      logLevel: "silent",
+    });
+    const summary = summarizeBuildResult(result, outDir, entryFile, publicPath);
+    return {
+      script: summary.script,
+      styles: summary.styles,
+      outputs: summary.outputs,
+      sourcemaps: summary.sourcemaps,
+      assets: summary.assets,
+      clientReferences: [],
+      moduleGraph: moduleGraph.nodes,
+    };
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 function routeToEntryName(route) {
@@ -298,7 +320,7 @@ async function bundleActionBootstrap(routeEntryName, projectRoot, outDir, public
 }
 
 function mergeSorted(...lists) {
-  return [...new Set(lists.flat())].sort();
+  return [...new Set(lists.flat())].sort(compareDeterministicStrings);
 }
 
 async function bundleClientReference(clientReference, projectRoot, outDir, publicPath) {
@@ -367,9 +389,6 @@ function clientReferenceImportStatement(clientReference) {
   if (clientReference.exportName === "default") {
     return `import ClientReferenceComponent from ${source};`;
   }
-  if (clientReference.exportName === "*") {
-    return `import * as ClientReferenceComponent from ${source};`;
-  }
   return `import { ${clientReference.exportName} as ClientReferenceComponent } from ${source};`;
 }
 
@@ -407,30 +426,58 @@ function summarizeBuildResult(result, outDir, entryFile, publicPath) {
   };
 }
 
-async function collectClientReferences(entryFiles, projectRoot) {
+async function collectClientReferences(entryFiles, projectRoot, compilerOptions, compilerSources) {
   const references = new Map();
   const graph = new Map();
   const visiting = [];
   const visited = new Set();
+  const snapshot = {
+    sources: new Map(compilerSources),
+    resolutions: new Map(),
+    unstable: false,
+  };
+  const compilerWatchFiles = [...compilerSources.keys()]
+    .filter((file) => isPathInsideRoot(projectRoot, file))
+    .map((file) => relative(projectRoot, file).split(sep).join("/"))
+    .sort(compareDeterministicStrings);
 
   for (const entryFile of [...entryFiles].sort(compareDeterministicStrings)) {
-    const resolved = await resolveSourceFile(resolve(entryFile));
+    const resolution = await resolveSourceFile(resolve(entryFile), projectRoot, snapshot);
+    const resolved = resolution.file;
     if (resolved) {
       if (!isProjectModule(resolved, projectRoot)) {
         throw new Error(`Ferrite module graph entry escapes the project root: ${relative(projectRoot, resolved).split(sep).join("/")}`);
       }
-      await scanServerFileForClientReferences(resolved, projectRoot, graph, visiting, visited, references);
+      await scanServerFileForClientReferences(
+        resolved,
+        projectRoot,
+        graph,
+        visiting,
+        visited,
+        references,
+        compilerOptions,
+        snapshot,
+        false,
+        mergeSorted(compilerWatchFiles, portableWatchCandidates(resolution, projectRoot)),
+      );
     }
   }
 
   return {
-    references: [...references.values()].sort((left, right) => left.id.localeCompare(right.id)),
+    references: [...references.values()].sort((left, right) => compareDeterministicStrings(left.id, right.id)),
     nodes: [...graph.entries()]
-      .map(([file, imports]) => ({
-        file: relative(projectRoot, file).split(sep).join("/"),
-        imports: imports.map((entry) => relative(projectRoot, entry).split(sep).join("/")),
-      }))
+      .map(([file, node]) => {
+        const serialized = {
+          file: relative(projectRoot, file).split(sep).join("/"),
+          imports: node.imports.map((entry) => relative(projectRoot, entry).split(sep).join("/")),
+        };
+        if (node.watchFiles.length > 0) {
+          serialized.watchFiles = node.watchFiles;
+        }
+        return serialized;
+      })
       .sort((left, right) => compareDeterministicStrings(left.file, right.file)),
+    snapshot,
   };
 }
 
@@ -441,7 +488,10 @@ async function scanServerFileForClientReferences(
   visiting,
   visited,
   references,
+  compilerOptions,
+  snapshot,
   inheritedClientSubtree = false,
+  initialWatchFiles = [],
 ) {
   const resolvedFile = resolve(file);
   const cycleStart = visiting.indexOf(resolvedFile);
@@ -452,7 +502,12 @@ async function scanServerFileForClientReferences(
     throw new Error(`Ferrite module graph cycle: ${cycle}`);
   }
 
+  const graphNode = graph.get(resolvedFile) ?? { imports: [], watchFiles: [] };
+  graphNode.watchFiles = mergeSorted(graphNode.watchFiles, initialWatchFiles);
+  graph.set(resolvedFile, graphNode);
+
   const source = await readFile(resolvedFile, "utf8");
+  recordSnapshotValue(snapshot.sources, resolvedFile, sha256(source), snapshot);
   const clientSubtree = inheritedClientSubtree || startsWithDirective(source, "use client");
   const visitKey = `${clientSubtree ? "client" : "server"}\0${resolvedFile}`;
   if (visited.has(visitKey)) {
@@ -461,8 +516,14 @@ async function scanServerFileForClientReferences(
   visiting.push(resolvedFile);
 
   const imports = [];
-  for (const importRecord of parseRelativeImportRecords(source, resolvedFile).sort((left, right) => compareDeterministicStrings(left.specifier, right.specifier))) {
-    const importedFile = await resolveSourceFile(resolve(dirname(resolvedFile), importRecord.specifier));
+  const watchFiles = [...graphNode.watchFiles];
+  for (const importRecord of parseRelativeImportRecords(source, resolvedFile, compilerOptions).sort((left, right) => compareDeterministicStrings(left.specifier, right.specifier))) {
+    const resolution = await resolveSourceFile(
+      resolve(dirname(resolvedFile), importRecord.specifier),
+      projectRoot,
+      snapshot,
+    );
+    const importedFile = resolution.file;
     if (!importedFile) {
       const owner = relative(projectRoot, resolvedFile).split(sep).join("/");
       throw new Error(`Ferrite module graph could not resolve ${JSON.stringify(importRecord.specifier)} from ${owner}`);
@@ -472,10 +533,18 @@ async function scanServerFileForClientReferences(
       throw new Error(`Ferrite module graph import escapes the project root: ${JSON.stringify(importRecord.specifier)} from ${owner}`);
     }
     imports.push(importedFile);
+    watchFiles.push(...portableWatchCandidates(resolution, projectRoot));
 
     const importedSource = await readFile(importedFile, "utf8");
+    recordSnapshotValue(snapshot.sources, importedFile, sha256(importedSource), snapshot);
     const importedIsClientModule = startsWithDirective(importedSource, "use client");
     if (!clientSubtree && importedIsClientModule) {
+      if (importRecord.exportNames.length === 0 || importRecord.exportNames.includes("*")) {
+        const owner = relative(projectRoot, resolvedFile).split(sep).join("/");
+        throw new Error(
+          `Ferrite client boundary ${JSON.stringify(importRecord.specifier)} from ${owner} must use concrete default or named imports/exports; namespace, side-effect, require, import-equals, and dynamic imports are unsupported across a \"use client\" boundary.`,
+        );
+      }
       for (const exportName of importRecord.exportNames) {
         const module = relative(projectRoot, importedFile).split(sep).join("/");
         const id = `${module}#${exportName}`;
@@ -490,10 +559,13 @@ async function scanServerFileForClientReferences(
       visiting,
       visited,
       references,
+      compilerOptions,
+      snapshot,
       clientSubtree || importedIsClientModule,
     );
   }
-  graph.set(resolvedFile, [...new Set(imports)].sort(compareDeterministicStrings));
+  graphNode.imports = [...new Set(imports)].sort(compareDeterministicStrings);
+  graphNode.watchFiles = [...new Set(watchFiles)].sort(compareDeterministicStrings);
   visiting.pop();
   visited.add(visitKey);
 }
@@ -502,17 +574,99 @@ function compareDeterministicStrings(left, right) {
   return Buffer.from(left).compare(Buffer.from(right));
 }
 
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function recordSnapshotValue(values, key, value, snapshot) {
+  const existing = values.get(key);
+  if (existing !== undefined && existing !== value) {
+    snapshot.unstable = true;
+  }
+  values.set(key, value);
+}
+
+async function moduleGraphSnapshotIsCurrent(snapshot, projectRoot) {
+  if (snapshot.unstable) {
+    return false;
+  }
+
+  for (const [file, expected] of snapshot.sources) {
+    try {
+      if (sha256(await readFile(file)) !== expected) {
+        return false;
+      }
+    } catch (_error) {
+      return false;
+    }
+  }
+  for (const [candidate, expected] of snapshot.resolutions) {
+    if ((await describeResolutionCandidate(candidate, projectRoot)) !== expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function loadGraphCompilerOptions(projectRoot) {
+  const configPath = join(projectRoot, "tsconfig.json");
+  try {
+    await access(configPath);
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      return { options: {}, sources: new Map() };
+    }
+    throw error;
+  }
+
+  const sources = new Map();
+  const readConfigFile = (file) => {
+    const source = ts.sys.readFile(file);
+    if (source !== undefined) {
+      sources.set(resolve(file), sha256(source));
+    }
+    return source;
+  };
+  const config = ts.readConfigFile(configPath, readConfigFile);
+  if (config.error) {
+    throw new Error(`Ferrite module graph could not read tsconfig.json: ${formatTypeScriptDiagnostics([config.error])}`);
+  }
+  const parsed = ts.parseJsonConfigFileContent(
+    config.config,
+    { ...ts.sys, readFile: readConfigFile },
+    projectRoot,
+    undefined,
+    configPath,
+  );
+  if (parsed.errors.length > 0) {
+    throw new Error(`Ferrite module graph could not load tsconfig.json: ${formatTypeScriptDiagnostics(parsed.errors)}`);
+  }
+  return {
+    options: {
+      verbatimModuleSyntax: parsed.options.verbatimModuleSyntax === true,
+    },
+    sources,
+  };
+}
+
+function formatTypeScriptDiagnostics(diagnostics) {
+  return diagnostics
+    .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, " "))
+    .join("; ");
+}
+
 function isProjectModule(file, projectRoot) {
   return isPathInsideRoot(projectRoot, file);
 }
 
-function parseRelativeImportRecords(source, fileName) {
+function parseRelativeImportRecords(source, fileName, compilerOptions) {
   const records = [];
   const runtimeSource = ts.transpileModule(source, {
     compilerOptions: {
       jsx: ts.JsxEmit.Preserve,
       module: ts.ModuleKind.Preserve,
       target: ts.ScriptTarget.Latest,
+      verbatimModuleSyntax: compilerOptions.verbatimModuleSyntax === true,
     },
     fileName,
   }).outputText;
@@ -561,7 +715,7 @@ function parseRelativeImportRecords(source, fileName) {
     } else if (
       ts.isCallExpression(node)
       && node.expression.kind === ts.SyntaxKind.ImportKeyword
-      && node.arguments.length === 1
+      && node.arguments.length >= 1
       && node.arguments[0]
       && ts.isStringLiteralLike(node.arguments[0])
     ) {
@@ -653,7 +807,7 @@ function isRelativeSpecifier(specifier) {
   return specifier.startsWith("./") || specifier.startsWith("../");
 }
 
-async function resolveSourceFile(path) {
+async function resolveSourceFile(path, projectRoot, snapshot) {
   const extension = extname(path);
   const candidates = extension
     ? [
@@ -667,16 +821,55 @@ async function resolveSourceFile(path) {
         ...extensionlessSourceExtensions.map((extension) => join(path, `index${extension}`)),
       ];
 
-  for (const candidate of candidates) {
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
     try {
       await access(candidate);
-      return await realpath(candidate);
+      const file = await realpath(candidate);
+      const checkedCandidates = candidates.slice(0, index + 1);
+      await recordResolutionSnapshot(checkedCandidates, projectRoot, snapshot);
+      return { file, candidates: checkedCandidates };
     } catch (_error) {
       // Try the next source-file candidate.
     }
   }
 
-  return null;
+  await recordResolutionSnapshot(candidates, projectRoot, snapshot);
+  return { file: null, candidates };
+}
+
+async function recordResolutionSnapshot(candidates, projectRoot, snapshot) {
+  for (const candidate of candidates) {
+    recordSnapshotValue(
+      snapshot.resolutions,
+      candidate,
+      await describeResolutionCandidate(candidate, projectRoot),
+      snapshot,
+    );
+  }
+}
+
+async function describeResolutionCandidate(candidate, projectRoot) {
+  try {
+    const resolved = await realpath(candidate);
+    if (!isPathInsideRoot(projectRoot, resolved)) {
+      return "outside-project";
+    }
+    return `resolved:${relative(projectRoot, resolved).split(sep).join("/")}`;
+  } catch (error) {
+    if (error && typeof error === "object" && typeof error.code === "string") {
+      return `error:${error.code}`;
+    }
+    return "error:unknown";
+  }
+}
+
+function portableWatchCandidates(resolution, projectRoot) {
+  return resolution.candidates
+    .filter((candidate) => isPathInsideRoot(projectRoot, candidate))
+    .filter((candidate) => resolve(candidate) !== resolution.file)
+    .map((candidate) => relative(projectRoot, candidate).split(sep).join("/"))
+    .sort(compareDeterministicStrings);
 }
 
 async function routeHasClientDirective(files) {

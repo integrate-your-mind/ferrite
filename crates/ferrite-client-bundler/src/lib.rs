@@ -258,6 +258,8 @@ pub struct ModuleGraphNode {
     pub file: String,
     #[serde(default)]
     pub imports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +308,20 @@ impl ClientBundle {
             if node.imports.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(ClientBundleError::InvalidModuleGraph {
                     reason: "imports must be sorted and unique".to_owned(),
+                });
+            }
+            if node
+                .watch_files
+                .iter()
+                .any(|watch_file| !is_valid_module_graph_path(watch_file))
+            {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "contains an invalid watch path".to_owned(),
+                });
+            }
+            if node.watch_files.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "watch paths must be sorted and unique".to_owned(),
                 });
             }
         }
@@ -599,10 +615,12 @@ process.stdout.write(JSON.stringify({
                 ModuleGraphNode {
                     file: "app/Counter.tsx".to_owned(),
                     imports: Vec::new(),
+                    watch_files: Vec::new(),
                 },
                 ModuleGraphNode {
                     file: "app/page.tsx".to_owned(),
                     imports: vec!["app/Counter.tsx".to_owned()],
+                    watch_files: Vec::new(),
                 },
             ]
         );
@@ -635,10 +653,12 @@ process.stdout.write(JSON.stringify({
                 ModuleGraphNode {
                     file: "app/z.ts".to_owned(),
                     imports: vec!["app/b.ts".to_owned(), "app/a.ts".to_owned()],
+                    watch_files: Vec::new(),
                 },
                 ModuleGraphNode {
                     file: "app/a.ts".to_owned(),
                     imports: vec!["../outside.ts".to_owned()],
+                    watch_files: Vec::new(),
                 },
             ],
         };
@@ -646,6 +666,35 @@ process.stdout.write(JSON.stringify({
         assert_eq!(
             bundle.validate().unwrap_err().to_string(),
             "invalid client module graph: imports must be sorted and unique"
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_module_graph_watch_paths() {
+        let mut bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: vec![ModuleGraphNode {
+                file: "app/page.tsx".to_owned(),
+                imports: Vec::new(),
+                watch_files: vec!["app/z.ts".to_owned(), "app/a.ts".to_owned()],
+            }],
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: watch paths must be sorted and unique"
+        );
+
+        bundle.module_graph[0].watch_files = vec!["../outside.ts".to_owned()];
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an invalid watch path"
         );
     }
 
@@ -662,6 +711,7 @@ process.stdout.write(JSON.stringify({
             module_graph: vec![ModuleGraphNode {
                 file: "app/page.tsx".to_owned(),
                 imports: vec!["app/missing.ts".to_owned()],
+                watch_files: Vec::new(),
             }],
         };
 
@@ -674,10 +724,12 @@ process.stdout.write(JSON.stringify({
             ModuleGraphNode {
                 file: "app/a.ts".to_owned(),
                 imports: vec!["app/b.ts".to_owned()],
+                watch_files: Vec::new(),
             },
             ModuleGraphNode {
                 file: "app/b.ts".to_owned(),
                 imports: vec!["app/a.ts".to_owned()],
+                watch_files: Vec::new(),
             },
         ];
         assert_eq!(
@@ -699,6 +751,7 @@ process.stdout.write(JSON.stringify({
             module_graph: vec![ModuleGraphNode {
                 file: "C:\\app\\page.tsx".to_owned(),
                 imports: Vec::new(),
+                watch_files: Vec::new(),
             }],
         };
 
@@ -730,6 +783,7 @@ process.stdout.write(JSON.stringify({
             module_graph: vec![ModuleGraphNode {
                 file: "app/page.tsx".to_owned(),
                 imports: Vec::new(),
+                watch_files: Vec::new(),
             }],
         };
 
@@ -1017,18 +1071,18 @@ export function ShareButton({ id }) {
         assert_eq!(bundle.client_references.len(), 2);
         assert_eq!(
             bundle.client_references[0].id,
-            "app/posts/[id]/PostActions.tsx#default"
+            "app/posts/[id]/PostActions.tsx#ShareButton"
         );
         assert_eq!(
-            bundle.client_references[0].script.as_deref(),
+            bundle.client_references[1].script.as_deref(),
             Some("/_ferrite/static/client-reference-app-posts-id-PostActions-tsx-default.js")
         );
-        assert!(bundle.client_references[0].outputs.contains(&PathBuf::from(
+        assert!(bundle.client_references[1].outputs.contains(&PathBuf::from(
             "client-reference-app-posts-id-PostActions-tsx-default.js"
         )));
         assert_eq!(
             bundle.client_references[1].id,
-            "app/posts/[id]/PostActions.tsx#ShareButton"
+            "app/posts/[id]/PostActions.tsx#default"
         );
         assert!(bundle.outputs.contains(&PathBuf::from(
             "client-reference-app-posts-id-PostActions-tsx-default.js"

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { platform } from "node:process";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -89,6 +90,24 @@ async function buildClient(projectRoot, pageFile) {
   return JSON.parse(stdout);
 }
 
+async function waitForDirectoryWithPrefix(root, prefix) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      const entries = await readdir(root, { withFileTypes: true });
+      if (entries.some((entry) => entry.isDirectory() && entry.name.startsWith(prefix))) {
+        return;
+      }
+    } catch (error) {
+      if (!error || typeof error !== "object" || error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    await delay(1);
+  }
+  throw new Error(`Timed out waiting for ${prefix} in ${root}`);
+}
+
 test("build-client reports deterministic module-graph cycles and unresolved imports", async () => {
   await withTempProject(async (projectRoot) => {
     const pageFile = join(projectRoot, "app/page.tsx");
@@ -151,8 +170,12 @@ test("build-client emits a complete module graph and refreshes it after dependen
       { file: "app/Button.tsx", imports: [] },
       { file: "app/Counter.tsx", imports: ["app/Button.tsx"] },
       { file: "app/Lazy.mts", imports: [] },
-      { file: "app/page.tsx", imports: ["app/shared.ts"] },
-      { file: "app/shared.ts", imports: ["app/Counter.tsx", "app/Lazy.mts"] },
+      { file: "app/page.tsx", imports: ["app/shared.ts"], watchFiles: ["app/shared.tsx"] },
+      {
+        file: "app/shared.ts",
+        imports: ["app/Counter.tsx", "app/Lazy.mts"],
+        watchFiles: ["app/Lazy.mjs"],
+      },
     ]);
     assert.deepEqual(first.clientReferences.map((reference) => reference.id), ["app/Counter.tsx#default"]);
 
@@ -165,7 +188,7 @@ test("build-client emits a complete module graph and refreshes it after dependen
     const second = await buildClient(projectRoot, pageFile);
     assert.deepEqual(second.moduleGraph, [
       { file: "app/CounterTwo.tsx", imports: [] },
-      { file: "app/page.tsx", imports: ["app/shared.ts"] },
+      { file: "app/page.tsx", imports: ["app/shared.ts"], watchFiles: ["app/shared.tsx"] },
       { file: "app/shared.ts", imports: ["app/CounterTwo.tsx"] },
     ]);
     assert.deepEqual(second.clientReferences.map((reference) => reference.id), ["app/CounterTwo.tsx#default"]);
@@ -228,6 +251,7 @@ test("build-client preserves runtime-file precedence with TypeScript source fall
       {
         file: "app/page.tsx",
         imports: ["app/legacy.cts", "app/modern.mts", "app/server.js", "app/view.tsx"],
+        watchFiles: ["app/legacy.cjs", "app/modern.mjs", "app/view.jsx"],
       },
       { file: "app/server.js", imports: [] },
       { file: "app/view.tsx", imports: [] },
@@ -279,10 +303,161 @@ test("build-client excludes emit-erased type-only imports from the runtime modul
 
     assert.deepEqual(bundle.moduleGraph, [
       { file: "app/Client.tsx", imports: [] },
-      { file: "app/page.tsx", imports: ["app/server.ts"] },
+      {
+        file: "app/page.tsx",
+        imports: ["app/server.ts"],
+        watchFiles: ["app/server.tsx"],
+      },
       { file: "app/server.ts", imports: ["app/Client.tsx"] },
     ]);
     assert.deepEqual(bundle.clientReferences.map((reference) => reference.id), ["app/Client.tsx#Widget"]);
+  });
+});
+
+test("build-client honors verbatimModuleSyntax when deriving runtime graph edges", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const serverFile = join(projectRoot, "app/server.ts");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      join(projectRoot, "tsconfig.json"),
+      JSON.stringify({ compilerOptions: { verbatimModuleSyntax: true } }, null, 2),
+    );
+    await writeFile(pageFile, `import "./server"; export default function Page() { return null; }\n`);
+    await writeFile(
+      serverFile,
+      `import { Widget } from "./Client"; export type WidgetType = typeof Widget;\n`,
+    );
+    await writeFile(
+      join(projectRoot, "app/Client.tsx"),
+      `"use client"; export function Widget() { return null; }\n`,
+    );
+
+    const preserved = await buildClient(projectRoot, pageFile);
+    assert.deepEqual(preserved.moduleGraph, [
+      { file: "app/Client.tsx", imports: [] },
+      {
+        file: "app/page.tsx",
+        imports: ["app/server.ts"],
+        watchFiles: ["app/server.tsx", "tsconfig.json"],
+      },
+      { file: "app/server.ts", imports: ["app/Client.tsx"] },
+    ]);
+    assert.deepEqual(preserved.clientReferences.map((reference) => reference.id), ["app/Client.tsx#Widget"]);
+
+    await writeFile(
+      serverFile,
+      `import type { Widget } from "./Client"; export type WidgetType = typeof Widget;\n`,
+    );
+    const erased = await buildClient(projectRoot, pageFile);
+    assert.deepEqual(erased.moduleGraph, [
+      {
+        file: "app/page.tsx",
+        imports: ["app/server.ts"],
+        watchFiles: ["app/server.tsx", "tsconfig.json"],
+      },
+      { file: "app/server.ts", imports: [] },
+    ]);
+    assert.deepEqual(erased.clientReferences, []);
+  });
+});
+
+test("build-client reports malformed or unresolved TypeScript configuration", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const configFile = join(projectRoot, "tsconfig.json");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `export default function Page() { return null; }\n`);
+
+    await writeFile(configFile, `{ "compilerOptions": {`);
+    await assert.rejects(buildClient(projectRoot, pageFile), /could not read tsconfig\.json/);
+
+    await writeFile(configFile, JSON.stringify({ extends: "./missing-tsconfig.json" }, null, 2));
+    await assert.rejects(buildClient(projectRoot, pageFile), /could not load tsconfig\.json/);
+  });
+});
+
+test("build-client includes two-argument dynamic imports in the runtime graph", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `import "./server"; export default function Page() { return null; }\n`);
+    await writeFile(
+      join(projectRoot, "app/server.ts"),
+      `void import("./lazy", { with: { type: "javascript" } });\n`,
+    );
+    await writeFile(join(projectRoot, "app/lazy.ts"), `export const value = "lazy";\n`);
+
+    const bundle = await buildClient(projectRoot, pageFile);
+    assert.deepEqual(bundle.moduleGraph, [
+      { file: "app/lazy.ts", imports: [] },
+      { file: "app/page.tsx", imports: ["app/server.ts"], watchFiles: ["app/server.tsx"] },
+      { file: "app/server.ts", imports: ["app/lazy.ts"], watchFiles: ["app/lazy.tsx"] },
+    ]);
+  });
+});
+
+test("build-client rejects ambiguous imports across use-client boundaries", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const serverFile = join(projectRoot, "app/server.ts");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `import "./server"; export default function Page() { return null; }\n`);
+    await writeFile(
+      join(projectRoot, "app/Client.tsx"),
+      `"use client"; export default function Client() { return null; } export const Named = Client;\n`,
+    );
+
+    const cases = [
+      `import * as Client from "./Client"; void Client;`,
+      `import "./Client";`,
+      `void import("./Client", { with: {} });`,
+      `const Client = require("./Client"); void Client;`,
+      `import Client = require("./Client"); void Client;`,
+      `export * from "./Client";`,
+    ];
+    for (const source of cases) {
+      await writeFile(serverFile, `${source}\nexport const value = true;\n`);
+      await assert.rejects(
+        buildClient(projectRoot, pageFile),
+        /must use concrete default or named imports\/exports/,
+      );
+    }
+  });
+});
+
+test("build-client retries when a resolver input changes during bundling", { skip: platform === "win32" }, async () => {
+  await withTempProject(async (projectRoot) => {
+    const appDir = join(projectRoot, "app");
+    const pageFile = join(appDir, "page.tsx");
+    const clientLink = join(appDir, "Client.tsx");
+    await mkdir(appDir, { recursive: true });
+    await writeFile(
+      pageFile,
+      `import Client from "./Client"; export default function Page() { return <Client />; }\n`,
+    );
+    const filler = Array.from({ length: 20_000 }, (_value, index) => `export const value${index} = ${index};`).join("\n");
+    await writeFile(
+      join(appDir, "ClientA.tsx"),
+      `"use client";\n${filler}\nexport default function Client() { return null; }\n`,
+    );
+    await writeFile(
+      join(appDir, "ClientB.tsx"),
+      `"use client"; export default function Client() { return <button>stable</button>; }\n`,
+    );
+    await symlink("ClientA.tsx", clientLink);
+
+    const build = buildClient(projectRoot, pageFile);
+    await waitForDirectoryWithPrefix(join(projectRoot, ".ferrite/tmp"), "client-reference-");
+    await rm(clientLink);
+    await symlink("ClientB.tsx", clientLink);
+    const bundle = await build;
+
+    assert.deepEqual(bundle.clientReferences.map((reference) => reference.id), ["app/ClientB.tsx#default"]);
+    assert.deepEqual(bundle.moduleGraph, [
+      { file: "app/ClientB.tsx", imports: [] },
+      { file: "app/page.tsx", imports: ["app/ClientB.tsx"], watchFiles: ["app/Client.tsx"] },
+    ]);
   });
 });
 
@@ -355,7 +530,7 @@ test("build-client includes static CommonJS and TypeScript import-equals depende
     assert.deepEqual(bundle.moduleGraph, [
       { file: "app/legacy.cjs", imports: ["app/nested.cjs"] },
       { file: "app/nested.cjs", imports: [] },
-      { file: "app/page.tsx", imports: ["app/server.ts"] },
+      { file: "app/page.tsx", imports: ["app/server.ts"], watchFiles: ["app/server.tsx"] },
       { file: "app/server.ts", imports: ["app/legacy.cjs"] },
     ]);
   });

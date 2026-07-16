@@ -1186,7 +1186,11 @@ impl DevProject {
 
         let files = module_graph
             .iter()
-            .map(|node| node.file.clone())
+            .flat_map(|node| {
+                std::iter::once(node.file.clone()).chain(node.watch_files.iter().cloned())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         let fingerprint = fingerprint_module_graph(&self.config.project, &files)?;
         snapshot.module_graphs.insert(
@@ -9509,10 +9513,6 @@ process.stdout.write(JSON.stringify({
             &temp.path().join("shared.ts"),
             "export const value = 'first';",
         );
-        write(
-            &temp.path().join("shared.js"),
-            "export const value = 'runtime';",
-        );
         let mut project = project_for(&app);
         project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../packages/runtime/bin/build-client.mjs");
@@ -9524,15 +9524,113 @@ process.stdout.write(JSON.stringify({
             &temp.path().join("shared.ts"),
             "export const value = 'other';",
         );
+        let fallback_build = project.build_id().unwrap();
+        assert!(fallback_build > first_build);
 
-        assert_eq!(project.build_id().unwrap(), first_build);
+        // A newly created runtime file outranks the previously selected TypeScript fallback.
+        write(
+            &temp.path().join("shared.js"),
+            "export const value = 'runtime';",
+        );
+        let runtime_build = project.build_id().unwrap();
+        assert!(runtime_build > fallback_build);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let refreshed_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'ignored fallback';",
+        );
+        assert_eq!(project.build_id().unwrap(), refreshed_build);
 
         write(
             &temp.path().join("shared.js"),
+            "export const value = 'changed runtime';",
+        );
+        assert!(project.build_id().unwrap() > refreshed_build);
+    }
+
+    #[test]
+    fn compiler_config_changes_invalidate_dev_module_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &temp.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": false } }"#,
+        );
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn layout_module_graph_dependencies_invalidate_the_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("layout.tsx"),
+            "import '../layout-shared'; export default function Layout({ children }) { return children; }",
+        );
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &temp.path().join("layout-shared.ts"),
+            "export const value = 'first';",
+        );
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("layout-shared.ts"),
             "export const value = 'changed';",
         );
 
         assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn removed_routes_drop_their_module_graph_watch_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("page.tsx"),
+            "import '../shared'; export default function Page() {}",
+        );
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'first';",
+        );
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        fs::remove_file(app.join("page.tsx")).unwrap();
+        let after_removal = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'changed after route removal';",
+        );
+
+        assert_eq!(project.build_id().unwrap(), after_removal);
     }
 
     #[test]
