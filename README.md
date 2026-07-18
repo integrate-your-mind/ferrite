@@ -48,7 +48,28 @@ The safest alpha offer today is a controlled internal dashboard, docs portal, or
 - An `ErrorBoundary` runtime primitive that catches render failures in DOM, hydration, SSR, and transition-triggered rerenders.
 - A small priority scheduler for sync and transition work, with cooperative yielding before transition DOM commits.
 - DOM reconciliation that patches compatible text/elements in place and reorders keyed element children.
-- A sample app that typechecks through the Ferrite CLI.
+- Source-build examples ranging from a minimal route to a product-shaped docs workbench and the broader framework feature fixture.
+
+## Examples
+
+- [`examples/hello-world-demo`](examples/hello-world-demo/README.md) is the smallest source-checkout path: one TypeScript route, `ferrite check`, a production artifact, and artifact-only serving.
+- [`examples/docs-workbench`](examples/docs-workbench/README.md) is a product-shaped server-first documentation app with a custom document, layouts, generated dynamic and catch-all route types, metadata, prerendered paths, and one isolated client navigation island.
+- [`examples/basic`](examples/basic/README.md) remains the advanced framework fixture for full-route hydration, imported client islands, server actions, streaming, route loading/error conventions, and error boundaries.
+
+Run the dedicated gates from the repository root:
+
+```sh
+pnpm check:demos
+pnpm build:demos
+pnpm test:demos
+```
+
+`test:demos` builds real artifacts, validates every declared file hash and route,
+starts the actual `ferrite serve` adapter, exercises normal, query, deep-route,
+and 404 requests, drives the hydrated Docs Workbench in Chrome, and proves a
+tampered artifact is rejected before the server binds. The examples still
+require a source checkout; public packages and hosted deployment are not part
+of this proof.
 
 ## Commands
 
