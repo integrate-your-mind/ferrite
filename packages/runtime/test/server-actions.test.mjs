@@ -197,7 +197,7 @@ test("server render serializes server action forms to POST metadata", async () =
           tag: "input",
           props: {
             name: "title",
-            defaultValue: "Draft",
+            value: "Draft",
           },
           children: [],
         },

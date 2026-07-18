@@ -71,6 +71,19 @@ const fileLoaders = {
   ".woff2": "file",
   ".wasm": "file",
 };
+const sourceLoaders = {
+  ".js": "js",
+  ".jsx": "jsx",
+  ".ts": "ts",
+  ".tsx": "tsx",
+  ".mjs": "js",
+  ".cjs": "js",
+  ".mts": "ts",
+  ".cts": "ts",
+  ".css": "css",
+  ".json": "json",
+};
+const buildInputLoaders = { ...sourceLoaders, ...fileLoaders };
 const extensionlessSourceExtensions = [".tsx", ".ts", ".jsx", ".js"];
 const sourceExtensions = [...extensionlessSourceExtensions, ".mts", ".cts", ".mjs", ".cjs"];
 const emittedSourceSubstitutions = new Map([
@@ -121,10 +134,16 @@ if (!response) {
 await writeResponse(response);
 
 async function bundleServerRoute(moduleGraph, buildOutDir) {
-  const referenceBundles = await bundleClientReferences(moduleGraph.references, projectRoot, buildOutDir, publicPath);
+  const referenceBundles = await bundleClientReferences(
+    moduleGraph.references,
+    projectRoot,
+    buildOutDir,
+    publicPath,
+    moduleGraph.snapshot,
+  );
   const actionBootstrap =
     options.actionBootstrap === true && referenceBundles.clientReferences.length === 0
-      ? await bundleActionBootstrap(entryName, projectRoot, buildOutDir, publicPath)
+      ? await bundleActionBootstrap(entryName, projectRoot, buildOutDir, publicPath, moduleGraph.snapshot)
       : null;
   return {
     script: null,
@@ -171,7 +190,7 @@ async function bundleClientRoute(moduleGraph, buildOutDir) {
     `}`,
     "",
   ].join("\n");
-  const summary = await buildGeneratedEntry(entryName, source, "tsx", buildOutDir);
+  const summary = await buildGeneratedEntry(entryName, source, "tsx", buildOutDir, moduleGraph.snapshot);
   return {
     script: summary.script,
     styles: summary.styles,
@@ -279,14 +298,14 @@ function ferriteRuntimeAliasPlugin() {
   };
 }
 
-async function bundleClientReferences(clientReferences, projectRoot, outDir, publicPath) {
+async function bundleClientReferences(clientReferences, projectRoot, outDir, publicPath, snapshot) {
   const bundledReferences = [];
   const outputs = new Set();
   const sourcemaps = new Set();
   const assets = new Set();
 
   for (const clientReference of clientReferences) {
-    const summary = await bundleClientReference(clientReference, projectRoot, outDir, publicPath);
+    const summary = await bundleClientReference(clientReference, projectRoot, outDir, publicPath, snapshot);
     bundledReferences.push({
       id: clientReference.id,
       module: clientReference.module,
@@ -316,7 +335,7 @@ async function bundleClientReferences(clientReferences, projectRoot, outDir, pub
   };
 }
 
-async function bundleActionBootstrap(routeEntryName, projectRoot, outDir, publicPath) {
+async function bundleActionBootstrap(routeEntryName, projectRoot, outDir, publicPath, snapshot) {
   const entryName = `${routeEntryName}-action-bootstrap`;
   const source = [
     `import { bootstrapServerActionForms } from "@ferrite/runtime/dom";`,
@@ -325,16 +344,22 @@ async function bundleActionBootstrap(routeEntryName, projectRoot, outDir, public
     `}`,
     "",
   ].join("\n");
-  return buildGeneratedEntry(entryName, source, "ts", outDir);
+  return buildGeneratedEntry(entryName, source, "ts", outDir, snapshot);
 }
 
 function mergeSorted(...lists) {
   return [...new Set(lists.flat())].sort(compareDeterministicStrings);
 }
 
-async function bundleClientReference(clientReference, projectRoot, outDir, publicPath) {
+async function bundleClientReference(clientReference, projectRoot, outDir, publicPath, snapshot) {
   const entryName = clientReferenceEntryName(clientReference);
-  return buildGeneratedEntry(entryName, await clientReferenceEntrySource(clientReference), "tsx", outDir);
+  return buildGeneratedEntry(
+    entryName,
+    await clientReferenceEntrySource(clientReference),
+    "tsx",
+    outDir,
+    snapshot,
+  );
 }
 
 async function clientReferenceEntrySource(clientReference) {
@@ -385,11 +410,12 @@ function clientReferenceEntryName(clientReference) {
   return `client-reference-${clientReference.id.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "index"}`;
 }
 
-async function buildGeneratedEntry(generatedEntryName, source, loader, buildOutDir) {
+async function buildGeneratedEntry(generatedEntryName, source, loader, buildOutDir, snapshot) {
   if (!/^[A-Za-z0-9_-]+$/.test(generatedEntryName)) {
     throw new Error(`Invalid Ferrite generated client entry name: ${generatedEntryName}`);
   }
   const sourcefile = `.ferrite/generated/${generatedEntryName}.${loader}`;
+  const loadedInputs = new Map();
   const result = await build({
     stdin: {
       contents: source,
@@ -409,11 +435,51 @@ async function buildGeneratedEntry(generatedEntryName, source, loader, buildOutD
     sourcemap: true,
     metafile: true,
     ...(loader === "tsx" ? { jsx: "automatic", jsxImportSource: "@ferrite/runtime" } : {}),
-    plugins: [ferriteRuntimeAliasPlugin()],
+    plugins: [ferriteRuntimeAliasPlugin(), snapshotBuildInputsPlugin(snapshot, loadedInputs)],
     loader: fileLoaders,
     logLevel: "silent",
   });
+  assertBuildInputsSnapshotted(result, sourcefile, loadedInputs, snapshot);
   return summarizeBuildResult(result, buildOutDir, sourcefile, publicPath);
+}
+
+function snapshotBuildInputsPlugin(snapshot, loadedInputs) {
+  return {
+    name: "ferrite-build-input-snapshot",
+    setup(build) {
+      build.onLoad({ filter: /.*/, namespace: "file" }, async (args) => {
+        const loader = buildInputLoaders[extname(args.path).toLowerCase()];
+        if (!loader) {
+          return undefined;
+        }
+
+        const canonical = await realpath(args.path);
+        const contents = await readFile(canonical);
+        loadedInputs.set(resolve(args.path), canonical);
+        recordSnapshotValue(snapshot.sources, canonical, `sha256:${sha256(contents)}`, snapshot);
+        return {
+          contents,
+          loader,
+          resolveDir: dirname(canonical),
+        };
+      });
+    },
+  };
+}
+
+function assertBuildInputsSnapshotted(result, generatedSourcefile, loadedInputs, snapshot) {
+  const generatedInput = resolve(projectRoot, generatedSourcefile);
+  for (const input of Object.keys(result.metafile.inputs)) {
+    const absoluteInput = resolve(projectRoot, input);
+    if (absoluteInput === generatedInput) {
+      continue;
+    }
+
+    const canonical = loadedInputs.get(absoluteInput);
+    if (!canonical || !snapshot.sources.has(canonical)) {
+      throw new Error(`Ferrite client build input was not snapshotted: ${input}`);
+    }
+  }
 }
 
 function summarizeBuildResult(result, outDir, entryPoint, publicPath) {

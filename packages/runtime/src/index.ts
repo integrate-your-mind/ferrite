@@ -184,7 +184,7 @@ export function toSerializableNode(child: Child): SerializableNode | null {
   return {
     kind: "element",
     tag: child.type,
-    props: serializeProps(child.props),
+    props: serializeProps(child.type, child.props),
     children: flattenChildren(child.props.children),
   };
 }
@@ -249,7 +249,7 @@ function flattenChildren(child: Child): SerializableNode[] {
   return [serialized];
 }
 
-function serializeProps(props: Record<string, unknown>): Record<string, SerializableProp> {
+function serializeProps(tag: string, props: Record<string, unknown>): Record<string, SerializableProp> {
   const serialized: Record<string, SerializableProp> = {};
 
   for (const [key, value] of Object.entries(props)) {
@@ -262,7 +262,7 @@ function serializeProps(props: Record<string, unknown>): Record<string, Serializ
     }
 
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      serialized[serializablePropName(key)] = value;
+      serialized[serializablePropName(tag, key)] = value;
       continue;
     }
 
@@ -272,13 +272,21 @@ function serializeProps(props: Record<string, unknown>): Record<string, Serializ
   return serialized;
 }
 
-function serializablePropName(name: string): string {
+function serializablePropName(tag: string, name: string): string {
   if (name === "className") {
     return "class";
   }
 
   if (name === "htmlFor") {
     return "for";
+  }
+
+  if (tag === "input" && name === "defaultValue") {
+    return "value";
+  }
+
+  if (tag === "input" && name === "defaultChecked") {
+    return "checked";
   }
 
   return name;

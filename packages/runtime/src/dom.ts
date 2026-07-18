@@ -1149,7 +1149,7 @@ function appendCompactHeadChild(parent: Element, node: unknown, document: Docume
 function applyCompactHeadProps(element: Element, value: unknown, path: string): void {
   const props = compactProps(value, path);
   for (const [name, prop] of Object.entries(props)) {
-    const attribute = attributeNameFromProp(name);
+    const attribute = attributeNameFromProp(element.localName, name);
     if (prop === true) {
       element.setAttribute(attribute, "");
     } else if (prop !== false) {
@@ -2041,7 +2041,7 @@ class DomRoot {
       return;
     }
 
-    const attributeName = attributeNameFromProp(name);
+    const attributeName = attributeNameFromProp(element.localName, name);
 
     if (value === true) {
       element.setAttribute(attributeName, "");
@@ -2071,7 +2071,7 @@ class DomRoot {
   }
 
   private assertHydratedAttribute(element: Element, name: string, value: unknown): void {
-    const attributeName = attributeNameFromProp(name);
+    const attributeName = attributeNameFromProp(element.localName, name);
 
     if (value === null || value === undefined || value === false) {
       if (element.hasAttribute(attributeName)) {
@@ -2578,13 +2578,21 @@ class HydrationCursor {
   }
 }
 
-function attributeNameFromProp(name: string): string {
+function attributeNameFromProp(tag: string, name: string): string {
   if (name === "className") {
     return "class";
   }
 
   if (name === "htmlFor") {
     return "for";
+  }
+
+  if (tag === "input" && name === "defaultValue") {
+    return "value";
+  }
+
+  if (tag === "input" && name === "defaultChecked") {
+    return "checked";
   }
 
   return name;

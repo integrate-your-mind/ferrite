@@ -2317,6 +2317,23 @@ test("toRenderPacket emits compact text, fragment, and element nodes", () => {
   });
 });
 
+test("form defaults serialize to effective HTML attributes", () => {
+  const packet = toRenderPacket(
+    createElement("input", {
+      name: "title",
+      type: "checkbox",
+      defaultValue: "Draft",
+      defaultChecked: true,
+    }),
+  );
+
+  assert.deepEqual(packet, {
+    ferrite: "render-packet",
+    version: 1,
+    root: [2, "input", { name: "title", type: "checkbox", value: "Draft", checked: true }, []],
+  });
+});
+
 test("toRenderPacket uses an empty fragment for empty output", () => {
   assert.deepEqual(toRenderPacket(null), {
     ferrite: "render-packet",

@@ -4861,6 +4861,7 @@ fn is_source_file(path: &Path) -> bool {
                 | "jpeg"
                 | "jpg"
                 | "js"
+                | "json"
                 | "jsx"
                 | "cjs"
                 | "cts"
@@ -4871,6 +4872,7 @@ fn is_source_file(path: &Path) -> bool {
                 | "ts"
                 | "tsx"
                 | "webp"
+                | "wasm"
                 | "woff"
                 | "woff2",
         )
@@ -9876,6 +9878,55 @@ process.stdout.write(JSON.stringify({
             "export const value = 'changed runtime';",
         );
         assert!(project.build_id().unwrap() > refreshed_build);
+    }
+
+    #[test]
+    fn real_compiler_build_inputs_drive_css_json_and_wasm_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("page.tsx"),
+            r#""use client";
+import data from "../data.json";
+import wasmUrl from "../module.wasm";
+import "../style.css";
+export default function Page() { return <main data-wasm={wasmUrl}>{data.label}</main>; }
+"#,
+        );
+        write(&temp.path().join("data.json"), r#"{ "label": "first" }"#);
+        write(&temp.path().join("style.css"), ".page { color: red; }");
+        fs::write(
+            temp.path().join("module.wasm"),
+            [0_u8, 97, 115, 109, 1, 0, 0, 0],
+        )
+        .unwrap();
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(&temp.path().join("data.json"), r#"{ "label": "second" }"#);
+        let json_build = project.build_id().unwrap();
+        assert!(json_build > first_build);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let after_json = project.build_id().unwrap();
+
+        write(&temp.path().join("style.css"), ".page { color: blue; }");
+        let css_build = project.build_id().unwrap();
+        assert!(css_build > after_json);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let after_css = project.build_id().unwrap();
+
+        fs::write(
+            temp.path().join("module.wasm"),
+            [0_u8, 97, 115, 109, 1, 0, 0, 0, 1],
+        )
+        .unwrap();
+        assert!(project.build_id().unwrap() > after_css);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
     }
 
     #[test]

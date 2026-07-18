@@ -900,7 +900,7 @@ function renderServerChildMaybe(
     return children.then((resolvedChildren) => ({
       kind: "element",
       tag: child.type as string,
-      props: serializeServerProps(child.props),
+      props: serializeServerProps(child.type as string, child.props),
       children: resolvedChildren,
     }));
   }
@@ -908,7 +908,7 @@ function renderServerChildMaybe(
   return {
     kind: "element",
     tag: child.type,
-    props: serializeServerProps(child.props),
+    props: serializeServerProps(child.type, child.props),
     children,
   };
 }
@@ -1131,7 +1131,7 @@ function createHiddenServerActionInput(name: string, value: string): Serializabl
 
 function serializeServerActionFormProps(props: Record<string, unknown>): Record<string, string | number | boolean> {
   const { action: _action, children: _children, key: _key, method: _method, ...rest } = props;
-  return serializeServerProps({
+  return serializeServerProps("form", {
     ...rest,
     action: SERVER_ACTION_URL,
     method: "post",
@@ -1188,7 +1188,10 @@ function isServerActionReference(value: unknown): value is ServerActionReference
   );
 }
 
-function serializeServerProps(props: Record<string, unknown>): Record<string, string | number | boolean> {
+function serializeServerProps(
+  tag: string,
+  props: Record<string, unknown>,
+): Record<string, string | number | boolean> {
   const serialized: Record<string, string | number | boolean> = {};
 
   for (const [key, value] of Object.entries(props)) {
@@ -1201,7 +1204,7 @@ function serializeServerProps(props: Record<string, unknown>): Record<string, st
     }
 
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      serialized[serializablePropName(key)] = value;
+      serialized[serializablePropName(tag, key)] = value;
       continue;
     }
 
@@ -1257,13 +1260,21 @@ function serializeClientReferenceValue(value: unknown, path: string): ClientRefe
   throw new TypeError(`Ferrite client reference ${path} must be JSON-serializable.`);
 }
 
-function serializablePropName(name: string): string {
+function serializablePropName(tag: string, name: string): string {
   if (name === "className") {
     return "class";
   }
 
   if (name === "htmlFor") {
     return "for";
+  }
+
+  if (tag === "input" && name === "defaultValue") {
+    return "value";
+  }
+
+  if (tag === "input" && name === "defaultChecked") {
+    return "checked";
   }
 
   return name;

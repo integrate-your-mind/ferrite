@@ -13,7 +13,7 @@ import { chromium } from "playwright-core";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const chromeExecutable = process.env.FERRITE_BROWSER_EXECUTABLE ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
-test("generated action form bootstrap works in Chromium for route, island, and server-only assets", async (t) => {
+test("generated action form bootstrap submits to a fixture server for route, island, and server-only assets", async (t) => {
   if (!existsSync(chromeExecutable)) {
     t.skip(`Chrome executable not found at ${chromeExecutable}`);
     return;
@@ -60,6 +60,205 @@ test("generated action form bootstrap works in Chromium for route, island, and s
   });
 });
 
+test("production serve handles browser hydration, payloads, and action success and failure", { timeout: 90_000 }, async (t) => {
+  if (!existsSync(chromeExecutable)) {
+    t.skip(`Chrome executable not found at ${chromeExecutable}`);
+    return;
+  }
+
+  const exampleProject = join(repoRoot, "examples/basic");
+  const metadata = JSON.parse(
+    (
+      await runCapture("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
+        cwd: repoRoot,
+      })
+    ).stdout,
+  );
+  const ferriteBinary = join(
+    metadata.target_directory,
+    "debug",
+    process.platform === "win32" ? "ferrite.exe" : "ferrite",
+  );
+
+  await run("cargo", ["build", "-p", "ferrite-cli"], { cwd: repoRoot });
+  await run(ferriteBinary, ["build", "--project", exampleProject], { cwd: repoRoot });
+
+  const port = await reserveLoopbackPort();
+  const origin = `http://127.0.0.1:${port}`;
+  const csrfToken = "ferrite-production-browser-proof";
+  const server = spawn(
+    ferriteBinary,
+    [
+      "serve",
+      "--project",
+      exampleProject,
+      "--artifact",
+      ".ferrite/build",
+      "--page-renderer",
+      join(repoRoot, "packages/runtime/bin/render-artifact.mjs"),
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--server-action-csrf-token-env",
+      "FERRITE_TEST_ACTION_CSRF",
+      "--server-action-replay-ttl-ms",
+      "60000",
+      "--access-log",
+      "json",
+      "--action-log",
+      "json",
+    ],
+    {
+      cwd: repoRoot,
+      env: { ...process.env, FERRITE_TEST_ACTION_CSRF: csrfToken },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const logs = captureChildOutput(server);
+
+  let browser;
+  try {
+    await waitForServer(origin, server, logs);
+    browser = await chromium.launch({ executablePath: chromeExecutable, headless: true });
+    const page = await browser.newPage();
+    await page.addInitScript(() => {
+      const fetchImpl = globalThis.fetch.bind(globalThis);
+      globalThis.__ferriteActionResponses = [];
+      globalThis.fetch = async (...args) => {
+        const response = await fetchImpl(...args);
+        const requestUrl = new URL(
+          typeof args[0] === "string" || args[0] instanceof URL ? args[0] : args[0].url,
+          globalThis.location.href,
+        );
+        if (requestUrl.pathname === "/_ferrite/action") {
+          globalThis.__ferriteActionResponses.push({
+            status: response.status,
+            body: await response.clone().text(),
+          });
+        }
+        return response;
+      };
+    });
+
+    const documentResponse = await page.goto(`${origin}/posts/alpha`, { waitUntil: "networkidle" });
+    assert.equal(documentResponse?.status(), 200);
+    assert.equal(await page.title(), "Post alpha");
+    await page.getByRole("heading", { name: "Post alpha" }).waitFor();
+    assert.equal(await page.locator('input[name="title"]').inputValue(), "Post alpha");
+    assert.deepEqual(
+      await page.locator("form").first().locator('input[type="hidden"]').evaluateAll((inputs) =>
+        Object.fromEntries(inputs.map((input) => [input.name, input.value])),
+      ),
+      {
+        __ferrite_action: "app/posts/[id]/page.tsx#savePost",
+        __ferrite_route: "/posts/alpha",
+        __ferrite_csrf: csrfToken,
+        __ferrite_nonce: await page.locator('input[name="__ferrite_nonce"]').inputValue(),
+      },
+    );
+    assert.ok((await page.locator('input[name="__ferrite_nonce"]').inputValue()).length > 0);
+
+    await page.getByRole("button", { name: "Like alpha: 0" }).click();
+    await page.getByRole("button", { name: "Like alpha: 1" }).waitFor();
+
+    const payloads = await page.evaluate(async () => {
+      const payloadResponse = await fetch("/posts/beta?__ferrite_payload=server");
+      const streamResponse = await fetch("/posts/beta?__ferrite_payload=stream");
+      return {
+        payload: {
+          status: payloadResponse.status,
+          contentType: payloadResponse.headers.get("content-type"),
+          body: await payloadResponse.json(),
+        },
+        stream: {
+          status: streamResponse.status,
+          contentType: streamResponse.headers.get("content-type"),
+          frames: (await streamResponse.text())
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line)),
+        },
+      };
+    });
+    assert.equal(payloads.payload.status, 200);
+    assert.match(payloads.payload.contentType, /^application\/vnd\.ferrite\.server-payload\+json/);
+    assert.equal(payloads.payload.body.ferrite, "server-payload");
+    assert.equal(payloads.payload.body.version, 1);
+    assert.equal(payloads.stream.status, 200);
+    assert.match(
+      payloads.stream.contentType,
+      /^application\/vnd\.ferrite\.server-payload-stream\+jsonl/,
+    );
+    assert.ok(payloads.stream.frames.length >= 1);
+    assert.equal(payloads.stream.frames[0].ferrite, "server-payload-frame");
+    assert.equal(payloads.stream.frames[0].version, 1);
+    assert.equal(payloads.stream.frames[0].kind, "shell");
+
+    const betaResponse = await page.goto(`${origin}/posts/beta`, { waitUntil: "networkidle" });
+    assert.equal(betaResponse?.status(), 200);
+    assert.equal(await page.title(), "Post beta");
+    await page.getByRole("heading", { name: "Post beta" }).waitFor();
+
+    await page.goto(`${origin}/posts/alpha`, { waitUntil: "networkidle" });
+    await page.locator('input[name="title"]').fill("Browser production title");
+    await page.getByRole("button", { name: "Save" }).click();
+    await page.waitForFunction(() => globalThis.__ferriteActionResponses.length === 1);
+    assert.deepEqual(JSON.parse((await capturedActionResponses(page))[0].body), {
+      ferrite: "server-action-response",
+      version: 1,
+      status: "ok",
+      data: {
+        ok: true,
+        routePath: "/posts/alpha",
+        title: "Browser production title",
+      },
+    });
+    assert.equal(page.url(), `${origin}/posts/alpha`);
+
+    await page.reload({ waitUntil: "networkidle" });
+    await page.locator('input[name="__ferrite_action"]').evaluate((input) => {
+      input.value = "app/posts/[id]/page.tsx#missing";
+    });
+    await page.getByRole("button", { name: "Save" }).click();
+    await page.waitForFunction(() => globalThis.__ferriteActionResponses.length === 1);
+    const rejectedResponse = (await capturedActionResponses(page))[0];
+    assert.equal(rejectedResponse.status, 404);
+    assert.match(rejectedResponse.body, /No Ferrite server action .*#missing.* was registered/);
+    assert.equal(page.url(), `${origin}/posts/alpha`);
+    await page.getByRole("heading", { name: "Post alpha" }).waitFor();
+    await page.getByRole("button", { name: "Like alpha: 0" }).click();
+    await page.getByRole("button", { name: "Like alpha: 1" }).waitFor();
+
+    await page.close();
+  } finally {
+    await browser?.close();
+    await stopChild(server, logs);
+  }
+
+  assert.doesNotMatch(`${logs.stdout}\n${logs.stderr}`, new RegExp(csrfToken));
+  const actionEntries = parseJsonLogEntries(logs.stderr).filter((entry) => "action_id" in entry);
+  assert.ok(
+    actionEntries.some(
+      (entry) =>
+        entry.action_id === "app/posts/[id]/page.tsx#savePost" &&
+        entry.route_path === "/posts/alpha" &&
+        entry.status === 200 &&
+        entry.outcome === "accepted",
+    ),
+  );
+  assert.ok(
+    actionEntries.some(
+      (entry) =>
+        entry.action_id === "app/posts/[id]/page.tsx#missing" &&
+        entry.route_path === "/posts/alpha" &&
+        entry.status === 404 &&
+        entry.outcome === "rejected",
+    ),
+  );
+});
+
 async function assertEnhancedSubmission(browser, origin, receivedActions, route) {
   const page = await browser.newPage();
   try {
@@ -88,6 +287,10 @@ async function assertEnhancedSubmission(browser, origin, receivedActions, route)
   } finally {
     await page.close();
   }
+}
+
+async function capturedActionResponses(page) {
+  return page.evaluate(() => globalThis.__ferriteActionResponses);
 }
 
 async function createBrowserFixtureProject() {
@@ -357,6 +560,10 @@ function createAsyncQueue() {
 }
 
 async function run(command, args, options) {
+  await runCapture(command, args, options);
+}
+
+async function runCapture(command, args, options) {
   const child = spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
   const stdout = [];
   const stderr = [];
@@ -368,4 +575,93 @@ async function run(command, args, options) {
       `${command} ${args.join(" ")} failed with exit code ${status}\n${Buffer.concat(stdout).toString("utf8")}${Buffer.concat(stderr).toString("utf8")}`,
     );
   }
+  return {
+    stdout: Buffer.concat(stdout).toString("utf8"),
+    stderr: Buffer.concat(stderr).toString("utf8"),
+  };
+}
+
+async function reserveLoopbackPort() {
+  const server = createServer();
+  await new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  await new Promise((resolveClose, rejectClose) =>
+    server.close((error) => (error ? rejectClose(error) : resolveClose())),
+  );
+  return address.port;
+}
+
+function captureChildOutput(child) {
+  const logs = { stdout: "", stderr: "" };
+  const append = (name, chunk) => {
+    logs[name] = `${logs[name]}${chunk.toString("utf8")}`.slice(-256 * 1024);
+  };
+  child.stdout.on("data", (chunk) => append("stdout", chunk));
+  child.stderr.on("data", (chunk) => append("stderr", chunk));
+  return logs;
+}
+
+async function waitForServer(origin, child, logs) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(
+        `Ferrite production server exited before readiness\n${logs.stdout}\n${logs.stderr}`,
+      );
+    }
+    try {
+      const response = await fetch(`${origin}/posts/alpha`, { signal: AbortSignal.timeout(500) });
+      if (response.status === 200) {
+        await response.arrayBuffer();
+        return;
+      }
+    } catch {
+      // The bounded readiness loop reports captured server output on timeout.
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  throw new Error(`Ferrite production server did not become ready\n${logs.stdout}\n${logs.stderr}`);
+}
+
+async function stopChild(child, logs) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    assert.equal(
+      child.exitCode,
+      0,
+      `Ferrite production server exited by ${child.signalCode ?? child.exitCode}\n${logs.stdout}\n${logs.stderr}`,
+    );
+    return;
+  }
+
+  const exitPromise = new Promise((resolveExit) =>
+    child.once("exit", (code, signal) => resolveExit({ code, signal, timedOut: false })),
+  );
+  child.kill("SIGTERM");
+  const terminal = await Promise.race([
+    exitPromise,
+    new Promise((resolveTimeout) =>
+      setTimeout(() => resolveTimeout({ code: null, signal: null, timedOut: true }), 10_000),
+    ),
+  ]);
+  if (terminal.timedOut) {
+    child.kill("SIGKILL");
+    await new Promise((resolveExit) => child.once("exit", resolveExit));
+    throw new Error(`Ferrite production server did not stop after SIGTERM\n${logs.stdout}\n${logs.stderr}`);
+  }
+  assert.equal(terminal.code, 0, `Ferrite production server exited by ${terminal.signal ?? terminal.code}`);
+}
+
+function parseJsonLogEntries(log) {
+  return log.split(/\r?\n/).flatMap((line) => {
+    try {
+      const entry = JSON.parse(line);
+      return entry && typeof entry === "object" ? [entry] : [];
+    } catch {
+      return [];
+    }
+  });
 }

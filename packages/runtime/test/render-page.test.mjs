@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
@@ -113,6 +114,16 @@ async function readBundleOutputs(outDir, bundle) {
     outputs[output] = (await readFile(join(outDir, output))).toString("base64");
   }
   return outputs;
+}
+
+function sourceSnapshotValue(bundle, file) {
+  return bundle.inputSnapshot.find(
+    (input) => input.kind === "source" && input.path === file,
+  )?.value;
+}
+
+function sha256(value) {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 async function assertPublishedSourceMaps(projectRoot, outDir, bundle) {
@@ -246,6 +257,66 @@ test("build-client emits a complete module graph and refreshes it after dependen
       { file: "app/shared.ts", imports: ["app/CounterTwo.tsx"] },
     ]);
     assert.deepEqual(second.clientReferences.map((reference) => reference.id), ["app/CounterTwo.tsx#default"]);
+  });
+});
+
+test("build-client snapshots every CSS, JSON, and WASM input esbuild consumes", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const cssFile = join(projectRoot, "app/style.css");
+    const jsonFile = join(projectRoot, "app/data.json");
+    const wasmFile = join(projectRoot, "app/module.wasm");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `"use client";`,
+        `import data from "./data.json";`,
+        `import wasmUrl from "./module.wasm";`,
+        `import "./style.css";`,
+        `export default function Page() { return <main data-wasm={wasmUrl}>{data.label}</main>; }`,
+        "",
+      ].join("\n"),
+    );
+    const initialCss = ".page { color: red; }\n";
+    const initialJson = '{ "label": "first" }\n';
+    const initialWasm = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]);
+    await writeFile(cssFile, initialCss);
+    await writeFile(jsonFile, initialJson);
+    await writeFile(wasmFile, initialWasm);
+
+    const canonicalCss = await realpath(cssFile);
+    const canonicalJson = await realpath(jsonFile);
+    const canonicalWasm = await realpath(wasmFile);
+    const first = await buildClient(projectRoot, pageFile);
+    assert.equal(sourceSnapshotValue(first, canonicalCss), sha256(initialCss));
+    assert.equal(sourceSnapshotValue(first, canonicalJson), sha256(initialJson));
+    assert.equal(sourceSnapshotValue(first, canonicalWasm), sha256(initialWasm));
+    const firstOutputs = await readBundleOutputs(join(projectRoot, "out"), first);
+
+    const changedJson = '{ "label": "second" }\n';
+    await writeFile(jsonFile, changedJson);
+    const afterJson = await buildClient(projectRoot, pageFile);
+    assert.equal(sourceSnapshotValue(afterJson, canonicalJson), sha256(changedJson));
+    assert.notDeepEqual(
+      firstOutputs,
+      await readBundleOutputs(join(projectRoot, "out"), afterJson),
+    );
+
+    const changedCss = ".page { color: blue; }\n";
+    await writeFile(cssFile, changedCss);
+    const afterCss = await buildClient(projectRoot, pageFile);
+    assert.equal(sourceSnapshotValue(afterCss, canonicalCss), sha256(changedCss));
+    assert.notEqual(sourceSnapshotValue(afterCss, canonicalCss), sourceSnapshotValue(afterJson, canonicalCss));
+
+    const changedWasm = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0, 1]);
+    await writeFile(wasmFile, changedWasm);
+    const afterWasm = await buildClient(projectRoot, pageFile);
+    assert.equal(sourceSnapshotValue(afterWasm, canonicalWasm), sha256(changedWasm));
+    assert.notEqual(
+      sourceSnapshotValue(afterWasm, canonicalWasm),
+      sourceSnapshotValue(afterCss, canonicalWasm),
+    );
   });
 });
 
