@@ -145,12 +145,24 @@ impl ClientBundler {
     }
 
     pub fn bundle_route_request(&self, request: ClientBundleRequest<'_>) -> Result<ClientBundle> {
+        self.bundle_route_request_with_snapshot_files(request, &[])
+    }
+
+    pub fn bundle_route_request_with_snapshot_files(
+        &self,
+        request: ClientBundleRequest<'_>,
+        snapshot_files: &[PathBuf],
+    ) -> Result<ClientBundle> {
         let props = ClientProps {
             params: request.params.iter().cloned().collect(),
         };
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(request.layouts)?;
-        let options_json = serde_json::to_string(&request.options)?;
+        let mut options = serde_json::to_value(request.options)?;
+        if !snapshot_files.is_empty() {
+            options["snapshotFiles"] = serde_json::to_value(snapshot_files)?;
+        }
+        let options_json = serde_json::to_string(&options)?;
         let mut stale_error = None;
         for _attempt in 0..MAX_BUNDLE_SNAPSHOT_ATTEMPTS {
             let mut command = Command::new("node");

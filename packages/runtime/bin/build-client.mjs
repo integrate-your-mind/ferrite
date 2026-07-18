@@ -48,6 +48,11 @@ if (!options || typeof options !== "object" || Array.isArray(options)) {
   console.error("options JSON must be an object");
   process.exit(2);
 }
+const snapshotFiles = options.snapshotFiles ?? [];
+if (!Array.isArray(snapshotFiles) || snapshotFiles.some((file) => typeof file !== "string")) {
+  console.error("options.snapshotFiles must be an array of file paths");
+  process.exit(2);
+}
 
 const projectRoot = await realpath(await findNearestPackageRoot(resolve(pageFile)));
 const runtimeSrcRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "src");
@@ -76,13 +81,14 @@ const emittedSourceSubstitutions = new Map([
 await mkdir(outDir, { recursive: true });
 
 const routeFiles = [pageFile, ...layoutFiles];
+const graphFiles = [...routeFiles, ...snapshotFiles];
 const maxStableBuildAttempts = 2;
 let response;
 
 for (let attempt = 1; attempt <= maxStableBuildAttempts; attempt += 1) {
   const graphCompiler = await loadGraphCompilerOptions(projectRoot);
   const moduleGraph = await collectClientReferences(
-    routeFiles,
+    graphFiles,
     projectRoot,
     graphCompiler.options,
     graphCompiler.sources,

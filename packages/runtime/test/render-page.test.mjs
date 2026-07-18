@@ -426,6 +426,60 @@ test("build-client snapshots inherited TypeScript configuration outside the proj
   }
 });
 
+test("build-client snapshots additional production render roots and their imports", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const documentFile = join(projectRoot, "app/document.tsx");
+    const documentDependency = join(projectRoot, "app/document-shell.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `export default function Page() { return null; }\n`);
+    await writeFile(
+      documentFile,
+      `import { shell } from "./document-shell"; export default function Document() { return shell; }\n`,
+    );
+    await writeFile(documentDependency, `export const shell = "document";\n`);
+
+    const outDir = join(projectRoot, "out");
+    const { stdout } = await execFileAsync(
+      "node",
+      [
+        buildClientScript,
+        pageFile,
+        outDir,
+        "/_ferrite/static",
+        "/",
+        "{}",
+        "[]",
+        JSON.stringify({ snapshotFiles: [documentFile] }),
+      ],
+      { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+    );
+    const bundle = JSON.parse(stdout);
+    const canonicalDocument = await realpath(documentFile);
+    const canonicalDependency = await realpath(documentDependency);
+
+    assert.match(
+      bundle.inputSnapshot.find((entry) => entry.path === canonicalDocument && entry.kind === "source")?.value ?? "",
+      /^sha256:[a-f0-9]{64}$/,
+    );
+    assert.match(
+      bundle.inputSnapshot.find((entry) => entry.path === canonicalDependency && entry.kind === "source")?.value ?? "",
+      /^sha256:[a-f0-9]{64}$/,
+    );
+    assert.deepEqual(
+      bundle.moduleGraph.filter((node) => node.file.startsWith("app/document")),
+      [
+        { file: "app/document-shell.tsx", imports: [] },
+        {
+          file: "app/document.tsx",
+          imports: ["app/document-shell.tsx"],
+          watchFiles: ["tsconfig.json"],
+        },
+      ],
+    );
+  });
+});
+
 test("build-client includes two-argument dynamic imports in the runtime graph", async () => {
   await withTempProject(async (projectRoot) => {
     const pageFile = join(projectRoot, "app/page.tsx");
