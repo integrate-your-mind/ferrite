@@ -2654,7 +2654,7 @@ fn reject_overloaded_stream(
 ) {
     let _ = write_overload_response(&mut stream, response_write_timeout);
     let _ = stream.shutdown(Shutdown::Write);
-    let _ = drain_overload_request(
+    let _ = drain_request_with_budget(
         &mut stream,
         request_read_timeout
             .min(PRODUCTION_OVERLOAD_REQUEST_DRAIN_TIMEOUT)
@@ -2690,7 +2690,7 @@ fn write_overload_response(stream: &mut TcpStream, response_write_timeout: Durat
     )
 }
 
-fn drain_overload_request(
+fn drain_request_with_budget(
     stream: &mut TcpStream,
     timeout: Duration,
     max_request_bytes: usize,
@@ -3185,7 +3185,6 @@ where
         RequestReadResult::Request(request) => request,
         RequestReadResult::Response(response) => {
             let response = response.with_cache_control("no-store");
-            let _ = stream.shutdown(Shutdown::Read);
             write_response_with_options(
                 stream,
                 &response,
@@ -3194,6 +3193,15 @@ where
                     deadline: Some(response_write_timeout),
                 },
             )?;
+            let _ = stream.shutdown(Shutdown::Write);
+            let _ = drain_request_with_budget(
+                stream,
+                request_read_timeout
+                    .min(PRODUCTION_OVERLOAD_REQUEST_DRAIN_TIMEOUT)
+                    .max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT),
+                max_request_bytes,
+            );
+            let _ = stream.shutdown(Shutdown::Read);
             return Ok(());
         }
     };
@@ -8121,7 +8129,7 @@ setInterval(() => {}, 1000);
         let (mut stream, _) = listener.accept().unwrap();
 
         let started = Instant::now();
-        drain_overload_request(&mut stream, Duration::from_millis(25), 1024).unwrap();
+        drain_request_with_budget(&mut stream, Duration::from_millis(25), 1024).unwrap();
         let elapsed = started.elapsed();
         drop(stream);
         client.join().unwrap();
@@ -8747,7 +8755,9 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
 
         let started = Instant::now();
         let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
+        if let Err(error) = stream.read_to_string(&mut response) {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
         let elapsed = started.elapsed();
         trickle.join().unwrap();
         server.join().unwrap();
@@ -8796,7 +8806,9 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
 
         let started = Instant::now();
         let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
+        if let Err(error) = stream.read_to_string(&mut response) {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
         let elapsed = started.elapsed();
         trickle.join().unwrap();
         server.join().unwrap();

@@ -43,6 +43,13 @@ test("shutdown reuses terminal observation installed at spawn time", async () =>
   await stopChild(child, terminal, logs);
 });
 
+test("shutdown result accepts Windows forced SIGTERM semantics", () => {
+  assert.equal(isExpectedChildShutdown({ code: 0, signal: null }, "darwin"), true);
+  assert.equal(isExpectedChildShutdown({ code: null, signal: "SIGTERM" }, "win32"), true);
+  assert.equal(isExpectedChildShutdown({ code: null, signal: "SIGTERM" }, "darwin"), false);
+  assert.equal(isExpectedChildShutdown({ code: 1, signal: null }, "win32"), false);
+});
+
 test("browser cleanup still stops the server when browser close rejects", async (t) => {
   const child = spawn(
     process.execPath,
@@ -71,7 +78,7 @@ test("browser cleanup still stops the server when browser close rejects", async 
     ),
     /browser close failed/,
   );
-  assert.equal((await terminal).code, 0);
+  assert.equal(isExpectedChildShutdown(await terminal), true);
 });
 
 test("generated action form bootstrap submits to a fixture server for route, island, and server-only assets", async (t) => {
@@ -767,11 +774,14 @@ async function stopChild(child, terminalPromise, logs) {
   if (terminal.error) {
     throw new Error(`Ferrite production server failed to start: ${terminal.error.message}\n${logs.stdout}\n${logs.stderr}`);
   }
-  assert.equal(
-    terminal.code,
-    0,
+  assert.ok(
+    isExpectedChildShutdown(terminal),
     `Ferrite production server exited by ${terminal.signal ?? terminal.code}\n${logs.stdout}\n${logs.stderr}`,
   );
+}
+
+function isExpectedChildShutdown(terminal, platform = process.platform) {
+  return terminal.code === 0 || (platform === "win32" && terminal.signal === "SIGTERM");
 }
 
 async function waitForChildTerminal(terminalPromise, timeoutMs) {
