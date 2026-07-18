@@ -43,6 +43,37 @@ test("shutdown reuses terminal observation installed at spawn time", async () =>
   await stopChild(child, terminal, logs);
 });
 
+test("browser cleanup still stops the server when browser close rejects", async (t) => {
+  const child = spawn(
+    process.execPath,
+    ["-e", 'process.on("SIGTERM", () => process.exit(0)); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);'],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  const terminal = captureChildTerminal(child);
+  const logs = captureChildOutput(child);
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    await terminal;
+  });
+  await new Promise((resolveReady, rejectReady) => {
+    child.once("error", rejectReady);
+    child.stdout.once("data", resolveReady);
+  });
+
+  await assert.rejects(
+    closeOwnedBrowserAndServer(
+      { close: async () => { throw new Error("browser close failed"); } },
+      child,
+      terminal,
+      logs,
+    ),
+    /browser close failed/,
+  );
+  assert.equal((await terminal).code, 0);
+});
+
 test("generated action form bootstrap submits to a fixture server for route, island, and server-only assets", async (t) => {
   if (!existsSync(chromeExecutable)) {
     t.skip(`Chrome executable not found at ${chromeExecutable}`);
