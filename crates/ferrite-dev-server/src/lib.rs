@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
@@ -16,8 +16,9 @@ use ferrite_builder::{
     FERRITE_PRODUCTION_ARTIFACT_MANIFEST, ProductionArtifactError, load_production_artifact,
 };
 use ferrite_client_bundler::{
-    ClientBundle, ClientBundleError, ClientBundleOptions, ClientBundleRequest, ClientBundler,
-    fingerprint_client_bundle,
+    ClientBundle, ClientBundleError, ClientBundleInputSnapshot, ClientBundleOptions,
+    ClientBundleRequest, ClientBundler, fingerprint_client_bundle,
+    fingerprint_client_bundle_inputs,
 };
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
@@ -33,6 +34,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const SERVER_PAYLOAD_CONTENT_TYPE: &str =
     "application/vnd.ferrite.server-payload+json; charset=utf-8";
@@ -48,6 +50,7 @@ const SERVER_ACTION_CSRF_FIELD: &str = "__ferrite_csrf";
 const SERVER_ACTION_REPLAY_NONCE_FIELD: &str = "__ferrite_nonce";
 const SERVER_ACTION_RESPONSE_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 const SERVER_ACTION_CSRF_COOKIE_ATTRIBUTES: &str = "Path=/; SameSite=Lax; HttpOnly; Secure";
+const MAX_PRODUCTION_REPLAY_NONCES: usize = 4_096;
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -190,6 +193,10 @@ impl ProductionShutdownController {
 
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
     }
 }
 
@@ -411,6 +418,7 @@ fn prometheus_label_value(value: &str) -> String {
 struct ProductionReplayNonces {
     ttl: Duration,
     entries: BTreeMap<String, Instant>,
+    issuance_order: VecDeque<String>,
 }
 
 impl ProductionReplayNonces {
@@ -418,6 +426,7 @@ impl ProductionReplayNonces {
         Self {
             ttl,
             entries: BTreeMap::new(),
+            issuance_order: VecDeque::new(),
         }
     }
 
@@ -431,18 +440,41 @@ impl ProductionReplayNonces {
                 .with_cache_control("no-store"),
             )
         })?;
+        while self.entries.len() >= MAX_PRODUCTION_REPLAY_NONCES {
+            let Some(oldest) = self.issuance_order.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                break;
+            }
+        }
         self.entries
             .insert(nonce.clone(), Instant::now() + self.ttl);
+        self.issuance_order.push_back(nonce.clone());
         Ok(nonce)
     }
 
     fn consume(&mut self, nonce: &str) -> bool {
         self.prune_expired(Instant::now());
-        self.entries.remove(nonce).is_some()
+        let consumed = self.entries.remove(nonce).is_some();
+        if consumed {
+            self.issuance_order.retain(|issued| issued != nonce);
+        }
+        consumed
     }
 
     fn prune_expired(&mut self, now: Instant) {
-        self.entries.retain(|_, expires_at| *expires_at > now);
+        while let Some(oldest) = self.issuance_order.front() {
+            if self
+                .entries
+                .get(oldest)
+                .is_some_and(|expires_at| *expires_at > now)
+            {
+                break;
+            }
+            let oldest = self.issuance_order.pop_front().expect("front entry exists");
+            self.entries.remove(&oldest);
+        }
     }
 }
 
@@ -722,18 +754,42 @@ impl DevProject {
 
     fn ensure_fresh(&mut self) -> Result<()> {
         let fingerprint = fingerprint_app_dir(&self.config.app_dir)?;
+        let mut module_graphs = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.module_graphs.clone())
+            .unwrap_or_default();
+        let mut module_graph_changed = false;
+        for watched in module_graphs.values_mut() {
+            let fingerprint = if watched.inputs.is_empty() {
+                fingerprint_module_graph(&self.config.project, &watched.files)?
+            } else {
+                fingerprint_client_bundle_inputs(&self.config.project, &watched.inputs)?
+            };
+            if watched.fingerprint != fingerprint {
+                watched.fingerprint = fingerprint;
+                module_graph_changed = true;
+            }
+        }
         let changed = self
             .snapshot
             .as_ref()
-            .is_none_or(|snapshot| snapshot.fingerprint != fingerprint);
+            .is_none_or(|snapshot| snapshot.fingerprint != fingerprint)
+            || module_graph_changed;
 
         if changed {
             let routes = scan_app_dir(&self.config.app_dir)?;
             write_route_types(&routes, &self.config.types_out)?;
+            let route_paths = routes
+                .iter()
+                .map(|route| route.path.as_str())
+                .collect::<BTreeSet<_>>();
+            module_graphs.retain(|route_path, _watched| route_paths.contains(route_path.as_str()));
             self.build_id += 1;
             self.snapshot = Some(RouteSnapshot {
                 fingerprint,
                 routes,
+                module_graphs,
             });
         }
 
@@ -791,13 +847,13 @@ impl DevProject {
         Ok(DevResponse::ok("application/json; charset=utf-8", body))
     }
 
-    fn route_response(&self, path: &str, mode: RouteResponseMode) -> DevResponse {
-        let snapshot = self
+    fn route_response(&mut self, path: &str, mode: RouteResponseMode) -> DevResponse {
+        let match_result = self
             .snapshot
             .as_ref()
-            .expect("snapshot built before response");
+            .and_then(|snapshot| match_route(path, &snapshot.routes));
 
-        if let Some(match_result) = match_route(path, &snapshot.routes) {
+        if let Some(match_result) = match_result {
             let renderer = self.page_renderer();
             let conventions = route_conventions(&match_result.route);
             match mode {
@@ -820,7 +876,12 @@ impl DevProject {
                 ),
             }
         } else {
-            DevResponse::not_found(render_not_found(self.build_id, path, &snapshot.routes))
+            let routes = &self
+                .snapshot
+                .as_ref()
+                .expect("snapshot built before response")
+                .routes;
+            DevResponse::not_found(render_not_found(self.build_id, path, routes))
         }
     }
 
@@ -885,7 +946,7 @@ impl DevProject {
     }
 
     fn route_stream_response(
-        &self,
+        &mut self,
         path: &str,
         match_result: &RouteMatch,
         renderer: &PageRenderer,
@@ -898,10 +959,6 @@ impl DevProject {
                 &match_result.params,
             ) {
                 Ok(metadata) => {
-                    let bundler = ClientBundler::new(
-                        self.config.project.clone(),
-                        self.config.client_bundler.clone(),
-                    );
                     let action_bootstrap =
                         match route_needs_action_bootstrap(renderer, match_result, conventions) {
                             Ok(action_bootstrap) => action_bootstrap,
@@ -914,18 +971,7 @@ impl DevProject {
                                 ));
                             }
                         };
-                    match bundler.bundle_route_request(ClientBundleRequest {
-                        page_file: &match_result.route.file,
-                        layouts: &match_result.route.layouts,
-                        route_path: &match_result.route.path,
-                        params: &match_result.params,
-                        out_dir: &self.config.client_out_dir,
-                        public_path: &self.config.client_public_path,
-                        options: ClientBundleOptions {
-                            action_bootstrap,
-                            runtime_props: false,
-                        },
-                    }) {
+                    match self.bundle_dev_route(match_result, action_bootstrap) {
                         Ok(client_bundle) => match renderer
                             .render_document_to_stream_parts_with_conventions(
                                 &match_result.route.file,
@@ -988,10 +1034,6 @@ impl DevProject {
                     &match_result.params,
                 ) {
                     Ok(metadata) => {
-                        let bundler = ClientBundler::new(
-                            self.config.project.clone(),
-                            self.config.client_bundler.clone(),
-                        );
                         let action_bootstrap =
                             match route_needs_action_bootstrap(renderer, match_result, conventions)
                             {
@@ -1005,18 +1047,7 @@ impl DevProject {
                                     ));
                                 }
                             };
-                        match bundler.bundle_route_request(ClientBundleRequest {
-                            page_file: &match_result.route.file,
-                            layouts: &match_result.route.layouts,
-                            route_path: &match_result.route.path,
-                            params: &match_result.params,
-                            out_dir: &self.config.client_out_dir,
-                            public_path: &self.config.client_public_path,
-                            options: ClientBundleOptions {
-                                action_bootstrap,
-                                runtime_props: false,
-                            },
-                        }) {
+                        match self.bundle_dev_route(match_result, action_bootstrap) {
                             Ok(client_bundle) => {
                                 let shell = render_route_document(
                                     self.build_id,
@@ -1057,7 +1088,7 @@ impl DevProject {
     }
 
     fn route_server_payload_response(
-        &self,
+        &mut self,
         path: &str,
         match_result: &RouteMatch,
         renderer: &PageRenderer,
@@ -1071,10 +1102,6 @@ impl DevProject {
                 &match_result.params,
             ) {
                 Ok(metadata) => {
-                    let bundler = ClientBundler::new(
-                        self.config.project.clone(),
-                        self.config.client_bundler.clone(),
-                    );
                     let action_bootstrap =
                         match route_needs_action_bootstrap(renderer, match_result, conventions) {
                             Ok(action_bootstrap) => action_bootstrap,
@@ -1087,18 +1114,7 @@ impl DevProject {
                                 ));
                             }
                         };
-                    match bundler.bundle_route_request(ClientBundleRequest {
-                        page_file: &match_result.route.file,
-                        layouts: &match_result.route.layouts,
-                        route_path: &match_result.route.path,
-                        params: &match_result.params,
-                        out_dir: &self.config.client_out_dir,
-                        public_path: &self.config.client_public_path,
-                        options: ClientBundleOptions {
-                            action_bootstrap,
-                            runtime_props: false,
-                        },
-                    }) {
+                    match self.bundle_dev_route(match_result, action_bootstrap) {
                         Ok(client_bundle) => match renderer
                             .render_document_to_server_payload_json_with_conventions(
                                 &match_result.route.file,
@@ -1161,6 +1177,75 @@ impl DevProject {
                 )),
             },
         }
+    }
+
+    fn bundle_dev_route(
+        &mut self,
+        match_result: &RouteMatch,
+        action_bootstrap: bool,
+    ) -> std::result::Result<ClientBundle, ClientBundleError> {
+        let bundler = ClientBundler::new(
+            self.config.project.clone(),
+            self.config.client_bundler.clone(),
+        );
+        let client_bundle = bundler.bundle_route_request(ClientBundleRequest {
+            page_file: &match_result.route.file,
+            layouts: &match_result.route.layouts,
+            route_path: &match_result.route.path,
+            params: &match_result.params,
+            out_dir: &self.config.client_out_dir,
+            public_path: &self.config.client_public_path,
+            options: ClientBundleOptions {
+                action_bootstrap,
+                runtime_props: false,
+            },
+        })?;
+        self.record_module_graph(&match_result.route.path, &client_bundle)
+            .map_err(ClientBundleError::Io)?;
+        Ok(client_bundle)
+    }
+
+    fn record_module_graph(
+        &mut self,
+        route_path: &str,
+        client_bundle: &ClientBundle,
+    ) -> std::io::Result<()> {
+        client_bundle
+            .validate_input_snapshot(&self.config.project)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let snapshot = self
+            .snapshot
+            .as_mut()
+            .expect("snapshot built before client bundle");
+        if client_bundle.module_graph.is_empty() && client_bundle.input_snapshot.is_empty() {
+            snapshot.module_graphs.remove(route_path);
+            return Ok(());
+        }
+
+        let files = client_bundle
+            .module_graph
+            .iter()
+            .flat_map(|node| {
+                std::iter::once(node.file.clone()).chain(node.watch_files.iter().cloned())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let inputs = client_bundle.input_snapshot.clone();
+        let fingerprint = if inputs.is_empty() {
+            fingerprint_module_graph(&self.config.project, &files)?
+        } else {
+            fingerprint_client_bundle_inputs(&self.config.project, &inputs)?
+        };
+        snapshot.module_graphs.insert(
+            route_path.to_owned(),
+            WatchedModuleGraph {
+                files,
+                inputs,
+                fingerprint,
+            },
+        );
+        Ok(())
     }
 
     fn static_asset_response(&self, path: &str) -> DevResponse {
@@ -1469,13 +1554,13 @@ impl ProductionProject {
     }
 
     fn route_response(&self, path: &str, mode: RouteResponseMode) -> DevResponse {
-        let replay_nonce = match self.issue_server_action_replay_nonce() {
-            Ok(replay_nonce) => replay_nonce,
-            Err(response) => return *response,
-        };
         let snapshot = self.snapshot.get().expect("snapshot built before response");
 
         let response = if let Some(match_result) = match_route(path, &snapshot.routes) {
+            let replay_nonce = match self.issue_server_action_replay_nonce() {
+                Ok(replay_nonce) => replay_nonce,
+                Err(response) => return *response,
+            };
             let module_source = snapshot
                 .server_module_sources
                 .get(&match_result.route.path)
@@ -2446,10 +2531,10 @@ impl ProductionWorkerPool {
                         break;
                     };
                     let _in_flight_guard = ProductionInFlightGuard(Arc::clone(&in_flight));
-                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project)
-                        && is_response_write_deadline_error(&error)
-                    {
-                        eprintln!("Ferrite production response write deadline exceeded");
+                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project) {
+                        if is_response_write_deadline_error(&error) {
+                            eprintln!("Ferrite production response write deadline exceeded");
+                        }
                     }
                 }
             }));
@@ -2569,7 +2654,7 @@ fn reject_overloaded_stream(
 ) {
     let _ = write_overload_response(&mut stream, response_write_timeout);
     let _ = stream.shutdown(Shutdown::Write);
-    let _ = drain_overload_request(
+    let _ = drain_request_with_budget(
         &mut stream,
         request_read_timeout
             .min(PRODUCTION_OVERLOAD_REQUEST_DRAIN_TIMEOUT)
@@ -2605,7 +2690,7 @@ fn write_overload_response(stream: &mut TcpStream, response_write_timeout: Durat
     )
 }
 
-fn drain_overload_request(
+fn drain_request_with_budget(
     stream: &mut TcpStream,
     timeout: Duration,
     max_request_bytes: usize,
@@ -2668,6 +2753,14 @@ pub struct RouteMatch {
 struct RouteSnapshot {
     fingerprint: String,
     routes: Vec<Route>,
+    module_graphs: BTreeMap<String, WatchedModuleGraph>,
+}
+
+#[derive(Debug, Clone)]
+struct WatchedModuleGraph {
+    files: Vec<String>,
+    inputs: Vec<ClientBundleInputSnapshot>,
+    fingerprint: String,
 }
 
 #[derive(Debug)]
@@ -2906,11 +2999,19 @@ pub fn serve<A: ToSocketAddrs>(addr: A, mut project: DevProject) -> Result<()> {
 }
 
 pub fn serve_production<A: ToSocketAddrs>(addr: A, project: ProductionProject) -> Result<()> {
+    serve_production_with_shutdown(addr, project, ProductionShutdownSignal::never())
+}
+
+pub fn serve_production_with_shutdown<A: ToSocketAddrs>(
+    addr: A,
+    project: ProductionProject,
+    shutdown: ProductionShutdownSignal,
+) -> Result<()> {
     let mut addrs = addr.to_socket_addrs()?;
     let addr = addrs.next().ok_or(DevServerError::NoSocketAddress)?;
     let listener = TcpListener::bind(addr)?;
     project.ensure_ready()?;
-    serve_production_listener_concurrent(listener, project)
+    serve_production_listener_with_shutdown(listener, project, shutdown)
 }
 
 pub fn serve_listener(listener: TcpListener, project: &mut DevProject) -> Result<()> {
@@ -3073,11 +3174,14 @@ fn handle_production_stream_with_limits<F>(
 where
     F: FnMut(&ParsedHttpRequest) -> Result<DevResponse>,
 {
-    stream.set_read_timeout(Some(
-        request_read_timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT),
-    ))?;
+    let request_read_timeout = request_read_timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT);
+    let request_read_deadline = Instant::now() + request_read_timeout;
     let response_write_timeout = response_write_timeout.max(MIN_PRODUCTION_RESPONSE_WRITE_TIMEOUT);
-    let request = match read_http_request(stream, max_request_bytes)? {
+    let request = match read_http_request_with_deadline(
+        stream,
+        max_request_bytes,
+        Some(request_read_deadline),
+    )? {
         RequestReadResult::Request(request) => request,
         RequestReadResult::Response(response) => {
             let response = response.with_cache_control("no-store");
@@ -3089,6 +3193,15 @@ where
                     deadline: Some(response_write_timeout),
                 },
             )?;
+            let _ = stream.shutdown(Shutdown::Write);
+            let _ = drain_request_with_budget(
+                stream,
+                request_read_timeout
+                    .min(PRODUCTION_OVERLOAD_REQUEST_DRAIN_TIMEOUT)
+                    .max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT),
+                max_request_bytes,
+            );
+            let _ = stream.shutdown(Shutdown::Read);
             return Ok(());
         }
     };
@@ -3127,17 +3240,31 @@ fn read_http_request(
     stream: &mut TcpStream,
     max_request_bytes: usize,
 ) -> Result<RequestReadResult> {
+    read_http_request_with_deadline(stream, max_request_bytes, None)
+}
+
+fn read_http_request_with_deadline(
+    stream: &mut TcpStream,
+    max_request_bytes: usize,
+    deadline: Option<Instant>,
+) -> Result<RequestReadResult> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
-        match stream.read(&mut buffer) {
+        match read_request_bytes(stream, &mut buffer, deadline) {
             Ok(0) => {
                 let Some(header_end) = find_http_header_end(&request) else {
                     return Ok(RequestReadResult::Response(DevResponse::bad_request(
                         "incomplete HTTP request headers",
                     )));
                 };
-                return finish_read_http_request(stream, request, header_end, max_request_bytes);
+                return finish_read_http_request_with_deadline(
+                    stream,
+                    request,
+                    header_end,
+                    max_request_bytes,
+                    deadline,
+                );
             }
             Ok(bytes) => {
                 request.extend_from_slice(&buffer[..bytes]);
@@ -3145,11 +3272,12 @@ fn read_http_request(
                     return Ok(RequestReadResult::Response(DevResponse::payload_too_large()));
                 }
                 if let Some(header_end) = find_http_header_end(&request) {
-                    return finish_read_http_request(
+                    return finish_read_http_request_with_deadline(
                         stream,
                         request,
                         header_end,
                         max_request_bytes,
+                        deadline,
                     );
                 }
             }
@@ -3166,11 +3294,22 @@ fn read_http_request(
     }
 }
 
+#[cfg(test)]
 fn finish_read_http_request(
+    stream: &mut TcpStream,
+    request: Vec<u8>,
+    header_end: usize,
+    max_request_bytes: usize,
+) -> Result<RequestReadResult> {
+    finish_read_http_request_with_deadline(stream, request, header_end, max_request_bytes, None)
+}
+
+fn finish_read_http_request_with_deadline(
     stream: &mut TcpStream,
     mut request: Vec<u8>,
     header_end: usize,
     max_request_bytes: usize,
+    deadline: Option<Instant>,
 ) -> Result<RequestReadResult> {
     let header_bytes = header_end + 4;
     let mut parsed = match parse_http_request_head(&request[..header_bytes]) {
@@ -3194,7 +3333,7 @@ fn finish_read_http_request(
     let expected_len = header_bytes + content_length;
     let mut buffer = [0_u8; 1024];
     while request.len() < expected_len {
-        match stream.read(&mut buffer) {
+        match read_request_bytes(stream, &mut buffer, deadline) {
             Ok(0) => {
                 return Ok(RequestReadResult::Response(DevResponse::bad_request(
                     "incomplete server action request body",
@@ -3225,6 +3364,32 @@ fn finish_read_http_request(
     parsed.body = request[header_bytes..expected_len].to_vec();
 
     Ok(RequestReadResult::Request(parsed))
+}
+
+fn read_request_bytes(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Option<Instant>,
+) -> std::io::Result<usize> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request read deadline elapsed",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+    }
+
+    let read = stream.read(buffer)?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "request read deadline elapsed",
+        ));
+    }
+    Ok(read)
 }
 
 fn parse_http_request_head(
@@ -4644,6 +4809,24 @@ fn fingerprint_app_dir(app_dir: &Path) -> Result<String> {
     Ok(entries.join("\n"))
 }
 
+fn fingerprint_module_graph(project: &Path, files: &[String]) -> std::io::Result<String> {
+    let project = fs::canonicalize(project)?;
+    let mut entries = Vec::with_capacity(files.len());
+    for file in files {
+        let requested = project.join(file);
+        let digest = match fs::canonicalize(&requested) {
+            Ok(resolved) if resolved.starts_with(&project) && resolved.is_file() => {
+                sha256_hex(&fs::read(resolved)?)
+            }
+            Ok(_resolved) => "outside-project-or-not-file".to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_owned(),
+            Err(error) => return Err(error),
+        };
+        entries.push(format!("{file}|{digest}"));
+    }
+    Ok(entries.join("\n"))
+}
+
 fn collect_app_files(root: &Path, current: &Path, entries: &mut Vec<String>) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
@@ -4667,6 +4850,16 @@ fn collect_app_files(root: &Path, current: &Path, entries: &mut Vec<String>) -> 
     Ok(())
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 fn is_source_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -4676,12 +4869,19 @@ fn is_source_file(path: &Path) -> bool {
                 | "jpeg"
                 | "jpg"
                 | "js"
+                | "json"
                 | "jsx"
+                | "cjs"
+                | "cts"
+                | "mjs"
+                | "mts"
                 | "png"
                 | "svg"
+                | "txt"
                 | "ts"
                 | "tsx"
                 | "webp"
+                | "wasm"
                 | "woff"
                 | "woff2",
         )
@@ -5877,6 +6077,8 @@ process.exit(1);
                     sourcemaps: Vec::new(),
                     assets: Vec::new(),
                     client_references: Vec::new(),
+                    module_graph: Vec::new(),
+                    input_snapshot: Vec::new(),
                 },
                 prerendered: BTreeMap::new(),
                 observed_actions: Vec::new(),
@@ -6959,6 +7161,49 @@ process.exit(1);
     }
 
     #[test]
+    fn production_replay_nonce_store_stays_bounded() {
+        let mut replay_nonces = ProductionReplayNonces::new(Duration::from_secs(30));
+        let first = replay_nonces.issue().unwrap();
+        let mut newest = String::new();
+        for _ in 0..4_096 {
+            newest = replay_nonces.issue().unwrap();
+        }
+
+        assert!(
+            replay_nonces.entries.len() <= MAX_PRODUCTION_REPLAY_NONCES,
+            "replay nonce storage must not grow without a hard bound"
+        );
+        assert!(!replay_nonces.consume(&first));
+        assert!(replay_nonces.consume(&newest));
+    }
+
+    #[test]
+    fn production_replay_nonce_is_not_issued_for_missing_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let config = production_project_for(&app)
+            .config
+            .with_server_action_replay_ttl(Duration::from_secs(30));
+        let project = ProductionProject::new(config);
+
+        let response = project.handle_get("/missing").unwrap();
+
+        assert_eq!(response.status, 404);
+        assert!(
+            project
+                .replay_nonces
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty(),
+            "unmatched requests must not allocate replay state"
+        );
+    }
+
+    #[test]
     fn dev_action_post_invokes_route_action_with_urlencoded_form() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -7149,6 +7394,81 @@ process.exit(1);
         assert_eq!(events[0].status, 200);
         assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
         assert!(events[0].client_ip.is_some());
+    }
+
+    #[test]
+    fn production_action_post_hides_unexpected_renderer_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let project = action_production_project_for(
+            &app,
+            r#"
+if (process.argv[2] === "--server-action") {
+  console.error("private action failure detail");
+  process.exit(17);
+}
+process.exit(2);
+"#,
+        );
+        let body = action_form_body("/posts/abc");
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        let headers = response_headers(&response);
+        let body = String::from_utf8_lossy(response_body(&response));
+
+        assert!(headers.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(body.contains("Ferrite could not render this route."));
+        assert!(!body.contains("private action failure detail"));
+    }
+
+    #[test]
+    fn production_action_post_preserves_explicit_public_error_codes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let project = action_production_project_for(
+            &app,
+            r#"
+if (process.argv[2] === "--server-action") {
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-action-response",
+    version: 1,
+    status: "error",
+    code: "POST_CONFLICT",
+    message: "Could not save post."
+  }));
+  process.exit(0);
+}
+process.exit(2);
+"#,
+        );
+        let body = action_form_body("/posts/abc");
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        let headers = response_headers(&response);
+        let body: Value = serde_json::from_slice(response_body(&response)).unwrap();
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["code"], "POST_CONFLICT");
+        assert_eq!(body["message"], "Could not save post.");
     }
 
     #[test]
@@ -7809,7 +8129,7 @@ setInterval(() => {}, 1000);
         let (mut stream, _) = listener.accept().unwrap();
 
         let started = Instant::now();
-        drain_overload_request(&mut stream, Duration::from_millis(25), 1024).unwrap();
+        drain_request_with_budget(&mut stream, Duration::from_millis(25), 1024).unwrap();
         let elapsed = started.elapsed();
         drop(stream);
         client.join().unwrap();
@@ -8405,6 +8725,102 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
     }
 
     #[test]
+    fn production_adapter_uses_one_absolute_request_read_budget_for_trickle_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = production_project_for(&app);
+        project.config.request_read_timeout = Duration::from_millis(80);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            serve_production_listener_once(listener, &project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let trickle = thread::spawn(move || {
+            for byte in b"GET / HTTP/1.1\r\nHost" {
+                if writer.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = writer.shutdown(Shutdown::Write);
+        });
+
+        let started = Instant::now();
+        let mut response = String::new();
+        if let Err(error) = stream.read_to_string(&mut response) {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        let elapsed = started.elapsed();
+        trickle.join().unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout"));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "request timeout reset across trickled bytes: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn production_adapter_keeps_the_header_deadline_for_a_trickled_action_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = production_project_for(&app);
+        project.config.request_read_timeout = Duration::from_millis(80);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            serve_production_listener_once(listener, &project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let trickle = thread::spawn(move || {
+            if writer
+                .write_all(b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\r\n")
+                .is_err()
+            {
+                return;
+            }
+            for byte in b"abcdefghijklmnopqrst" {
+                if writer.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = writer.shutdown(Shutdown::Write);
+        });
+
+        let started = Instant::now();
+        let mut response = String::new();
+        if let Err(error) = stream.read_to_string(&mut response) {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        let elapsed = started.elapsed();
+        trickle.join().unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout"));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "body reads renewed the request deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn response_deadline_writer_uses_one_budget_across_writes() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -8877,6 +9293,8 @@ process.stdout.write(JSON.stringify({
             sourcemaps: Vec::new(),
             assets: Vec::new(),
             client_references: Vec::new(),
+            module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&server_only),
@@ -8891,6 +9309,8 @@ process.stdout.write(JSON.stringify({
             sourcemaps: Vec::new(),
             assets: Vec::new(),
             client_references: Vec::new(),
+            module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&client_route),
@@ -8918,6 +9338,8 @@ process.stdout.write(JSON.stringify({
                 sourcemaps: Vec::new(),
                 assets: Vec::new(),
             }],
+            module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&island_route),
@@ -8939,6 +9361,8 @@ process.stdout.write(JSON.stringify({
             sourcemaps: Vec::new(),
             assets: Vec::new(),
             client_references: Vec::new(),
+            module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&action_route),
@@ -9361,6 +9785,384 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
         assert!(about.body_text().contains("<h1>Home Page</h1>"));
         assert!(project.build_id().unwrap() > first_build);
         assert!(temp.path().join(".ferrite/types/routes.d.ts").is_file());
+    }
+
+    #[test]
+    fn rebuilds_when_a_compiler_module_graph_dependency_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("page.tsx"),
+            "import '../shared.mts'; export default function Page() {}",
+        );
+        write(
+            &temp.path().join("shared.mts"),
+            "export const value = 'first';",
+        );
+        let mut project = project_for(&app);
+        make_script(
+            &project.config.client_bundler,
+            r#"
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  clientReferences: [],
+  moduleGraph: [
+    { file: "app/page.tsx", imports: ["shared.mts"] },
+    { file: "shared.mts", imports: [] }
+  ]
+}));
+"#,
+        );
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+        assert_eq!(project.build_id().unwrap(), first_build);
+
+        write(
+            &temp.path().join("shared.mts"),
+            "export const value = 'other';",
+        );
+
+        let changed_build = project.build_id().unwrap();
+        assert!(changed_build > first_build);
+
+        fs::remove_file(temp.path().join("shared.mts")).unwrap();
+
+        let deleted_build = project.build_id().unwrap();
+        assert!(deleted_build > changed_build);
+
+        write(
+            &temp.path().join("shared.mts"),
+            "export const value = 'restored';",
+        );
+
+        assert!(project.build_id().unwrap() > deleted_build);
+    }
+
+    #[test]
+    fn real_compiler_module_graph_drives_dev_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("page.tsx"),
+            "import '../shared.js'; export default function Page() {}",
+        );
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'first';",
+        );
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'other';",
+        );
+        let fallback_build = project.build_id().unwrap();
+        assert!(fallback_build > first_build);
+
+        // A newly created runtime file outranks the previously selected TypeScript fallback.
+        write(
+            &temp.path().join("shared.js"),
+            "export const value = 'runtime';",
+        );
+        let runtime_build = project.build_id().unwrap();
+        assert!(runtime_build > fallback_build);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let refreshed_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'ignored fallback';",
+        );
+        assert_eq!(project.build_id().unwrap(), refreshed_build);
+
+        write(
+            &temp.path().join("shared.js"),
+            "export const value = 'changed runtime';",
+        );
+        assert!(project.build_id().unwrap() > refreshed_build);
+    }
+
+    #[test]
+    fn real_compiler_build_inputs_drive_css_json_text_and_wasm_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("page.tsx"),
+            r#""use client";
+import data from "../data.json";
+import copy from "../copy.txt";
+import wasmUrl from "../module.wasm";
+import "../style.css";
+export default function Page() { return <main data-wasm={wasmUrl}>{data.label}: {copy}</main>; }
+"#,
+        );
+        write(&temp.path().join("data.json"), r#"{ "label": "first" }"#);
+        write(&temp.path().join("copy.txt"), "first copy");
+        write(&temp.path().join("style.css"), ".page { color: red; }");
+        fs::write(
+            temp.path().join("module.wasm"),
+            [0_u8, 97, 115, 109, 1, 0, 0, 0],
+        )
+        .unwrap();
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(&temp.path().join("data.json"), r#"{ "label": "second" }"#);
+        let json_build = project.build_id().unwrap();
+        assert!(json_build > first_build);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let after_json = project.build_id().unwrap();
+
+        write(&temp.path().join("style.css"), ".page { color: blue; }");
+        let css_build = project.build_id().unwrap();
+        assert!(css_build > after_json);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let after_css = project.build_id().unwrap();
+
+        write(&temp.path().join("copy.txt"), "second copy");
+        let text_build = project.build_id().unwrap();
+        assert!(text_build > after_css);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let after_text = project.build_id().unwrap();
+
+        fs::write(
+            temp.path().join("module.wasm"),
+            [0_u8, 97, 115, 109, 1, 0, 0, 0, 1],
+        )
+        .unwrap();
+        assert!(project.build_id().unwrap() > after_text);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_compiler_asset_symlink_retarget_invalidates_dev_module_graph() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        let data_link = temp.path().join("data.json");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("page.tsx"),
+            r#""use client";
+import data from "../data.json";
+export default function Page() { return <main>{data.label}</main>; }
+"#,
+        );
+        write(&temp.path().join("data-a.json"), r#"{ "label": "A" }"#);
+        write(&temp.path().join("data-b.json"), r#"{ "label": "B" }"#);
+        symlink("data-a.json", &data_link).unwrap();
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        fs::remove_file(&data_link).unwrap();
+        symlink("data-b.json", &data_link).unwrap();
+        assert!(project.build_id().unwrap() > first_build);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+    }
+
+    #[test]
+    fn compiler_config_changes_invalidate_dev_module_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &temp.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": false } }"#,
+        );
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn compiler_config_appearance_invalidates_dev_module_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn inherited_external_compiler_config_changes_invalidate_dev_module_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let app = project_root.join("app");
+        write(&project_root.join("package.json"), r#"{ "private": true }"#);
+        write(
+            &project_root.join("tsconfig.json"),
+            r#"{ "extends": "../tsconfig.base.json" }"#,
+        );
+        write(
+            &temp.path().join("tsconfig.base.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": false } }"#,
+        );
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("tsconfig.base.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_compiler_config_target_changes_invalidate_dev_module_graph() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let app = project_root.join("app");
+        write(&project_root.join("package.json"), r#"{ "private": true }"#);
+        write(
+            &project_root.join("tsconfig.json"),
+            r#"{ "extends": "./linked-config.json" }"#,
+        );
+        let external_config = temp.path().join("external-config.json");
+        write(
+            &external_config,
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": false } }"#,
+        );
+        symlink(&external_config, project_root.join("linked-config.json")).unwrap();
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &external_config,
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn layout_module_graph_dependencies_invalidate_the_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("layout.tsx"),
+            "import '../layout-shared'; export default function Layout({ children }) { return children; }",
+        );
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &temp.path().join("layout-shared.ts"),
+            "export const value = 'first';",
+        );
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("layout-shared.ts"),
+            "export const value = 'changed';",
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn removed_routes_drop_their_module_graph_watch_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("page.tsx"),
+            "import '../shared'; export default function Page() {}",
+        );
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'first';",
+        );
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        fs::remove_file(app.join("page.tsx")).unwrap();
+        let after_removal = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("shared.ts"),
+            "export const value = 'changed after route removal';",
+        );
+
+        assert_eq!(project.build_id().unwrap(), after_removal);
+    }
+
+    #[test]
+    fn rebuilds_when_an_app_module_with_an_emitted_js_extension_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(&app.join("state.mts"), "export const value = 'first';");
+        let mut project = project_for(&app);
+        let first_build = project.build_id().unwrap();
+
+        write(&app.join("state.mts"), "export const value = 'other';");
+
+        assert!(project.build_id().unwrap() > first_build);
     }
 
     #[test]
@@ -10065,6 +10867,8 @@ export default function Page({ params }) {
                     sourcemaps: Vec::new(),
                     assets: Vec::new(),
                     client_references: Vec::new(),
+                    module_graph: Vec::new(),
+                    input_snapshot: Vec::new(),
                 },
                 prerendered: BTreeMap::new(),
                 observed_actions: Vec::new(),

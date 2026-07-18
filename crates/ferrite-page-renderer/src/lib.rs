@@ -1353,6 +1353,7 @@ process.stdout.write(JSON.stringify({
         assert_eq!(
             response.outcome,
             ServerActionResponseOutcome::Error {
+                code: None,
                 message: "Action exploded".to_owned()
             }
         );

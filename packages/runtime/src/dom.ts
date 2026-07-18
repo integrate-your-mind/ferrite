@@ -1149,7 +1149,7 @@ function appendCompactHeadChild(parent: Element, node: unknown, document: Docume
 function applyCompactHeadProps(element: Element, value: unknown, path: string): void {
   const props = compactProps(value, path);
   for (const [name, prop] of Object.entries(props)) {
-    const attribute = attributeNameFromProp(name);
+    const attribute = attributeNameFromProp(element.localName, name);
     if (prop === true) {
       element.setAttribute(attribute, "");
     } else if (prop !== false) {
@@ -2011,6 +2011,10 @@ class DomRoot {
         continue;
       }
 
+      if (inputAliasedPropIsShadowed(element.localName, name, value, props)) {
+        continue;
+      }
+
       if (name.startsWith("on")) {
         this.applyEventProp(element, name, value);
       } else {
@@ -2041,7 +2045,7 @@ class DomRoot {
       return;
     }
 
-    const attributeName = attributeNameFromProp(name);
+    const attributeName = attributeNameFromProp(element.localName, name);
 
     if (value === true) {
       element.setAttribute(attributeName, "");
@@ -2062,6 +2066,10 @@ class DomRoot {
         continue;
       }
 
+      if (inputAliasedPropIsShadowed(element.localName, name, value, props)) {
+        continue;
+      }
+
       if (name.startsWith("on")) {
         this.applyEventProp(element, name, value);
       } else {
@@ -2071,7 +2079,7 @@ class DomRoot {
   }
 
   private assertHydratedAttribute(element: Element, name: string, value: unknown): void {
-    const attributeName = attributeNameFromProp(name);
+    const attributeName = attributeNameFromProp(element.localName, name);
 
     if (value === null || value === undefined || value === false) {
       if (element.hasAttribute(attributeName)) {
@@ -2578,13 +2586,45 @@ class HydrationCursor {
   }
 }
 
-function attributeNameFromProp(name: string): string {
+function inputAliasedPropIsShadowed(
+  tag: string,
+  name: string,
+  value: unknown,
+  props: Record<string, unknown>,
+): boolean {
+  if (tag.toLowerCase() !== "input") {
+    return false;
+  }
+  if (name === "defaultValue") {
+    return props.value !== null && props.value !== undefined;
+  }
+  if (name === "defaultChecked") {
+    return props.checked !== null && props.checked !== undefined;
+  }
+  if (name === "value") {
+    return (value === null || value === undefined) && props.defaultValue !== null && props.defaultValue !== undefined;
+  }
+  if (name === "checked") {
+    return (value === null || value === undefined) && props.defaultChecked !== null && props.defaultChecked !== undefined;
+  }
+  return false;
+}
+
+function attributeNameFromProp(tag: string, name: string): string {
   if (name === "className") {
     return "class";
   }
 
   if (name === "htmlFor") {
     return "for";
+  }
+
+  if (tag.toLowerCase() === "input" && name === "defaultValue") {
+    return "value";
+  }
+
+  if (tag.toLowerCase() === "input" && name === "defaultChecked") {
+    return "checked";
   }
 
   return name;

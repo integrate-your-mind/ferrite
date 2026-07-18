@@ -202,25 +202,45 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
     fs::create_dir_all(&server_out_dir)?;
 
     for (route_index, route) in routes.iter().enumerate() {
-        let static_param_sets = if route.params.is_empty() {
-            vec![BTreeMap::new()]
-        } else {
-            let generated = page_renderer.generate_static_params(&route.file)?;
-            if !generated.has_generate_static_params {
-                skipped_dynamic_routes.push(route.path.clone());
-                Vec::new()
-            } else {
-                generated.params
-            }
-        };
+        let (static_param_sets, skipped_dynamic_route) =
+            route_static_param_sets(&page_renderer, route)?;
         let artifact_param_set = static_param_sets
             .first()
             .cloned()
             .unwrap_or_else(|| placeholder_route_params(route));
         let artifact_params = ordered_route_params(route, &artifact_param_set)?;
         let conventions = route_conventions(route);
+        let snapshot_files =
+            production_route_snapshot_files(document_file.as_deref(), &conventions);
         let server_module_relative = format!("server/route-{route_index:04}.mjs");
         let server_module = config.out_dir.join(&server_module_relative);
+        let action_bootstrap = !page_renderer
+            .collect_server_actions(&route.file, &route.layouts, &artifact_params, &conventions)?
+            .actions
+            .is_empty();
+        let route_client_bundle = bundle_production_route(
+            &client_bundler,
+            route,
+            &snapshot_files,
+            &artifact_params,
+            &client_out_dir,
+            action_bootstrap,
+        )?;
+
+        let (refreshed_static_param_sets, refreshed_skipped_dynamic_route) =
+            route_static_param_sets(&page_renderer, route)?;
+        if static_param_sets != refreshed_static_param_sets
+            || skipped_dynamic_route != refreshed_skipped_dynamic_route
+        {
+            return Err(ClientBundleError::StaleInputSnapshot {
+                path: route.file.display().to_string(),
+            }
+            .into());
+        }
+        if skipped_dynamic_route {
+            skipped_dynamic_routes.push(route.path.clone());
+        }
+
         page_renderer.build_server_module(
             &route.file,
             &route.layouts,
@@ -237,15 +257,12 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
             &artifact_params,
             &conventions,
         )?;
-        let route_client_bundle = bundle_production_route(
-            &client_bundler,
-            &route.file,
-            &route.layouts,
-            &route.path,
-            &artifact_params,
-            &client_out_dir,
-            !artifact_action_manifest.actions.is_empty(),
-        )?;
+        if action_bootstrap == artifact_action_manifest.actions.is_empty() {
+            return Err(ClientBundleError::StaleInputSnapshot {
+                path: route.file.display().to_string(),
+            }
+            .into());
+        }
         let mut prerendered = BTreeMap::new();
 
         for params in static_param_sets {
@@ -324,6 +341,8 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
             }
         }
 
+        route_client_bundle.validate_input_snapshot(&config.project)?;
+
         production_routes.push(ProductionArtifactRoute {
             path: route.path.clone(),
             params: route.params.clone(),
@@ -337,6 +356,8 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
                 .collect(),
         });
     }
+
+    validate_route_input_snapshots(&production_routes, &config.project)?;
 
     let mut artifact_paths = BTreeSet::new();
     for route in &production_routes {
@@ -393,6 +414,8 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
     };
     fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
 
+    validate_route_input_snapshots(&production_manifest.routes, &config.project)?;
+
     Ok(BuildReport {
         out_dir: config.out_dir.clone(),
         routes_count: routes.len(),
@@ -406,6 +429,32 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
         client_bundles,
         server_action_manifests,
     })
+}
+
+fn validate_route_input_snapshots(
+    routes: &[ProductionArtifactRoute],
+    project: &Path,
+) -> Result<()> {
+    for route in routes {
+        route.client_bundle.validate_input_snapshot(project)?;
+    }
+    Ok(())
+}
+
+fn route_static_param_sets(
+    page_renderer: &PageRenderer,
+    route: &Route,
+) -> Result<(Vec<BTreeMap<String, Value>>, bool)> {
+    if route.params.is_empty() {
+        return Ok((vec![BTreeMap::new()], false));
+    }
+
+    let generated = page_renderer.generate_static_params(&route.file)?;
+    if generated.has_generate_static_params {
+        Ok((generated.params, false))
+    } else {
+        Ok((Vec::new(), true))
+    }
 }
 
 fn install_staged_build(staged: &Path, destination: &Path) -> std::io::Result<()> {
@@ -474,6 +523,21 @@ fn route_conventions(route: &Route) -> RouteConventions {
     }
 }
 
+fn production_route_snapshot_files(
+    document_file: Option<&Path>,
+    conventions: &RouteConventions,
+) -> Vec<PathBuf> {
+    let mut files = document_file
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(conventions.loading.iter().cloned())
+        .chain(conventions.error.iter().cloned())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
 fn placeholder_route_params(route: &Route) -> BTreeMap<String, Value> {
     route
         .params
@@ -511,25 +575,27 @@ fn artifact_relative_path(root: &Path, path: &Path) -> Result<String> {
 
 fn bundle_production_route(
     client_bundler: &ClientBundler,
-    page_file: &Path,
-    layouts: &[PathBuf],
-    route_path: &str,
+    route: &Route,
+    snapshot_files: &[PathBuf],
     params: &[(String, Value)],
     client_out_dir: &Path,
     action_bootstrap: bool,
 ) -> Result<ClientBundle> {
-    let mut client_bundle = client_bundler.bundle_route_request(ClientBundleRequest {
-        page_file,
-        layouts,
-        route_path,
-        params,
-        out_dir: client_out_dir,
-        public_path: CLIENT_PUBLIC_PATH,
-        options: ClientBundleOptions {
-            action_bootstrap,
-            runtime_props: true,
+    let mut client_bundle = client_bundler.bundle_route_request_with_snapshot_files(
+        ClientBundleRequest {
+            page_file: &route.file,
+            layouts: &route.layouts,
+            route_path: &route.path,
+            params,
+            out_dir: client_out_dir,
+            public_path: CLIENT_PUBLIC_PATH,
+            options: ClientBundleOptions {
+                action_bootstrap,
+                runtime_props: true,
+            },
         },
-    })?;
+        snapshot_files,
+    )?;
     fingerprint_client_bundle(&mut client_bundle, client_out_dir, CLIENT_PUBLIC_PATH)?;
     Ok(client_bundle)
 }
@@ -1229,6 +1295,10 @@ process.stdout.write(JSON.stringify({
         "client-reference-app-Counter-tsx-default.js"
       ]
     }
+  ],
+  moduleGraph: [
+    { file: "app/Counter.tsx", imports: [] },
+    { file: "app/page.tsx", imports: ["app/Counter.tsx"] }
   ]
 }));
 "#,
@@ -1244,6 +1314,13 @@ process.stdout.write(JSON.stringify({
         assert_eq!(reference["id"].as_str(), Some("app/Counter.tsx#default"));
         assert_eq!(reference["module"].as_str(), Some("app/Counter.tsx"));
         assert_eq!(reference["exportName"].as_str(), Some("default"));
+        assert_eq!(
+            manifest["client_bundles"][0]["moduleGraph"],
+            serde_json::json!([
+                { "file": "app/Counter.tsx", "imports": [] },
+                { "file": "app/page.tsx", "imports": ["app/Counter.tsx"] },
+            ])
+        );
         let script = reference["script"]
             .as_str()
             .expect("client reference script");
@@ -2159,5 +2236,248 @@ process.exit(1);
             BuildError::ClientBundle(ClientBundleError::NodeFailed { stderr, .. })
                 if stderr == "client bundle failed"
         ));
+    }
+
+    #[test]
+    fn rejects_a_mixed_server_and_client_source_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let page = temp.path().join("app/page.tsx");
+        write(&page, "export const version = 'A';");
+        let renderer = temp.path().join("snapshot-renderer.mjs");
+        make_script(
+            &renderer,
+            r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const mode = process.argv[2];
+const page = mode.startsWith("--") ? process.argv[3] : process.argv[2];
+if (mode === "--build-artifact") {
+  const output = process.argv[4];
+  const source = await fs.readFile(page, "utf8");
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  await fs.writeFile(output, `export const capturedSource = ${JSON.stringify(source)};\n`);
+  await fs.writeFile(page, "export const version = 'B';");
+  process.exit(0);
+}
+if (mode === "--static-params") {
+  process.stdout.write(JSON.stringify({ has_generate_static_params: false, params: [] }));
+  process.exit(0);
+}
+if (mode === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
+  process.exit(0);
+}
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
+"#,
+        );
+        let bundler = temp.path().join("snapshot-bundler.mjs");
+        make_script(
+            &bundler,
+            r#"
+const crypto = await import("node:crypto");
+const fs = await import("node:fs/promises");
+const page = await fs.realpath(process.argv[2]);
+const source = await fs.readFile(page);
+const digest = crypto.createHash("sha256").update(source).digest("hex");
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  inputSnapshot: [{ path: page, kind: "source", value: `sha256:${digest}` }]
+}));
+"#,
+        );
+        let config = BuildConfig::new(
+            temp.path().to_path_buf(),
+            temp.path().join("app"),
+            temp.path().join(".ferrite/build"),
+            temp.path().join(".ferrite/types/routes.d.ts"),
+            renderer,
+            bundler,
+        );
+
+        let error = build_project(&config).expect_err(
+            "a build must not combine server output from A with a client snapshot of B",
+        );
+
+        assert!(matches!(
+            error,
+            BuildError::ClientBundle(ClientBundleError::StaleInputSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_mixed_snapshot_across_multiple_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("app/page.tsx"),
+            "export default function Page() {}",
+        );
+        write(
+            &temp.path().join("app/about/page.tsx"),
+            "export default function About() {}",
+        );
+        let shared_input = temp.path().join("shared.json");
+        let invocation_count = temp.path().join("bundle-invocations.txt");
+        write(&shared_input, r#"{"version":"A"}"#);
+        let config = build_config(temp.path());
+        let shared_input_json = serde_json::to_string(&shared_input).unwrap();
+        let invocation_count_json = serde_json::to_string(&invocation_count).unwrap();
+        make_script(
+            &config.client_bundler,
+            &format!(
+                r#"
+const crypto = await import("node:crypto");
+const fs = await import("node:fs/promises");
+const sharedInput = {shared_input_json};
+const invocationCount = {invocation_count_json};
+let count = 0;
+try {{
+  count = Number(await fs.readFile(invocationCount, "utf8"));
+}} catch (error) {{
+  if (error.code !== "ENOENT") throw error;
+}}
+if (count === 1) {{
+  await fs.writeFile(sharedInput, '{{"version":"B"}}');
+}}
+await fs.writeFile(invocationCount, String(count + 1));
+const resolved = await fs.realpath(sharedInput);
+const source = await fs.readFile(resolved);
+const digest = crypto.createHash("sha256").update(source).digest("hex");
+process.stdout.write(JSON.stringify({{
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  inputSnapshot: [{{ path: resolved, kind: "source", value: `sha256:${{digest}}` }}]
+}}));
+"#
+            ),
+        );
+        write(&config.out_dir.join("previous.txt"), "previous release");
+
+        let error = build_project(&config)
+            .expect_err("a build must not combine route snapshots from different source states");
+
+        assert!(matches!(
+            error,
+            BuildError::ClientBundle(ClientBundleError::StaleInputSnapshot { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("previous.txt")).unwrap(),
+            "previous release"
+        );
+    }
+
+    fn assert_rejects_mixed_convention_snapshot(file_name: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("app");
+        let page = app_dir.join("page.tsx");
+        let mutation_target = app_dir.join(file_name);
+        write(&page, "export default function Page() {}");
+        write(&mutation_target, "export const version = 'A';");
+        let renderer = temp.path().join("snapshot-renderer.mjs");
+        let mutation_target_json = serde_json::to_string(&mutation_target).unwrap();
+        make_script(
+            &renderer,
+            &format!(
+                r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const mode = process.argv[2];
+if (mode === "--build-artifact") {{
+  const output = process.argv[4];
+  const target = {mutation_target_json};
+  const source = await fs.readFile(target, "utf8");
+  await fs.mkdir(path.dirname(output), {{ recursive: true }});
+  await fs.writeFile(output, `export const capturedSource = ${{JSON.stringify(source)}};\n`);
+  await fs.writeFile(target, "export const version = 'B';");
+  process.exit(0);
+}}
+if (mode === "--static-params") {{
+  process.stdout.write(JSON.stringify({{ has_generate_static_params: false, params: [] }}));
+  process.exit(0);
+}}
+if (mode === "--server-action-manifest") {{
+  process.stdout.write(JSON.stringify({{ routePath: "/", actions: [] }}));
+  process.exit(0);
+}}
+if (mode === "--metadata") {{
+  process.stdout.write("{{}}");
+  process.exit(0);
+}}
+process.stdout.write(JSON.stringify({{ kind: "text", value: "ok" }}));
+"#
+            ),
+        );
+        let bundler = temp.path().join("snapshot-bundler.mjs");
+        make_script(
+            &bundler,
+            r#"
+const crypto = await import("node:crypto");
+const fs = await import("node:fs/promises");
+const options = JSON.parse(process.argv[8] || "{}");
+const inputs = [process.argv[2], ...(options.snapshotFiles || [])];
+const inputSnapshot = [];
+for (const input of inputs) {
+  const resolved = await fs.realpath(input);
+  const source = await fs.readFile(resolved);
+  const digest = crypto.createHash("sha256").update(source).digest("hex");
+  inputSnapshot.push({ path: resolved, kind: "source", value: `sha256:${digest}` });
+}
+inputSnapshot.sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  inputSnapshot
+}));
+"#,
+        );
+        let config = BuildConfig::new(
+            temp.path().to_path_buf(),
+            app_dir,
+            temp.path().join(".ferrite/build"),
+            temp.path().join(".ferrite/types/routes.d.ts"),
+            renderer,
+            bundler,
+        );
+        write(&config.out_dir.join("previous.txt"), "previous release");
+
+        let error = build_project(&config)
+            .expect_err("a convention source change must reject staged mixed output");
+
+        assert!(matches!(
+            error,
+            BuildError::ClientBundle(ClientBundleError::StaleInputSnapshot { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("previous.txt")).unwrap(),
+            "previous release"
+        );
+    }
+
+    #[test]
+    fn rejects_a_mixed_document_source_snapshot() {
+        assert_rejects_mixed_convention_snapshot("document.tsx");
+    }
+
+    #[test]
+    fn rejects_a_mixed_loading_source_snapshot() {
+        assert_rejects_mixed_convention_snapshot("loading.tsx");
+    }
+
+    #[test]
+    fn rejects_a_mixed_error_source_snapshot() {
+        assert_rejects_mixed_convention_snapshot("error.tsx");
     }
 }

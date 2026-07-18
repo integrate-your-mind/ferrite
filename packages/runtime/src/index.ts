@@ -181,10 +181,12 @@ export function toSerializableNode(child: Child): SerializableNode | null {
     throw new TypeError("Cannot serialize unsupported Ferrite element type.");
   }
 
+  const tag = child.type.toLowerCase();
+
   return {
     kind: "element",
-    tag: child.type,
-    props: serializeProps(child.props),
+    tag,
+    props: serializeProps(tag, child.props),
     children: flattenChildren(child.props.children),
   };
 }
@@ -249,11 +251,15 @@ function flattenChildren(child: Child): SerializableNode[] {
   return [serialized];
 }
 
-function serializeProps(props: Record<string, unknown>): Record<string, SerializableProp> {
+function serializeProps(tag: string, props: Record<string, unknown>): Record<string, SerializableProp> {
   const serialized: Record<string, SerializableProp> = {};
 
   for (const [key, value] of Object.entries(props)) {
     if (key === "children" || key === "key" || key.startsWith("on")) {
+      continue;
+    }
+
+    if (inputDefaultPropIsShadowed(tag, key, props)) {
       continue;
     }
 
@@ -262,7 +268,7 @@ function serializeProps(props: Record<string, unknown>): Record<string, Serializ
     }
 
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      serialized[serializablePropName(key)] = value;
+      serialized[serializablePropName(tag, key)] = value;
       continue;
     }
 
@@ -272,13 +278,34 @@ function serializeProps(props: Record<string, unknown>): Record<string, Serializ
   return serialized;
 }
 
-function serializablePropName(name: string): string {
+function inputDefaultPropIsShadowed(tag: string, name: string, props: Record<string, unknown>): boolean {
+  if (tag.toLowerCase() !== "input") {
+    return false;
+  }
+  if (name === "defaultValue") {
+    return props.value !== null && props.value !== undefined;
+  }
+  if (name === "defaultChecked") {
+    return props.checked !== null && props.checked !== undefined;
+  }
+  return false;
+}
+
+function serializablePropName(tag: string, name: string): string {
   if (name === "className") {
     return "class";
   }
 
   if (name === "htmlFor") {
     return "for";
+  }
+
+  if (tag.toLowerCase() === "input" && name === "defaultValue") {
+    return "value";
+  }
+
+  if (tag.toLowerCase() === "input" && name === "defaultChecked") {
+    return "checked";
   }
 
   return name;

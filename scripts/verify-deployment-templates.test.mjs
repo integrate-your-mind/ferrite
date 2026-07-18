@@ -105,6 +105,7 @@ test("container template runs as a non-root runtime user with a health check", a
   assert.doesNotMatch(dockerfile, /\/srv\/ferrite\/app\/node_modules/);
   assert.match(dockerfile, /HEALTHCHECK /);
   assert.match(dockerfile, /EXPOSE 3000/);
+  assert.match(dockerfile, /CMD \["sh", "-c", "exec ferrite serve/);
   assert.doesNotMatch(dockerfile, /FERRITE_ACTION_CSRF=[a-zA-Z0-9_-]{24,}/);
   assert.match(dockerignore, /^target$/m);
   assert.match(dockerignore, /^node_modules$/m);
