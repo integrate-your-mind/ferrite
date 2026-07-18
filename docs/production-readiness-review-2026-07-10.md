@@ -20,11 +20,11 @@ The highest-return work is no longer broad React or Next.js parity. It is the pr
 
 ## July 18 PR Backlog Ledger
 
-PR #4 is the sole open delivery unit. Its base is `main` at `d10b4e9c364f533d621a9cd151bbcd1bb161278c`. The remote delivery branch was fast-forwarded to tested source commit `55302c0810f0e1fc2e15d3867451876ccd6203c3` on July 18; the GitHub pull ref still reported the prior `5dd3f9885b44ca3b7182abe39b20274c43cb2fe2` immediately after the push, so final pull-ref convergence remains a separate refresh check. The dedicated mutable worktree is `codex/module-graph-backlog-fix`. No other owner may edit this delivery unit.
+PR #4 is the sole open delivery unit. Its base is `main` at `d10b4e9c364f533d621a9cd151bbcd1bb161278c`. The tested local source is `b022a76956c4d3ca45c65a957e5be5cbb508d659`; the remote delivery branch and pull head were still `55302c0810f0e1fc2e15d3867451876ccd6203c3` at the final pre-push refresh. The dedicated mutable worktree is `codex/module-graph-backlog-fix`. No other owner may edit this delivery unit.
 
 | Unit | Intent and dependency | Review/CI debt | Evidence state | Disposition |
 | --- | --- | --- | --- | --- |
-| Draft PR #4 | Compiler-owned runtime graph, cycle diagnostics, resolver/config invalidation, then the dependent slow-client, action-security, deployment, MSRV, and cross-platform fixes found during release audit | The independent reviewer returned `ACCEPT_FOR_LOCAL_READINESS` with no actionable finding at exact source SHA `55302c0`. GitHub still has no proven executed status check; hosted Actions previously ended in `startup_failure` before job allocation. The current GitHub API request returns HTTP 401, so current comments, draft state, and checks cannot be refreshed without crossing the credential boundary. | Source SHA `55302c0` passes exact-head lint, typecheck, build, 480 tests, package archives, dependency/workflow scans, Rust 1.85, Linux/Windows cross-checks, coverage, four Chromium scenarios, real example build/dev/serve, direct normal/failure/odd production HTTP QA, real SIGINT/SIGTERM accepted-work drain, and negative descendant cleanup. Receipt: `docs/proof-receipts/2026-07-18T081012Z-55302c0-pr4-final-review.md`. | `EXTERNALLY_BLOCKED`. The source satisfies the local technical bar, but hosted checks, authenticated PR state, and attached media are not proven. No merge or draft-promotion authority is inferred. |
+| Draft PR #4 | Compiler-owned runtime graph, cycle diagnostics, resolver/config invalidation, then dependent slow-client, action-security, deployment, shutdown, reproducibility, and output-publication fixes | The independent reviewer first found invalid published maps and an output symlink escape, then returned `ACCEPT` with no High, Medium, or Low finding at exact source `b022a76`. GitHub still has no proven executed status check; hosted Actions previously ended in `startup_failure` before job allocation. Authenticated comments, draft state, branch protection, and checks cannot be refreshed without crossing the credential boundary. | Source `b022a76` passes lint, typecheck, build, 484 tests, package archives, dependency/workflow scans, Rust 1.85, Linux/Windows cross-checks, coverage, four Chromium scenarios, real example build/dev/serve, same-head byte reproducibility, valid source maps, symlink rejection, direct normal/failure/odd HTTP QA, accepted-work signal drain, and descendant cleanup. Receipt: `docs/proof-receipts/2026-07-18T085933Z-b022a76-pr4-backlog-clearance.md`. | `EXTERNALLY_BLOCKED`. Local source satisfies the technical bar, but the remote head must converge and hosted checks, authenticated PR state, and attached media remain unproven. No merge or draft-promotion authority is inferred. |
 | Issue #3 | Broad productionization backlog; PR #4 closes only its graph, request-budget, action-error, and shutdown subfindings | The remaining license, distribution, hosted staging, hosted capacity, session/auth, distributed replay, atomic release-pointer, and external observability work must stay open after PR #4. | Local proof cannot close hosted or release claims. | `EXTERNALLY_BLOCKED` or future scoped backlog, depending on each subfinding; not a reason to add scope to PR #4. |
 | Historical `codex/nginx-proof-harness` local delta | Earlier nginx evidence already represented by merged HTTP-framing work and preserved local files | It overlaps the completed framing lane and must not be mixed into PR #4. | Preserved in its original worktree; no unique file was deleted or moved. | `SUPERSEDE_CANDIDATE`, pending a separate preservation decision with close/delete authority. |
 
@@ -32,13 +32,15 @@ PR #4 is the sole open delivery unit. Its base is `main` at `d10b4e9c364f533d621
 
 Historically proven across the merged HTTP-framing lane and the current PR #4 branch:
 
-- Exact source SHA `55302c0810f0e1fc2e15d3867451876ccd6203c3` and tree `e5e9f84187e542dce95a4aeaf7818f6c7fd7aa10` pass the July 18 local proof packet and independent review.
+- Exact source SHA `b022a76956c4d3ca45c65a957e5be5cbb508d659` and tree `9ee1747ea91a3f57e54a90338a6669f8e94222cd` pass the July 18 local proof packet and independent review.
 - Rust formatting and clippy with warnings denied.
 - TypeScript package checks and example app typechecking.
 - Rust and JavaScript/TypeScript builds.
 - Full workspace tests, including real loopback HTTP tests.
 - Four sequential Chromium tests.
 - Real example static build, render fixture, dev one-shot, and production serve one-shot.
+- Two complete same-source builds produce the same build id, 25-file inventory, and bytes. Published maps resolve 12 real sources, embed two generated sources, and contain no staging paths.
+- Client output publication rejects directory and file symlink escapes and cleans failed attempt/publish staging.
 - npm release-shaped tarball creation plus clean external-directory `check`, `build`, and artifact-serve verification for four JS-facing packages and a copied candidate CLI.
 - Bounded production admission, artifact-runner deadlines, generic public production errors, trusted forwarded-IP selection, and static deployment-template checks.
 - Staged production artifact installation with activation rollback, strict version/build/path/size/SHA-256/symlink validation, self-contained server modules for every route, parameter-independent browser bundles, verified-byte dynamic HTML/payload/action serving, runtime route-action registration, and manifest-only static asset serving.
@@ -60,7 +62,7 @@ Explicitly not proven:
 - Hosted capacity, long-duration soak, host-process supervisor recovery, hosted multi-instance behavior, and rollback under live traffic. The local mixed-load soak is a bounded regression proof, not a throughput or capacity benchmark.
 - A clean-machine install from published packages and a publicly distributed CLI rather than locally packed candidates and a copied CLI binary.
 - Atomic release activation through a versioned directory or image pointer; direct replacement of an existing build directory has a brief activation window.
-- Enforced workspace-wide Rust/JS coverage thresholds, mutation testing, or a browser-to-real-`ferrite serve` action/payload test. The final July 18 report measures Rust at 91.00% lines, 88.97% functions, and 89.50% regions; Node runtime tests measure 78.96% lines, 74.32% branches, and 88.10% functions, with `build-client.mjs` at 89.40% lines. These are reports, not committed fail-under thresholds.
+- Enforced workspace-wide Rust/JS coverage thresholds, mutation testing, or a browser-to-real-`ferrite serve` action/payload test. The final July 18 report measures Rust at 91.16% lines, 89.14% functions, and 89.65% regions; Node runtime tests measure 79.75% lines, 74.78% branches, and 88.56% functions, with `build-client.mjs` at 93.80% lines. These are reports, not committed fail-under thresholds.
 - Session-bound CSRF rotation, distributed replay storage, deployment-stable action IDs, first-class auth integration, or external tracing/audit sinks.
 - A Builder AI Lab model-gateway call or shared `proof_receipt` implementation.
 
@@ -84,7 +86,7 @@ Required exit criteria:
 
 ### P0: Developers Cannot Install A Coherent Release
 
-The source npm packages remain `private: true` and `UNLICENSED`; release staging rewrites them only for local tarball proof. Fake Cargo repository metadata has been removed, all internal path dependencies now carry versions, and all 11 crate archives package locally. The repository still has no root license file or real repository metadata, and no public CLI binary, npm release, native artifact set, or container image exists.
+The source npm packages remain `private: true` and `UNLICENSED`; release staging rewrites them only for local tarball proof. Fake Cargo repository metadata has been removed, all internal path dependencies now carry versions, and all 11 crate archives package locally. The repository still has no root license, `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, changelog, or real repository metadata, and no public CLI binary, npm release, native artifact set, or container image exists.
 
 Required exit criteria:
 
@@ -116,13 +118,13 @@ The general Verify workflow and candidate-image nginx harness exist, but every r
 
 ## Fastest Developer Launch
 
-1. Define throughput and latency targets, then run hosted and long-duration capacity tests around the completed bounded mixed-load regression soak.
-2. Resolve the GitHub Actions startup/allocation blocker and obtain a distinct current-head review of PR #4 without bypassing checks or repository policy.
+1. Select and add the root license, align Cargo/npm metadata, and add the public security, contribution, conduct, changelog, and support policies. Without this, public visibility is source-available rather than a defensible open-source launch.
+2. Push the proven PR #4 head, resolve the GitHub Actions startup/allocation blocker, and obtain real hosted checks without bypassing repository policy.
 3. Run the required remote workflow for lint, typecheck, build, full tests, Chromium, artifact-backed example integration, pinned-nginx candidate-image proof, npm verification, Cargo packaging, and native artifacts.
-4. Publish the locally proven `ferrite init` starter path with a public CLI binary and pinned toolchain matrix, then validate it on a clean machine.
-5. Add a single `/builder-lab` demo route that executes one allowlisted real tool and returns the shared Builder AI Lab `proof_receipt` once that schema is authoritative. Do not present a fixture response as model or proof-runtime integration.
+4. Ship the locally proven `ferrite init` path through one supported source-build developer-preview installer, then validate the exact instructions on a clean machine. Keep registry publication separate until package policy is approved.
+5. Define throughput and latency targets, then run hosted and long-duration capacity tests around the completed bounded mixed-load regression soak.
 6. Deploy the exact candidate artifact to staging behind TLS and the supplied proxy policy. Capture success, malformed input, action rejection, overload, timeout, metrics, logs, restart, and rollback evidence.
-7. Onboard one or two trusted developers. Continue only if each reaches a real successful run and can inspect a corresponding failure receipt without maintainer intervention.
+7. Onboard one to three experienced design partners. Continue only if each reaches a real successful run and can inspect a corresponding failure receipt without maintainer intervention.
 
 ## Market Boundary
 
