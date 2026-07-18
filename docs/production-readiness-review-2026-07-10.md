@@ -20,11 +20,22 @@ The highest-return work is no longer broad React or Next.js parity. It is the pr
 
 ## July 18 PR Backlog Ledger
 
-PR #4 is the sole open delivery unit known from the last authenticated API inventory. Its base is `main` at `d10b4e9c364f533d621a9cd151bbcd1bb161278c`. The accepted source is `308ad586b5825add2b5a639176573adc6c887861`. Authenticated SSH delivery fast-forwarded the remote branch and pull head from `99fc7c6` through documentation checkpoint `d2e2f3c` and then through receipt-only reconciliation commits to the current report head. GitHub regenerated the merge ref after each push with the expected base/head parents and a tree identical to the delivered head. GitHub API state remains unavailable because the stored `gh` credential returns HTTP 401. The dedicated mutable worktree is `codex/module-graph-backlog-fix`; no other owner may edit this delivery unit.
+PR #4 is the sole open delivery unit in the refreshed authenticated GitHub
+inventory. Its base is `main` at
+`d10b4e9c364f533d621a9cd151bbcd1bb161278c`. Exact source
+`f7a1b1fc7bce53bfff17f3e66918aa0188353257` preserves the legacy TypeScript
+action-error factory after the independent reviewer reproduced the source break.
+Before this checkpoint, the remote branch and pull head were both `ccc9519`, the
+PR was open, draft, and mergeable, both review threads were resolved, and the
+exact remote head had one `startup_failure` workflow run with zero allocated jobs.
+The authenticated GitHub connector provides current PR/review/check visibility;
+the separately stored `gh` CLI API token still returns HTTP 401. The dedicated
+mutable worktree is `codex/module-graph-backlog-fix`; no other owner may edit
+this delivery unit.
 
 | Unit | Intent and dependency | Review/CI debt | Evidence state | Disposition |
 | --- | --- | --- | --- | --- |
-| Draft PR #4 | Compiler-owned runtime graph, cycle diagnostics, resolver/config invalidation, then dependent slow-client, action-security, deployment, shutdown, reproducibility, and output-publication fixes | The sole bounded reviewer returned final `ACCEPT` with no blocking security, build-integrity, or portability finding at exact source `308ad58`. Git transport and the existing branch are current. Hosted Actions previously ended in `startup_failure` before job allocation, while the stored `gh` API credential now returns HTTP 401, so comments, draft state, branch protection, and checks cannot be refreshed. | Source `308ad58` passes lint, typecheck, build, 509 tests, package archives, dependency/workflow scans, Rust 1.85, Linux/Windows cross-checks, coverage, 10 real-Chrome scenarios, real example build/dev/serve, real production action success/failure, same-head byte reproducibility, snapshot/invalidation tests, bounded slow-client timeout handling, and descendant cleanup. Authenticated branch/pull convergence and an identical merge-ref tree are reverified after every receipt-only push. Receipt: `docs/proof-receipts/2026-07-18T110657Z-308ad58-pr4-backlog-final.md`. | `EXTERNALLY_BLOCKED`. The source and remote Git delivery satisfy the technical bar, but hosted checks, authenticated API review state, and attached media remain unproven. No merge or draft-promotion authority is inferred. |
+| Draft PR #4 | Compiler-owned runtime graph, cycle diagnostics, resolver/config invalidation, then dependent slow-client, action-security, deployment, shutdown, reproducibility, output-publication, and compatibility fixes | The sole bounded reviewer returned `ACCEPT` at source `308ad58`, then `NEEDS_EVIDENCE` for the exact-source nginx gap and TypeScript factory break. Commit `f7a1b1f` fixed the factory; the reviewer independently returned `ACCEPT` for that remediation with no new finding. Both GitHub review threads are resolved. Hosted Actions still ends in `startup_failure` before job allocation. | Source `f7a1b1f` passes lint, typecheck, build, 509 executable tests plus a no-emit compile regression, package archives, dependency/workflow scans, Rust 1.85, Linux/Windows cross-checks, coverage, 10 real-Chrome scenarios, real example build/dev/serve, production action success/failure, and same-head byte reproducibility. Receipt: `docs/proof-receipts/2026-07-18T141937Z-f7a1b1f-pr4-checkpoint.md`. | `EXTERNALLY_BLOCKED`. Exact-source nginx execution could not start because no Docker daemon was available and the bounded clean Colima attempt failed before project execution. Hosted CI allocated zero jobs. No merge or draft-promotion authority is inferred. |
 | Issue #3 | Cached prior inventory describes a broad productionization backlog; PR #4 closes only its graph, request-budget, action-error, and shutdown subfindings | Current authenticated issue state is unavailable. The remaining license, distribution, hosted staging, hosted capacity, session/auth, distributed replay, atomic release-pointer, and external observability work must stay open after PR #4. | Local proof cannot close hosted or release claims. | `EXTERNALLY_BLOCKED` or future scoped backlog, depending on each subfinding; not a fresh authenticated GitHub inventory and not a reason to add scope to PR #4. |
 | Historical `codex/nginx-proof-harness` local delta | Earlier nginx evidence already represented by merged HTTP-framing work and preserved local files | It overlaps the completed framing lane and must not be mixed into PR #4. Every dirty exported helper and named runtime case exists in `308ad58`; accepted source adds 16 runtime cases and stronger source-pinning, interruption, cleanup, HTTP/2, and proxy-rejection proof. | Preserved in its original worktree with exact hashes in the final receipt; no unique intended behavior needs merging, and no file was deleted or moved. All other 24 non-current local branch tips are ancestors of `308ad58`. | `SUPERSEDE_CANDIDATE`; the original remains untouched because close/delete authority is absent. |
 
@@ -32,7 +43,9 @@ PR #4 is the sole open delivery unit known from the last authenticated API inven
 
 Historically proven across the merged HTTP-framing lane and the current PR #4 branch:
 
-- Exact source SHA `308ad586b5825add2b5a639176573adc6c887861` and tree `b7a43134b1dca199fbfb4eb6d812151c6dd4b9aa` pass the July 18 local proof packet and independent review.
+- Exact source SHA `f7a1b1fc7bce53bfff17f3e66918aa0188353257`
+  and tree `051612a0a2c341fa4dfdd4e5e006688e77c225d3` pass the July 18
+  local proof packet and independent compatibility review.
 - Rust formatting and clippy with warnings denied.
 - TypeScript package checks and example app typechecking.
 - Rust and JavaScript/TypeScript builds.
@@ -115,7 +128,16 @@ The merged HTTP-framing work and PR #4 backlog fixes address unbounded socket ad
 
 ### P1: Remote And Hosted Evidence Is Missing
 
-The general Verify workflow and candidate-image nginx harness exist, but every relevant hosted Actions attempt has failed before job allocation. A credential-free GitHub API probe at 2026-07-18T11:17:36Z returned HTTP 404, while authenticated SSH later proved the repository and existing PR branch are reachable and accepted the fast-forward. The stored `gh` API credential returns HTTP 401, so current reviews, comments, protection, and checks remain unobservable. The regenerated merge-ref tree matches the delivered head, but that does not substitute for hosted checks. There is no hosted deployment. Local exact-commit proof cannot substitute for real hosted CI, registry, or staging evidence.
+The general Verify workflow and candidate-image nginx harness exist, but every
+relevant hosted Actions attempt has failed before job allocation. Authenticated
+SSH proves the repository and existing PR branch are reachable. The authenticated
+GitHub connector now proves PR #4 is open, draft, mergeable, and has zero
+unresolved threads; the stored `gh` CLI token separately returns HTTP 401. The
+exact-source nginx stack could not start because Docker Desktop exposed no
+responsive daemon and the clean bounded Colima attempt failed during VM image
+conversion before project execution. There is no hosted deployment. Local
+exact-commit proof cannot substitute for real nginx, hosted CI, registry, or
+staging evidence.
 
 ## Fastest Developer Launch
 
