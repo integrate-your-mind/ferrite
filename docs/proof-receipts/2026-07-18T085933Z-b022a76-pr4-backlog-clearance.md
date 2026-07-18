@@ -10,6 +10,8 @@ Recorded: 2026-07-18T08:59:33Z
 - Base: `main` at `d10b4e9c364f533d621a9cd151bbcd1bb161278c`
 - Remote branch and pull head before the final push: `55302c0810f0e1fc2e15d3867451876ccd6203c3`
 - Remote merge ref before the final push: `ea92d87688c38476e34314e943f6df2e54a28511`
+- First post-proof remote convergence: branch and pull head `c8352211bb6571ed4cfbc8d55e0a46b8073cc90e`; merge ref `64bab253b8bc72fc78cef4590e077281732f6cbe` with parents `d10b4e9c364f533d621a9cd151bbcd1bb161278c` and `c8352211bb6571ed4cfbc8d55e0a46b8073cc90e`
+- Merge-ref tree: `a7389aece383b6b7db1b6f8e37f536611c57d254`, identical to the `c835221` tree
 - Sole mutable owner: root task in `codex/module-graph-backlog-fix`
 - Independent advisory reviewer: `/root/pr4_final_security_review`; read-only and no merge authority
 - Environment: macOS 26.5.2 build 25F84, arm64, Node 24.13.0, pnpm 11.7.0, Homebrew Rust 1.95.0, declared MSRV Rust 1.85.0, cargo-llvm-cov 0.8.5, Actionlint 1.7.12
@@ -18,9 +20,11 @@ Recorded: 2026-07-18T08:59:33Z
 - Canonical 25-file artifact hash-list SHA-256: `268daaa5ee941fc6cab568ad63421112a5a8a040e671b30d602456fed39b889c`
 - `Cargo.lock` SHA-256: `cf5a096c562abdaae60f34b2541e105edd48bc4b546df9090f2892b0e951e0a2`
 
-The documentation commit containing this receipt follows the tested source
-commit. It changes no runtime source, tests, manifests, dependencies, or build
-configuration, so all executable proof below is tied to `b022a76`.
+The documentation commits containing and updating this receipt follow the tested
+source commit. They change no runtime source, tests, manifests, dependencies, or
+build configuration, so the source-specific proof below is tied to `b022a76`.
+The complete primary chain also passed at documentation head `c835221` before
+the remote-convergence update.
 
 ## Reproduced Findings And Disposition
 
@@ -85,14 +89,15 @@ and grants no reserved-action authority.
 
 | Unit | Exact state | Evidence | Disposition and next action |
 | --- | --- | --- | --- |
-| Draft PR #4 | Base `d10b4e9`; tested local source `b022a76`; remote branch/pull head `55302c0` before final push; no authenticated current review/check rollup | All local gates above and independent `ACCEPT`; no hosted job or attached PR media | `EXTERNALLY_BLOCKED`. Push the existing branch, verify remote convergence, then obtain hosted checks and authenticated PR/media evidence. No merge or draft-promotion authority. |
+| Draft PR #4 | Base `d10b4e9`; tested local source `b022a76`; first post-proof remote branch/pull convergence `c835221`; merge ref `64bab25` has the expected base/head parents and a tree identical to `c835221`; no authenticated current review/check rollup | All local gates above and independent `ACCEPT`; no hosted job or attached PR media | `EXTERNALLY_BLOCKED`. Obtain hosted checks and authenticated PR/media evidence. No merge or draft-promotion authority. |
 | Issue #3 | Broad productionization backlog; authenticated issue state unavailable | Remaining license, distribution, hosted staging/capacity, session/auth, distributed replay, atomic release pointer, and external observability are not closed by PR #4 | `EXTERNALLY_BLOCKED` or future scoped backlog. Keep these claims open. |
 | Historical `codex/nginx-proof-harness` delta | Original worktree retains one modified verifier and untracked harness/library files; it overlaps the merged framing lane | Files remain preserved; no unique work was deleted or mixed into PR #4 | `SUPERSEDE_CANDIDATE`. Requires separate preservation and close/delete authority. |
 | Old module-graph delivery worktree | Clean at `1ad7c32`, four commits behind the remote PR branch | No unique dirty delta | Superseded by the sole mutable PR #4 worktree; leave untouched. |
 
 ## External And Productization Gaps
 
-- Git refs prove PR #4 and its pre-push head, but authenticated PR comments,
+- Git refs prove PR #4 remote branch/pull convergence and the expected merge-ref
+  tree, but authenticated PR comments,
   draft state, review rollup, branch protection, and checks remain unavailable.
 - Hosted Actions previously ended in `startup_failure` before job allocation and
   supplied no status check. Exact local parity does not establish hosted execution.
