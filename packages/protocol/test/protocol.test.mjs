@@ -180,6 +180,12 @@ test("creates and validates server action protocol values", () => {
     code: "POST_CONFLICT",
     message: "Could not save post.",
   });
+  assert.deepEqual(createServerActionErrorResponse({ message: "Legacy public error." }), {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "error",
+    message: "Legacy public error.",
+  });
   assert.deepEqual(validateServerActionResponse({
     ferrite: SERVER_ACTION_RESPONSE_MARKER,
     version: SERVER_ACTION_RESPONSE_VERSION,

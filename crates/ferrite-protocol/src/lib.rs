@@ -358,12 +358,12 @@ export function createServerActionRedirectResponse(input: { location: string }):
   return validateServerActionResponse(response) as ServerActionRedirectResponse;
 }
 
-export function createServerActionErrorResponse(input: { code: string; message: string }): ServerActionErrorResponse {
+export function createServerActionErrorResponse(input: { code?: string; message: string }): ServerActionErrorResponse {
   const response: ServerActionErrorResponse = {
     ferrite: SERVER_ACTION_RESPONSE_MARKER,
     version: SERVER_ACTION_RESPONSE_VERSION,
     status: "error",
-    code: input.code,
+    ...(input.code === undefined ? {} : { code: input.code }),
     message: input.message,
   };
   return validateServerActionResponse(response) as ServerActionErrorResponse;
