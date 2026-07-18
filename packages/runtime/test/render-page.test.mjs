@@ -390,6 +390,108 @@ test("build-client snapshots esbuild inputs with import suffixes", async () => {
   });
 });
 
+test("build-client snapshots suffixed asset symlink resolution", { skip: platform === "win32" }, async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const dataLink = join(projectRoot, "app/data.json");
+    const dataA = join(projectRoot, "app/data-a.json");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      `"use client"; import data from "./data.json?variant"; export default function Page() { return <main>{data.label}</main>; }\n`,
+    );
+    await writeFile(dataA, '{ "label": "A" }\n');
+    await writeFile(join(projectRoot, "app/data-b.json"), '{ "label": "B" }\n');
+    await symlink("data-a.json", dataLink);
+
+    const canonicalProjectRoot = await realpath(projectRoot);
+    const canonicalDataA = await realpath(dataA);
+    const bundle = await buildClient(projectRoot, pageFile);
+
+    assert.equal(
+      resolutionSnapshotValue(bundle, join(canonicalProjectRoot, "app/data.json")),
+      "resolved:app/data-a.json",
+    );
+    assert.equal(sourceSnapshotValue(bundle, canonicalDataA), sha256('{ "label": "A" }\n'));
+  });
+});
+
+test("build-client snapshots nested CSS asset symlink resolution", { skip: platform === "win32" }, async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const iconLink = join(projectRoot, "app/icon.svg");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      `"use client"; import "./style.css"; export default function Page() { return <main className="icon" />; }\n`,
+    );
+    await writeFile(join(projectRoot, "app/style.css"), `.icon { background-image: url(icon.svg#mark); }\n`);
+    await writeFile(join(projectRoot, "app/icon-a.svg"), `<svg xmlns="http://www.w3.org/2000/svg"><g id="mark"/></svg>\n`);
+    await symlink("icon-a.svg", iconLink);
+
+    const canonicalProjectRoot = await realpath(projectRoot);
+    const bundle = await buildClient(projectRoot, pageFile);
+
+    assert.equal(
+      resolutionSnapshotValue(bundle, join(canonicalProjectRoot, "app/icon.svg")),
+      "resolved:app/icon-a.svg",
+    );
+  });
+});
+
+test("build-client distinguishes outside-project asset symlink targets", { skip: platform === "win32" }, async () => {
+  const externalRoot = await mkdtemp(join(tmpdir(), "ferrite-external-assets-"));
+  try {
+    await withTempProject(async (projectRoot) => {
+      const pageFile = join(projectRoot, "app/page.tsx");
+      const dataLink = join(projectRoot, "app/data.json");
+      const dataA = join(externalRoot, "data-a.json");
+      const dataB = join(externalRoot, "data-b.json");
+      await mkdir(dirname(pageFile), { recursive: true });
+      await writeFile(
+        pageFile,
+        `"use client"; import data from "./data.json"; export default function Page() { return <main>{data.label}</main>; }\n`,
+      );
+      await writeFile(dataA, '{ "label": "A" }\n');
+      await writeFile(dataB, '{ "label": "B" }\n');
+      await symlink(dataA, dataLink);
+
+      const canonicalProjectRoot = await realpath(projectRoot);
+      const snapshotPath = join(canonicalProjectRoot, "app/data.json");
+      const first = await buildClient(projectRoot, pageFile);
+      const firstResolution = resolutionSnapshotValue(first, snapshotPath);
+
+      await rm(dataLink);
+      await symlink(dataB, dataLink);
+      const second = await buildClient(projectRoot, pageFile);
+      const secondResolution = resolutionSnapshotValue(second, snapshotPath);
+
+      assert.match(firstResolution, /^outside-project:sha256:[a-f0-9]{64}$/);
+      assert.match(secondResolution, /^outside-project:sha256:[a-f0-9]{64}$/);
+      assert.notEqual(secondResolution, firstResolution);
+    });
+  } finally {
+    await rm(externalRoot, { recursive: true, force: true });
+  }
+});
+
+test("build-client accepts deterministic data URL modules", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      `"use client"; import message from "data:text/javascript,export default 'inline'"; export default function Page() { return <main>{message}</main>; }\n`,
+    );
+
+    const canonicalPage = await realpath(pageFile);
+    const bundle = await buildClient(projectRoot, pageFile);
+
+    assert.ok(bundle.script);
+    assert.ok(bundle.inputSnapshot.some((input) => input.kind === "source" && input.path === canonicalPage));
+  });
+});
+
 test("build-client rejects extensionless module candidates that esbuild does not resolve", async () => {
   for (const extension of [".mts", ".cts", ".mjs", ".cjs"]) {
     for (const dependencyPath of [`dependency${extension}`, join("dependency", `index${extension}`)]) {

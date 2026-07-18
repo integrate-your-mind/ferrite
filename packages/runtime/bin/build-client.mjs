@@ -85,6 +85,7 @@ const sourceLoaders = {
   ".txt": "text",
 };
 const buildInputLoaders = { ...sourceLoaders, ...fileLoaders };
+const cssFilesystemResolveKinds = new Set(["composes-from", "import-rule", "url-token"]);
 const extensionlessSourceExtensions = [".tsx", ".ts", ".jsx", ".js"];
 const sourceExtensions = [...extensionlessSourceExtensions, ".mts", ".cts", ".mjs", ".cjs"];
 const emittedSourceSubstitutions = new Map([
@@ -449,15 +450,16 @@ function snapshotBuildInputsPlugin(snapshot, loadedInputs) {
     name: "ferrite-build-input-snapshot",
     setup(build) {
       build.onResolve({ filter: /.*/ }, async (args) => {
+        const inputPath = args.path.replace(/[?#].*$/, "");
         if (
           args.namespace !== "file"
-          || (!args.path.startsWith(".") && !isAbsolute(args.path))
-          || !buildInputLoaders[extname(args.path).toLowerCase()]
+          || (!inputPath.startsWith(".") && !isAbsolute(inputPath) && !cssFilesystemResolveKinds.has(args.kind))
+          || !buildInputLoaders[extname(inputPath).toLowerCase()]
         ) {
           return undefined;
         }
 
-        await recordResolutionSnapshot([resolve(args.resolveDir, args.path)], projectRoot, snapshot);
+        await recordResolutionSnapshot([resolve(args.resolveDir, inputPath)], projectRoot, snapshot);
         return undefined;
       });
       build.onLoad({ filter: /.*/, namespace: "file" }, async (args) => {
@@ -485,6 +487,9 @@ function assertBuildInputsSnapshotted(result, generatedSourcefile, loadedInputs,
   for (const input of Object.keys(result.metafile.inputs)) {
     const absoluteInput = resolve(projectRoot, input);
     if (absoluteInput === generatedInput) {
+      continue;
+    }
+    if (input.startsWith("<data:") && input.endsWith(">")) {
       continue;
     }
 
@@ -972,7 +977,8 @@ async function describeResolutionCandidate(candidate, projectRoot) {
   try {
     const resolved = await realpath(candidate);
     if (!isPathInsideRoot(projectRoot, resolved)) {
-      return "outside-project";
+      const portableResolved = resolved.split(sep).join("/");
+      return `outside-project:sha256:${sha256(portableResolved)}`;
     }
     return `resolved:${relative(projectRoot, resolved).split(sep).join("/")}`;
   } catch (error) {

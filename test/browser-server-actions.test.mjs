@@ -21,6 +21,17 @@ test("command capture reports spawn failures", async () => {
   );
 });
 
+test("command capture waits for output drainage", async () => {
+  const expectedBytes = 256 * 1024;
+  const { stdout } = await runCapture(
+    process.execPath,
+    ["-e", `process.stdout.write("x".repeat(${expectedBytes}))`],
+    { cwd: repoRoot },
+  );
+
+  assert.equal(Buffer.byteLength(stdout), expectedBytes);
+});
+
 test("shutdown reuses terminal observation installed at spawn time", async () => {
   const child = spawn(process.execPath, ["-e", "process.exit(0)"], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -263,8 +274,7 @@ test("production serve handles browser hydration, payloads, and action success a
 
     await page.close();
   } finally {
-    await browser?.close();
-    await stopChild(server, serverTerminal, logs);
+    await closeOwnedBrowserAndServer(browser, server, serverTerminal, logs);
   }
 
   assert.doesNotMatch(`${logs.stdout}\n${logs.stderr}`, new RegExp(csrfToken));
@@ -617,24 +627,50 @@ async function runCapture(command, args, options) {
 
 function captureChildTerminal(child) {
   return new Promise((resolveTerminal) => {
-    let settled = false;
-    const finish = (terminal) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
+    let error = null;
+    let exitCode = child.exitCode;
+    let signalCode = child.signalCode;
+    const onError = (nextError) => {
+      error = nextError;
+    };
+    const onExit = (code, signal) => {
+      exitCode = code;
+      signalCode = signal;
+    };
+    const onClose = (code, signal) => {
       child.off("error", onError);
       child.off("exit", onExit);
-      resolveTerminal(terminal);
+      child.off("close", onClose);
+      resolveTerminal({
+        code: exitCode ?? code,
+        signal: signalCode ?? signal,
+        error,
+      });
     };
-    const onError = (error) => finish({ code: null, signal: null, error });
-    const onExit = (code, signal) => finish({ code, signal, error: null });
     child.once("error", onError);
     child.once("exit", onExit);
-    if (child.exitCode !== null || child.signalCode !== null) {
-      finish({ code: child.exitCode, signal: child.signalCode, error: null });
-    }
+    child.once("close", onClose);
   });
+}
+
+async function closeOwnedBrowserAndServer(browser, server, serverTerminal, logs) {
+  const errors = [];
+  try {
+    await browser?.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    await stopChild(server, serverTerminal, logs);
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length === 1) {
+    throw errors[0];
+  }
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Ferrite browser and server cleanup failed");
+  }
 }
 
 async function reserveLoopbackPort() {

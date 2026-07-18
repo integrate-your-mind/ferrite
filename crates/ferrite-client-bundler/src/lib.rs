@@ -507,7 +507,8 @@ fn current_input_snapshot_value(
                     .replace('\\', "/");
                 Ok(format!("resolved:{relative}"))
             }
-            Ok(_resolved) => Ok("outside-project".to_owned()),
+            Ok(_resolved) if input.value == "outside-project" => Ok("outside-project".to_owned()),
+            Ok(resolved) => Ok(outside_project_resolution_value(&resolved)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing".to_owned()),
             Err(_error) => Ok("error".to_owned()),
         },
@@ -525,6 +526,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn outside_project_resolution_value(path: &Path) -> String {
+    let portable = path.to_string_lossy().replace('\\', "/");
+    format!("outside-project:sha256:{}", sha256_hex(portable.as_bytes()))
 }
 
 fn module_graph_has_cycle<'a>(
@@ -572,12 +578,24 @@ fn is_valid_input_snapshot_value(input: &ClientBundleInputSnapshot) -> bool {
         }
         "resolution" => match input.value.as_str() {
             "missing" | "error" | "outside-project" => true,
-            value => value
-                .strip_prefix("resolved:")
-                .is_some_and(is_valid_module_graph_path),
+            value => {
+                value
+                    .strip_prefix("resolved:")
+                    .is_some_and(is_valid_module_graph_path)
+                    || value
+                        .strip_prefix("outside-project:sha256:")
+                        .is_some_and(is_valid_sha256_digest)
+            }
         },
         _ => false,
     }
+}
+
+fn is_valid_sha256_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn fingerprint_client_bundle(
@@ -841,6 +859,47 @@ process.stdout.write(JSON.stringify({{
         assert!(result.is_err(), "stale input snapshots must be rejected");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn detects_outside_project_resolution_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let first = external.path().join("first.json");
+        let second = external.path().join("second.json");
+        let link = project.path().join("data.json");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        symlink(&first, &link).unwrap();
+        let expected = outside_project_resolution_value(&fs::canonicalize(&first).unwrap());
+        let bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: Vec::new(),
+            input_snapshot: vec![ClientBundleInputSnapshot {
+                path: link.display().to_string(),
+                kind: "resolution".to_owned(),
+                value: expected,
+            }],
+        };
+
+        bundle.validate().unwrap();
+        bundle.validate_input_snapshot(project.path()).unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+
+        assert!(matches!(
+            bundle.validate_input_snapshot(project.path()),
+            Err(ClientBundleError::StaleInputSnapshot { .. })
+        ));
+    }
+
     #[test]
     fn retries_one_stale_rust_acceptance_snapshot() {
         let temp = tempfile::tempdir().unwrap();
@@ -953,9 +1012,19 @@ process.stdout.write(JSON.stringify({
         );
 
         bundle.input_snapshot = vec![ClientBundleInputSnapshot {
-            path: absolute,
+            path: absolute.clone(),
             kind: "resolution".to_owned(),
             value: "resolved:../outside.ts".to_owned(),
+        }];
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an invalid input snapshot entry"
+        );
+
+        bundle.input_snapshot = vec![ClientBundleInputSnapshot {
+            path: absolute,
+            kind: "resolution".to_owned(),
+            value: "outside-project:sha256:not-a-digest".to_owned(),
         }];
         assert_eq!(
             bundle.validate().unwrap_err().to_string(),
