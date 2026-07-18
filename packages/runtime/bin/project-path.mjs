@@ -11,3 +11,15 @@ export function isPathInsideRoot(root, file, path = nativePath) {
     && !path.isAbsolute(rootRelative)
   );
 }
+
+export function portableCanonicalPath(file) {
+  const portable = file.replaceAll("\\", "/");
+  const extendedUncPrefix = "//?/UNC/";
+  if (portable.slice(0, extendedUncPrefix.length).toUpperCase() === extendedUncPrefix) {
+    return `//${portable.slice(extendedUncPrefix.length)}`;
+  }
+  if (portable.startsWith("//?/")) {
+    return portable.slice(4);
+  }
+  return portable;
+}

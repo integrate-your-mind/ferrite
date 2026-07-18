@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import ts from "typescript";
 
-import { isPathInsideRoot } from "./project-path.mjs";
+import { isPathInsideRoot, portableCanonicalPath } from "./project-path.mjs";
 
 const [, , pageFile, outDirArg, publicPathArg, routePath = "/", propsJson = "{}", layoutsJson = "[]", optionsJson = "{}"] =
   process.argv;
@@ -977,7 +977,7 @@ async function describeResolutionCandidate(candidate, projectRoot) {
   try {
     const resolved = await realpath(candidate);
     if (!isPathInsideRoot(projectRoot, resolved)) {
-      const portableResolved = resolved.split(sep).join("/");
+      const portableResolved = portableCanonicalPath(resolved);
       return `outside-project:sha256:${sha256(portableResolved)}`;
     }
     return `resolved:${relative(projectRoot, resolved).split(sep).join("/")}`;

@@ -529,8 +529,23 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn outside_project_resolution_value(path: &Path) -> String {
-    let portable = path.to_string_lossy().replace('\\', "/");
+    let portable = portable_canonical_path(path);
     format!("outside-project:sha256:{}", sha256_hex(portable.as_bytes()))
+}
+
+fn portable_canonical_path(path: &Path) -> String {
+    let portable = path.to_string_lossy().replace('\\', "/");
+    const EXTENDED_UNC_PREFIX: &str = "//?/UNC/";
+    if portable
+        .get(..EXTENDED_UNC_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(EXTENDED_UNC_PREFIX))
+    {
+        return format!("//{}", &portable[EXTENDED_UNC_PREFIX.len()..]);
+    }
+    if let Some(path) = portable.strip_prefix("//?/") {
+        return path.to_owned();
+    }
+    portable
 }
 
 fn module_graph_has_cycle<'a>(
@@ -898,6 +913,30 @@ process.stdout.write(JSON.stringify({{
             bundle.validate_input_snapshot(project.path()),
             Err(ClientBundleError::StaleInputSnapshot { .. })
         ));
+    }
+
+    #[test]
+    fn canonical_path_normalization_aligns_windows_drive_and_unc_forms() {
+        assert_eq!(
+            portable_canonical_path(Path::new(r"C:\workspace\asset.json")),
+            "C:/workspace/asset.json"
+        );
+        assert_eq!(
+            portable_canonical_path(Path::new(r"\\?\C:\workspace\asset.json")),
+            "C:/workspace/asset.json"
+        );
+        assert_eq!(
+            portable_canonical_path(Path::new(r"\\server\share\asset.json")),
+            "//server/share/asset.json"
+        );
+        assert_eq!(
+            portable_canonical_path(Path::new(r"\\?\UNC\server\share\asset.json")),
+            "//server/share/asset.json"
+        );
+        assert_eq!(
+            portable_canonical_path(Path::new(r"\\?\unc\server\share\asset.json")),
+            "//server/share/asset.json"
+        );
     }
 
     #[test]
