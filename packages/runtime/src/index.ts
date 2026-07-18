@@ -181,10 +181,12 @@ export function toSerializableNode(child: Child): SerializableNode | null {
     throw new TypeError("Cannot serialize unsupported Ferrite element type.");
   }
 
+  const tag = child.type.toLowerCase();
+
   return {
     kind: "element",
-    tag: child.type,
-    props: serializeProps(child.type, child.props),
+    tag,
+    props: serializeProps(tag, child.props),
     children: flattenChildren(child.props.children),
   };
 }
@@ -257,6 +259,10 @@ function serializeProps(tag: string, props: Record<string, unknown>): Record<str
       continue;
     }
 
+    if (inputDefaultPropIsShadowed(tag, key, props)) {
+      continue;
+    }
+
     if (value === null || value === undefined || value === false) {
       continue;
     }
@@ -272,6 +278,19 @@ function serializeProps(tag: string, props: Record<string, unknown>): Record<str
   return serialized;
 }
 
+function inputDefaultPropIsShadowed(tag: string, name: string, props: Record<string, unknown>): boolean {
+  if (tag.toLowerCase() !== "input") {
+    return false;
+  }
+  if (name === "defaultValue") {
+    return props.value !== null && props.value !== undefined;
+  }
+  if (name === "defaultChecked") {
+    return props.checked !== null && props.checked !== undefined;
+  }
+  return false;
+}
+
 function serializablePropName(tag: string, name: string): string {
   if (name === "className") {
     return "class";
@@ -281,11 +300,11 @@ function serializablePropName(tag: string, name: string): string {
     return "for";
   }
 
-  if (tag === "input" && name === "defaultValue") {
+  if (tag.toLowerCase() === "input" && name === "defaultValue") {
     return "value";
   }
 
-  if (tag === "input" && name === "defaultChecked") {
+  if (tag.toLowerCase() === "input" && name === "defaultChecked") {
     return "checked";
   }
 

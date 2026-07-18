@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm } from "node:fs/promises";
-import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { build } from "esbuild";
@@ -82,6 +82,7 @@ const sourceLoaders = {
   ".cts": "ts",
   ".css": "css",
   ".json": "json",
+  ".txt": "text",
 };
 const buildInputLoaders = { ...sourceLoaders, ...fileLoaders };
 const extensionlessSourceExtensions = [".tsx", ".ts", ".jsx", ".js"];
@@ -447,6 +448,18 @@ function snapshotBuildInputsPlugin(snapshot, loadedInputs) {
   return {
     name: "ferrite-build-input-snapshot",
     setup(build) {
+      build.onResolve({ filter: /.*/ }, async (args) => {
+        if (
+          args.namespace !== "file"
+          || (!args.path.startsWith(".") && !isAbsolute(args.path))
+          || !buildInputLoaders[extname(args.path).toLowerCase()]
+        ) {
+          return undefined;
+        }
+
+        await recordResolutionSnapshot([resolve(args.resolveDir, args.path)], projectRoot, snapshot);
+        return undefined;
+      });
       build.onLoad({ filter: /.*/, namespace: "file" }, async (args) => {
         const loader = buildInputLoaders[extname(args.path).toLowerCase()];
         if (!loader) {
@@ -455,7 +468,7 @@ function snapshotBuildInputsPlugin(snapshot, loadedInputs) {
 
         const canonical = await realpath(args.path);
         const contents = await readFile(canonical);
-        loadedInputs.set(resolve(args.path), canonical);
+        loadedInputs.set(`${resolve(args.path)}${args.suffix}`, canonical);
         recordSnapshotValue(snapshot.sources, canonical, `sha256:${sha256(contents)}`, snapshot);
         return {
           contents,

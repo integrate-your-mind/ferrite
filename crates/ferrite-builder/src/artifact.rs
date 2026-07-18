@@ -517,7 +517,16 @@ fn is_sha256_hex(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    fn symlink_file(original: &Path, link: &Path) {
+        std::os::unix::fs::symlink(original, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(original: &Path, link: &Path) {
+        std::os::windows::fs::symlink_file(original, link).unwrap();
+    }
 
     fn write_file(root: &Path, path: &str, contents: &[u8]) -> ProductionArtifactFile {
         let full_path = root.join(path);
@@ -639,13 +648,14 @@ mod tests {
         assert!(finalize_production_artifact_manifest(&mut manifest).is_err());
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn rejects_symlinks_that_escape_the_artifact_root() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
         let mut manifest = valid_manifest(root.path());
         fs::remove_file(root.path().join("server/index.mjs")).unwrap();
-        symlink(outside.path(), root.path().join("server/index.mjs")).unwrap();
+        symlink_file(outside.path(), &root.path().join("server/index.mjs"));
         manifest.files[1] = ProductionArtifactFile {
             path: "server/index.mjs".to_owned(),
             size: 0,

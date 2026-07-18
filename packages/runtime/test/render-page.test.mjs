@@ -122,6 +122,12 @@ function sourceSnapshotValue(bundle, file) {
   )?.value;
 }
 
+function resolutionSnapshotValue(bundle, file) {
+  return bundle.inputSnapshot.find(
+    (input) => input.kind === "resolution" && input.path === file,
+  )?.value;
+}
+
 function sha256(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
@@ -260,11 +266,12 @@ test("build-client emits a complete module graph and refreshes it after dependen
   });
 });
 
-test("build-client snapshots every CSS, JSON, and WASM input esbuild consumes", async () => {
+test("build-client snapshots every CSS, JSON, text, and WASM input esbuild consumes", async () => {
   await withTempProject(async (projectRoot) => {
     const pageFile = join(projectRoot, "app/page.tsx");
     const cssFile = join(projectRoot, "app/style.css");
     const jsonFile = join(projectRoot, "app/data.json");
+    const textFile = join(projectRoot, "app/copy.txt");
     const wasmFile = join(projectRoot, "app/module.wasm");
     await mkdir(dirname(pageFile), { recursive: true });
     await writeFile(
@@ -272,25 +279,30 @@ test("build-client snapshots every CSS, JSON, and WASM input esbuild consumes", 
       [
         `"use client";`,
         `import data from "./data.json";`,
+        `import copy from "./copy.txt";`,
         `import wasmUrl from "./module.wasm";`,
         `import "./style.css";`,
-        `export default function Page() { return <main data-wasm={wasmUrl}>{data.label}</main>; }`,
+        `export default function Page() { return <main data-wasm={wasmUrl}>{data.label}: {copy}</main>; }`,
         "",
       ].join("\n"),
     );
     const initialCss = ".page { color: red; }\n";
     const initialJson = '{ "label": "first" }\n';
+    const initialText = "first copy\n";
     const initialWasm = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]);
     await writeFile(cssFile, initialCss);
     await writeFile(jsonFile, initialJson);
+    await writeFile(textFile, initialText);
     await writeFile(wasmFile, initialWasm);
 
     const canonicalCss = await realpath(cssFile);
     const canonicalJson = await realpath(jsonFile);
+    const canonicalText = await realpath(textFile);
     const canonicalWasm = await realpath(wasmFile);
     const first = await buildClient(projectRoot, pageFile);
     assert.equal(sourceSnapshotValue(first, canonicalCss), sha256(initialCss));
     assert.equal(sourceSnapshotValue(first, canonicalJson), sha256(initialJson));
+    assert.equal(sourceSnapshotValue(first, canonicalText), sha256(initialText));
     assert.equal(sourceSnapshotValue(first, canonicalWasm), sha256(initialWasm));
     const firstOutputs = await readBundleOutputs(join(projectRoot, "out"), first);
 
@@ -309,14 +321,72 @@ test("build-client snapshots every CSS, JSON, and WASM input esbuild consumes", 
     assert.equal(sourceSnapshotValue(afterCss, canonicalCss), sha256(changedCss));
     assert.notEqual(sourceSnapshotValue(afterCss, canonicalCss), sourceSnapshotValue(afterJson, canonicalCss));
 
+    const changedText = "second copy\n";
+    await writeFile(textFile, changedText);
+    const afterText = await buildClient(projectRoot, pageFile);
+    assert.equal(sourceSnapshotValue(afterText, canonicalText), sha256(changedText));
+    assert.notEqual(
+      sourceSnapshotValue(afterText, canonicalText),
+      sourceSnapshotValue(afterCss, canonicalText),
+    );
+
     const changedWasm = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0, 1]);
     await writeFile(wasmFile, changedWasm);
     const afterWasm = await buildClient(projectRoot, pageFile);
     assert.equal(sourceSnapshotValue(afterWasm, canonicalWasm), sha256(changedWasm));
     assert.notEqual(
       sourceSnapshotValue(afterWasm, canonicalWasm),
-      sourceSnapshotValue(afterCss, canonicalWasm),
+      sourceSnapshotValue(afterText, canonicalWasm),
     );
+  });
+});
+
+test("build-client snapshots asset symlink resolution and canonical bytes", { skip: platform === "win32" }, async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const dataLink = join(projectRoot, "app/data.json");
+    const dataA = join(projectRoot, "app/data-a.json");
+    const dataB = join(projectRoot, "app/data-b.json");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      `"use client"; import data from "./data.json"; export default function Page() { return <main>{data.label}</main>; }\n`,
+    );
+    await writeFile(dataA, '{ "label": "A" }\n');
+    await writeFile(dataB, '{ "label": "B" }\n');
+    await symlink("data-a.json", dataLink);
+
+    const canonicalProjectRoot = await realpath(projectRoot);
+    const canonicalDataA = await realpath(dataA);
+    const bundle = await buildClient(projectRoot, pageFile);
+
+    assert.equal(
+      resolutionSnapshotValue(bundle, join(canonicalProjectRoot, "app/data.json")),
+      "resolved:app/data-a.json",
+    );
+    assert.equal(sourceSnapshotValue(bundle, canonicalDataA), sha256('{ "label": "A" }\n'));
+
+    await rm(dataLink);
+    await symlink("data-b.json", dataLink);
+    assert.equal(await realpath(dataLink), await realpath(dataB));
+  });
+});
+
+test("build-client snapshots esbuild inputs with import suffixes", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const dataFile = join(projectRoot, "app/data.json");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      `"use client"; import data from "./data.json?variant"; export default function Page() { return <main>{data.label}</main>; }\n`,
+    );
+    await writeFile(dataFile, '{ "label": "suffix" }\n');
+
+    const canonicalData = await realpath(dataFile);
+    const bundle = await buildClient(projectRoot, pageFile);
+
+    assert.equal(sourceSnapshotValue(bundle, canonicalData), sha256('{ "label": "suffix" }\n'));
   });
 });
 

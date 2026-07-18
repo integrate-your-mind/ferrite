@@ -357,6 +357,8 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
         });
     }
 
+    validate_route_input_snapshots(&production_routes, &config.project)?;
+
     let mut artifact_paths = BTreeSet::new();
     for route in &production_routes {
         artifact_paths.insert(route.server_module.clone());
@@ -412,6 +414,8 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
     };
     fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
 
+    validate_route_input_snapshots(&production_manifest.routes, &config.project)?;
+
     Ok(BuildReport {
         out_dir: config.out_dir.clone(),
         routes_count: routes.len(),
@@ -425,6 +429,16 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
         client_bundles,
         server_action_manifests,
     })
+}
+
+fn validate_route_input_snapshots(
+    routes: &[ProductionArtifactRoute],
+    project: &Path,
+) -> Result<()> {
+    for route in routes {
+        route.client_bundle.validate_input_snapshot(project)?;
+    }
+    Ok(())
 }
 
 fn route_static_param_sets(
@@ -2296,6 +2310,70 @@ process.stdout.write(JSON.stringify({
             error,
             BuildError::ClientBundle(ClientBundleError::StaleInputSnapshot { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_a_mixed_snapshot_across_multiple_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("app/page.tsx"),
+            "export default function Page() {}",
+        );
+        write(
+            &temp.path().join("app/about/page.tsx"),
+            "export default function About() {}",
+        );
+        let shared_input = temp.path().join("shared.json");
+        let invocation_count = temp.path().join("bundle-invocations.txt");
+        write(&shared_input, r#"{"version":"A"}"#);
+        let config = build_config(temp.path());
+        let shared_input_json = serde_json::to_string(&shared_input).unwrap();
+        let invocation_count_json = serde_json::to_string(&invocation_count).unwrap();
+        make_script(
+            &config.client_bundler,
+            &format!(
+                r#"
+const crypto = await import("node:crypto");
+const fs = await import("node:fs/promises");
+const sharedInput = {shared_input_json};
+const invocationCount = {invocation_count_json};
+let count = 0;
+try {{
+  count = Number(await fs.readFile(invocationCount, "utf8"));
+}} catch (error) {{
+  if (error.code !== "ENOENT") throw error;
+}}
+if (count === 1) {{
+  await fs.writeFile(sharedInput, '{{"version":"B"}}');
+}}
+await fs.writeFile(invocationCount, String(count + 1));
+const resolved = await fs.realpath(sharedInput);
+const source = await fs.readFile(resolved);
+const digest = crypto.createHash("sha256").update(source).digest("hex");
+process.stdout.write(JSON.stringify({{
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  inputSnapshot: [{{ path: resolved, kind: "source", value: `sha256:${{digest}}` }}]
+}}));
+"#
+            ),
+        );
+        write(&config.out_dir.join("previous.txt"), "previous release");
+
+        let error = build_project(&config)
+            .expect_err("a build must not combine route snapshots from different source states");
+
+        assert!(matches!(
+            error,
+            BuildError::ClientBundle(ClientBundleError::StaleInputSnapshot { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("previous.txt")).unwrap(),
+            "previous release"
+        );
     }
 
     fn assert_rejects_mixed_convention_snapshot(file_name: &str) {

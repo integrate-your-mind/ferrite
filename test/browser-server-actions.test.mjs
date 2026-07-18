@@ -13,6 +13,25 @@ import { chromium } from "playwright-core";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const chromeExecutable = process.env.FERRITE_BROWSER_EXECUTABLE ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
+test("command capture reports spawn failures", async () => {
+  const missingCommand = join(tmpdir(), `ferrite-missing-command-${process.pid}-${Date.now()}`);
+  await assert.rejects(
+    runCapture(missingCommand, [], { cwd: repoRoot }),
+    /failed to start:.*ENOENT/,
+  );
+});
+
+test("shutdown reuses terminal observation installed at spawn time", async () => {
+  const child = spawn(process.execPath, ["-e", "process.exit(0)"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const terminal = captureChildTerminal(child);
+  const logs = captureChildOutput(child);
+  await terminal;
+
+  await stopChild(child, terminal, logs);
+});
+
 test("generated action form bootstrap submits to a fixture server for route, island, and server-only assets", async (t) => {
   if (!existsSync(chromeExecutable)) {
     t.skip(`Chrome executable not found at ${chromeExecutable}`);
@@ -79,9 +98,19 @@ test("production serve handles browser hydration, payloads, and action success a
     "debug",
     process.platform === "win32" ? "ferrite.exe" : "ferrite",
   );
+  const proofRoot = await mkdtemp(join(tmpdir(), "ferrite-production-browser-"));
+  const artifact = join(proofRoot, "build");
+  const typesOut = join(proofRoot, "types/routes.d.ts");
+  t.after(async () => {
+    await rm(proofRoot, { recursive: true, force: true });
+  });
 
   await run("cargo", ["build", "-p", "ferrite-cli"], { cwd: repoRoot });
-  await run(ferriteBinary, ["build", "--project", exampleProject], { cwd: repoRoot });
+  await run(
+    ferriteBinary,
+    ["build", "--project", exampleProject, "--out", artifact, "--types-out", typesOut],
+    { cwd: repoRoot },
+  );
 
   const port = await reserveLoopbackPort();
   const origin = `http://127.0.0.1:${port}`;
@@ -93,7 +122,7 @@ test("production serve handles browser hydration, payloads, and action success a
       "--project",
       exampleProject,
       "--artifact",
-      ".ferrite/build",
+      artifact,
       "--page-renderer",
       join(repoRoot, "packages/runtime/bin/render-artifact.mjs"),
       "--host",
@@ -115,6 +144,7 @@ test("production serve handles browser hydration, payloads, and action success a
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  const serverTerminal = captureChildTerminal(server);
   const logs = captureChildOutput(server);
 
   let browser;
@@ -234,7 +264,7 @@ test("production serve handles browser hydration, payloads, and action success a
     await page.close();
   } finally {
     await browser?.close();
-    await stopChild(server, logs);
+    await stopChild(server, serverTerminal, logs);
   }
 
   assert.doesNotMatch(`${logs.stdout}\n${logs.stderr}`, new RegExp(csrfToken));
@@ -565,20 +595,46 @@ async function run(command, args, options) {
 
 async function runCapture(command, args, options) {
   const child = spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
+  const terminalPromise = captureChildTerminal(child);
   const stdout = [];
   const stderr = [];
   child.stdout.on("data", (chunk) => stdout.push(chunk));
   child.stderr.on("data", (chunk) => stderr.push(chunk));
-  const status = await new Promise((resolveExit) => child.on("exit", resolveExit));
-  if (status !== 0) {
+  const terminal = await terminalPromise;
+  if (terminal.error) {
+    throw new Error(`${command} ${args.join(" ")} failed to start: ${terminal.error.message}`);
+  }
+  if (terminal.code !== 0) {
     throw new Error(
-      `${command} ${args.join(" ")} failed with exit code ${status}\n${Buffer.concat(stdout).toString("utf8")}${Buffer.concat(stderr).toString("utf8")}`,
+      `${command} ${args.join(" ")} failed with ${terminal.signal ? `signal ${terminal.signal}` : `exit code ${terminal.code}`}\n${Buffer.concat(stdout).toString("utf8")}${Buffer.concat(stderr).toString("utf8")}`,
     );
   }
   return {
     stdout: Buffer.concat(stdout).toString("utf8"),
     stderr: Buffer.concat(stderr).toString("utf8"),
   };
+}
+
+function captureChildTerminal(child) {
+  return new Promise((resolveTerminal) => {
+    let settled = false;
+    const finish = (terminal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.off("error", onError);
+      child.off("exit", onExit);
+      resolveTerminal(terminal);
+    };
+    const onError = (error) => finish({ code: null, signal: null, error });
+    const onExit = (code, signal) => finish({ code, signal, error: null });
+    child.once("error", onError);
+    child.once("exit", onExit);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish({ code: child.exitCode, signal: child.signalCode, error: null });
+    }
+  });
 }
 
 async function reserveLoopbackPort() {
@@ -627,32 +683,42 @@ async function waitForServer(origin, child, logs) {
   throw new Error(`Ferrite production server did not become ready\n${logs.stdout}\n${logs.stderr}`);
 }
 
-async function stopChild(child, logs) {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    assert.equal(
-      child.exitCode,
-      0,
-      `Ferrite production server exited by ${child.signalCode ?? child.exitCode}\n${logs.stdout}\n${logs.stderr}`,
-    );
-    return;
+async function stopChild(child, terminalPromise, logs) {
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGTERM");
   }
 
-  const exitPromise = new Promise((resolveExit) =>
-    child.once("exit", (code, signal) => resolveExit({ code, signal, timedOut: false })),
-  );
-  child.kill("SIGTERM");
-  const terminal = await Promise.race([
-    exitPromise,
-    new Promise((resolveTimeout) =>
-      setTimeout(() => resolveTimeout({ code: null, signal: null, timedOut: true }), 10_000),
-    ),
-  ]);
-  if (terminal.timedOut) {
+  let terminal = await waitForChildTerminal(terminalPromise, 10_000);
+  if (!terminal) {
     child.kill("SIGKILL");
-    await new Promise((resolveExit) => child.once("exit", resolveExit));
+    terminal = await waitForChildTerminal(terminalPromise, 5_000);
+    if (!terminal) {
+      throw new Error(`Ferrite production server remained alive after SIGKILL\n${logs.stdout}\n${logs.stderr}`);
+    }
     throw new Error(`Ferrite production server did not stop after SIGTERM\n${logs.stdout}\n${logs.stderr}`);
   }
-  assert.equal(terminal.code, 0, `Ferrite production server exited by ${terminal.signal ?? terminal.code}`);
+  if (terminal.error) {
+    throw new Error(`Ferrite production server failed to start: ${terminal.error.message}\n${logs.stdout}\n${logs.stderr}`);
+  }
+  assert.equal(
+    terminal.code,
+    0,
+    `Ferrite production server exited by ${terminal.signal ?? terminal.code}\n${logs.stdout}\n${logs.stderr}`,
+  );
+}
+
+async function waitForChildTerminal(terminalPromise, timeoutMs) {
+  let timeout;
+  try {
+    return await Promise.race([
+      terminalPromise,
+      new Promise((resolveTimeout) => {
+        timeout = setTimeout(() => resolveTimeout(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function parseJsonLogEntries(log) {

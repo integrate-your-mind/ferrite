@@ -2011,6 +2011,10 @@ class DomRoot {
         continue;
       }
 
+      if (inputAliasedPropIsShadowed(element.localName, name, value, props)) {
+        continue;
+      }
+
       if (name.startsWith("on")) {
         this.applyEventProp(element, name, value);
       } else {
@@ -2059,6 +2063,10 @@ class DomRoot {
   private applyHydratedProps(element: Element, props: Record<string, unknown>): void {
     for (const [name, value] of Object.entries(props)) {
       if (name === "children" || name === "key") {
+        continue;
+      }
+
+      if (inputAliasedPropIsShadowed(element.localName, name, value, props)) {
         continue;
       }
 
@@ -2578,6 +2586,30 @@ class HydrationCursor {
   }
 }
 
+function inputAliasedPropIsShadowed(
+  tag: string,
+  name: string,
+  value: unknown,
+  props: Record<string, unknown>,
+): boolean {
+  if (tag.toLowerCase() !== "input") {
+    return false;
+  }
+  if (name === "defaultValue") {
+    return props.value !== null && props.value !== undefined;
+  }
+  if (name === "defaultChecked") {
+    return props.checked !== null && props.checked !== undefined;
+  }
+  if (name === "value") {
+    return (value === null || value === undefined) && props.defaultValue !== null && props.defaultValue !== undefined;
+  }
+  if (name === "checked") {
+    return (value === null || value === undefined) && props.defaultChecked !== null && props.defaultChecked !== undefined;
+  }
+  return false;
+}
+
 function attributeNameFromProp(tag: string, name: string): string {
   if (name === "className") {
     return "class";
@@ -2587,11 +2619,11 @@ function attributeNameFromProp(tag: string, name: string): string {
     return "for";
   }
 
-  if (tag === "input" && name === "defaultValue") {
+  if (tag.toLowerCase() === "input" && name === "defaultValue") {
     return "value";
   }
 
-  if (tag === "input" && name === "defaultChecked") {
+  if (tag.toLowerCase() === "input" && name === "defaultChecked") {
     return "checked";
   }
 

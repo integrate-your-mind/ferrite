@@ -4869,6 +4869,7 @@ fn is_source_file(path: &Path) -> bool {
                 | "mts"
                 | "png"
                 | "svg"
+                | "txt"
                 | "ts"
                 | "tsx"
                 | "webp"
@@ -9881,7 +9882,7 @@ process.stdout.write(JSON.stringify({
     }
 
     #[test]
-    fn real_compiler_build_inputs_drive_css_json_and_wasm_invalidation() {
+    fn real_compiler_build_inputs_drive_css_json_text_and_wasm_invalidation() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
         write(&temp.path().join("package.json"), r#"{ "private": true }"#);
@@ -9889,12 +9890,14 @@ process.stdout.write(JSON.stringify({
             &app.join("page.tsx"),
             r#""use client";
 import data from "../data.json";
+import copy from "../copy.txt";
 import wasmUrl from "../module.wasm";
 import "../style.css";
-export default function Page() { return <main data-wasm={wasmUrl}>{data.label}</main>; }
+export default function Page() { return <main data-wasm={wasmUrl}>{data.label}: {copy}</main>; }
 "#,
         );
         write(&temp.path().join("data.json"), r#"{ "label": "first" }"#);
+        write(&temp.path().join("copy.txt"), "first copy");
         write(&temp.path().join("style.css"), ".page { color: red; }");
         fs::write(
             temp.path().join("module.wasm"),
@@ -9920,12 +9923,50 @@ export default function Page() { return <main data-wasm={wasmUrl}>{data.label}</
         assert_eq!(project.handle_get("/").unwrap().status, 200);
         let after_css = project.build_id().unwrap();
 
+        write(&temp.path().join("copy.txt"), "second copy");
+        let text_build = project.build_id().unwrap();
+        assert!(text_build > after_css);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let after_text = project.build_id().unwrap();
+
         fs::write(
             temp.path().join("module.wasm"),
             [0_u8, 97, 115, 109, 1, 0, 0, 0, 1],
         )
         .unwrap();
-        assert!(project.build_id().unwrap() > after_css);
+        assert!(project.build_id().unwrap() > after_text);
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_compiler_asset_symlink_retarget_invalidates_dev_module_graph() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        let data_link = temp.path().join("data.json");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(
+            &app.join("page.tsx"),
+            r#""use client";
+import data from "../data.json";
+export default function Page() { return <main>{data.label}</main>; }
+"#,
+        );
+        write(&temp.path().join("data-a.json"), r#"{ "label": "A" }"#);
+        write(&temp.path().join("data-b.json"), r#"{ "label": "B" }"#);
+        symlink("data-a.json", &data_link).unwrap();
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        fs::remove_file(&data_link).unwrap();
+        symlink("data-b.json", &data_link).unwrap();
+        assert!(project.build_id().unwrap() > first_build);
         assert_eq!(project.handle_get("/").unwrap().status, 200);
     }
 

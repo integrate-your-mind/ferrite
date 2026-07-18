@@ -890,25 +890,27 @@ function renderServerChildMaybe(
     throw new TypeError("Cannot serialize unsupported Ferrite element type.");
   }
 
-  if (child.type === "form" && isServerActionReference(child.props.action)) {
+  const tag = child.type.toLowerCase();
+
+  if (tag === "form" && isServerActionReference(child.props.action)) {
     return renderServerActionFormMaybe(child.props, context);
   }
 
-  assertNoServerActionProps(child.type, child.props);
+  assertNoServerActionProps(tag, child.props);
   const children = renderServerChildrenMaybe(child.props.children, context);
   if (isPromiseLike(children)) {
     return children.then((resolvedChildren) => ({
       kind: "element",
-      tag: child.type as string,
-      props: serializeServerProps(child.type as string, child.props),
+      tag,
+      props: serializeServerProps(tag, child.props),
       children: resolvedChildren,
     }));
   }
 
   return {
     kind: "element",
-    tag: child.type,
-    props: serializeServerProps(child.type, child.props),
+    tag,
+    props: serializeServerProps(tag, child.props),
     children,
   };
 }
@@ -1169,7 +1171,7 @@ function assertNoReservedServerActionFields(nodes: SerializableNode[]): void {
     }
 
     if (
-      node.tag === "input" &&
+      node.tag.toLowerCase() === "input" &&
       typeof node.props.name === "string" &&
       RESERVED_SERVER_ACTION_FIELDS.has(node.props.name)
     ) {
@@ -1199,6 +1201,10 @@ function serializeServerProps(
       continue;
     }
 
+    if (inputDefaultPropIsShadowed(tag, key, props)) {
+      continue;
+    }
+
     if (value === null || value === undefined || value === false) {
       continue;
     }
@@ -1212,6 +1218,19 @@ function serializeServerProps(
   }
 
   return serialized;
+}
+
+function inputDefaultPropIsShadowed(tag: string, name: string, props: Record<string, unknown>): boolean {
+  if (tag.toLowerCase() !== "input") {
+    return false;
+  }
+  if (name === "defaultValue") {
+    return props.value !== null && props.value !== undefined;
+  }
+  if (name === "defaultChecked") {
+    return props.checked !== null && props.checked !== undefined;
+  }
+  return false;
 }
 
 function serializeClientReferenceProps(props: Record<string, unknown>): ClientReferenceSerializedProps {
@@ -1269,11 +1288,11 @@ function serializablePropName(tag: string, name: string): string {
     return "for";
   }
 
-  if (tag === "input" && name === "defaultValue") {
+  if (tag.toLowerCase() === "input" && name === "defaultValue") {
     return "value";
   }
 
-  if (tag === "input" && name === "defaultChecked") {
+  if (tag.toLowerCase() === "input" && name === "defaultChecked") {
     return "checked";
   }
 
