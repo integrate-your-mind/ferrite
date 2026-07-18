@@ -18,6 +18,8 @@ ferrite-router = { path = "../ferrite-router", version = "0.1.0" }
 ferrite-ssr = { path = "../ferrite-ssr", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+signal-hook = { workspace = true }
 
 [dev-dependencies]
+ferrite-client-bundler = { path = "../ferrite-client-bundler", version = "0.1.0" }
 tempfile = { workspace = true }

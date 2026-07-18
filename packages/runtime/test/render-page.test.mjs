@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { platform } from "node:process";
@@ -170,7 +170,11 @@ test("build-client emits a complete module graph and refreshes it after dependen
       { file: "app/Button.tsx", imports: [] },
       { file: "app/Counter.tsx", imports: ["app/Button.tsx"] },
       { file: "app/Lazy.mts", imports: [] },
-      { file: "app/page.tsx", imports: ["app/shared.ts"], watchFiles: ["app/shared.tsx"] },
+      {
+        file: "app/page.tsx",
+        imports: ["app/shared.ts"],
+        watchFiles: ["app/shared.tsx", "tsconfig.json"],
+      },
       {
         file: "app/shared.ts",
         imports: ["app/Counter.tsx", "app/Lazy.mts"],
@@ -188,7 +192,11 @@ test("build-client emits a complete module graph and refreshes it after dependen
     const second = await buildClient(projectRoot, pageFile);
     assert.deepEqual(second.moduleGraph, [
       { file: "app/CounterTwo.tsx", imports: [] },
-      { file: "app/page.tsx", imports: ["app/shared.ts"], watchFiles: ["app/shared.tsx"] },
+      {
+        file: "app/page.tsx",
+        imports: ["app/shared.ts"],
+        watchFiles: ["app/shared.tsx", "tsconfig.json"],
+      },
       { file: "app/shared.ts", imports: ["app/CounterTwo.tsx"] },
     ]);
     assert.deepEqual(second.clientReferences.map((reference) => reference.id), ["app/CounterTwo.tsx#default"]);
@@ -251,7 +259,7 @@ test("build-client preserves runtime-file precedence with TypeScript source fall
       {
         file: "app/page.tsx",
         imports: ["app/legacy.cts", "app/modern.mts", "app/server.js", "app/view.tsx"],
-        watchFiles: ["app/legacy.cjs", "app/modern.mjs", "app/view.jsx"],
+        watchFiles: ["app/legacy.cjs", "app/modern.mjs", "app/view.jsx", "tsconfig.json"],
       },
       { file: "app/server.js", imports: [] },
       { file: "app/view.tsx", imports: [] },
@@ -306,7 +314,7 @@ test("build-client excludes emit-erased type-only imports from the runtime modul
       {
         file: "app/page.tsx",
         imports: ["app/server.ts"],
-        watchFiles: ["app/server.tsx"],
+        watchFiles: ["app/server.tsx", "tsconfig.json"],
       },
       { file: "app/server.ts", imports: ["app/Client.tsx"] },
     ]);
@@ -377,6 +385,47 @@ test("build-client reports malformed or unresolved TypeScript configuration", as
   });
 });
 
+test("build-client snapshots a missing TypeScript configuration input", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `export default function Page() { return null; }\n`);
+
+    const bundle = await buildClient(projectRoot, pageFile);
+    const canonicalProjectRoot = await realpath(projectRoot);
+
+    assert.deepEqual(
+      bundle.inputSnapshot.filter((entry) => entry.path === join(canonicalProjectRoot, "tsconfig.json")),
+      [{ kind: "source", path: join(canonicalProjectRoot, "tsconfig.json"), value: "missing" }],
+    );
+  });
+});
+
+test("build-client snapshots inherited TypeScript configuration outside the project root", async () => {
+  const container = await mkdtemp(join(tmpdir(), "ferrite-shared-tsconfig-"));
+  const projectRoot = join(container, "project");
+  try {
+    await mkdir(projectRoot, { recursive: true });
+    await writeFile(join(projectRoot, "package.json"), JSON.stringify({ private: true, type: "module" }));
+    await linkRuntimePackage(projectRoot);
+    const baseConfig = join(container, "tsconfig.base.json");
+    await writeFile(baseConfig, JSON.stringify({ compilerOptions: { verbatimModuleSyntax: true } }));
+    await writeFile(join(projectRoot, "tsconfig.json"), JSON.stringify({ extends: "../tsconfig.base.json" }));
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, `export default function Page() { return null; }\n`);
+
+    const bundle = await buildClient(projectRoot, pageFile);
+    const canonicalBaseConfig = await realpath(baseConfig);
+    const inherited = bundle.inputSnapshot.find((entry) => entry.path === canonicalBaseConfig);
+
+    assert.equal(inherited?.kind, "source");
+    assert.match(inherited?.value ?? "", /^sha256:[a-f0-9]{64}$/);
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
 test("build-client includes two-argument dynamic imports in the runtime graph", async () => {
   await withTempProject(async (projectRoot) => {
     const pageFile = join(projectRoot, "app/page.tsx");
@@ -391,7 +440,11 @@ test("build-client includes two-argument dynamic imports in the runtime graph", 
     const bundle = await buildClient(projectRoot, pageFile);
     assert.deepEqual(bundle.moduleGraph, [
       { file: "app/lazy.ts", imports: [] },
-      { file: "app/page.tsx", imports: ["app/server.ts"], watchFiles: ["app/server.tsx"] },
+      {
+        file: "app/page.tsx",
+        imports: ["app/server.ts"],
+        watchFiles: ["app/server.tsx", "tsconfig.json"],
+      },
       { file: "app/server.ts", imports: ["app/lazy.ts"], watchFiles: ["app/lazy.tsx"] },
     ]);
   });
@@ -456,7 +509,11 @@ test("build-client retries when a resolver input changes during bundling", { ski
     assert.deepEqual(bundle.clientReferences.map((reference) => reference.id), ["app/ClientB.tsx#default"]);
     assert.deepEqual(bundle.moduleGraph, [
       { file: "app/ClientB.tsx", imports: [] },
-      { file: "app/page.tsx", imports: ["app/ClientB.tsx"], watchFiles: ["app/Client.tsx"] },
+      {
+        file: "app/page.tsx",
+        imports: ["app/ClientB.tsx"],
+        watchFiles: ["app/Client.tsx", "tsconfig.json"],
+      },
     ]);
   });
 });
@@ -530,7 +587,11 @@ test("build-client includes static CommonJS and TypeScript import-equals depende
     assert.deepEqual(bundle.moduleGraph, [
       { file: "app/legacy.cjs", imports: ["app/nested.cjs"] },
       { file: "app/nested.cjs", imports: [] },
-      { file: "app/page.tsx", imports: ["app/server.ts"], watchFiles: ["app/server.tsx"] },
+      {
+        file: "app/page.tsx",
+        imports: ["app/server.ts"],
+        watchFiles: ["app/server.tsx", "tsconfig.json"],
+      },
       { file: "app/server.ts", imports: ["app/legacy.cjs"] },
     ]);
   });
@@ -772,7 +833,7 @@ test("render-page rejects unknown server action ids without invoking actions", a
   });
 });
 
-test("render-page returns sanitized error responses for thrown server actions", async () => {
+test("render-page does not expose unexpected server action exceptions", async () => {
   await withTempProject(async (projectRoot) => {
     const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
     await mkdir(dirname(pageFile), { recursive: true });
@@ -795,6 +856,48 @@ test("render-page returns sanitized error responses for thrown server actions", 
       ].join("\n"),
     );
 
+    await assert.rejects(
+      () =>
+        renderPageAction(
+          projectRoot,
+          pageFile,
+          createServerActionRequest({
+            id: "app/posts/[id]/page.tsx#savePost",
+            routePath: "/posts/alpha",
+          }),
+        ),
+      (error) => {
+        assert.match(error.stderr, /Action exploded/);
+        assert.doesNotMatch(error.stdout, /Action exploded/);
+        return true;
+      },
+    );
+  });
+});
+
+test("render-page returns explicit public server action errors with stable codes", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/posts/[id]/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        `import { createServerAction, FerriteActionError } from "@ferrite/runtime/server";`,
+        "",
+        `export default function Page() {`,
+        `  const savePost = createServerAction({`,
+        `    id: "app/posts/[id]/page.tsx#savePost",`,
+        `    routePattern: "/posts/:id",`,
+        `    async run() {`,
+        `      throw new FerriteActionError("POST_CONFLICT", "Could not save post.");`,
+        `    },`,
+        `  });`,
+        `  return <form action={savePost}><button type="submit">Save</button></form>;`,
+        `}`,
+        "",
+      ].join("\n"),
+    );
+
     const response = await renderPageAction(
       projectRoot,
       pageFile,
@@ -808,9 +911,9 @@ test("render-page returns sanitized error responses for thrown server actions", 
       ferrite: "server-action-response",
       version: 1,
       status: "error",
-      message: "Action exploded",
+      code: "POST_CONFLICT",
+      message: "Could not save post.",
     });
-    assert.equal(JSON.stringify(response).includes("at "), false);
   });
 });
 

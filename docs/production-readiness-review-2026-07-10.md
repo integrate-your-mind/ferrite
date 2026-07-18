@@ -1,6 +1,6 @@
 # Ferrite Production Readiness Review
 
-Updated: 2026-07-14
+Updated: 2026-07-18
 
 ## Decision
 
@@ -18,9 +18,19 @@ The highest-return work is no longer broad React or Next.js parity. It is the pr
 - Reserved actions: merge, deploy, release, publish, repository settings, credentials, billing, and recreation of the removed `ferrite-proof` VM. Generic instructions to continue, finish, or unblock do not authorize a reserved action; Romy must authorize that action explicitly.
 - Draft rule: PR #4 remains draft until every required local gate passes, the exact remote head and proof receipt agree, and no actionable review finding remains. Missing hosted execution or independent review keeps the disposition at `FIX` rather than implying readiness.
 
+## July 18 PR Backlog Ledger
+
+PR #4 is the sole open delivery unit. Its base is `main` at `d10b4e9c364f533d621a9cd151bbcd1bb161278c`; the remote delivery branch is `codex/module-graph-hardening` at `1ad7c32ec7d4ea4bf13d1d29a21fdb3b426cc359`. The dedicated mutable worktree is `codex/module-graph-backlog-fix`, based on local source commit `1c019f9c51bd54b9081f37361d543a511549fa4f`, with the July 18 backlog fixes still uncommitted while exact-head proof is in progress. No other owner may edit this delivery unit.
+
+| Unit | Intent and dependency | Review/CI debt | Evidence state | Disposition |
+| --- | --- | --- | --- | --- |
+| Draft PR #4 | Compiler-owned runtime graph, cycle diagnostics, resolver/config invalidation, then the dependent slow-client, action-security, and deployment fixes found during release audit | The independent reviewer returned `FIX_NOW` at `1c019f9` for the Node-to-Rust snapshot handoff and missing/external config watches. The same reviewer must inspect the final committed head. GitHub has no executed status check; hosted Actions previously ended in `startup_failure` before job allocation. | All listed findings were reproduced before the local fixes. Focused graph, production-build coherence, absolute request-read, bounded replay, public/internal action-error, real-socket action, and real CLI `SIGTERM` regressions pass. Full exact-head lint/typecheck/build/test/coverage/package/browser gates are pending. | `FIX_NOW` until the final head is committed, pushed to the existing PR branch, independently reviewed, and fully proven. Hosted execution remains a separately labeled external gap. |
+| Issue #3 | Broad productionization backlog; PR #4 closes only its graph, request-budget, action-error, and shutdown subfindings | The remaining license, distribution, hosted staging, hosted capacity, session/auth, distributed replay, atomic release-pointer, and external observability work must stay open after PR #4. | Local proof cannot close hosted or release claims. | `EXTERNALLY_BLOCKED` or future scoped backlog, depending on each subfinding; not a reason to add scope to PR #4. |
+| Historical `codex/nginx-proof-harness` local delta | Earlier nginx evidence already represented by merged HTTP-framing work and preserved local files | It overlaps the completed framing lane and must not be mixed into PR #4. | Preserved in its original worktree; no unique file was deleted or moved. | `SUPERSEDE_CANDIDATE`, pending a separate preservation decision with close/delete authority. |
+
 ## Current Evidence
 
-Locally proven through the current `codex/http-framing-hardening` PR branch:
+Historically proven across the merged HTTP-framing lane and the current PR #4 branch:
 
 - Rust formatting and clippy with warnings denied.
 - TypeScript package checks and example app typechecking.
@@ -40,7 +50,7 @@ Locally proven through the current `codex/http-framing-hardening` PR branch:
 
 Explicitly not proven:
 
-- GitHub-hosted job execution or a distinct external approval. The remote and PR #2 exist, but exact-head Actions runs end in `startup_failure` with zero allocated jobs and no status checks.
+- GitHub-hosted job execution or a distinct external approval. Draft PR #4 exists, but exact-head Actions attempts have ended in `startup_failure` with zero allocated jobs and no status checks.
 - Hosted staging behind real TLS, proxy, process manager, CDN, or rollback automation; local container proof does not establish this.
 - npm or native prebuild publication and registry installation.
 - Cargo registry publication. All 11 local archives now package with versioned internal dependencies, but publish ordering and registry installation are not proven.
@@ -95,16 +105,16 @@ Required exit criteria:
 
 ### P1: Security Is Private-Alpha Only
 
-This review and PR #2 fixed unbounded socket admission, an unbounded bundler subprocess, raw production error disclosure, forged forwarded client IPs in the supplied nginx topology, public proxying of metrics, common secret-file inclusion in Docker build context, unbounded response writes, and ambiguous duplicate-header/request-framing behavior. Remaining blockers are session-bound CSRF rotation, app-owned authentication guidance, distributed replay storage, deployment-stable action IDs, and external audit/tracing sinks.
+The merged HTTP-framing work and PR #4 backlog fixes address unbounded socket admission, an unbounded bundler subprocess, raw production error disclosure, forged forwarded client IPs in the supplied nginx topology, public proxying of metrics, common secret-file inclusion in Docker build context, unbounded response writes, ambiguous duplicate-header/request-framing behavior, renewable trickle-read timeouts, unbounded replay nonce state, and missing CLI signal drain. Remaining blockers are session-bound CSRF rotation, app-owned authentication guidance, distributed replay storage, deployment-stable action IDs, and external audit/tracing sinks.
 
 ### P1: Remote And Hosted Evidence Is Missing
 
-PR #2 and the general Verify workflow now exist, including the candidate-image nginx harness, but every exact-head Actions attempt has failed before job allocation. There is no hosted deployment. Local exact-commit proof cannot substitute for real hosted CI, registry, or staging evidence.
+The general Verify workflow and candidate-image nginx harness exist, but every relevant hosted Actions attempt has failed before job allocation. There is no hosted deployment. Local exact-commit proof cannot substitute for real hosted CI, registry, or staging evidence.
 
 ## Fastest Developer Launch
 
 1. Define throughput and latency targets, then run hosted and long-duration capacity tests around the completed bounded mixed-load regression soak.
-2. Resolve the GitHub Actions startup/allocation blocker and obtain a distinct review of PR #2 without bypassing checks or repository policy.
+2. Resolve the GitHub Actions startup/allocation blocker and obtain a distinct current-head review of PR #4 without bypassing checks or repository policy.
 3. Run the required remote workflow for lint, typecheck, build, full tests, Chromium, artifact-backed example integration, pinned-nginx candidate-image proof, npm verification, Cargo packaging, and native artifacts.
 4. Publish the locally proven `ferrite init` starter path with a public CLI binary and pinned toolchain matrix, then validate it on a clean machine.
 5. Add a single `/builder-lab` demo route that executes one allowlisted real tool and returns the shared Builder AI Lab `proof_receipt` once that schema is authoritative. Do not present a fixture response as model or proof-runtime integration.

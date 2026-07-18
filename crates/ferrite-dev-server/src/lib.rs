@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
@@ -16,8 +16,9 @@ use ferrite_builder::{
     FERRITE_PRODUCTION_ARTIFACT_MANIFEST, ProductionArtifactError, load_production_artifact,
 };
 use ferrite_client_bundler::{
-    ClientBundle, ClientBundleError, ClientBundleOptions, ClientBundleRequest, ClientBundler,
-    ModuleGraphNode, fingerprint_client_bundle,
+    ClientBundle, ClientBundleError, ClientBundleInputSnapshot, ClientBundleOptions,
+    ClientBundleRequest, ClientBundler, fingerprint_client_bundle,
+    fingerprint_client_bundle_inputs,
 };
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
@@ -49,6 +50,7 @@ const SERVER_ACTION_CSRF_FIELD: &str = "__ferrite_csrf";
 const SERVER_ACTION_REPLAY_NONCE_FIELD: &str = "__ferrite_nonce";
 const SERVER_ACTION_RESPONSE_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 const SERVER_ACTION_CSRF_COOKIE_ATTRIBUTES: &str = "Path=/; SameSite=Lax; HttpOnly; Secure";
+const MAX_PRODUCTION_REPLAY_NONCES: usize = 4_096;
 const DEFAULT_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_PRODUCTION_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_PRODUCTION_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -191,6 +193,10 @@ impl ProductionShutdownController {
 
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
     }
 }
 
@@ -412,6 +418,7 @@ fn prometheus_label_value(value: &str) -> String {
 struct ProductionReplayNonces {
     ttl: Duration,
     entries: BTreeMap<String, Instant>,
+    issuance_order: VecDeque<String>,
 }
 
 impl ProductionReplayNonces {
@@ -419,6 +426,7 @@ impl ProductionReplayNonces {
         Self {
             ttl,
             entries: BTreeMap::new(),
+            issuance_order: VecDeque::new(),
         }
     }
 
@@ -432,18 +440,41 @@ impl ProductionReplayNonces {
                 .with_cache_control("no-store"),
             )
         })?;
+        while self.entries.len() >= MAX_PRODUCTION_REPLAY_NONCES {
+            let Some(oldest) = self.issuance_order.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                break;
+            }
+        }
         self.entries
             .insert(nonce.clone(), Instant::now() + self.ttl);
+        self.issuance_order.push_back(nonce.clone());
         Ok(nonce)
     }
 
     fn consume(&mut self, nonce: &str) -> bool {
         self.prune_expired(Instant::now());
-        self.entries.remove(nonce).is_some()
+        let consumed = self.entries.remove(nonce).is_some();
+        if consumed {
+            self.issuance_order.retain(|issued| issued != nonce);
+        }
+        consumed
     }
 
     fn prune_expired(&mut self, now: Instant) {
-        self.entries.retain(|_, expires_at| *expires_at > now);
+        while let Some(oldest) = self.issuance_order.front() {
+            if self
+                .entries
+                .get(oldest)
+                .is_some_and(|expires_at| *expires_at > now)
+            {
+                break;
+            }
+            let oldest = self.issuance_order.pop_front().expect("front entry exists");
+            self.entries.remove(&oldest);
+        }
     }
 }
 
@@ -730,7 +761,11 @@ impl DevProject {
             .unwrap_or_default();
         let mut module_graph_changed = false;
         for watched in module_graphs.values_mut() {
-            let fingerprint = fingerprint_module_graph(&self.config.project, &watched.files)?;
+            let fingerprint = if watched.inputs.is_empty() {
+                fingerprint_module_graph(&self.config.project, &watched.files)?
+            } else {
+                fingerprint_client_bundle_inputs(&self.config.project, &watched.inputs)?
+            };
             if watched.fingerprint != fingerprint {
                 watched.fingerprint = fingerprint;
                 module_graph_changed = true;
@@ -1165,7 +1200,7 @@ impl DevProject {
                 runtime_props: false,
             },
         })?;
-        self.record_module_graph(&match_result.route.path, &client_bundle.module_graph)
+        self.record_module_graph(&match_result.route.path, &client_bundle)
             .map_err(ClientBundleError::Io)?;
         Ok(client_bundle)
     }
@@ -1173,18 +1208,22 @@ impl DevProject {
     fn record_module_graph(
         &mut self,
         route_path: &str,
-        module_graph: &[ModuleGraphNode],
+        client_bundle: &ClientBundle,
     ) -> std::io::Result<()> {
+        client_bundle
+            .validate_input_snapshot(&self.config.project)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let snapshot = self
             .snapshot
             .as_mut()
             .expect("snapshot built before client bundle");
-        if module_graph.is_empty() {
+        if client_bundle.module_graph.is_empty() && client_bundle.input_snapshot.is_empty() {
             snapshot.module_graphs.remove(route_path);
             return Ok(());
         }
 
-        let files = module_graph
+        let files = client_bundle
+            .module_graph
             .iter()
             .flat_map(|node| {
                 std::iter::once(node.file.clone()).chain(node.watch_files.iter().cloned())
@@ -1192,10 +1231,19 @@ impl DevProject {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let fingerprint = fingerprint_module_graph(&self.config.project, &files)?;
+        let inputs = client_bundle.input_snapshot.clone();
+        let fingerprint = if inputs.is_empty() {
+            fingerprint_module_graph(&self.config.project, &files)?
+        } else {
+            fingerprint_client_bundle_inputs(&self.config.project, &inputs)?
+        };
         snapshot.module_graphs.insert(
             route_path.to_owned(),
-            WatchedModuleGraph { files, fingerprint },
+            WatchedModuleGraph {
+                files,
+                inputs,
+                fingerprint,
+            },
         );
         Ok(())
     }
@@ -1506,13 +1554,13 @@ impl ProductionProject {
     }
 
     fn route_response(&self, path: &str, mode: RouteResponseMode) -> DevResponse {
-        let replay_nonce = match self.issue_server_action_replay_nonce() {
-            Ok(replay_nonce) => replay_nonce,
-            Err(response) => return *response,
-        };
         let snapshot = self.snapshot.get().expect("snapshot built before response");
 
         let response = if let Some(match_result) = match_route(path, &snapshot.routes) {
+            let replay_nonce = match self.issue_server_action_replay_nonce() {
+                Ok(replay_nonce) => replay_nonce,
+                Err(response) => return *response,
+            };
             let module_source = snapshot
                 .server_module_sources
                 .get(&match_result.route.path)
@@ -2483,10 +2531,10 @@ impl ProductionWorkerPool {
                         break;
                     };
                     let _in_flight_guard = ProductionInFlightGuard(Arc::clone(&in_flight));
-                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project)
-                        && is_response_write_deadline_error(&error)
-                    {
-                        eprintln!("Ferrite production response write deadline exceeded");
+                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project) {
+                        if is_response_write_deadline_error(&error) {
+                            eprintln!("Ferrite production response write deadline exceeded");
+                        }
                     }
                 }
             }));
@@ -2711,6 +2759,7 @@ struct RouteSnapshot {
 #[derive(Debug, Clone)]
 struct WatchedModuleGraph {
     files: Vec<String>,
+    inputs: Vec<ClientBundleInputSnapshot>,
     fingerprint: String,
 }
 
@@ -2950,11 +2999,19 @@ pub fn serve<A: ToSocketAddrs>(addr: A, mut project: DevProject) -> Result<()> {
 }
 
 pub fn serve_production<A: ToSocketAddrs>(addr: A, project: ProductionProject) -> Result<()> {
+    serve_production_with_shutdown(addr, project, ProductionShutdownSignal::never())
+}
+
+pub fn serve_production_with_shutdown<A: ToSocketAddrs>(
+    addr: A,
+    project: ProductionProject,
+    shutdown: ProductionShutdownSignal,
+) -> Result<()> {
     let mut addrs = addr.to_socket_addrs()?;
     let addr = addrs.next().ok_or(DevServerError::NoSocketAddress)?;
     let listener = TcpListener::bind(addr)?;
     project.ensure_ready()?;
-    serve_production_listener_concurrent(listener, project)
+    serve_production_listener_with_shutdown(listener, project, shutdown)
 }
 
 pub fn serve_listener(listener: TcpListener, project: &mut DevProject) -> Result<()> {
@@ -3117,14 +3174,18 @@ fn handle_production_stream_with_limits<F>(
 where
     F: FnMut(&ParsedHttpRequest) -> Result<DevResponse>,
 {
-    stream.set_read_timeout(Some(
-        request_read_timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT),
-    ))?;
+    let request_read_timeout = request_read_timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT);
+    let request_read_deadline = Instant::now() + request_read_timeout;
     let response_write_timeout = response_write_timeout.max(MIN_PRODUCTION_RESPONSE_WRITE_TIMEOUT);
-    let request = match read_http_request(stream, max_request_bytes)? {
+    let request = match read_http_request_with_deadline(
+        stream,
+        max_request_bytes,
+        Some(request_read_deadline),
+    )? {
         RequestReadResult::Request(request) => request,
         RequestReadResult::Response(response) => {
             let response = response.with_cache_control("no-store");
+            let _ = stream.shutdown(Shutdown::Read);
             write_response_with_options(
                 stream,
                 &response,
@@ -3171,17 +3232,31 @@ fn read_http_request(
     stream: &mut TcpStream,
     max_request_bytes: usize,
 ) -> Result<RequestReadResult> {
+    read_http_request_with_deadline(stream, max_request_bytes, None)
+}
+
+fn read_http_request_with_deadline(
+    stream: &mut TcpStream,
+    max_request_bytes: usize,
+    deadline: Option<Instant>,
+) -> Result<RequestReadResult> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
-        match stream.read(&mut buffer) {
+        match read_request_bytes(stream, &mut buffer, deadline) {
             Ok(0) => {
                 let Some(header_end) = find_http_header_end(&request) else {
                     return Ok(RequestReadResult::Response(DevResponse::bad_request(
                         "incomplete HTTP request headers",
                     )));
                 };
-                return finish_read_http_request(stream, request, header_end, max_request_bytes);
+                return finish_read_http_request_with_deadline(
+                    stream,
+                    request,
+                    header_end,
+                    max_request_bytes,
+                    deadline,
+                );
             }
             Ok(bytes) => {
                 request.extend_from_slice(&buffer[..bytes]);
@@ -3189,11 +3264,12 @@ fn read_http_request(
                     return Ok(RequestReadResult::Response(DevResponse::payload_too_large()));
                 }
                 if let Some(header_end) = find_http_header_end(&request) {
-                    return finish_read_http_request(
+                    return finish_read_http_request_with_deadline(
                         stream,
                         request,
                         header_end,
                         max_request_bytes,
+                        deadline,
                     );
                 }
             }
@@ -3210,11 +3286,22 @@ fn read_http_request(
     }
 }
 
+#[cfg(test)]
 fn finish_read_http_request(
+    stream: &mut TcpStream,
+    request: Vec<u8>,
+    header_end: usize,
+    max_request_bytes: usize,
+) -> Result<RequestReadResult> {
+    finish_read_http_request_with_deadline(stream, request, header_end, max_request_bytes, None)
+}
+
+fn finish_read_http_request_with_deadline(
     stream: &mut TcpStream,
     mut request: Vec<u8>,
     header_end: usize,
     max_request_bytes: usize,
+    deadline: Option<Instant>,
 ) -> Result<RequestReadResult> {
     let header_bytes = header_end + 4;
     let mut parsed = match parse_http_request_head(&request[..header_bytes]) {
@@ -3238,7 +3325,7 @@ fn finish_read_http_request(
     let expected_len = header_bytes + content_length;
     let mut buffer = [0_u8; 1024];
     while request.len() < expected_len {
-        match stream.read(&mut buffer) {
+        match read_request_bytes(stream, &mut buffer, deadline) {
             Ok(0) => {
                 return Ok(RequestReadResult::Response(DevResponse::bad_request(
                     "incomplete server action request body",
@@ -3269,6 +3356,32 @@ fn finish_read_http_request(
     parsed.body = request[header_bytes..expected_len].to_vec();
 
     Ok(RequestReadResult::Request(parsed))
+}
+
+fn read_request_bytes(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Option<Instant>,
+) -> std::io::Result<usize> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request read deadline elapsed",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+    }
+
+    let read = stream.read(buffer)?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "request read deadline elapsed",
+        ));
+    }
+    Ok(read)
 }
 
 fn parse_http_request_head(
@@ -5954,6 +6067,7 @@ process.exit(1);
                     assets: Vec::new(),
                     client_references: Vec::new(),
                     module_graph: Vec::new(),
+                    input_snapshot: Vec::new(),
                 },
                 prerendered: BTreeMap::new(),
                 observed_actions: Vec::new(),
@@ -7036,6 +7150,49 @@ process.exit(1);
     }
 
     #[test]
+    fn production_replay_nonce_store_stays_bounded() {
+        let mut replay_nonces = ProductionReplayNonces::new(Duration::from_secs(30));
+        let first = replay_nonces.issue().unwrap();
+        let mut newest = String::new();
+        for _ in 0..4_096 {
+            newest = replay_nonces.issue().unwrap();
+        }
+
+        assert!(
+            replay_nonces.entries.len() <= MAX_PRODUCTION_REPLAY_NONCES,
+            "replay nonce storage must not grow without a hard bound"
+        );
+        assert!(!replay_nonces.consume(&first));
+        assert!(replay_nonces.consume(&newest));
+    }
+
+    #[test]
+    fn production_replay_nonce_is_not_issued_for_missing_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let config = production_project_for(&app)
+            .config
+            .with_server_action_replay_ttl(Duration::from_secs(30));
+        let project = ProductionProject::new(config);
+
+        let response = project.handle_get("/missing").unwrap();
+
+        assert_eq!(response.status, 404);
+        assert!(
+            project
+                .replay_nonces
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty(),
+            "unmatched requests must not allocate replay state"
+        );
+    }
+
+    #[test]
     fn dev_action_post_invokes_route_action_with_urlencoded_form() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -7226,6 +7383,81 @@ process.exit(1);
         assert_eq!(events[0].status, 200);
         assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
         assert!(events[0].client_ip.is_some());
+    }
+
+    #[test]
+    fn production_action_post_hides_unexpected_renderer_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let project = action_production_project_for(
+            &app,
+            r#"
+if (process.argv[2] === "--server-action") {
+  console.error("private action failure detail");
+  process.exit(17);
+}
+process.exit(2);
+"#,
+        );
+        let body = action_form_body("/posts/abc");
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        let headers = response_headers(&response);
+        let body = String::from_utf8_lossy(response_body(&response));
+
+        assert!(headers.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(body.contains("Ferrite could not render this route."));
+        assert!(!body.contains("private action failure detail"));
+    }
+
+    #[test]
+    fn production_action_post_preserves_explicit_public_error_codes() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let project = action_production_project_for(
+            &app,
+            r#"
+if (process.argv[2] === "--server-action") {
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-action-response",
+    version: 1,
+    status: "error",
+    code: "POST_CONFLICT",
+    message: "Could not save post."
+  }));
+  process.exit(0);
+}
+process.exit(2);
+"#,
+        );
+        let body = action_form_body("/posts/abc");
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        );
+
+        let response = production_http_request(project, request.as_bytes());
+        let headers = response_headers(&response);
+        let body: Value = serde_json::from_slice(response_body(&response)).unwrap();
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["code"], "POST_CONFLICT");
+        assert_eq!(body["message"], "Could not save post.");
     }
 
     #[test]
@@ -8482,6 +8714,98 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
     }
 
     #[test]
+    fn production_adapter_uses_one_absolute_request_read_budget_for_trickle_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = production_project_for(&app);
+        project.config.request_read_timeout = Duration::from_millis(80);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            serve_production_listener_once(listener, &project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let trickle = thread::spawn(move || {
+            for byte in b"GET / HTTP/1.1\r\nHost" {
+                if writer.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = writer.shutdown(Shutdown::Write);
+        });
+
+        let started = Instant::now();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let elapsed = started.elapsed();
+        trickle.join().unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout"));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "request timeout reset across trickled bytes: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn production_adapter_keeps_the_header_deadline_for_a_trickled_action_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = production_project_for(&app);
+        project.config.request_read_timeout = Duration::from_millis(80);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            serve_production_listener_once(listener, &project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let trickle = thread::spawn(move || {
+            if writer
+                .write_all(b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\r\n")
+                .is_err()
+            {
+                return;
+            }
+            for byte in b"abcdefghijklmnopqrst" {
+                if writer.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = writer.shutdown(Shutdown::Write);
+        });
+
+        let started = Instant::now();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let elapsed = started.elapsed();
+        trickle.join().unwrap();
+        server.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout"));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "body reads renewed the request deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn response_deadline_writer_uses_one_budget_across_writes() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -8955,6 +9279,7 @@ process.stdout.write(JSON.stringify({
             assets: Vec::new(),
             client_references: Vec::new(),
             module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&server_only),
@@ -8970,6 +9295,7 @@ process.stdout.write(JSON.stringify({
             assets: Vec::new(),
             client_references: Vec::new(),
             module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&client_route),
@@ -8998,6 +9324,7 @@ process.stdout.write(JSON.stringify({
                 assets: Vec::new(),
             }],
             module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&island_route),
@@ -9020,6 +9347,7 @@ process.stdout.write(JSON.stringify({
             assets: Vec::new(),
             client_references: Vec::new(),
             module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
         assert_eq!(
             dev_document_scripts(&action_route),
@@ -9569,6 +9897,92 @@ process.stdout.write(JSON.stringify({
 
         write(
             &temp.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn compiler_config_appearance_invalidates_dev_module_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&temp.path().join("package.json"), r#"{ "private": true }"#);
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("tsconfig.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[test]
+    fn inherited_external_compiler_config_changes_invalidate_dev_module_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let app = project_root.join("app");
+        write(&project_root.join("package.json"), r#"{ "private": true }"#);
+        write(
+            &project_root.join("tsconfig.json"),
+            r#"{ "extends": "../tsconfig.base.json" }"#,
+        );
+        write(
+            &temp.path().join("tsconfig.base.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": false } }"#,
+        );
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &temp.path().join("tsconfig.base.json"),
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
+        );
+
+        assert!(project.build_id().unwrap() > first_build);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_compiler_config_target_changes_invalidate_dev_module_graph() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let app = project_root.join("app");
+        write(&project_root.join("package.json"), r#"{ "private": true }"#);
+        write(
+            &project_root.join("tsconfig.json"),
+            r#"{ "extends": "./linked-config.json" }"#,
+        );
+        let external_config = temp.path().join("external-config.json");
+        write(
+            &external_config,
+            r#"{ "compilerOptions": { "verbatimModuleSyntax": false } }"#,
+        );
+        symlink(&external_config, project_root.join("linked-config.json")).unwrap();
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut project = project_for(&app);
+        project.config.client_bundler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/runtime/bin/build-client.mjs");
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first_build = project.build_id().unwrap();
+
+        write(
+            &external_config,
             r#"{ "compilerOptions": { "verbatimModuleSyntax": true } }"#,
         );
 
@@ -10350,6 +10764,7 @@ export default function Page({ params }) {
                     assets: Vec::new(),
                     client_references: Vec::new(),
                     module_graph: Vec::new(),
+                    input_snapshot: Vec::new(),
                 },
                 prerendered: BTreeMap::new(),
                 observed_actions: Vec::new(),

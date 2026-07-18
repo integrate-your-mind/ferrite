@@ -144,6 +144,7 @@ export type ServerActionErrorResponse = {
   ferrite: typeof SERVER_ACTION_RESPONSE_MARKER;
   version: typeof SERVER_ACTION_RESPONSE_VERSION;
   status: "error";
+  code?: string;
   message: string;
 };
 
@@ -245,11 +246,12 @@ export function createServerActionRedirectResponse(input: { location: string }):
   return validateServerActionResponse(response) as ServerActionRedirectResponse;
 }
 
-export function createServerActionErrorResponse(input: { message: string }): ServerActionErrorResponse {
+export function createServerActionErrorResponse(input: { code: string; message: string }): ServerActionErrorResponse {
   const response: ServerActionErrorResponse = {
     ferrite: SERVER_ACTION_RESPONSE_MARKER,
     version: SERVER_ACTION_RESPONSE_VERSION,
     status: "error",
+    code: input.code,
     message: input.message,
   };
   return validateServerActionResponse(response) as ServerActionErrorResponse;
@@ -419,7 +421,11 @@ export function validateServerActionResponse(response: unknown): ServerActionRes
   }
 
   if (candidate.status === "error") {
-    assertOnlyServerActionResponseFields(candidate, ["ferrite", "version", "status", "message"], "error");
+    assertOnlyServerActionResponseFields(candidate, ["ferrite", "version", "status", "code", "message"], "error");
+    const code = (candidate as Partial<ServerActionErrorResponse>).code;
+    if (code !== undefined) {
+      validateServerActionErrorCode(code);
+    }
     const message = (candidate as Partial<ServerActionErrorResponse>).message;
     if (typeof message !== "string" || message.length === 0) {
       throw new TypeError("server action error message must be non-empty.");
@@ -571,6 +577,12 @@ function validateServerActionUrl(url: string): void {
   }
   if (url.includes("\\") || /[\u0000-\u001F\u007F]/.test(url)) {
     throw new TypeError(`invalid server action url "${url}"`);
+  }
+}
+
+function validateServerActionErrorCode(code: unknown): asserts code is string {
+  if (typeof code !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(code)) {
+    throw new TypeError("server action error code must be 1-64 uppercase ASCII letters, digits, or underscores and start with a letter.");
   }
 }
 

@@ -175,6 +175,24 @@ export type ServerActionInvokeOptions = {
   routePattern?: string;
 };
 
+export class FerriteActionError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(code)) {
+      throw new TypeError(
+        "FerriteActionError code must be 1-64 uppercase ASCII letters, digits, or underscores and start with a letter.",
+      );
+    }
+    if (message.length === 0) {
+      throw new TypeError("FerriteActionError message must be non-empty.");
+    }
+    super(message);
+    this.name = "FerriteActionError";
+    this.code = code;
+  }
+}
+
 export type ServerActionManifest = {
   routePath: string;
   routePattern?: string;
@@ -363,9 +381,13 @@ export async function invokeServerActionFromPageModule(
           data: result === undefined ? null : serializeClientReferenceValue(result, "server action result"),
         });
       } catch (error) {
-        return createServerActionErrorResponse({
-          message: error instanceof Error ? error.message : String(error),
-        });
+        if (error instanceof FerriteActionError) {
+          return createServerActionErrorResponse({
+            code: error.code,
+            message: error.message,
+          });
+        }
+        throw error;
       }
     },
   );

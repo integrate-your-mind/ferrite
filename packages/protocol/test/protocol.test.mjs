@@ -173,11 +173,23 @@ test("creates and validates server action protocol values", () => {
     status: "redirect",
     location: "/posts/abc?draft=1#saved",
   });
-  assert.deepEqual(createServerActionErrorResponse({ message: "Could not save post." }), {
+  assert.deepEqual(createServerActionErrorResponse({ code: "POST_CONFLICT", message: "Could not save post." }), {
     ferrite: SERVER_ACTION_RESPONSE_MARKER,
     version: SERVER_ACTION_RESPONSE_VERSION,
     status: "error",
+    code: "POST_CONFLICT",
     message: "Could not save post.",
+  });
+  assert.deepEqual(validateServerActionResponse({
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "error",
+    message: "Legacy public error.",
+  }), {
+    ferrite: SERVER_ACTION_RESPONSE_MARKER,
+    version: SERVER_ACTION_RESPONSE_VERSION,
+    status: "error",
+    message: "Legacy public error.",
   });
 
   const payloadResponse = createServerActionPayloadResponse({
@@ -193,6 +205,10 @@ test("creates and validates server action protocol values", () => {
 });
 
 test("rejects malformed server action protocol values", () => {
+  assert.throws(
+    () => createServerActionErrorResponse({ code: "post-conflict", message: "Could not save post." }),
+    /server action error code/,
+  );
   assert.throws(
     () =>
       validateServerActionReferencePayload({

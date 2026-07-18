@@ -545,6 +545,7 @@ mod tests {
                     assets: Vec::new(),
                     client_references: Vec::new(),
                     module_graph: Vec::new(),
+                    input_snapshot: Vec::new(),
                 },
                 prerendered: BTreeMap::new(),
                 observed_actions: Vec::new(),

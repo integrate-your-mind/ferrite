@@ -202,17 +202,8 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
     fs::create_dir_all(&server_out_dir)?;
 
     for (route_index, route) in routes.iter().enumerate() {
-        let static_param_sets = if route.params.is_empty() {
-            vec![BTreeMap::new()]
-        } else {
-            let generated = page_renderer.generate_static_params(&route.file)?;
-            if !generated.has_generate_static_params {
-                skipped_dynamic_routes.push(route.path.clone());
-                Vec::new()
-            } else {
-                generated.params
-            }
-        };
+        let (static_param_sets, skipped_dynamic_route) =
+            route_static_param_sets(&page_renderer, route)?;
         let artifact_param_set = static_param_sets
             .first()
             .cloned()
@@ -221,6 +212,34 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
         let conventions = route_conventions(route);
         let server_module_relative = format!("server/route-{route_index:04}.mjs");
         let server_module = config.out_dir.join(&server_module_relative);
+        let action_bootstrap = !page_renderer
+            .collect_server_actions(&route.file, &route.layouts, &artifact_params, &conventions)?
+            .actions
+            .is_empty();
+        let route_client_bundle = bundle_production_route(
+            &client_bundler,
+            &route.file,
+            &route.layouts,
+            &route.path,
+            &artifact_params,
+            &client_out_dir,
+            action_bootstrap,
+        )?;
+
+        let (refreshed_static_param_sets, refreshed_skipped_dynamic_route) =
+            route_static_param_sets(&page_renderer, route)?;
+        if static_param_sets != refreshed_static_param_sets
+            || skipped_dynamic_route != refreshed_skipped_dynamic_route
+        {
+            return Err(ClientBundleError::StaleInputSnapshot {
+                path: route.file.display().to_string(),
+            }
+            .into());
+        }
+        if skipped_dynamic_route {
+            skipped_dynamic_routes.push(route.path.clone());
+        }
+
         page_renderer.build_server_module(
             &route.file,
             &route.layouts,
@@ -237,15 +256,12 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
             &artifact_params,
             &conventions,
         )?;
-        let route_client_bundle = bundle_production_route(
-            &client_bundler,
-            &route.file,
-            &route.layouts,
-            &route.path,
-            &artifact_params,
-            &client_out_dir,
-            !artifact_action_manifest.actions.is_empty(),
-        )?;
+        if action_bootstrap == artifact_action_manifest.actions.is_empty() {
+            return Err(ClientBundleError::StaleInputSnapshot {
+                path: route.file.display().to_string(),
+            }
+            .into());
+        }
         let mut prerendered = BTreeMap::new();
 
         for params in static_param_sets {
@@ -323,6 +339,8 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
                 server_action_manifests.push(action_manifest);
             }
         }
+
+        route_client_bundle.validate_input_snapshot(&config.project)?;
 
         production_routes.push(ProductionArtifactRoute {
             path: route.path.clone(),
@@ -406,6 +424,22 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
         client_bundles,
         server_action_manifests,
     })
+}
+
+fn route_static_param_sets(
+    page_renderer: &PageRenderer,
+    route: &Route,
+) -> Result<(Vec<BTreeMap<String, Value>>, bool)> {
+    if route.params.is_empty() {
+        return Ok((vec![BTreeMap::new()], false));
+    }
+
+    let generated = page_renderer.generate_static_params(&route.file)?;
+    if generated.has_generate_static_params {
+        Ok((generated.params, false))
+    } else {
+        Ok((Vec::new(), true))
+    }
 }
 
 fn install_staged_build(staged: &Path, destination: &Path) -> std::io::Result<()> {
@@ -2169,6 +2203,80 @@ process.exit(1);
             error,
             BuildError::ClientBundle(ClientBundleError::NodeFailed { stderr, .. })
                 if stderr == "client bundle failed"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_mixed_server_and_client_source_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let page = temp.path().join("app/page.tsx");
+        write(&page, "export const version = 'A';");
+        let renderer = temp.path().join("snapshot-renderer.mjs");
+        make_script(
+            &renderer,
+            r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const mode = process.argv[2];
+const page = mode.startsWith("--") ? process.argv[3] : process.argv[2];
+if (mode === "--build-artifact") {
+  const output = process.argv[4];
+  const source = await fs.readFile(page, "utf8");
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  await fs.writeFile(output, `export const capturedSource = ${JSON.stringify(source)};\n`);
+  await fs.writeFile(page, "export const version = 'B';");
+  process.exit(0);
+}
+if (mode === "--static-params") {
+  process.stdout.write(JSON.stringify({ has_generate_static_params: false, params: [] }));
+  process.exit(0);
+}
+if (mode === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
+  process.exit(0);
+}
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
+"#,
+        );
+        let bundler = temp.path().join("snapshot-bundler.mjs");
+        make_script(
+            &bundler,
+            r#"
+const crypto = await import("node:crypto");
+const fs = await import("node:fs/promises");
+const page = await fs.realpath(process.argv[2]);
+const source = await fs.readFile(page);
+const digest = crypto.createHash("sha256").update(source).digest("hex");
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  inputSnapshot: [{ path: page, kind: "source", value: `sha256:${digest}` }]
+}));
+"#,
+        );
+        let config = BuildConfig::new(
+            temp.path().to_path_buf(),
+            temp.path().join("app"),
+            temp.path().join(".ferrite/build"),
+            temp.path().join(".ferrite/types/routes.d.ts"),
+            renderer,
+            bundler,
+        );
+
+        let error = build_project(&config).expect_err(
+            "a build must not combine server output from A with a client snapshot of B",
+        );
+
+        assert!(matches!(
+            error,
+            BuildError::ClientBundle(ClientBundleError::StaleInputSnapshot { .. })
         ));
     }
 }

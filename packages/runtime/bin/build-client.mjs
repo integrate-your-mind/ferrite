@@ -92,6 +92,7 @@ for (let attempt = 1; attempt <= maxStableBuildAttempts; attempt += 1) {
     : await bundleServerRoute(moduleGraph);
 
   if (await moduleGraphSnapshotIsCurrent(moduleGraph.snapshot, projectRoot)) {
+    response.inputSnapshot = serializeModuleGraphSnapshot(moduleGraph.snapshot);
     break;
   }
   response = undefined;
@@ -507,7 +508,7 @@ async function scanServerFileForClientReferences(
   graph.set(resolvedFile, graphNode);
 
   const source = await readFile(resolvedFile, "utf8");
-  recordSnapshotValue(snapshot.sources, resolvedFile, sha256(source), snapshot);
+  recordSnapshotValue(snapshot.sources, resolvedFile, `sha256:${sha256(source)}`, snapshot);
   const clientSubtree = inheritedClientSubtree || startsWithDirective(source, "use client");
   const visitKey = `${clientSubtree ? "client" : "server"}\0${resolvedFile}`;
   if (visited.has(visitKey)) {
@@ -536,7 +537,7 @@ async function scanServerFileForClientReferences(
     watchFiles.push(...portableWatchCandidates(resolution, projectRoot));
 
     const importedSource = await readFile(importedFile, "utf8");
-    recordSnapshotValue(snapshot.sources, importedFile, sha256(importedSource), snapshot);
+    recordSnapshotValue(snapshot.sources, importedFile, `sha256:${sha256(importedSource)}`, snapshot);
     const importedIsClientModule = startsWithDirective(importedSource, "use client");
     if (!clientSubtree && importedIsClientModule) {
       if (importRecord.exportNames.length === 0 || importRecord.exportNames.includes("*")) {
@@ -592,11 +593,7 @@ async function moduleGraphSnapshotIsCurrent(snapshot, projectRoot) {
   }
 
   for (const [file, expected] of snapshot.sources) {
-    try {
-      if (sha256(await readFile(file)) !== expected) {
-        return false;
-      }
-    } catch (_error) {
+    if ((await describeSourceInput(file)) !== expected) {
       return false;
     }
   }
@@ -608,22 +605,44 @@ async function moduleGraphSnapshotIsCurrent(snapshot, projectRoot) {
   return true;
 }
 
+function serializeModuleGraphSnapshot(snapshot) {
+  return [
+    ...[...snapshot.sources].map(([path, value]) => ({ path: resolve(path), kind: "source", value })),
+    ...[...snapshot.resolutions].map(([path, value]) => ({ path: resolve(path), kind: "resolution", value })),
+  ].sort((left, right) =>
+    compareDeterministicStrings(`${left.path}\0${left.kind}`, `${right.path}\0${right.kind}`),
+  );
+}
+
+async function describeSourceInput(file) {
+  try {
+    return `sha256:${sha256(await readFile(file))}`;
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      return "missing";
+    }
+    return "error";
+  }
+}
+
 async function loadGraphCompilerOptions(projectRoot) {
   const configPath = join(projectRoot, "tsconfig.json");
+  const sources = new Map([[resolve(configPath), await describeSourceInput(configPath)]]);
   try {
     await access(configPath);
   } catch (error) {
     if (error && typeof error === "object" && error.code === "ENOENT") {
-      return { options: {}, sources: new Map() };
+      return { options: {}, sources };
     }
     throw error;
   }
 
-  const sources = new Map();
   const readConfigFile = (file) => {
     const source = ts.sys.readFile(file);
     if (source !== undefined) {
-      sources.set(resolve(file), sha256(source));
+      sources.set(resolve(file), `sha256:${sha256(source)}`);
+    } else {
+      sources.set(resolve(file), "missing");
     }
     return source;
   };
@@ -857,10 +876,10 @@ async function describeResolutionCandidate(candidate, projectRoot) {
     }
     return `resolved:${relative(projectRoot, resolved).split(sep).join("/")}`;
   } catch (error) {
-    if (error && typeof error === "object" && typeof error.code === "string") {
-      return `error:${error.code}`;
+    if (error && typeof error === "object" && error.code === "ENOENT") {
+      return "missing";
     }
-    return "error:unknown";
+    return "error";
   }
 }
 
