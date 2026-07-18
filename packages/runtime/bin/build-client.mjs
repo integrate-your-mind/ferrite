@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { access, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm } from "node:fs/promises";
-import { dirname, extname, join, relative, resolve, sep } from "node:path";
+import { constants } from "node:fs";
+import { access, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm } from "node:fs/promises";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { build } from "esbuild";
@@ -84,8 +85,7 @@ const outDir = await realpath(outDirInput);
 const routeFiles = [pageFile, ...layoutFiles];
 const graphFiles = [...routeFiles, ...snapshotFiles];
 const maxStableBuildAttempts = 2;
-const stagingRoot = join(projectRoot, ".ferrite", "tmp");
-await mkdir(stagingRoot, { recursive: true });
+const stagingPrefix = join(dirname(outDir), `.${basename(outDir)}.ferrite-client-build-`);
 let response;
 
 for (let attempt = 1; attempt <= maxStableBuildAttempts; attempt += 1) {
@@ -96,7 +96,7 @@ for (let attempt = 1; attempt <= maxStableBuildAttempts; attempt += 1) {
     graphCompiler.options,
     graphCompiler.sources,
   );
-  const stagingOutDir = await realpath(await mkdtemp(join(stagingRoot, "client-build-")));
+  const stagingOutDir = await realpath(await mkdtemp(stagingPrefix));
   try {
     response = (await routeHasClientDirective(routeFiles))
       ? await bundleClientRoute(moduleGraph, stagingOutDir)
@@ -212,20 +212,50 @@ async function writeResponse(response) {
 }
 
 async function publishBuildOutputs(stagingOutDir, finalOutDir, outputs) {
-  for (const [index, output] of outputs.entries()) {
-    const source = resolve(stagingOutDir, output);
-    const destination = resolve(finalOutDir, output);
-    if (!isPathInsideRoot(stagingOutDir, source) || !isPathInsideRoot(finalOutDir, destination)) {
-      throw new Error(`Ferrite client output escapes its build directory: ${output}`);
-    }
-    await mkdir(dirname(destination), { recursive: true });
-    const pendingDestination = `${destination}.ferrite-${process.pid}-${index}.tmp`;
-    try {
-      await copyFile(source, pendingDestination);
+  const publishRoot = await realpath(await mkdtemp(join(finalOutDir, ".ferrite-publish-")));
+  try {
+    for (const [index, output] of outputs.entries()) {
+      const source = resolve(stagingOutDir, output);
+      const destination = resolve(finalOutDir, output);
+      if (!isPathInsideRoot(stagingOutDir, source) || !isPathInsideRoot(finalOutDir, destination)) {
+        throw new Error(`Ferrite client output escapes its build directory: ${output}`);
+      }
+
+      const sourceInfo = await lstat(source);
+      const canonicalSource = await realpath(source);
+      if (!sourceInfo.isFile() || canonicalSource !== source) {
+        throw new Error(`Ferrite staged client output is not a regular file: ${output}`);
+      }
+
+      await mkdir(dirname(destination), { recursive: true });
+      const canonicalDestinationParent = await realpath(dirname(destination));
+      if (
+        canonicalDestinationParent !== dirname(destination)
+        || (
+          canonicalDestinationParent !== finalOutDir
+          && !isPathInsideRoot(finalOutDir, canonicalDestinationParent)
+        )
+      ) {
+        throw new Error(`Ferrite client output directory escapes or aliases its build directory: ${output}`);
+      }
+
+      try {
+        const destinationInfo = await lstat(destination);
+        if (!destinationInfo.isFile()) {
+          throw new Error(`Ferrite client output destination is not a regular file: ${output}`);
+        }
+      } catch (error) {
+        if (!error || typeof error !== "object" || error.code !== "ENOENT") {
+          throw error;
+        }
+      }
+
+      const pendingDestination = join(publishRoot, `${index}-${basename(output)}`);
+      await copyFile(source, pendingDestination, constants.COPYFILE_EXCL);
       await rename(pendingDestination, destination);
-    } finally {
-      await rm(pendingDestination, { force: true });
     }
+  } finally {
+    await rm(publishRoot, { recursive: true, force: true });
   }
 }
 

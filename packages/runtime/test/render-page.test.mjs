@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { platform } from "node:process";
@@ -113,6 +113,27 @@ async function readBundleOutputs(outDir, bundle) {
     outputs[output] = (await readFile(join(outDir, output))).toString("base64");
   }
   return outputs;
+}
+
+async function assertPublishedSourceMaps(projectRoot, outDir, bundle) {
+  for (const output of bundle.sourcemaps) {
+    const mapPath = join(outDir, output);
+    const sourceMap = JSON.parse(await readFile(mapPath, "utf8"));
+    assert.equal(sourceMap.sources.length, sourceMap.sourcesContent.length);
+    for (const [index, source] of sourceMap.sources.entries()) {
+      const sourcePath = resolve(
+        dirname(mapPath),
+        decodeURIComponent(sourceMap.sourceRoot ?? ""),
+        decodeURIComponent(source),
+      );
+      assert.doesNotMatch(sourcePath, /\.ferrite-client-build-/);
+      if (sourcePath.startsWith(join(projectRoot, ".ferrite/generated/"))) {
+        assert.equal(typeof sourceMap.sourcesContent[index], "string");
+      } else {
+        assert.equal((await stat(sourcePath)).isFile(), true, `${source} must resolve from ${output}`);
+      }
+    }
+  }
 }
 
 async function waitForDirectoryWithPrefix(root, prefix) {
@@ -549,6 +570,8 @@ test("build-client emits byte-identical generated entries across repeated builds
         await readBundleOutputs(firstOut, first),
         `${buildCase.name} output bytes must be deterministic`,
       );
+      await assertPublishedSourceMaps(projectRoot, firstOut, first);
+      await assertPublishedSourceMaps(projectRoot, secondOut, second);
       for (const [output, encoded] of Object.entries(await readBundleOutputs(firstOut, first))) {
         if (output.endsWith(".js") || output.endsWith(".map")) {
           const contents = Buffer.from(encoded, "base64").toString("utf8");
@@ -570,9 +593,63 @@ test("build-client removes staged outputs after a bundling failure", async () =>
     );
 
     await assert.rejects(buildClient(projectRoot, pageFile), /Could not resolve/);
-    assert.deepEqual(await readdir(join(projectRoot, ".ferrite/tmp")), []);
+    assert.equal((await readdir(projectRoot)).some((entry) => entry.startsWith(".out.ferrite-client-build-")), false);
     assert.deepEqual(await readdir(join(projectRoot, "out")), []);
   });
+});
+
+test("build-client rejects symlinked output directories", { skip: platform === "win32" }, async () => {
+  const outside = await mkdtemp(join(tmpdir(), "ferrite-output-escape-"));
+  try {
+    await withTempProject(async (projectRoot) => {
+      const pageFile = join(projectRoot, "app/page.tsx");
+      const outDir = join(projectRoot, "out");
+      await mkdir(dirname(pageFile), { recursive: true });
+      await writeFile(join(projectRoot, "app/mark.svg"), `<svg xmlns="http://www.w3.org/2000/svg"/>\n`);
+      await writeFile(
+        pageFile,
+        `"use client"; import mark from "./mark.svg"; export default function Page() { return <img src={mark} />; }\n`,
+      );
+      await mkdir(outDir);
+      await symlink(outside, join(outDir, "assets"));
+
+      await assert.rejects(
+        buildClientTo(projectRoot, pageFile, outDir),
+        /output directory escapes or aliases its build directory/,
+      );
+      assert.deepEqual(await readdir(outside), []);
+      assert.equal((await readdir(projectRoot)).some((entry) => entry.startsWith(".out.ferrite-client-build-")), false);
+      assert.equal((await readdir(outDir)).some((entry) => entry.startsWith(".ferrite-publish-")), false);
+    });
+  } finally {
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("build-client rejects symlinked output files", { skip: platform === "win32" }, async () => {
+  const outside = await mkdtemp(join(tmpdir(), "ferrite-output-file-escape-"));
+  try {
+    await withTempProject(async (projectRoot) => {
+      const pageFile = join(projectRoot, "app/page.tsx");
+      const outDir = join(projectRoot, "out");
+      const outsideFile = join(outside, "route-index.js");
+      await mkdir(dirname(pageFile), { recursive: true });
+      await writeFile(pageFile, `"use client"; export default function Page() { return null; }\n`);
+      await mkdir(outDir);
+      await writeFile(outsideFile, "sentinel\n");
+      await symlink(outsideFile, join(outDir, "route-index.js"));
+
+      await assert.rejects(
+        buildClientTo(projectRoot, pageFile, outDir),
+        /output destination is not a regular file/,
+      );
+      assert.equal(await readFile(outsideFile, "utf8"), "sentinel\n");
+      assert.equal((await readdir(projectRoot)).some((entry) => entry.startsWith(".out.ferrite-client-build-")), false);
+      assert.equal((await readdir(outDir)).some((entry) => entry.startsWith(".ferrite-publish-")), false);
+    });
+  } finally {
+    await rm(outside, { recursive: true, force: true });
+  }
 });
 
 test("build-client includes two-argument dynamic imports in the runtime graph", async () => {
@@ -650,7 +727,7 @@ test("build-client retries when a resolver input changes during bundling", { ski
     await symlink("ClientA.tsx", clientLink);
 
     const build = buildClient(projectRoot, pageFile);
-    await waitForDirectoryWithPrefix(join(projectRoot, ".ferrite/tmp"), "client-build-");
+    await waitForDirectoryWithPrefix(projectRoot, ".out.ferrite-client-build-");
     await rm(clientLink);
     await symlink("ClientB.tsx", clientLink);
     const bundle = await build;
@@ -664,7 +741,7 @@ test("build-client retries when a resolver input changes during bundling", { ski
         watchFiles: ["app/Client.tsx", "tsconfig.json"],
       },
     ]);
-    assert.deepEqual(await readdir(join(projectRoot, ".ferrite/tmp")), []);
+    assert.equal((await readdir(projectRoot)).some((entry) => entry.startsWith(".out.ferrite-client-build-")), false);
     assert.doesNotMatch((await readdir(join(projectRoot, "out"))).join("\n"), /ClientA/);
   });
 });
