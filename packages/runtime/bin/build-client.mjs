@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,7 +56,7 @@ if (!Array.isArray(snapshotFiles) || snapshotFiles.some((file) => typeof file !=
 
 const projectRoot = await realpath(await findNearestPackageRoot(resolve(pageFile)));
 const runtimeSrcRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "src");
-const outDir = resolve(outDirArg);
+const outDirInput = resolve(outDirArg);
 const publicPath = publicPathArg.replace(/\/$/, "");
 const entryName = routeToEntryName(routePath);
 const fileLoaders = {
@@ -78,11 +78,14 @@ const emittedSourceSubstitutions = new Map([
   [".mjs", [".mts"]],
   [".cjs", [".cts"]],
 ]);
-await mkdir(outDir, { recursive: true });
+await mkdir(outDirInput, { recursive: true });
+const outDir = await realpath(outDirInput);
 
 const routeFiles = [pageFile, ...layoutFiles];
 const graphFiles = [...routeFiles, ...snapshotFiles];
 const maxStableBuildAttempts = 2;
+const stagingRoot = join(projectRoot, ".ferrite", "tmp");
+await mkdir(stagingRoot, { recursive: true });
 let response;
 
 for (let attempt = 1; attempt <= maxStableBuildAttempts; attempt += 1) {
@@ -93,15 +96,21 @@ for (let attempt = 1; attempt <= maxStableBuildAttempts; attempt += 1) {
     graphCompiler.options,
     graphCompiler.sources,
   );
-  response = (await routeHasClientDirective(routeFiles))
-    ? await bundleClientRoute(moduleGraph)
-    : await bundleServerRoute(moduleGraph);
+  const stagingOutDir = await realpath(await mkdtemp(join(stagingRoot, "client-build-")));
+  try {
+    response = (await routeHasClientDirective(routeFiles))
+      ? await bundleClientRoute(moduleGraph, stagingOutDir)
+      : await bundleServerRoute(moduleGraph, stagingOutDir);
 
-  if (await moduleGraphSnapshotIsCurrent(moduleGraph.snapshot, projectRoot)) {
-    response.inputSnapshot = serializeModuleGraphSnapshot(moduleGraph.snapshot);
-    break;
+    if (await moduleGraphSnapshotIsCurrent(moduleGraph.snapshot, projectRoot)) {
+      response.inputSnapshot = serializeModuleGraphSnapshot(moduleGraph.snapshot);
+      await publishBuildOutputs(stagingOutDir, outDir, response.outputs);
+      break;
+    }
+    response = undefined;
+  } finally {
+    await rm(stagingOutDir, { recursive: true, force: true });
   }
-  response = undefined;
 }
 
 if (!response) {
@@ -111,11 +120,11 @@ if (!response) {
 }
 await writeResponse(response);
 
-async function bundleServerRoute(moduleGraph) {
-  const referenceBundles = await bundleClientReferences(moduleGraph.references, projectRoot, outDir, publicPath);
+async function bundleServerRoute(moduleGraph, buildOutDir) {
+  const referenceBundles = await bundleClientReferences(moduleGraph.references, projectRoot, buildOutDir, publicPath);
   const actionBootstrap =
     options.actionBootstrap === true && referenceBundles.clientReferences.length === 0
-      ? await bundleActionBootstrap(entryName, projectRoot, outDir, publicPath)
+      ? await bundleActionBootstrap(entryName, projectRoot, buildOutDir, publicPath)
       : null;
   return {
     script: null,
@@ -130,75 +139,48 @@ async function bundleServerRoute(moduleGraph) {
   };
 }
 
-async function bundleClientRoute(moduleGraph) {
-  const tempRoot = join(projectRoot, ".ferrite", "tmp");
-  await mkdir(tempRoot, { recursive: true });
-  const tempDir = await mkdtemp(join(tempRoot, "client-"));
-  const entryFile = join(tempDir, `${entryName}.tsx`);
-
-  try {
-    await writeFile(
-      entryFile,
-      [
-        `import { createElement } from "@ferrite/runtime";`,
-        `import { bootstrapServerActionForms, hydrate } from "@ferrite/runtime/dom";`,
-        `import Page from ${JSON.stringify(resolve(pageFile))};`,
-        ...layoutFiles.map((file, index) => `import Layout${index} from ${JSON.stringify(resolve(file))};`),
-        "",
-        `const layouts = [${layoutFiles.map((_file, index) => `Layout${index}`).join(", ")}];`,
-        `const root = document.getElementById("ferrite-root") || document.getElementById("ferrite-dev-root");`,
-        ...(options.runtimeProps === true
-          ? [
-              `const serializedProps = root?.getAttribute("data-ferrite-page-props");`,
-              `if (!serializedProps) {`,
-              `  throw new TypeError("Ferrite production hydration requires data-ferrite-page-props.");`,
-              `}`,
-              `const pageProps = JSON.parse(serializedProps);`,
-            ]
-          : [`const pageProps = ${JSON.stringify(props)};`]),
-        `const page = createElement(Page, pageProps);`,
-        `const tree = layouts.reduceRight((child, Layout) => createElement(Layout, { children: child }), page);`,
-        `if (root) {`,
-        `  hydrate(tree, root);`,
-        `}`,
-        `if (typeof document !== "undefined") {`,
-        `  bootstrapServerActionForms(document);`,
-        `}`,
-        "",
-      ].join("\n"),
-    );
-
-    const result = await build({
-      entryPoints: [entryFile],
-      bundle: true,
-      platform: "browser",
-      format: "esm",
-      target: "es2022",
-      outdir: outDir,
-      entryNames: entryName,
-      assetNames: "assets/[name]-[hash]",
-      publicPath,
-      sourcemap: true,
-      metafile: true,
-      jsx: "automatic",
-      jsxImportSource: "@ferrite/runtime",
-      plugins: [ferriteRuntimeAliasPlugin()],
-      loader: fileLoaders,
-      logLevel: "silent",
-    });
-    const summary = summarizeBuildResult(result, outDir, entryFile, publicPath);
-    return {
-      script: summary.script,
-      styles: summary.styles,
-      outputs: summary.outputs,
-      sourcemaps: summary.sourcemaps,
-      assets: summary.assets,
-      clientReferences: [],
-      moduleGraph: moduleGraph.nodes,
-    };
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+async function bundleClientRoute(moduleGraph, buildOutDir) {
+  const pageImport = await projectImportSpecifier(pageFile);
+  const layoutImports = await Promise.all(layoutFiles.map((file) => projectImportSpecifier(file)));
+  const source = [
+    `import { createElement } from "@ferrite/runtime";`,
+    `import { bootstrapServerActionForms, hydrate } from "@ferrite/runtime/dom";`,
+    `import Page from ${JSON.stringify(pageImport)};`,
+    ...layoutImports.map(
+      (file, index) => `import Layout${index} from ${JSON.stringify(file)};`,
+    ),
+    "",
+    `const layouts = [${layoutFiles.map((_file, index) => `Layout${index}`).join(", ")}];`,
+    `const root = document.getElementById("ferrite-root") || document.getElementById("ferrite-dev-root");`,
+    ...(options.runtimeProps === true
+      ? [
+          `const serializedProps = root?.getAttribute("data-ferrite-page-props");`,
+          `if (!serializedProps) {`,
+          `  throw new TypeError("Ferrite production hydration requires data-ferrite-page-props.");`,
+          `}`,
+          `const pageProps = JSON.parse(serializedProps);`,
+        ]
+      : [`const pageProps = ${JSON.stringify(props)};`]),
+    `const page = createElement(Page, pageProps);`,
+    `const tree = layouts.reduceRight((child, Layout) => createElement(Layout, { children: child }), page);`,
+    `if (root) {`,
+    `  hydrate(tree, root);`,
+    `}`,
+    `if (typeof document !== "undefined") {`,
+    `  bootstrapServerActionForms(document);`,
+    `}`,
+    "",
+  ].join("\n");
+  const summary = await buildGeneratedEntry(entryName, source, "tsx", buildOutDir);
+  return {
+    script: summary.script,
+    styles: summary.styles,
+    outputs: summary.outputs,
+    sourcemaps: summary.sourcemaps,
+    assets: summary.assets,
+    clientReferences: [],
+    moduleGraph: moduleGraph.nodes,
+  };
 }
 
 function routeToEntryName(route) {
@@ -210,7 +192,7 @@ function routeToEntryName(route) {
 }
 
 function relativeOut(outDir, outputPath) {
-  return relative(outDir, resolve(outputPath)).split(sep).join("/");
+  return relative(outDir, resolve(projectRoot, outputPath)).split(sep).join("/");
 }
 
 function publicUrl(publicPath, relativePath) {
@@ -227,6 +209,24 @@ async function writeResponse(response) {
       resolveWrite();
     });
   });
+}
+
+async function publishBuildOutputs(stagingOutDir, finalOutDir, outputs) {
+  for (const [index, output] of outputs.entries()) {
+    const source = resolve(stagingOutDir, output);
+    const destination = resolve(finalOutDir, output);
+    if (!isPathInsideRoot(stagingOutDir, source) || !isPathInsideRoot(finalOutDir, destination)) {
+      throw new Error(`Ferrite client output escapes its build directory: ${output}`);
+    }
+    await mkdir(dirname(destination), { recursive: true });
+    const pendingDestination = `${destination}.ferrite-${process.pid}-${index}.tmp`;
+    try {
+      await copyFile(source, pendingDestination);
+      await rename(pendingDestination, destination);
+    } finally {
+      await rm(pendingDestination, { force: true });
+    }
+  }
 }
 
 function ferriteRuntimeAliasPlugin() {
@@ -287,43 +287,15 @@ async function bundleClientReferences(clientReferences, projectRoot, outDir, pub
 }
 
 async function bundleActionBootstrap(routeEntryName, projectRoot, outDir, publicPath) {
-  const tempRoot = join(projectRoot, ".ferrite", "tmp");
-  await mkdir(tempRoot, { recursive: true });
-  const tempDir = await mkdtemp(join(tempRoot, "action-bootstrap-"));
   const entryName = `${routeEntryName}-action-bootstrap`;
-  const entryFile = join(tempDir, `${entryName}.ts`);
-
-  try {
-    await writeFile(
-      entryFile,
-      [
-        `import { bootstrapServerActionForms } from "@ferrite/runtime/dom";`,
-        `if (typeof document !== "undefined") {`,
-        `  bootstrapServerActionForms(document);`,
-        `}`,
-        "",
-      ].join("\n"),
-    );
-    const result = await build({
-      entryPoints: [entryFile],
-      bundle: true,
-      platform: "browser",
-      format: "esm",
-      target: "es2022",
-      outdir: outDir,
-      entryNames: entryName,
-      assetNames: "assets/[name]-[hash]",
-      publicPath,
-      sourcemap: true,
-      metafile: true,
-      plugins: [ferriteRuntimeAliasPlugin()],
-      loader: fileLoaders,
-      logLevel: "silent",
-    });
-    return summarizeBuildResult(result, outDir, entryFile, publicPath);
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  const source = [
+    `import { bootstrapServerActionForms } from "@ferrite/runtime/dom";`,
+    `if (typeof document !== "undefined") {`,
+    `  bootstrapServerActionForms(document);`,
+    `}`,
+    "",
+  ].join("\n");
+  return buildGeneratedEntry(entryName, source, "ts", outDir);
 }
 
 function mergeSorted(...lists) {
@@ -331,42 +303,14 @@ function mergeSorted(...lists) {
 }
 
 async function bundleClientReference(clientReference, projectRoot, outDir, publicPath) {
-  const tempRoot = join(projectRoot, ".ferrite", "tmp");
-  await mkdir(tempRoot, { recursive: true });
-  const tempDir = await mkdtemp(join(tempRoot, "client-reference-"));
   const entryName = clientReferenceEntryName(clientReference);
-  const entryFile = join(tempDir, `${entryName}.tsx`);
-
-  try {
-    await writeFile(entryFile, clientReferenceEntrySource(clientReference));
-    const result = await build({
-      entryPoints: [entryFile],
-      bundle: true,
-      platform: "browser",
-      format: "esm",
-      target: "es2022",
-      outdir: outDir,
-      entryNames: entryName,
-      assetNames: "assets/[name]-[hash]",
-      publicPath,
-      sourcemap: true,
-      metafile: true,
-      jsx: "automatic",
-      jsxImportSource: "@ferrite/runtime",
-      plugins: [ferriteRuntimeAliasPlugin()],
-      loader: fileLoaders,
-      logLevel: "silent",
-    });
-    return summarizeBuildResult(result, outDir, entryFile, publicPath);
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  return buildGeneratedEntry(entryName, await clientReferenceEntrySource(clientReference), "tsx", outDir);
 }
 
-function clientReferenceEntrySource(clientReference) {
+async function clientReferenceEntrySource(clientReference) {
   return [
     `import { bootstrapServerActionForms, hydrateClientReference } from "@ferrite/runtime/dom";`,
-    clientReferenceImportStatement(clientReference),
+    await clientReferenceImportStatement(clientReference),
     "",
     `const registration = {`,
     `  id: ${JSON.stringify(clientReference.id)},`,
@@ -391,25 +335,66 @@ function clientReferenceEntrySource(clientReference) {
   ].join("\n");
 }
 
-function clientReferenceImportStatement(clientReference) {
-  const source = JSON.stringify(clientReference.file);
+async function clientReferenceImportStatement(clientReference) {
+  const source = JSON.stringify(await projectImportSpecifier(clientReference.file));
   if (clientReference.exportName === "default") {
     return `import ClientReferenceComponent from ${source};`;
   }
   return `import { ${clientReference.exportName} as ClientReferenceComponent } from ${source};`;
 }
 
+async function projectImportSpecifier(file) {
+  const resolvedFile = await realpath(resolve(file));
+  if (!isPathInsideRoot(projectRoot, resolvedFile)) {
+    throw new Error(`Ferrite generated client entry escapes the project root: ${resolvedFile}`);
+  }
+  return `./${relative(projectRoot, resolvedFile).split(sep).join("/")}`;
+}
+
 function clientReferenceEntryName(clientReference) {
   return `client-reference-${clientReference.id.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "index"}`;
 }
 
-function summarizeBuildResult(result, outDir, entryFile, publicPath) {
+async function buildGeneratedEntry(generatedEntryName, source, loader, buildOutDir) {
+  if (!/^[A-Za-z0-9_-]+$/.test(generatedEntryName)) {
+    throw new Error(`Invalid Ferrite generated client entry name: ${generatedEntryName}`);
+  }
+  const sourcefile = `.ferrite/generated/${generatedEntryName}.${loader}`;
+  const result = await build({
+    stdin: {
+      contents: source,
+      resolveDir: projectRoot,
+      sourcefile,
+      loader,
+    },
+    bundle: true,
+    absWorkingDir: projectRoot,
+    platform: "browser",
+    format: "esm",
+    target: "es2022",
+    outdir: buildOutDir,
+    entryNames: generatedEntryName,
+    assetNames: "assets/[name]-[hash]",
+    publicPath,
+    sourcemap: true,
+    metafile: true,
+    ...(loader === "tsx" ? { jsx: "automatic", jsxImportSource: "@ferrite/runtime" } : {}),
+    plugins: [ferriteRuntimeAliasPlugin()],
+    loader: fileLoaders,
+    logLevel: "silent",
+  });
+  return summarizeBuildResult(result, buildOutDir, sourcefile, publicPath);
+}
+
+function summarizeBuildResult(result, outDir, entryPoint, publicPath) {
   const outputs = Object.entries(result.metafile.outputs);
-  const entryOutput =
-    outputs.find(([, output]) => output.entryPoint && resolve(output.entryPoint) === entryFile) ??
-    outputs.find(([, output]) => output.entryPoint);
+  const entryOutput = outputs.find(
+    ([, output]) =>
+      output.entryPoint === entryPoint
+      || (output.entryPoint && resolve(projectRoot, output.entryPoint) === resolve(projectRoot, entryPoint)),
+  );
   if (!entryOutput) {
-    throw new Error(`Could not find esbuild entry output for ${entryFile}`);
+    throw new Error(`Could not find esbuild entry output for ${entryPoint}`);
   }
 
   const [entryOutputPath, entryMeta] = entryOutput;

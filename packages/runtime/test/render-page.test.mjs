@@ -81,13 +81,38 @@ async function renderPageActionManifest(projectRoot, pageFile, props = {}) {
 }
 
 async function buildClient(projectRoot, pageFile) {
-  const outDir = join(projectRoot, "out");
+  return buildClientTo(projectRoot, pageFile, join(projectRoot, "out"));
+}
+
+async function buildClientTo(
+  projectRoot,
+  pageFile,
+  outDir,
+  { routePath = "/", props = {}, layouts = [], options = {} } = {},
+) {
   const { stdout } = await execFileAsync(
     "node",
-    [buildClientScript, pageFile, outDir, "/_ferrite/static"],
+    [
+      buildClientScript,
+      pageFile,
+      outDir,
+      "/_ferrite/static",
+      routePath,
+      JSON.stringify(props),
+      JSON.stringify(layouts),
+      JSON.stringify(options),
+    ],
     { cwd: projectRoot, maxBuffer: 1024 * 1024 },
   );
   return JSON.parse(stdout);
+}
+
+async function readBundleOutputs(outDir, bundle) {
+  const outputs = {};
+  for (const output of bundle.outputs) {
+    outputs[output] = (await readFile(join(outDir, output))).toString("base64");
+  }
+  return outputs;
 }
 
 async function waitForDirectoryWithPrefix(root, prefix) {
@@ -480,6 +505,76 @@ test("build-client snapshots additional production render roots and their import
   });
 });
 
+test("build-client emits byte-identical generated entries across repeated builds", async () => {
+  await withTempProject(async (projectRoot) => {
+    const clientRoute = join(projectRoot, "app/client/page.tsx");
+    const referenceRoute = join(projectRoot, "app/reference/page.tsx");
+    const clientReference = join(projectRoot, "app/reference/Client.tsx");
+    const actionRoute = join(projectRoot, "app/action/page.tsx");
+    await mkdir(dirname(clientRoute), { recursive: true });
+    await mkdir(dirname(referenceRoute), { recursive: true });
+    await mkdir(dirname(actionRoute), { recursive: true });
+    await writeFile(
+      clientRoute,
+      `"use client"; export default function Page() { return <button>client</button>; }\n`,
+    );
+    await writeFile(
+      referenceRoute,
+      `import Client from "./Client"; export default function Page() { return <Client />; }\n`,
+    );
+    await writeFile(
+      clientReference,
+      `"use client"; export default function Client() { return <button>reference</button>; }\n`,
+    );
+    await writeFile(actionRoute, `export default function Page() { return <main>action</main>; }\n`);
+
+    const cases = [
+      { name: "client-route", pageFile: clientRoute, options: { runtimeProps: true } },
+      { name: "client-reference", pageFile: referenceRoute, options: {} },
+      { name: "action-bootstrap", pageFile: actionRoute, options: { actionBootstrap: true } },
+    ];
+    for (const buildCase of cases) {
+      const firstOut = join(projectRoot, "repeated", `${buildCase.name}-first`);
+      const secondOut = join(projectRoot, "repeated", `${buildCase.name}-second`);
+      const buildOptions = {
+        routePath: `/${buildCase.name}`,
+        options: buildCase.options,
+      };
+      const first = await buildClientTo(projectRoot, buildCase.pageFile, firstOut, buildOptions);
+      const second = await buildClientTo(projectRoot, buildCase.pageFile, secondOut, buildOptions);
+
+      assert.deepEqual(second, first, `${buildCase.name} metadata must be deterministic`);
+      assert.deepEqual(
+        await readBundleOutputs(secondOut, second),
+        await readBundleOutputs(firstOut, first),
+        `${buildCase.name} output bytes must be deterministic`,
+      );
+      for (const [output, encoded] of Object.entries(await readBundleOutputs(firstOut, first))) {
+        if (output.endsWith(".js") || output.endsWith(".map")) {
+          const contents = Buffer.from(encoded, "base64").toString("utf8");
+          assert.doesNotMatch(contents, /\.ferrite\/tmp\/(?:client|client-reference|action-bootstrap)-/);
+          assert.doesNotMatch(contents, new RegExp(projectRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        }
+      }
+    }
+  });
+});
+
+test("build-client removes staged outputs after a bundling failure", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      `"use client"; import "missing-production-dependency"; export default function Page() { return null; }\n`,
+    );
+
+    await assert.rejects(buildClient(projectRoot, pageFile), /Could not resolve/);
+    assert.deepEqual(await readdir(join(projectRoot, ".ferrite/tmp")), []);
+    assert.deepEqual(await readdir(join(projectRoot, "out")), []);
+  });
+});
+
 test("build-client includes two-argument dynamic imports in the runtime graph", async () => {
   await withTempProject(async (projectRoot) => {
     const pageFile = join(projectRoot, "app/page.tsx");
@@ -555,7 +650,7 @@ test("build-client retries when a resolver input changes during bundling", { ski
     await symlink("ClientA.tsx", clientLink);
 
     const build = buildClient(projectRoot, pageFile);
-    await waitForDirectoryWithPrefix(join(projectRoot, ".ferrite/tmp"), "client-reference-");
+    await waitForDirectoryWithPrefix(join(projectRoot, ".ferrite/tmp"), "client-build-");
     await rm(clientLink);
     await symlink("ClientB.tsx", clientLink);
     const bundle = await build;
@@ -569,6 +664,8 @@ test("build-client retries when a resolver input changes during bundling", { ski
         watchFiles: ["app/Client.tsx", "tsconfig.json"],
       },
     ]);
+    assert.deepEqual(await readdir(join(projectRoot, ".ferrite/tmp")), []);
+    assert.doesNotMatch((await readdir(join(projectRoot, "out"))).join("\n"), /ClientA/);
   });
 });
 
