@@ -264,6 +264,7 @@ fn production_cli_drains_accepted_work_on_sigint() {
 fn child_guard_kills_unreleased_descendant_process_group() {
     let temp = tempfile::tempdir().unwrap();
     let grandchild_pid_path = temp.path().join("grandchild.pid");
+    let grandchild_pid_staging_path = temp.path().join("grandchild.pid.staging");
     let child_script = temp.path().join("cleanup-child.mjs");
     let parent_script = temp.path().join("cleanup-parent.mjs");
     fs::write(&child_script, "setInterval(() => {}, 1_000);\n").unwrap();
@@ -272,13 +273,16 @@ fn child_guard_kills_unreleased_descendant_process_group() {
         format!(
             r#"
 import {{ spawn }} from "node:child_process";
-import {{ writeFile }} from "node:fs/promises";
+import {{ rename, writeFile }} from "node:fs/promises";
 
 const child = spawn(process.execPath, [{}], {{ stdio: "ignore" }});
 await writeFile({}, String(child.pid));
+await rename({}, {});
 setInterval(() => {{}}, 1_000);
 "#,
             serde_json::to_string(&child_script).unwrap(),
+            serde_json::to_string(&grandchild_pid_staging_path).unwrap(),
+            serde_json::to_string(&grandchild_pid_staging_path).unwrap(),
             serde_json::to_string(&grandchild_pid_path).unwrap(),
         ),
     )
