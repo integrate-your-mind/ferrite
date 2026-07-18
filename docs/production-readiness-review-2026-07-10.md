@@ -20,11 +20,11 @@ The highest-return work is no longer broad React or Next.js parity. It is the pr
 
 ## July 18 PR Backlog Ledger
 
-PR #4 is the sole open delivery unit. Its base is `main` at `d10b4e9c364f533d621a9cd151bbcd1bb161278c`; the remote delivery branch is `codex/module-graph-hardening` at `1ad7c32ec7d4ea4bf13d1d29a21fdb3b426cc359`. The dedicated mutable worktree is `codex/module-graph-backlog-fix`, based on local source commit `1c019f9c51bd54b9081f37361d543a511549fa4f`, with the July 18 backlog fixes still uncommitted while exact-head proof is in progress. No other owner may edit this delivery unit.
+PR #4 is the sole open delivery unit. Its base is `main` at `d10b4e9c364f533d621a9cd151bbcd1bb161278c`; the remote delivery branch and GitHub pull ref were both still `1ad7c32ec7d4ea4bf13d1d29a21fdb3b426cc359` when captured through Git refs on July 18. The dedicated mutable worktree is `codex/module-graph-backlog-fix` at source commit `6f39d6627cb939c6948a9cf05bb72ede9d11b5e5`. No other owner may edit this delivery unit.
 
 | Unit | Intent and dependency | Review/CI debt | Evidence state | Disposition |
 | --- | --- | --- | --- | --- |
-| Draft PR #4 | Compiler-owned runtime graph, cycle diagnostics, resolver/config invalidation, then the dependent slow-client, action-security, and deployment fixes found during release audit | The independent reviewer returned `FIX_NOW` at `1c019f9` for the Node-to-Rust snapshot handoff and missing/external config watches. The same reviewer must inspect the final committed head. GitHub has no executed status check; hosted Actions previously ended in `startup_failure` before job allocation. | All listed findings were reproduced before the local fixes. Focused graph, production-build coherence, absolute request-read, bounded replay, public/internal action-error, real-socket action, and real CLI `SIGTERM` regressions pass. Full exact-head lint/typecheck/build/test/coverage/package/browser gates are pending. | `FIX_NOW` until the final head is committed, pushed to the existing PR branch, independently reviewed, and fully proven. Hosted execution remains a separately labeled external gap. |
+| Draft PR #4 | Compiler-owned runtime graph, cycle diagnostics, resolver/config invalidation, then the dependent slow-client, action-security, deployment, MSRV, and cross-platform fixes found during release audit | The independent reviewer returned `FIX_NOW` at `1c019f9` for the Node-to-Rust snapshot handoff and missing/external config watches. The same reviewer must inspect the final receipt head. GitHub has no executed status check; hosted Actions previously ended in `startup_failure` before job allocation. The current GitHub API session is unauthenticated and anonymous requests are rate-limited, so current comments/checks cannot be refreshed without crossing the credential boundary. | Source SHA `6f39d66` passes exact-head lint, typecheck, build, full tests, package archives, dependency/workflow scans, Rust 1.85, Linux/Windows cross-checks, coverage, four Chromium scenarios, real example build/dev/serve, direct normal/failure/odd production HTTP QA, and clean `SIGTERM` drain. Receipt: `docs/proof-receipts/2026-07-18T071154Z-6f39d66-pr4-backlog.md`. | `FIX_NOW` until the existing PR branch is updated, the final reviewer returns no actionable finding, and remote state can be refreshed. Hosted execution remains a separately labeled external gap. |
 | Issue #3 | Broad productionization backlog; PR #4 closes only its graph, request-budget, action-error, and shutdown subfindings | The remaining license, distribution, hosted staging, hosted capacity, session/auth, distributed replay, atomic release-pointer, and external observability work must stay open after PR #4. | Local proof cannot close hosted or release claims. | `EXTERNALLY_BLOCKED` or future scoped backlog, depending on each subfinding; not a reason to add scope to PR #4. |
 | Historical `codex/nginx-proof-harness` local delta | Earlier nginx evidence already represented by merged HTTP-framing work and preserved local files | It overlaps the completed framing lane and must not be mixed into PR #4. | Preserved in its original worktree; no unique file was deleted or moved. | `SUPERSEDE_CANDIDATE`, pending a separate preservation decision with close/delete authority. |
 
@@ -32,6 +32,7 @@ PR #4 is the sole open delivery unit. Its base is `main` at `d10b4e9c364f533d621
 
 Historically proven across the merged HTTP-framing lane and the current PR #4 branch:
 
+- Exact source SHA `6f39d6627cb939c6948a9cf05bb72ede9d11b5e5` and tree `ece931ca7f55d8348476787883eb171a054c2e34` pass the July 18 local proof packet.
 - Rust formatting and clippy with warnings denied.
 - TypeScript package checks and example app typechecking.
 - Rust and JavaScript/TypeScript builds.
@@ -47,6 +48,8 @@ Historically proven across the merged HTTP-framing lane and the current PR #4 br
 - Production sockets enforce a configurable absolute response-write deadline across fixed, gzip, and chunked output; parse errors, overload rejection, and shutdown drain use bounded writers, and a real stalled-reader test proves typed timeout failure.
 - An artifact-backed real-socket saturation test holds both workers, receives six prompt `503` responses, releases the work, and proves a later request succeeds; a separate single-worker test proves a failed artifact-runner subprocess returns a generic `500` and the next request succeeds.
 - A bounded artifact-backed mixed-load soak repeats four-worker slow-reader saturation and barrier-synchronized concurrent load waves, proves write-deadline truncation, complete overload `503` delivery, no false `408` responses for complete requests, post-saturation runner failure recovery, fixed rejection-worker limits, runner lifecycle cleanup, and bounded joined shutdown.
+- The declared Rust 1.85 workspace floor passes all targets; `ferrite-cli` also cross-checks for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`. Native Windows runtime signal behavior remains unproven.
+- Exact-source dependency scans report no known Cargo or production pnpm vulnerabilities; Actionlint, tracked/history secret-pattern scans, and the current-delta secret scan pass.
 
 Explicitly not proven:
 
@@ -57,7 +60,7 @@ Explicitly not proven:
 - Hosted capacity, long-duration soak, host-process supervisor recovery, hosted multi-instance behavior, and rollback under live traffic. The local mixed-load soak is a bounded regression proof, not a throughput or capacity benchmark.
 - A clean-machine install from published packages and a publicly distributed CLI rather than locally packed candidates and a copied CLI binary.
 - Atomic release activation through a versioned directory or image pointer; direct replacement of an existing build directory has a brief activation window.
-- Workspace-wide Rust/JS branch thresholds, mutation testing, or a browser-to-real-`ferrite serve` action/payload test. A one-time local `ferrite-dev-server` coverage run reports 90.12% line, 90.20% function, and 89.58% region coverage, but it is not yet a committed CI threshold.
+- Enforced workspace-wide Rust/JS coverage thresholds, mutation testing, or a browser-to-real-`ferrite serve` action/payload test. The July 18 report measures Rust at 91.11% lines, 89.08% functions, and 89.63% regions; Node runtime tests measure 78.95% lines, 74.29% branches, and 88.07% functions, with `build-client.mjs` at 89.44% lines. These are reports, not committed fail-under thresholds.
 - Session-bound CSRF rotation, distributed replay storage, deployment-stable action IDs, first-class auth integration, or external tracing/audit sinks.
 - A Builder AI Lab model-gateway call or shared `proof_receipt` implementation.
 
