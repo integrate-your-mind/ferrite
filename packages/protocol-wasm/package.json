@@ -3,7 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "description": "Rust-backed WASM validation for Ferrite server payload protocol packets.",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "homepage": "https://github.com/integrate-your-mind/ferrite#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/integrate-your-mind/ferrite.git",
+    "directory": "packages/protocol-wasm"
+  },
+  "bugs": {
+    "url": "https://github.com/integrate-your-mind/ferrite/issues"
+  },
   "keywords": [
     "ferrite",
     "wasm",

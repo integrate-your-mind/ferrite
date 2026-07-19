@@ -3,7 +3,9 @@ name = "ferrite-page-renderer"
 description = "Validated TypeScript page-runner bridge for Ferrite server rendering."
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]

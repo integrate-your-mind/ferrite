@@ -3,7 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "description": "TypeScript JSX runtime, DOM helpers, and server facade for the Rust-first Ferrite framework.",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "homepage": "https://github.com/integrate-your-mind/ferrite#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/integrate-your-mind/ferrite.git",
+    "directory": "packages/runtime"
+  },
+  "bugs": {
+    "url": "https://github.com/integrate-your-mind/ferrite/issues"
+  },
   "keywords": [
     "ferrite",
     "jsx",

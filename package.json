@@ -1,6 +1,7 @@
 {
   "name": "ferrite-workspace",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "cargo build --workspace && pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/protocol-wasm build && pnpm --filter @ferrite/runtime build && pnpm --filter @ferrite/node build",

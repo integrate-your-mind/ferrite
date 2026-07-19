@@ -3,7 +3,9 @@ name = "ferrite-ssr"
 description = "Rust server-side rendering for validated Ferrite protocol packets."
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
