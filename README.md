@@ -1,58 +1,94 @@
 # Ferrite
 
-Ferrite is a Rust-first experiment toward a React-like UI runtime and a Next.js-like application framework with a JavaScript/TypeScript-facing API.
+Ferrite is a Rust-first experiment toward a React-like UI runtime and a Next.js-like application framework with a JavaScript and TypeScript authoring API.
 
-This repository is intentionally scoped as a buildable foundation, not a finished framework. The current proof surface is summarized below.
+Rust owns the framework boundaries that need strict validation: routing, render protocols, server-side rendering, production artifacts, and bounded serving. TypeScript owns application authoring and browser behavior.
 
-## Private Alpha Status
+## Experimental developer preview
 
-Ferrite is ready to demonstrate as a self-hosted private-alpha framework for trusted teams evaluating the Rust-first app/runtime model. It is not ready for unmanaged public production use or authenticated mutation-heavy workloads.
+Ferrite's source is published for technical evaluation, research, issue reporting, and focused contributions. It is not ready for unmanaged public production use, authenticated mutation-heavy workloads, or compatibility-sensitive deployments.
 
-The safest alpha offer today is a controlled internal dashboard, docs portal, or content-heavy app using the documented `ferrite check`, `ferrite build`, and artifact-backed `ferrite serve` path. The remaining market blockers are hosted CI job-level proof, hosted staging and rollback proof behind the deployment templates, real npm/native publish proof, public CLI distribution and starter onboarding, hosted capacity and process-recovery evidence, full server-action session/replay/auth hardening, and external tracing or audit sink integration.
+Expect breaking changes, incomplete packages, unsupported platforms, and revisions to public APIs. The npm packages and public CLI distribution are not yet available. A public repository does not mean that Ferrite has reached a supported public release.
 
-## Current Proof Surface
+Before contributing, read:
 
-- A Rust virtual tree with validated HTML element/attribute names.
-- Rust server-side HTML rendering with escaping and void-element checks.
-- A Rust file-system route scanner for `app/page.tsx` style applications.
-- A Rust CLI with `routes`, `check`, `render`, and `dev` commands.
-- A Rust dev server that serves discovered app routes and rebuilds its route manifest after app file changes.
-- A Rust production build command that stages and installs a versioned `ferrite-server.json` artifact containing verified self-contained server modules, route-level browser bundles, build-observed action metadata, prerendered HTML, and SHA-256 file records.
-- A JS page executor used by Rust dev/build paths to compile TSX page modules and emit versioned compact render packets for Rust SSR.
-- A JS browser bundler used by Rust dev/build paths to emit route client modules, CSS, source maps, and imported assets, including WASM assets imported by browser-capable packages.
-- A Rust `ferrite-protocol` crate that owns render-packet, render-stream, client-reference, server-payload, and server-payload stream-frame markers, versioning, packet shapes, and validation.
-- A Rust `ferrite-protocol-wasm` crate and `@ferrite/protocol-wasm` TypeScript package that expose Rust server-payload packet and stream-frame validation to browser-capable WASM consumers; generated browser bundles can emit and reference its `.wasm` artifact through the configured static public path.
-- A native Node package, `@ferrite/node`, that exposes Rust SSR to JavaScript consumers through a Node-API addon, can resolve local source builds or optional platform prebuild packages, and has a dry-run native prebuild workflow that verifies generated package artifacts without publishing.
-- Server-first route output with `"use client"` directive detection for whole-route browser hydration bundles.
-- Client reference manifests, versioned payloads, browser chunks, and automatic island hydration for `"use client"` components imported by otherwise server-rendered routes.
-- Static parameter generation for dynamic and catch-all routes through `generateStaticParams`.
-- App-directory layout discovery and root layout composition for dev/build output and hydration.
-- Optional `app/document.tsx` ownership of `<html>`, `<head>`, and `<body>` while Ferrite supplies framework head tags and the hydration root.
-- Route-level `loading.tsx` and `error.tsx` conventions discovered beside app routes and passed through Rust dev/build rendering.
-- Static `metadata` and dynamic `generateMetadata` collection for page/layout title, description, Open Graph, icon, and alternate-link tags.
-- Automatic route type generation into `.ferrite/types/routes.d.ts`.
-- A TypeScript JSX runtime facade in `@ferrite/runtime`.
-- A versioned compact render-packet bridge from the TypeScript facade into Rust SSR, while the legacy serialized VNode input remains supported by the render CLI.
-- A `Suspense` server primitive for async child components, plus versioned render-stream packets with fallback shell HTML and deferred replacement chunks.
-- A versioned server-payload stream that carries compact shell/chunk output plus validated client-reference payloads.
-- A browser-safe `@ferrite/protocol` package generated by the Rust `ferrite-protocol` crate, with compatibility re-exports from `@ferrite/runtime`.
-- Dev HTTP routes render through the stream-capable path and use chunked transfer encoding when stream chunks exist, while preserving buffered responses for ordinary routes.
-- Dev and production HTTP adapters can return validated `server-payload` protocol JSON for matched routes with `?__ferrite_payload=server`, or line-delimited server-payload stream frames with `?__ferrite_payload=stream`.
-- Dev and production HTTP adapters can accept same-origin form `POST /_ferrite/action` submissions for explicit route-scoped server action ids, require a valid `Host` header, reject action POSTs with browser-supplied `Origin` or `Referer` hosts that do not match the request `Host`, optionally validate action origins against an explicit trusted proxy public origin using `X-Forwarded-Proto` and `X-Forwarded-Host`, optionally require a configured hidden CSRF token for action POSTs, optionally bind production CSRF checks to a SameSite/HttpOnly/Secure double-submit cookie, optionally require production one-time replay nonces for action POSTs, parse urlencoded or small text multipart fields, invoke the matched route through the existing page-renderer boundary, and return validated `server-action-response` JSON. The DOM runtime also exposes server-action form enhancement that submits those forms with `FormData` and validates the response packet; generated route, client-reference, and server-only action bootstrap browser entrypoints install that enhancement idempotently when browser JavaScript is present, with Chromium proof for each generated asset path. Build/dev manifests now record explicit `createServerAction()` form references discovered during route render. This is still explicit form transport; automatic `"use server"` discovery, deployment-stable inferred action ids, session-bound CSRF token rotation, multi-process replay coordination, and client event invocation remain future work.
-- An artifact-only production HTTP adapter that validates the complete build before startup, executes prebuilt route modules through a production runner with no esbuild dependency, supports concurrent route execution without a project-wide lock, serves only manifest-declared generated assets, emits conservative cache/deployment metadata, returns server-payload responses on request, gzip-compresses eligible route/payload responses when requested, and omits dev reload state.
-- A locally built and runtime-smoked non-root container containing only the CLI, dependency-free artifact runner, and verified artifact; its dynamic route, fingerprinted asset, and JSON access-log paths are proven without runtime workspace packages or `node_modules`.
-- A browser DOM runtime with mounting, hydration, direct event handlers, `useState`, `useEffect`, `useLayoutEffect`, `useRef`, `useMemo`, `useCallback`, `startTransition`, `useTransition`, and `useDeferredValue`.
-- Browser helpers that fetch, validate, and apply full server-payload responses or shell-first stream-frame responses through the existing DOM update path.
-- A payload-backed browser navigator that prefetches safe same-origin targets, intercepts safe links, can opt into HTTP stream-frame navigation with JSON fallback before shell commit, updates route roots/history from server payloads, restores marked back/forward entries, and falls back to normal navigation for failed or bypassed requests.
-- Document-head reconciliation for payload navigation, including framework-managed title/meta/link/script/style replacement while preserving unrelated head nodes.
-- An `ErrorBoundary` runtime primitive that catches render failures in DOM, hydration, SSR, and transition-triggered rerenders.
-- A small priority scheduler for sync and transition work, with cooperative yielding before transition DOM commits.
-- DOM reconciliation that patches compatible text/elements in place and reorders keyed element children.
-- A sample app that typechecks through the Ferrite CLI.
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [MIT license](LICENSE)
 
-## Commands
+## Current model
 
-Create a minimal TypeScript application with a locally built or installed `ferrite` binary:
+Ferrite currently provides a buildable framework foundation with:
+
+- a Rust virtual tree and escaped server-side HTML renderer;
+- file-system routing for `app/page.tsx` applications, layouts, dynamic routes, catch-all routes, loading files, error files, and metadata;
+- a Rust CLI with `init`, `routes`, `check`, `render`, `dev`, `build`, and `serve` workflows;
+- TypeScript-aware page execution and browser bundling;
+- a versioned Rust-owned protocol for render packets, streams, client references, server payloads, and server actions;
+- server-first routes with whole-route hydration and imported client-component islands;
+- a browser DOM runtime with mounting, hydration, events, state, effects, refs, memo helpers, transitions, error boundaries, and keyed reconciliation;
+- payload-backed navigation, prefetching, stream-frame handling, history restoration, and managed document-head updates;
+- explicit form-based server actions with origin checks and optional CSRF, replay, proxy, logging, and metrics controls;
+- deterministic production artifacts with declared files, sizes, SHA-256 records, route metadata, browser bundles, prerenders, and action metadata;
+- an artifact-only production server with bounded requests, worker admission, timeouts, overload rejection, cleanup, and generic public errors;
+- native Node SSR bindings and a browser-consumable WASM protocol validator;
+- local package, browser, nginx, container, failure-path, and recovery proof.
+
+Ferrite is not a drop-in React or Next.js replacement. It does not yet provide a stable package install path, full React Server Components, automatic `"use server"` discovery, distributed replay state, general auth middleware, file uploads, complete tracing, broad platform proof, or a supported public HTTP edge.
+
+## Requirements
+
+The repository currently targets:
+
+- Rust 1.85 or newer;
+- Node.js 22 or newer;
+- pnpm 11.7.0 through Corepack;
+- a Chromium-family browser for the full browser proof;
+- Docker for the nginx and container checks.
+
+Some checks need platform tools that are not available on every workstation.
+
+## Build from source
+
+```sh
+corepack enable
+pnpm install --frozen-lockfile
+cargo build --workspace
+pnpm build
+```
+
+Run the normal repository gates:
+
+```sh
+pnpm lint
+pnpm typecheck
+pnpm test
+```
+
+Run package verification when changing package or release files:
+
+```sh
+pnpm release:verify:npm
+pnpm release:verify:cargo
+```
+
+## Exercise the included application
+
+```sh
+cargo run -p ferrite-cli -- check --project examples/basic
+node examples/basic/render.mjs | cargo run -p ferrite-cli -- render --input -
+cargo run -p ferrite-cli -- dev --project examples/basic --once --request-path /posts/abc
+cargo run -p ferrite-cli -- build --project examples/basic
+cargo run -p ferrite-cli -- serve \
+  --project examples/basic \
+  --artifact .ferrite/build \
+  --page-renderer packages/runtime/bin/render-artifact.mjs \
+  --once \
+  --request-path /posts/abc
+```
+
+A locally built or installed `ferrite` binary can initialize a small application:
 
 ```sh
 ferrite init my-app
@@ -62,74 +98,32 @@ npm run check
 npm run dev
 ```
 
-Initialization refuses non-empty directories. Generated scripts use renderer and bundler files from installed `@ferrite/runtime`; a public Ferrite CLI binary and registry packages are not yet available.
+Initialization refuses non-empty directories. Generated projects currently depend on locally built or staged Ferrite candidates because public registry distribution has not been proven.
 
-```sh
-pnpm install
-cargo fmt --all -- --check
-cargo test --workspace
-pnpm --filter @ferrite/runtime test
-pnpm --filter @ferrite/node test
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
-pnpm --filter @ferrite/protocol build
-pnpm --filter @ferrite/protocol-wasm build
-pnpm --filter @ferrite/runtime build
-pnpm --filter @ferrite/node build
-pnpm --filter @ferrite/node prebuild:package
-pnpm --filter @ferrite/node prebuild:verify
-pnpm test:release
-pnpm release:verify:npm
-pnpm release:verify:cargo
-cargo run -p ferrite-cli -- check --project examples/basic
-node examples/basic/render.mjs | cargo run -p ferrite-cli -- render --input -
-cargo run -p ferrite-cli -- dev --project examples/basic --once --request-path /posts/abc
-cargo run -p ferrite-cli -- build --project examples/basic
-cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path /posts/abc
-```
+## Production boundary
 
-See [docs/deployment.md](docs/deployment.md) for the operator checklist and [docs/production-readiness-review-2026-07-10.md](docs/production-readiness-review-2026-07-10.md) for the prioritized developer-launch blockers and exit criteria.
+`ferrite build` creates the deployable artifact. `ferrite serve` validates that artifact before it binds a socket and serves only manifest-declared routes and files.
 
-## CLI
+Ferrite's direct socket has a narrow one-request HTTP/1.1 upstream contract. It is intended to run behind a mature edge such as nginx, Envoy, or Caddy. Do not expose Ferrite as a general-purpose public HTTP server.
 
-```sh
-ferrite routes --project examples/basic
-ferrite routes --project examples/basic --json
-ferrite check --project examples/basic
-node examples/basic/render.mjs | ferrite render --input -
-ferrite dev --project examples/basic --host 127.0.0.1 --port 3000
-ferrite dev --project examples/basic --once --request-path /posts/abc
-ferrite dev --project examples/basic --once --request-path '/posts/abc?__ferrite_payload=server'
-ferrite dev --project examples/basic --once --request-path '/posts/abc?__ferrite_payload=stream'
-ferrite build --project examples/basic --out .ferrite/build
-ferrite serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --host 127.0.0.1 --port 3000 --render-timeout-ms 30000 --request-read-timeout-ms 5000 --response-write-timeout-ms 5000 --max-request-bytes 16384 --max-in-flight-requests 64 --server-action-csrf-token-env FERRITE_ACTION_CSRF --server-action-csrf-cookie-name ferrite_action_csrf --server-action-replay-ttl-ms 300000 --trusted-proxy-public-origin https://app.example.com --trusted-proxy-client-ip-hops 1 --access-log json --action-log json --metrics-path /__ferrite/metrics
-ferrite serve --project examples/basic --artifact .ferrite/build --once --request-path /posts/abc
-ferrite serve --project examples/basic --artifact .ferrite/build --once --request-path '/posts/abc?__ferrite_payload=server'
-ferrite serve --project examples/basic --artifact .ferrite/build --once --request-path '/posts/abc?__ferrite_payload=stream'
-```
+Use the deployment guide and checked templates for proxy, TLS, process supervision, smoke testing, logging, metrics, rollback, and failure handling:
 
-The `check` command scans routes, writes generated route types, then runs the local TypeScript compiler with `--noEmit`.
+- [Deployment guide](docs/deployment.md)
+- [Architecture](docs/architecture.md)
+- [Production-readiness review](docs/production-readiness-review-2026-07-10.md)
 
-The `dev` command scans app routes, writes generated route types, executes matched TSX page modules, collects page/layout metadata, renders output through Rust SSR, emits route browser bundles only when the page or one of its layouts starts with `"use client"`, serves generated client assets under `/_ferrite/static`, exposes `__ferrite` route/build manifests, and includes a tiny polling client that reloads when the route build id changes. HTML routes render through the stream path and use chunked transfer encoding when stream chunks exist; `--once` prints the buffered concatenation for deterministic checks. Matched app routes can also return the validated server-payload protocol JSON by adding `?__ferrite_payload=server`, or the line-delimited shell/chunk frame stream by adding `?__ferrite_payload=stream`. Server-rendered forms using `createServerAction()` submit to `POST /_ferrite/action`; the dev adapter parses form fields, validates the hidden Ferrite action metadata, invokes the matched route action, and returns `application/json` server-action responses. The dev build manifest endpoint also includes route-scoped explicit server-action references collected from rendered forms.
+## Proof and limits
 
-The `serve` command uses the artifact-only production HTTP adapter. Before binding a socket it validates the manifest version/build id, normalized relative paths, route uniqueness, declared client URLs, file sizes, SHA-256 digests, and symlink containment. It retains the verified server-module and static-asset bytes, then executes modules through `render-artifact.mjs` over stdin with configurable render, request-read, whole-response-write, request-byte, and in-flight request limits; there is no production source scan, route-type write, esbuild import, artifact file reopen, action-manifest rediscovery, or client bundling. It serves only manifest-declared client assets under the manifest-owned `/_ferrite/static` path, adds conservative `Cache-Control` and `X-Ferrite-Route-Pattern` metadata, returns validated server-payload JSON or line-delimited frames, and accepts route-registered same-origin form actions with the existing CSRF, replay, proxy, audit, and metrics controls. Long-running sockets use a reusable bounded worker pool, while immutable route state is shared directly and replay nonces use a narrow mutex; independent route executions are not serialized through a global project lock. It does not expose dev manifests, inject the dev reload client, or add `data-ferrite-build-id`.
+The repository records exact-source local proof for linting, type checks, builds, tests, browser flows, package candidates, artifact integrity, request framing, overload, timeouts, cleanup, and rollback behavior.
 
-The worker pool returns sockets accepted from the nonblocking listener to blocking mode before admission, counts accepted and queued sockets against `--max-in-flight-requests`, and returns `503 Service Unavailable` when full. The overload path shuts down unread request input before the bounded response and then closes the write side, avoiding a reset that could discard the `503`. `--render-timeout-ms` applies to artifact-runner subprocesses; deadline failures return generic `504` HTML, and non-timeout failures return generic `500` HTML while detailed diagnostics stay on server stderr. `--response-write-timeout-ms` is an absolute budget across response headers and all fixed, gzip, or chunked body writes. Once a response is partially transmitted, deadline exhaustion closes the connection and emits a generic stderr transport message instead of attempting a second HTTP response. Overload `503` writes keep a stricter 100 ms cap.
+Hosted GitHub Actions has recently failed before job allocation, so local proof must not be represented as hosted CI proof. Registry publication, clean public installation, hosted deployment, long-duration production soak, and broad external platform evidence remain release gates.
 
-The `build` command scans app routes, writes generated route types, compiles one self-contained server module and parameter-independent browser bundle per route pattern, prerenders known static paths, and writes both the diagnostic `ferrite-build.json` report and production `ferrite-server.json` manifest. Static application dependencies and the matching Ferrite server runtime are bundled into each server module. The production manifest versions the format, records the build identity, route params, server modules, client bundles, actions observed during build rendering, optional prerenders, and SHA-256/size metadata for every referenced file. Builds complete in a sibling staging directory and replace the prior output only after success; failed staging or activation restores the previous artifact when rollback succeeds. The direct directory replacement has a brief non-atomic activation window, so deployments should build a fresh versioned release directory or image and atomically switch an external release pointer. Dynamic routes without `generateStaticParams` remain available to production serving even though they have no prerendered HTML.
+## Contributions
 
-When `app/document.tsx` exists, Ferrite renders it as the full document shell. The document component receives `{ head, children, routePath, routePattern, buildId, metadata }`; `head` contains Ferrite-managed meta/title/style/script tags and `children` is the hydration root containing the page/layout tree.
+Use a fork and open a pull request against `main`. Keep changes focused, add tests for changed behavior, document checks that were and were not run, and avoid adding broad framework surface without a concrete use case.
 
-Ferrite discovers the nearest route `loading.{tsx,ts,jsx,js}` and `error.{tsx,ts,jsx,js}` files from the app root down to the page directory. `loading.tsx` is used as the route shell fallback for stream rendering; final dev/build HTML still resolves async pages before output. `error.tsx` catches page-tree render failures below that route boundary and renders the fallback through dev, build, and document rendering.
+Security flaws must use the private process in [SECURITY.md](SECURITY.md), not a public issue.
 
-Routes are server-first by default. A page or layout that starts with a `"use client"` directive opts the whole matched route into browser hydration and route-specific client bundling. When a server route imports a separate `"use client"` module, the production manifest records a validated `clientReferences` entry for that module/export and emits a browser chunk for it while keeping the route itself scriptless. The server renderer automatically proxies that imported client component into an island container with `data-ferrite-client-reference`, legacy JSON `data-ferrite-client-props`, a versioned `data-ferrite-client-payload`, and server fallback HTML. The referenced chunk validates the payload and hydrates that subtree without hydrating the whole route. The TSX page runner and Rust page renderer can also emit a versioned `server-payload` packet containing the compact shell, deferred chunks, and shell/chunk client-reference payloads. Dev and production route adapters expose that packet as protocol JSON with `?__ferrite_payload=server` and as line-delimited stream frames with `?__ferrite_payload=stream`; `@ferrite/runtime/dom` can fetch, validate, merge returned chunks into the shell, reconcile framework-managed document head nodes, apply the result through a mounted root, consume line-delimited shell/chunk stream frames, opt the navigator into stream-frame navigation with JSON fallback before shell commit, prefetch safe same-origin payloads, intercept safe same-origin link clicks, and restore marked browser back/forward entries for payload-backed route navigation. This is an island-oriented server payload contract, not full React Server Components yet.
+## License
 
-## HTTP Request Contract
-
-Ferrite's dev and production sockets share a narrow one-request HTTP/1.1 upstream contract. `httparse` owns request-line and header syntax; Ferrite then requires exact CRLF framing, an origin-form target, one valid `Host`, no request `Transfer-Encoding` or `Expect`, and positive request bodies only for `POST /_ferrite/action` with one decimal `Content-Length`. Interpreted and framing-sensitive duplicate fields fail closed, while other repeated fields are combined in wire order instead of silently using the last value. The parser also rejects malformed authorities, encoded path separator/dot bytes, unsupported target/version forms, and already-buffered pipelined suffixes. This intentionally removes direct HTTP/1.0, bare-LF, and absolute-form compatibility from the application socket; normal browser HTTP/1.1 traffic is unaffected. Every response closes the connection. Production deployments should use the authority-rejecting, buffering, and header-sanitizing nginx template documented in `docs/deployment.md`, not expose Ferrite as a general-purpose public HTTP edge. `pnpm test:nginx:stack` exports a clean exact commit into an immutable source root, consumes the Dockerfile, nginx template, child verifier, and candidate build context only from that root, labels the production image with its revision and tree, resolves official nginx 1.29.3 from an immutable multi-platform index digest on an isolated Docker network, records the platform-specific image identity, generates ephemeral local TLS material, and runs 43 raw HTTP/1 cases plus seven negotiated HTTP/2 cases, fail-closed controls, and verified cleanup. Five ambiguous framing probes and nine malformed target probes must have no nginx upstream status, so an application-level response cannot masquerade as proxy rejection. Dirty-worktree runs require an explicit development override and are not release evidence. Hosted proxy/CDN behavior remains unproven.
-
-## Current Boundaries
-
-Production admission, strict HTTP/1.1 request framing, local nginx TLS framing parity, artifact validation, subprocess and response-write deadlines, public error redaction, source-independent dynamic route/action execution, overlapping request execution, bounded mixed-load soak, concurrent slow-reader deadline recovery, controlled saturation recovery, and artifact-runner failure recovery are locally tested. Remaining runtime proof gaps are hosted capacity benchmarking, long-duration soak, host-process supervisor recovery, hosted proxy/CDN/TLS behavior, and horizontally coordinated replay state.
-
-Ferrite now has a small browser DOM runtime, hydration proof, keyed element reconciliation, core state/effect/ref/memo hooks, layout-effect-before-passive timing, priority transition scheduling, cooperative yielding before transition DOM commits, error boundary fallback routing, server `Suspense` fallback shells for async child components, route-level loading/error file conventions, Rust dev/build/serve route handling, chunked dev and production HTTP output for streamed route chunks, validated server-payload JSON responses for app routes, line-delimited server-payload stream-frame responses for app routes, first form-based server-action POST transport for explicit route-scoped action ids with same-host `Origin`/`Referer` rejection, opt-in trusted-proxy public-origin validation, opt-in trusted forwarded client-IP log policy, opt-in hidden CSRF token enforcement, opt-in production CSRF double-submit cookie binding, opt-in single-process action replay nonce enforcement, and production server-action audit logs for attempts and rejections, explicit server-action reference manifests for rendered form actions, idempotent browser bootstrap for enhanced server-action form submissions in generated route/client-reference entrypoints and dedicated server-only action bootstrap assets, Chromium proof for enhanced action forms across those generated asset paths, Chromium proof for payload prefetch/navigation, stream-frame navigation, popstate restoration, malformed-payload rejection, and malformed clicked-payload fallback, gzip production compression for eligible HTML and payload responses, browser-side full-payload and incremental stream-frame fetch/application helpers, same-origin payload navigation helpers with opt-in stream mode, managed document-head reconciliation, popstate restoration, and opt-in payload prefetching, conservative production cache-control and route-pattern metadata headers, production request limits, render timeout controls, request observer hooks, CLI access-log output for production request events, CLI action-log output for production server-action events, CLI Prometheus text metrics output for in-memory production request/action counters, reusable production workers, graceful production shutdown/drain hooks, first-pass systemd/nginx/container deployment templates, an operator-facing deployment guide, TSX page-module execution for server output, root layout composition, app-owned document shells, page/layout metadata composition with Open Graph/icons/alternates, directive-gated whole-route browser bundling with CSS/source maps/assets/WASM assets, client reference manifests plus versioned payloads and emitted/loaded browser chunks for automatically proxied imported-client islands, generated static output for known static, dynamic, and catch-all routes, duplicate static output detection, dev and production static asset serving, a native Rust render protocol crate, a Rust-generated browser-safe TypeScript protocol package, a browser-consumable WASM protocol validation package for full server-payload packets and stream frames, compatibility protocol re-exports from the runtime, a loadable native Node SSR addon with source-build resolution, checksum-verified optional prebuild resolution, dry-run multi-platform native prebuild workflow for package-artifact verification, and local npm package tarball verification for the JS-facing packages, versioned compact render packets, versioned render-stream packets, versioned server-payload packets, versioned server-payload stream frames, and versioned server-action request/response packets for the JS-to-Rust SSR boundary. The npm verifier builds packages and the CLI, stages release-shaped copies, packs and inspects real tarballs, rejects source-only `private` and `workspace:*` fields, and installs the tarballs in a clean temp project outside the workspace. It smoke-imports the packages, then uses the copied candidate CLI and installed runtime runners to reject a missing artifact, run TypeScript-aware `check`, build a production artifact, and serve rendered HTML. Exact-pinned external build tools resolve from npm during this proof; Ferrite packages remain local tarballs, so registry publication and public CLI distribution are not proven. It does not yet provide npm-published WASM/native packages, real remote CI proof, hosted staging proof, automated npm release publishing, automatic `"use server"` discovery, deployment-stable inferred server-action ids, session-bound CSRF token rotation, distributed replay nonce storage, auth middleware integration, file upload support, tracing or external audit sinks, resumable Fiber-style rendering, or full React Server Components. The JavaScript runtime package is a typed facade over the intended API while the Rust core owns validated tree construction, SSR primitives, route analysis, legacy serialized VNode compatibility, render-packet/render-stream/client-reference/server-payload/server-action decoding, dev route serving, production output, and CLI orchestration.
+Ferrite is licensed under the [MIT License](LICENSE).
