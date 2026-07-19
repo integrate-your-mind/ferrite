@@ -249,7 +249,7 @@ async function resolveProjectLocalNonRelativeImport(specifier, containingFile, p
 
   try {
     const resolved = await realpath(resolvedModule.resolvedFileName);
-    return isProjectSourceModule(resolved, projectRoot) ? resolved : null;
+    return isProjectLocalModule(resolved, projectRoot) ? resolved : null;
   } catch {
     return null;
   }
@@ -278,9 +278,13 @@ async function resolveSourceFile(path) {
   return null;
 }
 
-function isProjectSourceModule(file, projectRoot) {
+function isProjectLocalModule(file, projectRoot) {
   return isPathInside(projectRoot, file)
-    && !relative(projectRoot, file).split(sep).includes("node_modules")
+    && !relative(projectRoot, file).split(sep).includes("node_modules");
+}
+
+function isProjectSourceModule(file, projectRoot) {
+  return isProjectLocalModule(file, projectRoot)
     && sourceExtensions.includes(extname(file).toLowerCase());
 }
 
