@@ -1,0 +1,89 @@
+name: Feature request
+description: Propose a focused Ferrite capability or improvement
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ferrite is in an experimental developer preview. New surface area needs a clear user problem, narrow scope, and proof plan.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the concrete user or operator problem. Avoid starting with the proposed implementation.
+      placeholder: A Ferrite application cannot ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: Who needs this, in what workflow, and how often?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Define the smallest observable behavior that would solve the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include current workarounds and why they are not enough.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Primary area
+      options:
+        - CLI
+        - Router
+        - Compiler or module graph
+        - Rust SSR
+        - Browser runtime or hydration
+        - Server actions
+        - Development server
+        - Production build or serve
+        - Protocol or WASM
+        - Native Node package
+        - Packaging or distribution
+        - Deployment or observability
+        - Documentation or onboarding
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: proof
+    attributes:
+      label: Verification plan
+      description: Explain the tests, fixtures, browser runs, failure cases, or measurements that should prove the change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and risk
+      description: Note likely API, protocol, artifact, deployment, security, performance, or package impact.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and pull requests for related work.
+          required: true
+        - label: I described a user problem rather than only a preferred implementation.
+          required: true
+        - label: I kept the proposed scope suitable for the current developer preview.
+          required: true
