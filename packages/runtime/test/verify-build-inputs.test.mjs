@@ -150,3 +150,24 @@ test("build input verifier rejects project-local TypeScript path aliases", async
     );
   });
 });
+
+test("build input verifier permits installed package imports even when symlinked into the project", async () => {
+  await withTempProject(async (project) => {
+    const packageRoot = join(project, "packages/local-runtime");
+    await mkdir(packageRoot, { recursive: true });
+    await writeFile(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ name: "@local/runtime", type: "module", exports: "./index.js" }, null, 2),
+    );
+    await writeFile(join(packageRoot, "index.js"), `export const value = "package";\n`);
+    await mkdir(join(project, "node_modules/@local"), { recursive: true });
+    await symlink(packageRoot, join(project, "node_modules/@local/runtime"), platform === "win32" ? "junction" : "dir");
+    await writeFile(
+      join(project, "app/page.tsx"),
+      `import { value } from "@local/runtime"; export default function Page() { return <main>{value}</main>; }\n`,
+    );
+
+    const response = JSON.parse((await runVerifier(project)).stdout);
+    assert.ok(response.inputs.some((input) => input.path.endsWith("/packages/local-runtime/index.js")));
+  });
+});

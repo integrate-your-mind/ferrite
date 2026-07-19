@@ -75,10 +75,6 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
         &initial_contract,
         &capture_build_input_contract(config)?,
     )?;
-    ensure_build_contract_unchanged(
-        &initial_contract,
-        &capture_build_input_contract(config)?,
-    )?;
 
     if let Err(error) = install_verified_build(&candidate_path, &config.out_dir) {
         let _ = fs::remove_dir_all(&candidate_path);

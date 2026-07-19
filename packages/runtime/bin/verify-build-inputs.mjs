@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { readFile, realpath } from "node:fs/promises";
+import { access, readFile, realpath } from "node:fs/promises";
 import { isBuiltin } from "node:module";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -146,7 +146,10 @@ function projectAliasGuardPlugin(projectRoot) {
         if (resolved.errors.length > 0 || !resolved.path || resolved.external) {
           return undefined;
         }
-        if (resolved.path.split(/[\\/]/).includes("node_modules")) {
+        if (
+          resolved.path.split(/[\\/]/).includes("node_modules")
+          || await packageSpecifierExists(args.path, args.resolveDir, projectRoot)
+        ) {
           return undefined;
         }
 
@@ -169,6 +172,41 @@ function projectAliasGuardPlugin(projectRoot) {
       });
     },
   };
+}
+
+async function packageSpecifierExists(specifier, resolveDir, projectRoot) {
+  const packageName = packageNameFromSpecifier(specifier);
+  if (!packageName) {
+    return false;
+  }
+  let current = resolveDir || projectRoot;
+  while (true) {
+    try {
+      await access(resolve(current, "node_modules", packageName));
+      return true;
+    } catch {
+      // Keep walking toward the project root.
+    }
+    if (current === projectRoot) {
+      return false;
+    }
+    const parent = dirname(current);
+    if (parent === current || !isPathInside(projectRoot, parent) && parent !== projectRoot) {
+      return false;
+    }
+    current = parent;
+  }
+}
+
+function packageNameFromSpecifier(specifier) {
+  if (specifier.startsWith("#")) {
+    return null;
+  }
+  const parts = specifier.split("/");
+  if (specifier.startsWith("@")) {
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : null;
+  }
+  return parts[0] || null;
 }
 
 async function canonicalProjectImporter(importer, projectRoot) {
