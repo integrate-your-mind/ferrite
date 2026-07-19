@@ -68,8 +68,8 @@ Use a clear, scoped subject where practical:
 ```text
 feat(router): reject ambiguous route shapes
 fix(serve): bound response shutdown
- test(runtime): cover stale navigation
- docs: clarify developer preview limits
+test(runtime): cover stale navigation
+docs: clarify developer preview limits
 ```
 
 ## License
