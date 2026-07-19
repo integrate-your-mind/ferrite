@@ -2,7 +2,14 @@ type GuideProps = {
   params: Ferrite.RouteParams["/guides/*slug"];
 };
 
-const guides: Record<string, { title: string; kicker: string; body: string; next: string }> = {
+type Guide = {
+  title: string;
+  kicker: string;
+  body: string;
+  next: string;
+};
+
+const guides: Record<string, Guide> = {
   "getting-started": {
     title: "Getting started",
     kicker: "A source-build path",
@@ -17,23 +24,26 @@ const guides: Record<string, { title: string; kicker: string; body: string; next
   },
 };
 
+function guideForSlug(slug: string[]): Guide {
+  return guides[slug.join("-")] ?? {
+    title: slug.join(" / "),
+    kicker: "Unlisted guide path",
+    body: "This route is rendered from the catch-all parameter and is not one of the pre-rendered guide entries.",
+    next: "Add a verified entry before treating this path as documentation content.",
+  };
+}
+
 export function generateStaticParams() {
   return [{ slug: ["getting-started"] }, { slug: ["architecture"] }];
 }
 
 export function generateMetadata({ params }: GuideProps) {
-  const guide = guides[params.slug.join("-")] ?? guides["getting-started"];
+  const guide = guideForSlug(params.slug);
   return { title: `${guide.title} · Ferrite Docs Workbench`, description: guide.body };
 }
 
 export default function GuidePage({ params }: GuideProps) {
-  const key = params.slug.join("-");
-  const guide = guides[key] ?? {
-    title: params.slug.join(" / "),
-    kicker: "Unlisted guide path",
-    body: "This route is rendered from the catch-all parameter and is not one of the pre-rendered guide entries.",
-    next: "Add a verified entry before treating this path as documentation content.",
-  };
+  const guide = guideForSlug(params.slug);
 
   return (
     <div className="inner-page page-frame">
