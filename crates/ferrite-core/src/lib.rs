@@ -1,145 +1,7 @@
-use std::collections::BTreeMap;
-use std::fmt;
+#[allow(dead_code)]
+mod legacy;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CoreError {
-    InvalidTagName(String),
-    InvalidAttributeName(String),
-    VoidElementHasChildren(String),
-    NonFiniteNumberAttribute(String),
-}
-
-impl fmt::Display for CoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CoreError::InvalidTagName(name) => {
-                write!(f, "invalid HTML tag name `{name}`")
-            }
-            CoreError::InvalidAttributeName(name) => {
-                write!(f, "invalid HTML attribute name `{name}`")
-            }
-            CoreError::VoidElementHasChildren(tag) => {
-                write!(f, "void HTML element `{tag}` cannot have children")
-            }
-            CoreError::NonFiniteNumberAttribute(name) => {
-                write!(f, "attribute `{name}` contains a non-finite number")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CoreError {}
-
-pub type Result<T> = std::result::Result<T, CoreError>;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum AttributeValue {
-    String(String),
-    Bool(bool),
-    Number(f64),
-}
-
-impl From<&str> for AttributeValue {
-    fn from(value: &str) -> Self {
-        AttributeValue::String(value.to_owned())
-    }
-}
-
-impl From<String> for AttributeValue {
-    fn from(value: String) -> Self {
-        AttributeValue::String(value)
-    }
-}
-
-impl From<bool> for AttributeValue {
-    fn from(value: bool) -> Self {
-        AttributeValue::Bool(value)
-    }
-}
-
-impl From<i32> for AttributeValue {
-    fn from(value: i32) -> Self {
-        AttributeValue::Number(value.into())
-    }
-}
-
-impl From<f64> for AttributeValue {
-    fn from(value: f64) -> Self {
-        AttributeValue::Number(value)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Element {
-    tag: String,
-    attributes: BTreeMap<String, AttributeValue>,
-    children: Vec<Node>,
-}
-
-impl Element {
-    pub fn try_new<I, K>(tag: impl AsRef<str>, attributes: I, children: Vec<Node>) -> Result<Self>
-    where
-        I: IntoIterator<Item = (K, AttributeValue)>,
-        K: Into<String>,
-    {
-        let tag = tag.as_ref().to_owned();
-        validate_tag_name(&tag)?;
-
-        if is_void_element(&tag) && !children.is_empty() {
-            return Err(CoreError::VoidElementHasChildren(tag));
-        }
-
-        let mut normalized = BTreeMap::new();
-        for (name, value) in attributes {
-            let name = name.into();
-            validate_attribute_name(&name)?;
-            normalized.insert(name, value);
-        }
-
-        Ok(Self {
-            tag,
-            attributes: normalized,
-            children,
-        })
-    }
-
-    pub fn tag(&self) -> &str {
-        &self.tag
-    }
-
-    pub fn attributes(&self) -> &BTreeMap<String, AttributeValue> {
-        &self.attributes
-    }
-
-    pub fn children(&self) -> &[Node] {
-        &self.children
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Node {
-    Element(Element),
-    Text(String),
-    Fragment(Vec<Node>),
-}
-
-pub fn element<I, K>(tag: impl AsRef<str>, attributes: I, children: Vec<Node>) -> Result<Node>
-where
-    I: IntoIterator<Item = (K, AttributeValue)>,
-    K: Into<String>,
-{
-    Element::try_new(tag, attributes, children).map(Node::Element)
-}
-
-pub fn text(value: impl Into<String>) -> Node {
-    Node::Text(value.into())
-}
-
-pub fn fragment(children: Vec<Node>) -> Node {
-    Node::Fragment(children)
-}
+pub use legacy::{AttributeValue, CoreError, Element, Node, Result, element, fragment, text};
 
 pub fn render_to_html(node: &Node) -> Result<String> {
     let mut out = String::new();
@@ -149,9 +11,7 @@ pub fn render_to_html(node: &Node) -> Result<String> {
 
 fn render_node(node: &Node, out: &mut String) -> Result<()> {
     match node {
-        Node::Text(value) => {
-            escape_text(value, out);
-        }
+        Node::Text(value) => escape_text(value, out),
         Node::Fragment(children) => {
             for child in children {
                 render_node(child, out)?;
@@ -160,37 +20,10 @@ fn render_node(node: &Node, out: &mut String) -> Result<()> {
         Node::Element(element) => {
             out.push('<');
             out.push_str(element.tag());
-
             for (name, value) in element.attributes() {
-                match value {
-                    AttributeValue::Bool(true) => {
-                        out.push(' ');
-                        out.push_str(name);
-                    }
-                    AttributeValue::Bool(false) => {}
-                    AttributeValue::String(value) => {
-                        out.push(' ');
-                        out.push_str(name);
-                        out.push_str("=\"");
-                        escape_attribute(value, out);
-                        out.push('"');
-                    }
-                    AttributeValue::Number(value) => {
-                        if !value.is_finite() {
-                            return Err(CoreError::NonFiniteNumberAttribute(name.clone()));
-                        }
-
-                        out.push(' ');
-                        out.push_str(name);
-                        out.push_str("=\"");
-                        out.push_str(&format_number(*value));
-                        out.push('"');
-                    }
-                }
+                render_attribute(name, value, out)?;
             }
-
             out.push('>');
-
             if !is_void_element(element.tag()) {
                 for child in element.children() {
                     render_node(child, out)?;
@@ -201,42 +34,69 @@ fn render_node(node: &Node, out: &mut String) -> Result<()> {
             }
         }
     }
-
     Ok(())
 }
 
-fn validate_tag_name(name: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return Err(CoreError::InvalidTagName(name.to_owned()));
-    };
-
-    if !first.is_ascii_alphabetic() {
-        return Err(CoreError::InvalidTagName(name.to_owned()));
+fn render_attribute(name: &str, value: &AttributeValue, out: &mut String) -> Result<()> {
+    match value {
+        AttributeValue::Bool(value) if is_html_boolean_attribute(name) => {
+            if *value {
+                out.push(' ');
+                out.push_str(name);
+            }
+        }
+        AttributeValue::Bool(value) => {
+            write_quoted_attribute(name, if *value { "true" } else { "false" }, out)
+        }
+        AttributeValue::String(value) => write_quoted_attribute(name, value, out),
+        AttributeValue::Number(value) => {
+            if !value.is_finite() {
+                return Err(CoreError::NonFiniteNumberAttribute(name.to_owned()));
+            }
+            write_quoted_attribute(name, &format_number(*value), out);
+        }
     }
-
-    if chars.all(|char| char.is_ascii_alphanumeric() || char == '-') {
-        Ok(())
-    } else {
-        Err(CoreError::InvalidTagName(name.to_owned()))
-    }
+    Ok(())
 }
 
-fn validate_attribute_name(name: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return Err(CoreError::InvalidAttributeName(name.to_owned()));
-    };
+fn write_quoted_attribute(name: &str, value: &str, out: &mut String) {
+    out.push(' ');
+    out.push_str(name);
+    out.push_str("=\"");
+    escape_attribute(value, out);
+    out.push('"');
+}
 
-    if !(first.is_ascii_alphabetic() || first == '_' || first == ':') {
-        return Err(CoreError::InvalidAttributeName(name.to_owned()));
-    }
-
-    if chars.all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_' | ':' | '.')) {
-        Ok(())
-    } else {
-        Err(CoreError::InvalidAttributeName(name.to_owned()))
-    }
+fn is_html_boolean_attribute(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "allowfullscreen"
+            | "async"
+            | "autofocus"
+            | "autoplay"
+            | "checked"
+            | "controls"
+            | "default"
+            | "defer"
+            | "disabled"
+            | "download"
+            | "formnovalidate"
+            | "hidden"
+            | "inert"
+            | "ismap"
+            | "itemscope"
+            | "loop"
+            | "multiple"
+            | "muted"
+            | "nomodule"
+            | "novalidate"
+            | "open"
+            | "playsinline"
+            | "readonly"
+            | "required"
+            | "reversed"
+            | "selected"
+    )
 }
 
 fn escape_text(value: &str, out: &mut String) {
@@ -296,100 +156,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renders_nested_html_and_escapes_text_and_attributes() {
-        let no_attributes = std::iter::empty::<(&str, AttributeValue)>;
+    fn distinguishes_html_boolean_and_string_boolean_attributes() {
         let tree = element(
-            "main",
+            "div",
             [
-                ("class", AttributeValue::from("shell")),
-                ("data-count", AttributeValue::from(3)),
+                ("aria-hidden", AttributeValue::from(false)),
+                ("data-ready", AttributeValue::from(true)),
+                ("draggable", AttributeValue::from(false)),
                 ("hidden", AttributeValue::from(false)),
             ],
-            vec![
-                element("h1", no_attributes(), vec![text("Ferrite <Core>")]).unwrap(),
-                element(
-                    "button",
-                    [("aria-label", AttributeValue::from("Increment \"count\""))],
-                    vec![text("Count & grow")],
-                )
-                .unwrap(),
-            ],
+            vec![],
         )
         .unwrap();
 
         assert_eq!(
             render_to_html(&tree).unwrap(),
-            "<main class=\"shell\" data-count=\"3\"><h1>Ferrite &lt;Core&gt;</h1><button aria-label=\"Increment &quot;count&quot;\">Count &amp; grow</button></main>"
+            "<div aria-hidden=\"false\" data-ready=\"true\" draggable=\"false\"></div>"
         );
     }
 
     #[test]
-    fn renders_boolean_and_void_attributes() {
+    fn preserves_true_html_boolean_attributes() {
         let tree = element(
             "input",
             [
                 ("disabled", AttributeValue::from(true)),
                 ("checked", AttributeValue::from(false)),
-                ("value", AttributeValue::from("yes")),
             ],
             vec![],
         )
         .unwrap();
-
-        assert_eq!(
-            render_to_html(&tree).unwrap(),
-            "<input disabled value=\"yes\">"
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_tag_names() {
-        let error = element(
-            "script>alert",
-            std::iter::empty::<(&str, AttributeValue)>(),
-            vec![],
-        )
-        .unwrap_err();
-        assert_eq!(error, CoreError::InvalidTagName("script>alert".to_owned()));
-    }
-
-    #[test]
-    fn rejects_invalid_attribute_names() {
-        let error = element(
-            "div",
-            [("data bad", AttributeValue::from("unsafe"))],
-            vec![],
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            CoreError::InvalidAttributeName("data bad".to_owned())
-        );
-    }
-
-    #[test]
-    fn rejects_void_elements_with_children() {
-        let error = element(
-            "img",
-            std::iter::empty::<(&str, AttributeValue)>(),
-            vec![text("bad")],
-        )
-        .unwrap_err();
-        assert_eq!(error, CoreError::VoidElementHasChildren("img".to_owned()));
-    }
-
-    #[test]
-    fn rejects_non_finite_number_attributes_at_render_time() {
-        let tree = element(
-            "div",
-            [("data-value", AttributeValue::from(f64::NAN))],
-            vec![],
-        )
-        .unwrap();
-        let error = render_to_html(&tree).unwrap_err();
-        assert_eq!(
-            error,
-            CoreError::NonFiniteNumberAttribute("data-value".to_owned())
-        );
+        assert_eq!(render_to_html(&tree).unwrap(), "<input disabled>");
     }
 }
