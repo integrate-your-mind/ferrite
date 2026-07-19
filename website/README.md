@@ -1,6 +1,6 @@
 # Ferrite developer preview site
 
-This is the private, source-backed Ferrite showcase. It documents the current
+This is the publicly viewable, source-backed Ferrite showcase. It documents the current
 Rust-first framework experiment and embeds real captures from the
 `examples/docs-workbench` artifact-backed serve.
 
@@ -13,9 +13,7 @@ npm install
 npm run dev
 ```
 
-Open the local URL printed by vinext. The site is owner-only when deployed
-through ChatGPT Sites; it is not a public Ferrite demo or production
-deployment.
+Open the local URL printed by vinext. The site can be published for public access from the ChatGPT Sites deployment connected to this repository. This preview is source-backed and clearly marks pre-production scope.
 
 ## Validate
 
