@@ -153,6 +153,35 @@ test("build-client guard checks aliases reached through relative dependencies", 
   );
 });
 
+test("build-client guard rejects project-local JSON aliases", async () => {
+  await withProject(
+    {
+      tsconfig: {
+        compilerOptions: {
+          baseUrl: ".",
+          module: "ESNext",
+          moduleResolution: "Bundler",
+          paths: { "@data": ["app/data.json"] },
+          resolveJsonModule: true,
+        },
+      },
+    },
+    async (project) => {
+      await writeFile(join(project, "app/data.json"), JSON.stringify({ value: 1 }));
+      const pageFile = join(project, "app/page.tsx");
+      await writeFile(
+        pageFile,
+        `import data from "@data"; export default function Page() { return data.value; }\n`,
+      );
+
+      await assert.rejects(
+        assertBuildClientImportContract(buildClientArgs(pageFile)),
+        /project-local non-relative import "@data".*app\/data\.json/,
+      );
+    },
+  );
+});
+
 test("build-client guard ignores erased type-only aliases and unresolved external packages", async () => {
   await withProject(
     {
