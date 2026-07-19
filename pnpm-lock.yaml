@@ -26,6 +26,9 @@ importers:
       '@ferrite/runtime':
         specifier: workspace:*
         version: link:../../packages/runtime
+      three:
+        specifier: ^0.179.1
+        version: 0.179.1
     devDependencies:
       '@types/node':
         specifier: 26.0.1
@@ -260,6 +263,9 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
+  three@0.179.1:
+    resolution: {integrity: sha512-5y/elSIQbrvKOISxpwXCR4sQqHtGiOI+MKLc3SsBdDXA2hz3Mdp3X59aUp8DyybMa34aeBwbFTpdoLJaUDEWSw==}
+
   typescript@6.0.3:
     resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
     engines: {node: '>=14.17'}
@@ -423,6 +429,8 @@ snapshots:
       - utf-8-validate
 
   playwright-core@1.57.0: {}
+
+  three@0.179.1: {}
 
   typescript@6.0.3: {}
 

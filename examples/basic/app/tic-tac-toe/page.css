@@ -1,0 +1,44 @@
+.tic-tac-toe-demo {
+  max-width: 26.25rem;
+  margin: 2rem auto;
+  padding: 0 1rem 2rem;
+}
+
+.tic-tac-toe-title {
+  margin-bottom: 0.5rem;
+}
+
+.tic-tac-toe-copy {
+  color: #4b5563;
+  max-width: 23.75rem;
+}
+
+.tic-tac-toe-status {
+  font-weight: 600;
+}
+
+.tic-tac-toe-board {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  margin: 1rem 0;
+  width: 12.5rem;
+  gap: 0;
+}
+
+.ferrite-tictactoe-square {
+  font-size: 1.6rem;
+  width: 4.125rem;
+  height: 4.125rem;
+  border: 1px solid #3b82f6;
+  color: #1f2937;
+  background: #f8fafc;
+}
+
+.tic-tac-toe-reset {
+  margin-top: 0.4rem;
+  border: 1px solid #111827;
+  color: #111827;
+  background: #f3f4f6;
+  padding: 0.45rem 0.9rem;
+  border-radius: 0.25rem;
+}

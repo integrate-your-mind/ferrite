@@ -4,11 +4,14 @@ Ferrite is a Rust-first experiment toward a React-like UI runtime and a Next.js-
 
 This repository is intentionally scoped as a buildable foundation, not a finished framework. The current proof surface is summarized below.
 
-## Private Alpha Status
+## Open Source Status
+Ferrite is now published as a source-available MIT-licensed project and remains a private-alpha runtime experiment in scope.
+It is open for inspection, contribution, and local adoption, but not ready for unmanaged public production use or authenticated mutation-heavy workloads.
 
-Ferrite is ready to demonstrate as a self-hosted private-alpha framework for trusted teams evaluating the Rust-first app/runtime model. It is not ready for unmanaged public production use or authenticated mutation-heavy workloads.
+See [`LICENSE`](./LICENSE) and [`CONTRIBUTING.md`](./CONTRIBUTING.md) for open-source contribution terms.
 
-The safest alpha offer today is a controlled internal dashboard, docs portal, or content-heavy app using the documented `ferrite check`, `ferrite build`, and artifact-backed `ferrite serve` path. The remaining market blockers are hosted CI job-level proof, hosted staging and rollback proof behind the deployment templates, real npm/native publish proof, public CLI distribution and starter onboarding, hosted capacity and process-recovery evidence, full server-action session/replay/auth hardening, and external tracing or audit sink integration.
+The safest alpha offer today is a controlled internal dashboard, docs portal, or content-heavy app using the documented `ferrite check`, `ferrite build`, and artifact-backed `ferrite serve` path.
+Remaining blockers are hosted CI proof, hosted staging/rollback proof behind deployment templates, public npm/native publishing proof, public CLI distribution and starter onboarding, hosted capacity and process-recovery evidence, full server-action session/replay/auth hardening, and external tracing or audit sink integration.
 
 ## Current Proof Surface
 
@@ -89,6 +92,10 @@ cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/b
 ```
 
 See [docs/deployment.md](docs/deployment.md) for the operator checklist and [docs/production-readiness-review-2026-07-10.md](docs/production-readiness-review-2026-07-10.md) for the prioritized developer-launch blockers and exit criteria.
+
+## Investment and support
+
+If you want to support Ferrite today, use the public wallet listed in [INVEST.md](./INVEST.md).
 
 ## CLI
 

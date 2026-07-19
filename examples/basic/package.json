@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@ferrite/runtime": "workspace:*"
+    "@ferrite/runtime": "workspace:*",
+    "three": "^0.179.1"
   },
   "devDependencies": {
     "@types/node": "26.0.1",
