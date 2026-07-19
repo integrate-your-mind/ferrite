@@ -3,7 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "description": "Native Node.js bindings for Ferrite Rust server-side rendering.",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/integrate-your-mind/ferrite.git",
+    "directory": "packages/node"
+  },
+  "homepage": "https://github.com/integrate-your-mind/ferrite#readme",
+  "bugs": {
+    "url": "https://github.com/integrate-your-mind/ferrite/issues"
+  },
   "keywords": [
     "ferrite",
     "node-api",
