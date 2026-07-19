@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { access, readFile, realpath } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { isBuiltin } from "node:module";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -146,12 +146,6 @@ function projectAliasGuardPlugin(projectRoot) {
         if (resolved.errors.length > 0 || !resolved.path || resolved.external) {
           return undefined;
         }
-        if (
-          resolved.path.split(/[\\/]/).includes("node_modules")
-          || await packageSpecifierExists(args.path, args.resolveDir, projectRoot)
-        ) {
-          return undefined;
-        }
 
         const importer = await canonicalProjectImporter(args.importer, projectRoot);
         if (!importer) {
@@ -161,6 +155,12 @@ function projectAliasGuardPlugin(projectRoot) {
         try {
           target = await realpath(resolved.path);
         } catch {
+          return undefined;
+        }
+        if (
+          resolved.path.split(/[\\/]/).includes("node_modules")
+          || await resolvedFromInstalledPackage(args.path, args.resolveDir, projectRoot, target)
+        ) {
           return undefined;
         }
         if (isPathInside(projectRoot, target)) {
@@ -174,7 +174,7 @@ function projectAliasGuardPlugin(projectRoot) {
   };
 }
 
-async function packageSpecifierExists(specifier, resolveDir, projectRoot) {
+async function resolvedFromInstalledPackage(specifier, resolveDir, projectRoot, target) {
   const packageName = packageNameFromSpecifier(specifier);
   if (!packageName) {
     return false;
@@ -182,8 +182,10 @@ async function packageSpecifierExists(specifier, resolveDir, projectRoot) {
   let current = resolveDir || projectRoot;
   while (true) {
     try {
-      await access(resolve(current, "node_modules", packageName));
-      return true;
+      const packageRoot = await realpath(resolve(current, "node_modules", packageName));
+      if (target === packageRoot || isPathInside(packageRoot, target)) {
+        return true;
+      }
     } catch {
       // Keep walking toward the project root.
     }
