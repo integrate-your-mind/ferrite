@@ -186,8 +186,11 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
     fs::create_dir_all(&config.out_dir)?;
     write_route_types(&routes, &config.types_out)?;
     let document_file = find_document_file(&config.app_dir);
-    let page_renderer = PageRenderer::new(config.project.clone(), config.page_renderer.clone());
-    let client_bundler = ClientBundler::new(config.project.clone(), config.client_bundler.clone());
+    let cancellation_flag = crate::build_cancellation_flag();
+    let page_renderer = PageRenderer::new(config.project.clone(), config.page_renderer.clone())
+        .with_cancellation_flag(std::sync::Arc::clone(&cancellation_flag));
+    let client_bundler = ClientBundler::new(config.project.clone(), config.client_bundler.clone())
+        .with_cancellation_flag(cancellation_flag);
 
     let mut html_files = Vec::new();
     let mut page_metadata = Vec::new();
