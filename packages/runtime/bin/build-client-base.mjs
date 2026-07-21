@@ -119,6 +119,7 @@ for (let attempt = 1; attempt <= maxStableBuildAttempts; attempt += 1) {
 
     if (await moduleGraphSnapshotIsCurrent(moduleGraph.snapshot, projectRoot)) {
       response.inputSnapshot = serializeModuleGraphSnapshot(moduleGraph.snapshot);
+      assertDistinctClientReferenceOutputs(response.clientReferences ?? []);
       await publishBuildOutputs(stagingOutDir, outDir, response.outputs);
       break;
     }
@@ -205,11 +206,13 @@ async function bundleClientRoute(moduleGraph, buildOutDir) {
 }
 
 function routeToEntryName(route) {
-  const trimmed = route.replace(/^\/+|\/+$/g, "");
-  if (!trimmed) {
-    return "route-index";
-  }
-  return `route-${trimmed.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "index"}`;
+  const readable = route
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "index";
+  const identity = sha256(route).slice(0, 16);
+  return `route-${readable}-${identity}`;
 }
 
 function relativeOut(outDir, outputPath) {
@@ -410,6 +413,22 @@ async function projectImportSpecifier(file) {
 
 function clientReferenceEntryName(clientReference) {
   return `client-reference-${clientReference.id.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "index"}`;
+}
+
+function assertDistinctClientReferenceOutputs(references) {
+  const owners = new Map();
+  for (const reference of references) {
+    if (typeof reference.script !== "string" || reference.script.length === 0) {
+      throw new Error(`Ferrite client reference ${JSON.stringify(reference.id)} is missing its generated script.`);
+    }
+    const previous = owners.get(reference.script);
+    if (previous && previous !== reference.id) {
+      throw new Error(
+        `Ferrite generated client-reference output collision: ${JSON.stringify(previous)} and ${JSON.stringify(reference.id)} both map to ${JSON.stringify(reference.script)}.`,
+      );
+    }
+    owners.set(reference.script, reference.id);
+  }
 }
 
 async function buildGeneratedEntry(generatedEntryName, source, loader, buildOutDir, snapshot) {

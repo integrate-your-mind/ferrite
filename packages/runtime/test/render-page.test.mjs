@@ -875,12 +875,14 @@ test("build-client rejects symlinked output files", { skip: platform === "win32"
     await withTempProject(async (projectRoot) => {
       const pageFile = join(projectRoot, "app/page.tsx");
       const outDir = join(projectRoot, "out");
-      const outsideFile = join(outside, "route-index.js");
+      const routeIdentity = createHash("sha256").update("/").digest("hex").slice(0, 16);
+      const routeOutput = `route-index-${routeIdentity}.js`;
+      const outsideFile = join(outside, routeOutput);
       await mkdir(dirname(pageFile), { recursive: true });
       await writeFile(pageFile, `"use client"; export default function Page() { return null; }\n`);
       await mkdir(outDir);
       await writeFile(outsideFile, "sentinel\n");
-      await symlink(outsideFile, join(outDir, "route-index.js"));
+      await symlink(outsideFile, join(outDir, routeOutput));
 
       await assert.rejects(
         buildClientTo(projectRoot, pageFile, outDir),
