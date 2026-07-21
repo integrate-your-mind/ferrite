@@ -57,6 +57,14 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
   assert.equal(response?.status(), 200);
   await page.waitForFunction(() => Boolean(globalThis.ferriteRuntimeTest));
   await page.getByRole("heading", { name: "Old route" }).waitFor();
+  assert.equal(await page.locator("#ferrite-root").getAttribute("aria-hidden"), "false");
+  assert.equal(await page.locator("#ferrite-root").getAttribute("data-ready"), "true");
+  assert.equal(await page.locator("#ferrite-root").getAttribute("draggable"), "false");
+  assert.equal(await page.locator("#ferrite-root").getAttribute("hidden"), null);
+  assert.equal(await page.locator("#capture-input").getAttribute("capture"), null);
+  assert.equal(await page.locator("#capture-input").getAttribute("disabled"), "");
+  assert.equal(await page.locator("#media-probe").getAttribute("disablepictureinpicture"), null);
+  assert.equal(await page.locator("#media-probe").getAttribute("disableremoteplayback"), "");
 
   await page.hover("#prefetch-link");
   await waitForRequest(requests, "/posts/prefetched?__ferrite_payload=server");
@@ -83,6 +91,10 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
   await page.click("#prefetch-link");
   await page.getByRole("heading", { name: "Prefetched route" }).waitFor();
   await page.getByText("Loaded prefetched details").waitFor();
+  assert.equal(await page.locator("strong").getAttribute("data-loaded"), "true");
+  assert.equal(await page.locator("strong").getAttribute("hidden"), null);
+  assert.equal(await page.locator("strong").getAttribute("download"), null);
+  assert.equal(await page.locator("strong").getAttribute("disablepictureinpicture"), "");
   assert.equal(page.url(), `${origin}/posts/prefetched`);
   assert.equal(await page.title(), "Prefetched title");
   assert.equal(
@@ -192,8 +204,17 @@ async function createPayloadNavigationFixture() {
       ``,
       `const container = document.getElementById("app");`,
       `const root = mount(`,
-      `  createElement("div", { id: "ferrite-root", "data-route": "/posts/old" },`,
+      `  createElement("div", {`,
+      `    id: "ferrite-root",`,
+      `    "data-route": "/posts/old",`,
+      `    "aria-hidden": false,`,
+      `    "data-ready": true,`,
+      `    draggable: false,`,
+      `    hidden: false,`,
+      `  },`,
       `    createElement("h1", null, "Old route"),`,
+      `    createElement("input", { id: "capture-input", type: "file", capture: false, disabled: true }),`,
+      `    createElement("video", { id: "media-probe", disablePictureInPicture: false, disableRemotePlayback: true }),`,
       `    createElement("a", { href: "/posts/prefetched", id: "prefetch-link" }, "Prefetch route"),`,
       `    createElement("a", { href: "/posts/stream", id: "stream-link" }, "Stream route"),`,
       `    createElement("a", { href: "/posts/malformed", id: "malformed-link" }, "Malformed route"),`,
@@ -329,7 +350,12 @@ function serverPayloadPacket(route) {
     chunks: [
       {
         id: `${route}-details`,
-        root: [2, "strong", {}, [[0, "Loaded prefetched details"]]],
+        root: [
+          2,
+          "strong",
+          { "data-loaded": true, hidden: false, download: false, disablePictureInPicture: true },
+          [[0, "Loaded prefetched details"]],
+        ],
         clientReferences: [],
       },
     ],
