@@ -66,15 +66,16 @@ async function verifyPrebuildPackageDir(directory) {
 }
 
 async function assertPackageManifest(root, manifest, target) {
+  const nodePackage = await nodePackageManifest();
   assertArrayEquals(root, manifest.os, [target.os], `must declare os ${target.os}`);
   assertArrayEquals(root, manifest.cpu, [target.cpu], `must declare cpu ${target.cpu}`);
-  if (manifest.version !== (await nodePackageVersion())) {
+  if (manifest.version !== nodePackage.version) {
     throw new Error(`${root}: package version must match @ferrite/node.`);
   }
   if (typeof manifest.description !== "string" || manifest.description.trim() === "") {
     throw new Error(`${root}: package description is required.`);
   }
-  if (manifest.license !== "UNLICENSED") {
+  if (manifest.license !== nodePackage.license) {
     throw new Error(`${root}: package license must match @ferrite/node.`);
   }
   assertArrayIncludes(root, manifest.keywords, "ferrite", "keywords");
@@ -121,15 +122,16 @@ function verifyExpectedPackages(results, expectedPackages) {
   }
 }
 
-let cachedNodePackageVersion;
-async function nodePackageVersion() {
-  if (!cachedNodePackageVersion) {
+let cachedNodePackageManifest;
+async function nodePackageManifest() {
+  if (!cachedNodePackageManifest) {
     const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-    cachedNodePackageVersion = (
-      await readJsonObject(join(packageRoot, "package.json"), "@ferrite/node package manifest")
-    ).version;
+    cachedNodePackageManifest = await readJsonObject(
+      join(packageRoot, "package.json"),
+      "@ferrite/node package manifest",
+    );
   }
-  return cachedNodePackageVersion;
+  return cachedNodePackageManifest;
 }
 
 async function readJsonObject(path, label) {

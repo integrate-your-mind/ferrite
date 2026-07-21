@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { verifyPrebuildPackageDirs } from "../scripts/verify-prebuild-package.mjs";
+
+const nodePackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
 test("verifies a valid generated prebuild package", async () => {
   await withPackageFixture(async (dir) => {
@@ -97,6 +99,23 @@ test("rejects native packages without public publish metadata", async () => {
   });
 });
 
+test("rejects native package licenses that do not match @ferrite/node", async () => {
+  await withPackageFixture(async (dir) => {
+    await writePrebuildPackage(dir, {
+      packageName: "@ferrite/node-darwin-arm64",
+      os: "darwin",
+      cpu: "arm64",
+      binding: Buffer.from("native binding"),
+      license: `${nodePackage.license}-mismatch`,
+    });
+
+    await assert.rejects(
+      () => verifyPrebuildPackageDirs([dir]),
+      /package license must match @ferrite\/node/,
+    );
+  });
+});
+
 async function withPackageFixture(callback) {
   const dir = await mkdtemp(join(tmpdir(), "ferrite-prebuild-"));
   try {
@@ -114,6 +133,7 @@ async function writePrebuildPackage(
     cpu,
     binding,
     sha256,
+    license = nodePackage.license,
     publishConfig = { access: "public" },
   },
 ) {
@@ -138,7 +158,7 @@ async function writePrebuildPackage(
         name: packageName,
         version: "0.1.0",
         description: `Ferrite native Node.js binding for ${os}/${cpu}.`,
-        license: "UNLICENSED",
+        license,
         keywords: ["ferrite", "node-api", "native", "ssr", "rust"],
         publishConfig,
         os: [os],
