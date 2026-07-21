@@ -3,3 +3,6 @@ contact_links:
   - name: Security vulnerability
     url: https://github.com/integrate-your-mind/ferrite/security/policy
     about: Do not disclose vulnerabilities in a public issue. Read the security policy and use private vulnerability reporting when enabled.
+  - name: Usage questions
+    url: https://github.com/integrate-your-mind/ferrite/discussions
+    about: Use GitHub Discussions for general evaluation and usage questions.

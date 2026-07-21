@@ -3,7 +3,9 @@ name = "ferrite-client-bundler"
 description = "Rust orchestration for Ferrite browser bundle generation and validation."
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
