@@ -18,10 +18,15 @@ struct ProjectSourceEntry {
 
 impl ProjectSourceSnapshot {
     pub(crate) fn capture(project: &Path, excluded_paths: &[PathBuf]) -> io::Result<Self> {
-        let project = fs::canonicalize(project)?;
+        let requested_project = if project.is_absolute() {
+            project.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(project)
+        };
+        let project = fs::canonicalize(&requested_project)?;
         let excluded_paths = excluded_paths
             .iter()
-            .map(|path| absolute_path(&project, path))
+            .map(|path| normalized_excluded_path(&requested_project, &project, path))
             .collect::<Vec<_>>();
         let mut entries = Vec::new();
         visit_project(&project, &project, &excluded_paths, &mut entries)?;
@@ -69,11 +74,21 @@ fn visit_project(
     Ok(())
 }
 
-fn absolute_path(project: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+fn normalized_excluded_path(
+    requested_project: &Path,
+    canonical_project: &Path,
+    path: &Path,
+) -> PathBuf {
+    let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        project.join(path)
+        requested_project.join(path)
+    };
+
+    if let Ok(relative) = path.strip_prefix(requested_project) {
+        canonical_project.join(relative)
+    } else {
+        path
     }
 }
 
@@ -85,8 +100,10 @@ fn is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool {
 
 fn is_generated_directory(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy();
-    matches!(name.as_ref(), ".git" | ".ferrite" | "node_modules" | "target")
-        || name.starts_with(".ferrite-build-")
+    matches!(
+        name.as_ref(),
+        ".git" | ".ferrite" | "node_modules" | "target"
+    ) || name.starts_with(".ferrite-build-")
         || name.starts_with(".ferrite-verified-build-")
         || name.starts_with(".ferrite-previous-")
 }
@@ -169,11 +186,9 @@ mod tests {
         .unwrap();
         let types_out = project.path().join("generated/routes.d.ts");
         let out_dir = project.path().join("custom-build");
-        let initial = ProjectSourceSnapshot::capture(
-            project.path(),
-            &[out_dir.clone(), types_out.clone()],
-        )
-        .unwrap();
+        let initial =
+            ProjectSourceSnapshot::capture(project.path(), &[out_dir.clone(), types_out.clone()])
+                .unwrap();
 
         fs::create_dir_all(out_dir).unwrap();
         fs::write(project.path().join("custom-build/index.html"), "built").unwrap();

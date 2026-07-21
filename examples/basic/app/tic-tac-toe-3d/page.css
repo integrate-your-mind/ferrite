@@ -1,0 +1,73 @@
+.tic-tac-toe-3d-demo {
+  max-width: 760px;
+  margin: 1.5rem auto;
+  padding: 0 1rem 2.25rem;
+}
+
+.tic-tac-toe-3d-copy,
+.tic-tac-toe-3d-note,
+.tic-tac-toe-3d-status {
+  color: #4b5563;
+}
+
+.tic-tac-toe-3d-note {
+  margin-top: 0.55rem;
+}
+
+.tic-tac-toe-3d-code {
+  background: #111827;
+  color: #e5e7eb;
+  border-radius: 6px;
+  padding: 0.75rem;
+  overflow: auto;
+  margin: 0.45rem 0 1.15rem;
+}
+
+.tic-tac-toe-3d-status {
+  font-weight: 600;
+}
+
+.tic-tac-toe-3d-stage {
+  width: min(680px, 100%);
+  aspect-ratio: 16 / 9;
+  margin: 0.85rem auto;
+  border: 1px solid #93c5fd;
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+.tic-tac-toe-3d-stage canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.tic-tac-toe-3d-board-controls {
+  display: grid;
+  justify-items: center;
+  gap: 0.75rem;
+}
+
+.tic-tac-toe-3d-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 4.25rem));
+  gap: 0.45rem;
+}
+
+.tic-tac-toe-3d-square {
+  aspect-ratio: 1 / 1;
+  border: 1px solid #1f2937;
+  color: #1f2937;
+  background: #f8fafc;
+  font-size: 1.2rem;
+  cursor: pointer;
+}
+
+.tic-tac-toe-3d-reset {
+  border: 1px solid #111827;
+  background: #f3f4f6;
+  color: #111827;
+  border-radius: 4px;
+  padding: 0.45rem 0.85rem;
+}

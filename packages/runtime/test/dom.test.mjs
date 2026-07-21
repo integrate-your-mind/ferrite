@@ -875,7 +875,7 @@ test("fetchAndApplyServerPayload updates a mounted root from shell and chunks", 
   assert.equal(container.querySelector("main")?.getAttribute("data-route"), "/posts/alpha");
   assert.equal(container.querySelector("h1")?.textContent, "Post alpha");
   assert.equal(container.querySelector("strong")?.textContent, "Loaded chunk");
-  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "");
+  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "true");
   assert.equal(container.textContent, "Post alphaLoaded chunk");
 });
 

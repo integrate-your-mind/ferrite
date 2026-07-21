@@ -8,10 +8,13 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import ts from "typescript";
 
+import { assertBuildClientImportContract } from "./build-client-import-guard.mjs";
 import { isPathInsideRoot, portableCanonicalPath } from "./project-path.mjs";
 
 const [, , pageFile, outDirArg, publicPathArg, routePath = "/", propsJson = "{}", layoutsJson = "[]", optionsJson = "{}"] =
   process.argv;
+
+await assertBuildClientImportContract(process.argv.slice(2));
 
 if (!pageFile || !outDirArg || !publicPathArg) {
   console.error(

@@ -33,6 +33,35 @@ test("render packets preserve string-valued boolean attributes", () => {
   ]);
 });
 
+test("render packets omit false overloaded and modern HTML booleans", () => {
+  const packet = toRenderPacket(
+    createElement(
+      "section",
+      null,
+      createElement("input", { type: "file", capture: false }),
+      createElement("input", { type: "file", capture: "environment" }),
+      createElement("a", { download: false }, "Open"),
+      createElement("a", { download: "report.csv" }, "Download"),
+      createElement("video", { disablePictureInPicture: false, disableRemotePlayback: true }),
+      createElement("iframe", { credentialless: true }),
+    ),
+  );
+
+  assert.deepEqual(packet.root, [
+    2,
+    "section",
+    {},
+    [
+      [2, "input", { type: "file" }, []],
+      [2, "input", { type: "file", capture: "environment" }, []],
+      [2, "a", {}, [[0, "Open"]]],
+      [2, "a", { download: "report.csv" }, [[0, "Download"]]],
+      [2, "video", { disableRemotePlayback: true }, []],
+      [2, "iframe", { credentialless: true }, []],
+    ],
+  ]);
+});
+
 test("mount and update distinguish ARIA/data booleans from HTML booleans", () => {
   const window = new Window();
   const container = window.document.createElement("div");
@@ -62,4 +91,23 @@ test("hydration uses the same boolean attribute semantics", () => {
   window.document.body.append(container);
 
   assert.doesNotThrow(() => hydrate(createElement(AccessibilityProbe, null), container));
+});
+
+test("mount and update omit false overloaded booleans", () => {
+  const window = new Window();
+  const container = window.document.createElement("div");
+  window.document.body.append(container);
+
+  const root = mount(createElement("input", { type: "file", capture: false }), container);
+  assert.equal(container.firstElementChild?.hasAttribute("capture"), false);
+
+  root.update(createElement("input", { type: "file", capture: true }));
+  assert.equal(container.firstElementChild?.getAttribute("capture"), "");
+
+  root.update(createElement("input", { type: "file", capture: "environment" }));
+  assert.equal(container.firstElementChild?.getAttribute("capture"), "environment");
+
+  root.update(createElement("video", { disablePictureInPicture: false, disableRemotePlayback: true }));
+  assert.equal(container.firstElementChild?.hasAttribute("disablepictureinpicture"), false);
+  assert.equal(container.firstElementChild?.getAttribute("disableremoteplayback"), "");
 });

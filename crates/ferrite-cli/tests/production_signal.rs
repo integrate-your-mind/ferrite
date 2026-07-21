@@ -20,6 +20,25 @@ struct ChildGuard {
     process_group: u32,
 }
 
+struct ProcessGroupGuard(Option<u32>);
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.0 {
+            let _ = signal_process_group(process_group, "-KILL");
+        }
+    }
+}
+
+struct HangingBuild {
+    _temp: tempfile::TempDir,
+    child: ChildGuard,
+    stderr_path: std::path::PathBuf,
+    verifier_process_group: u32,
+    descendant_pid: u32,
+    verifier_guard: ProcessGroupGuard,
+}
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = signal_process_group(self.process_group, "-KILL");
@@ -61,6 +80,146 @@ fn process_exists(process_id: u32) -> bool {
 
 fn child_stderr(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| format!("<unreadable stderr: {error}>"))
+}
+
+fn spawn_hanging_build() -> HangingBuild {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("app");
+    let runtime_dir = temp.path().join("runtime");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::write(
+        app_dir.join("page.tsx"),
+        "export default function Page() { return null; }\n",
+    )
+    .unwrap();
+
+    let verifier_pid_path = temp.path().join("verifier.pid");
+    let descendant_pid_path = temp.path().join("descendant.pid");
+    let verifier = runtime_dir.join("verify-build-inputs.mjs");
+    let client_bundler = runtime_dir.join("build-client.mjs");
+    let page_renderer = runtime_dir.join("render-page.mjs");
+    fs::write(&client_bundler, "").unwrap();
+    fs::write(&page_renderer, "").unwrap();
+    fs::write(
+        &verifier,
+        format!(
+            r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+
+writeFileSync({}, String(process.pid));
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: "ignore",
+}});
+writeFileSync({}, String(descendant.pid));
+setInterval(() => {{}}, 1000);
+"#,
+            serde_json::to_string(&verifier_pid_path).unwrap(),
+            serde_json::to_string(&descendant_pid_path).unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let stderr_path = temp.path().join("ferrite-build.stderr.log");
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ferrite"));
+    command
+        .args([
+            "build",
+            "--project",
+            temp.path().to_str().unwrap(),
+            "--page-renderer",
+            page_renderer.to_str().unwrap(),
+            "--client-bundler",
+            client_bundler.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file));
+    let mut child = spawn_guarded(&mut command).unwrap();
+
+    let verifier_deadline = Instant::now() + Duration::from_secs(10);
+    while !verifier_pid_path.is_file() {
+        if let Some(status) = child.child.try_wait().unwrap() {
+            panic!(
+                "Ferrite build exited before starting verifier with {status}: {}",
+                child_stderr(&stderr_path)
+            );
+        }
+        assert!(
+            Instant::now() < verifier_deadline,
+            "Ferrite build verifier did not start: {}",
+            child_stderr(&stderr_path)
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let verifier_process_group = fs::read_to_string(&verifier_pid_path)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let verifier_guard = ProcessGroupGuard(Some(verifier_process_group));
+
+    let descendant_deadline = Instant::now() + Duration::from_secs(10);
+    while !descendant_pid_path.is_file() {
+        if let Some(status) = child.child.try_wait().unwrap() {
+            panic!(
+                "Ferrite build exited before starting verifier descendant with {status}: {}",
+                child_stderr(&stderr_path)
+            );
+        }
+        assert!(
+            Instant::now() < descendant_deadline,
+            "Ferrite verifier descendant did not start: {}",
+            child_stderr(&stderr_path)
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let descendant_pid = fs::read_to_string(descendant_pid_path)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    assert!(process_exists(verifier_process_group));
+    assert!(process_exists(descendant_pid));
+
+    HangingBuild {
+        _temp: temp,
+        child,
+        stderr_path,
+        verifier_process_group,
+        descendant_pid,
+        verifier_guard,
+    }
+}
+
+fn wait_for_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+    stderr_path: &std::path::Path,
+) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Ferrite CLI did not exit: {}",
+            child_stderr(stderr_path)
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_process_absence(process_id: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while process_exists(process_id) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    true
 }
 
 fn assert_production_cli_drains_signal(signal: &str, signal_name: &str) {
@@ -321,4 +480,56 @@ setInterval(() => {{}}, 1_000);
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn build_cli_sigint_cancels_verifier_process_tree() {
+    let mut build = spawn_hanging_build();
+    let kill_status = Command::new("kill")
+        .args(["-INT", &build.child.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill_status.success());
+
+    let status = wait_for_child_exit(
+        &mut build.child.child,
+        Duration::from_secs(10),
+        &build.stderr_path,
+    );
+    let stderr = child_stderr(&build.stderr_path);
+
+    assert_eq!(status.code(), Some(1), "unexpected exit {status}: {stderr}");
+    assert!(stderr.contains("was cancelled"), "{stderr}");
+    assert!(wait_for_process_absence(
+        build.verifier_process_group,
+        Duration::from_secs(5)
+    ));
+    assert!(wait_for_process_absence(
+        build.descendant_pid,
+        Duration::from_secs(5)
+    ));
+    build.verifier_guard.0 = None;
+}
+
+#[test]
+fn build_cli_second_termination_signal_forces_exit() {
+    let mut build = spawn_hanging_build();
+
+    // SAFETY: the guarded child PID belongs to this test, and both signals are valid.
+    unsafe {
+        assert_eq!(libc::kill(build.child.child.id() as i32, libc::SIGINT), 0);
+        assert_eq!(libc::kill(build.child.child.id() as i32, libc::SIGTERM), 0);
+    }
+
+    let status = wait_for_child_exit(
+        &mut build.child.child,
+        Duration::from_secs(2),
+        &build.stderr_path,
+    );
+
+    assert!(
+        matches!(status.code(), Some(130 | 143)),
+        "second termination signal should force exit, got {status}: {}",
+        child_stderr(&build.stderr_path)
+    );
 }
