@@ -1,2 +1,3 @@
-# SHA-256 hash of the PR #4 runtime log evidence artifact, not a credential.
+# The fingerprint starts with a 40-character commit SHA; its matched value is a
+# 64-character SHA-256 hash of the PR #4 runtime log evidence, not a credential.
 f25c006d14818e27a49e9e0650847d4c84fdfc4e:docs/proof-receipts/2026-07-18T081012Z-55302c0-pr4-final-review.md:generic-api-key:53
