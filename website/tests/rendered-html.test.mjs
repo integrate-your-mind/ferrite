@@ -5,15 +5,16 @@ import test from "node:test";
 
 const templateRoot = new URL("../", import.meta.url);
 const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
+let renderSequence = 0;
 
-async function render() {
+async function render(headers = { accept: "text/html" }) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${renderSequence++}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
     new Request("http://localhost/", {
-      headers: { accept: "text/html" },
+      headers,
     }),
     {
       ASSETS: {
@@ -36,7 +37,7 @@ test("server-renders the source-backed Ferrite site", async () => {
   assert.match(html, /<title>Ferrite[^<]*Rust-first application framework<\/title>/i);
   assert.match(html, /Rust owns the control plane/);
   assert.match(html, /<h1[^>]*>Ferrite<\/h1>/);
-  assert.match(html, /Private alpha/);
+  assert.match(html, /Open-source private-alpha preview/);
   assert.match(html, />509<\/strong>/);
   assert.match(html, />10<\/strong>/);
   assert.match(html, />Captured<\/strong><span>Rust dev-server coverage report<\/span>/);
@@ -60,6 +61,50 @@ test("server-renders the source-backed Ferrite site", async () => {
   assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
   assert.doesNotMatch(html, /404 behavior|target="_blank"/i);
+});
+
+test("does not derive public metadata from request-controlled proxy headers", async () => {
+  const response = await render({
+    accept: "text/html",
+    host: "attacker.example",
+    "x-forwarded-host": "attacker.example",
+    "x-forwarded-proto": "javascript",
+  });
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
+  assert.doesNotMatch(html, /attacker\.example|javascript:/);
+});
+
+test("accepts only an explicit HTTP or HTTPS origin for public metadata", async () => {
+  const previousOrigin = process.env.FERRITE_SITE_ORIGIN;
+
+  try {
+    process.env.FERRITE_SITE_ORIGIN = "https://preview.example.test";
+    const response = await render();
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /https:\/\/preview\.example\.test\/og\.png/);
+
+    for (const invalidOrigin of [
+      "preview.example.test",
+      "javascript:alert(1)",
+      "https://user:secret@preview.example.test",
+      "https://preview.example.test/path/..",
+      "https://preview.example.test/%2e",
+      "https://preview.example.test?query=1",
+      "https://preview.example.test#fragment",
+    ]) {
+      process.env.FERRITE_SITE_ORIGIN = invalidOrigin;
+      await assert.rejects(render(), /FERRITE_SITE_ORIGIN must be/);
+    }
+  } finally {
+    if (previousOrigin === undefined) {
+      delete process.env.FERRITE_SITE_ORIGIN;
+    } else {
+      process.env.FERRITE_SITE_ORIGIN = previousOrigin;
+    }
+  }
 });
 
 test("keeps the published source free of initializer artifacts", async () => {
