@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { platform } from "node:process";
 import test from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import { assertBuildClientImportContract } from "../bin/build-client-import-guard.mjs";
 
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const projectPathModule = join(workspaceRoot, "packages/runtime/bin/project-path.mjs");
+const buildClientModule = join(workspaceRoot, "packages/runtime/bin/build-client.mjs");
 
 async function withProject(config, run) {
   const project = await mkdtemp(join(tmpdir(), "ferrite-import-guard-"));
@@ -207,7 +208,7 @@ test("build-client guard ignores erased type-only aliases and unresolved externa
   );
 });
 
-test("project-path runs the guard before build-client continues", async () => {
+test("renaming the build-client launcher cannot bypass the import guard", { skip: platform === "win32" }, async () => {
   await withProject(
     {
       tsconfig: {
@@ -229,11 +230,8 @@ test("project-path runs the guard before build-client continues", async () => {
         pageFile,
         `import Client from "@app/Client"; export default function Page() { return <Client />; }\n`,
       );
-      const script = join(project, "build-client.mjs");
-      await writeFile(
-        script,
-        `import ${JSON.stringify(pathToFileURL(projectPathModule).href)}; process.stdout.write("continued");\n`,
-      );
+      const script = join(project, "renamed-runner.mjs");
+      await symlink(buildClientModule, script);
 
       const result = await runNode(script, buildClientArgs(pageFile), project);
       assert.notEqual(result.code, 0);

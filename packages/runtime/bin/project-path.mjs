@@ -1,11 +1,6 @@
-import { basename, isAbsolute, relative, sep } from "node:path";
+import { isAbsolute, relative, sep } from "node:path";
 
 const nativePath = { isAbsolute, relative, sep };
-
-if (basename(process.argv[1] ?? "") === "build-client.mjs") {
-  const { assertBuildClientImportContract } = await import("./build-client-import-guard.mjs");
-  await assertBuildClientImportContract(process.argv.slice(2));
-}
 
 export function isPathInsideRoot(root, file, path = nativePath) {
   const rootRelative = path.relative(root, file);
