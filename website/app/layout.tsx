@@ -24,6 +24,10 @@ function getSiteOrigin(): URL {
     return new URL(defaultSiteOrigin);
   }
 
+  if (!/^https?:\/\/[^/?#\\]+\/?$/i.test(configuredOrigin)) {
+    throw new Error("FERRITE_SITE_ORIGIN must be an HTTP or HTTPS origin without credentials, a path, query, or fragment");
+  }
+
   let origin: URL;
   try {
     origin = new URL(configuredOrigin);

@@ -5,10 +5,11 @@ import test from "node:test";
 
 const templateRoot = new URL("../", import.meta.url);
 const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
+let renderSequence = 0;
 
 async function render(headers = { accept: "text/html" }) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${renderSequence++}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
@@ -74,6 +75,36 @@ test("does not derive public metadata from request-controlled proxy headers", as
   const html = await response.text();
   assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
   assert.doesNotMatch(html, /attacker\.example|javascript:/);
+});
+
+test("accepts only an explicit HTTP or HTTPS origin for public metadata", async () => {
+  const previousOrigin = process.env.FERRITE_SITE_ORIGIN;
+
+  try {
+    process.env.FERRITE_SITE_ORIGIN = "https://preview.example.test";
+    const response = await render();
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /https:\/\/preview\.example\.test\/og\.png/);
+
+    for (const invalidOrigin of [
+      "preview.example.test",
+      "javascript:alert(1)",
+      "https://user:secret@preview.example.test",
+      "https://preview.example.test/path/..",
+      "https://preview.example.test/%2e",
+      "https://preview.example.test?query=1",
+      "https://preview.example.test#fragment",
+    ]) {
+      process.env.FERRITE_SITE_ORIGIN = invalidOrigin;
+      await assert.rejects(render(), /FERRITE_SITE_ORIGIN must be/);
+    }
+  } finally {
+    if (previousOrigin === undefined) {
+      delete process.env.FERRITE_SITE_ORIGIN;
+    } else {
+      process.env.FERRITE_SITE_ORIGIN = previousOrigin;
+    }
+  }
 });
 
 test("keeps the published source free of initializer artifacts", async () => {
