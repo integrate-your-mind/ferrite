@@ -74,11 +74,15 @@ fn is_html_boolean_attribute(name: &str) -> bool {
             | "async"
             | "autofocus"
             | "autoplay"
+            | "capture"
             | "checked"
             | "controls"
+            | "credentialless"
             | "default"
             | "defer"
             | "disabled"
+            | "disablepictureinpicture"
+            | "disableremoteplayback"
             | "download"
             | "formnovalidate"
             | "hidden"
@@ -95,6 +99,8 @@ fn is_html_boolean_attribute(name: &str) -> bool {
             | "readonly"
             | "required"
             | "reversed"
+            | "scoped"
+            | "seamless"
             | "selected"
     )
 }
@@ -187,5 +193,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(render_to_html(&tree).unwrap(), "<input disabled>");
+    }
+
+    #[test]
+    fn preserves_overloaded_and_modern_boolean_attribute_semantics() {
+        let tree = element(
+            "video",
+            [
+                ("capture", AttributeValue::from(false)),
+                ("credentialless", AttributeValue::from(false)),
+                ("disablepictureinpicture", AttributeValue::from(true)),
+                ("disableremoteplayback", AttributeValue::from(false)),
+                ("download", AttributeValue::from("clip.mp4")),
+            ],
+            vec![],
+        )
+        .unwrap();
+
+        assert_eq!(
+            render_to_html(&tree).unwrap(),
+            "<video disablepictureinpicture download=\"clip.mp4\"></video>"
+        );
     }
 }
