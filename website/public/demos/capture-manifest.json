@@ -1,0 +1,42 @@
+{
+  "capturedAt": "2026-07-18T16:21:39Z",
+  "source": {
+    "repository": "https://github.com/integrate-your-mind/ferrite",
+    "commit": "8716f30c83b9e4fc0835c2f37f9c00bd26e8152d",
+    "baseCommit": "8539f4a9288321f002658cebf6ac25a9bd952519",
+    "example": "examples/docs-workbench",
+    "buildId": "sha256:d54c36b56cc5dff3217c8ae6dc96e907733f5da302714341b5a8413f8d8af99d",
+    "server": "target/debug/ferrite serve",
+    "environment": "local artifact-backed loopback server"
+  },
+  "captures": [
+    {
+      "file": "docs-home-desktop.png",
+      "route": "/",
+      "state": "normal",
+      "viewport": "1440x1000",
+      "sha256": "433d72247a5748250d687517d6b542d16d8fabb053e95af80302d73006f3ec9d"
+    },
+    {
+      "file": "docs-guide-desktop.png",
+      "route": "/guides/architecture",
+      "state": "generated guide route",
+      "viewport": "1280x900",
+      "sha256": "e05daef8c65347eaacd048c430590eef352773e3d066835be9e44cb02aa915ae"
+    },
+    {
+      "file": "docs-catchall-desktop.png",
+      "route": "/guides/unlisted/path",
+      "state": "odd catch-all route",
+      "viewport": "1280x900",
+      "sha256": "02e8e5da14825e6c276bb1a9abe47e1b9ce7a7283c8eea3fd8708612b6106968"
+    },
+    {
+      "file": "docs-mobile-nav.png",
+      "route": "/",
+      "state": "hydrated mobile navigation open",
+      "viewport": "390x844",
+      "sha256": "fa82c71ab355d3d173997d1e0810d632c2128aea15b516fab4c4811cd9ea5b0b"
+    }
+  ]
+}
