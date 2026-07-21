@@ -7,9 +7,13 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { assertBuildClientImportContract } from "./build-client-import-guard.mjs";
+
 const execFileAsync = promisify(execFile);
 const [, , pageFile, outDirArg, publicPathArg, routePath = "/", propsJson = "{}", layoutsJson = "[]", optionsJson = "{}"] =
   process.argv;
+
+await assertBuildClientImportContract(process.argv.slice(2));
 
 if (!pageFile || !outDirArg || !publicPathArg) {
   console.error(

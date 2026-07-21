@@ -425,6 +425,7 @@ export async function verifyCleanDeveloperWorkflow(
     cliPath,
     ["serve", "--project", project, "--artifact", ".ferrite/build", "--page-renderer", join(runtimeBin, "render-artifact.mjs"), "--once"],
     { cwd: project, capture: true },
+    /artifact directory[\s\S]*\bos error (?:2|3)\b/i,
     "clean install serve must reject a missing build artifact",
   );
   await runCommand(cliPath, ["check", "--project", project], { cwd: project, capture: true });
@@ -443,11 +444,15 @@ export async function verifyCleanDeveloperWorkflow(
   }
 }
 
-async function assertCommandFails(runCommand, command, args, options, message) {
+async function assertCommandFails(runCommand, command, args, options, expectedError, message) {
   try {
     await runCommand(command, args, options);
-  } catch {
-    return;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (expectedError.test(errorMessage)) {
+      return;
+    }
+    throw new Error(`${message}: unexpected failure: ${errorMessage}`, { cause: error });
   }
   throw new Error(message);
 }

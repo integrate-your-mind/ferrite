@@ -28,5 +28,7 @@ tempfile = "3"
 flate2 = "1"
 getrandom = "0.2"
 httparse = "1.10.1"
+libc = "0.2"
+process-wrap = { version = "8.2.1", default-features = false, features = ["job-object", "std", "tracing"] }
 sha2 = "0.11"
 signal-hook = { version = "0.3", default-features = false }
