@@ -6,14 +6,14 @@ import test from "node:test";
 const templateRoot = new URL("../", import.meta.url);
 const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
 
-async function render() {
+async function render(headers = { accept: "text/html" }) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
     new Request("http://localhost/", {
-      headers: { accept: "text/html" },
+      headers,
     }),
     {
       ASSETS: {
@@ -60,6 +60,20 @@ test("server-renders the source-backed Ferrite site", async () => {
   assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
   assert.doesNotMatch(html, /404 behavior|target="_blank"/i);
+});
+
+test("does not derive public metadata from request-controlled proxy headers", async () => {
+  const response = await render({
+    accept: "text/html",
+    host: "attacker.example",
+    "x-forwarded-host": "attacker.example",
+    "x-forwarded-proto": "javascript",
+  });
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
+  assert.doesNotMatch(html, /attacker\.example|javascript:/);
 });
 
 test("keeps the published source free of initializer artifacts", async () => {
