@@ -237,6 +237,7 @@ async function writeResponse(response) {
 
 async function publishBuildOutputs(stagingOutDir, finalOutDir, outputs) {
   const publishRoot = await realpath(await mkdtemp(join(finalOutDir, ".ferrite-publish-")));
+  const publications = [];
   try {
     for (const [index, output] of outputs.entries()) {
       const source = resolve(stagingOutDir, output);
@@ -263,11 +264,13 @@ async function publishBuildOutputs(stagingOutDir, finalOutDir, outputs) {
         throw new Error(`Ferrite client output directory escapes or aliases its build directory: ${output}`);
       }
 
+      let hadDestination = false;
       try {
         const destinationInfo = await lstat(destination);
         if (!destinationInfo.isFile()) {
           throw new Error(`Ferrite client output destination is not a regular file: ${output}`);
         }
+        hadDestination = true;
       } catch (error) {
         if (!error || typeof error !== "object" || error.code !== "ENOENT") {
           throw error;
@@ -276,11 +279,56 @@ async function publishBuildOutputs(stagingOutDir, finalOutDir, outputs) {
 
       const pendingDestination = join(publishRoot, `${index}-${basename(output)}`);
       await copyFile(source, pendingDestination, constants.COPYFILE_EXCL);
-      await rename(pendingDestination, destination);
+      publications.push({
+        destination,
+        pendingDestination,
+        backupDestination: join(publishRoot, `${index}-${basename(output)}.previous`),
+        hadDestination,
+        backedUp: false,
+        published: false,
+      });
+    }
+
+    try {
+      for (const publication of publications) {
+        if (publication.hadDestination) {
+          await rename(publication.destination, publication.backupDestination);
+          publication.backedUp = true;
+        }
+        await rename(publication.pendingDestination, publication.destination);
+        publication.published = true;
+      }
+    } catch (publishError) {
+      const rollbackErrors = await rollbackPublishedOutputs(publications);
+      if (rollbackErrors.length > 0) {
+        throw new AggregateError(
+          [publishError, ...rollbackErrors],
+          "Ferrite client output publication failed and could not be fully rolled back.",
+        );
+      }
+      throw publishError;
     }
   } finally {
     await rm(publishRoot, { recursive: true, force: true });
   }
+}
+
+async function rollbackPublishedOutputs(publications) {
+  const errors = [];
+  for (let index = publications.length - 1; index >= 0; index -= 1) {
+    const publication = publications[index];
+    try {
+      if (publication.published) {
+        await rm(publication.destination, { force: true });
+      }
+      if (publication.backedUp) {
+        await rename(publication.backupDestination, publication.destination);
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return errors;
 }
 
 function ferriteRuntimeAliasPlugin() {
