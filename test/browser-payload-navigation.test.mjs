@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
-import test from "node:test";
+import test, { after, before } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { build } from "esbuild";
@@ -12,9 +12,21 @@ import { chromium } from "playwright-core";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const chromeExecutable = process.env.FERRITE_BROWSER_EXECUTABLE ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const chromeAvailable = existsSync(chromeExecutable);
+let browser;
+
+before(async () => {
+  if (chromeAvailable) {
+    browser = await chromium.launch({ executablePath: chromeExecutable, headless: true });
+  }
+});
+
+after(async () => {
+  await browser?.close();
+});
 
 test("server payload navigator handles prefetch, stream navigation, and popstate in Chromium", async (t) => {
-  if (!existsSync(chromeExecutable)) {
+  if (!chromeAvailable) {
     t.skip(`Chrome executable not found at ${chromeExecutable}`);
     return;
   }
@@ -29,12 +41,12 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
     await new Promise((resolveClose) => server.close(resolveClose));
   });
 
-  const browser = await chromium.launch({ executablePath: chromeExecutable, headless: true });
+  const context = await browser.newContext();
   t.after(async () => {
-    await browser.close();
+    await context.close();
   });
 
-  const page = await browser.newPage();
+  const page = await context.newPage();
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error));
   t.after(async () => {
@@ -120,7 +132,7 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
 });
 
 test("server payload navigator falls back from malformed clicked payloads in Chromium", async (t) => {
-  if (!existsSync(chromeExecutable)) {
+  if (!chromeAvailable) {
     t.skip(`Chrome executable not found at ${chromeExecutable}`);
     return;
   }
@@ -135,12 +147,12 @@ test("server payload navigator falls back from malformed clicked payloads in Chr
     await new Promise((resolveClose) => server.close(resolveClose));
   });
 
-  const browser = await chromium.launch({ executablePath: chromeExecutable, headless: true });
+  const context = await browser.newContext();
   t.after(async () => {
-    await browser.close();
+    await context.close();
   });
 
-  const page = await browser.newPage();
+  const page = await context.newPage();
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error));
   t.after(async () => {
