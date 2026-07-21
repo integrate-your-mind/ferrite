@@ -18,10 +18,15 @@ struct ProjectSourceEntry {
 
 impl ProjectSourceSnapshot {
     pub(crate) fn capture(project: &Path, excluded_paths: &[PathBuf]) -> io::Result<Self> {
-        let project = fs::canonicalize(project)?;
+        let requested_project = if project.is_absolute() {
+            project.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(project)
+        };
+        let project = fs::canonicalize(&requested_project)?;
         let excluded_paths = excluded_paths
             .iter()
-            .map(|path| absolute_path(&project, path))
+            .map(|path| normalized_excluded_path(&requested_project, &project, path))
             .collect::<Vec<_>>();
         let mut entries = Vec::new();
         visit_project(&project, &project, &excluded_paths, &mut entries)?;
@@ -69,11 +74,21 @@ fn visit_project(
     Ok(())
 }
 
-fn absolute_path(project: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+fn normalized_excluded_path(
+    requested_project: &Path,
+    canonical_project: &Path,
+    path: &Path,
+) -> PathBuf {
+    let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        project.join(path)
+        requested_project.join(path)
+    };
+
+    if let Ok(relative) = path.strip_prefix(requested_project) {
+        canonical_project.join(relative)
+    } else {
+        path
     }
 }
 
