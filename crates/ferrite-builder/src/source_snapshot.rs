@@ -85,8 +85,10 @@ fn is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool {
 
 fn is_generated_directory(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy();
-    matches!(name.as_ref(), ".git" | ".ferrite" | "node_modules" | "target")
-        || name.starts_with(".ferrite-build-")
+    matches!(
+        name.as_ref(),
+        ".git" | ".ferrite" | "node_modules" | "target"
+    ) || name.starts_with(".ferrite-build-")
         || name.starts_with(".ferrite-verified-build-")
         || name.starts_with(".ferrite-previous-")
 }
@@ -169,11 +171,9 @@ mod tests {
         .unwrap();
         let types_out = project.path().join("generated/routes.d.ts");
         let out_dir = project.path().join("custom-build");
-        let initial = ProjectSourceSnapshot::capture(
-            project.path(),
-            &[out_dir.clone(), types_out.clone()],
-        )
-        .unwrap();
+        let initial =
+            ProjectSourceSnapshot::capture(project.path(), &[out_dir.clone(), types_out.clone()])
+                .unwrap();
 
         fs::create_dir_all(out_dir).unwrap();
         fs::write(project.path().join("custom-build/index.html"), "built").unwrap();
