@@ -1,56 +1,44 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
 
+import {
+  browserExecutableCandidates,
+  expectedArtifactFiles,
+  launchVerifiedBrowser,
+  listArtifactFiles,
+} from "./demo-proof-helpers.mjs";
+
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const cli = join(repoRoot, "target", "debug", "ferrite");
 const renderer = join(repoRoot, "packages", "runtime", "bin", "render-artifact.mjs");
-const browserExecutableCandidates = [
-  process.env.FERRITE_BROWSER_EXECUTABLE,
-  chromium.executablePath(),
-  ...(process.platform === "darwin"
-    ? [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-      ]
-    : []),
-  ...(process.platform === "win32"
-    ? [
-        process.env.PROGRAMFILES ? join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe") : null,
-        process.env["PROGRAMFILES(X86)"] ? join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe") : null,
-        process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe") : null,
-        process.env.PROGRAMFILES ? join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe") : null,
-      ]
-    : []),
-  ...(process.platform === "linux"
-    ? [
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-      ]
-    : []),
-].filter((candidate) => typeof candidate === "string" && candidate.length > 0);
-const browserExecutable = browserExecutableCandidates.find((candidate) => existsSync(candidate));
+const browserSelection = browserExecutableCandidates({
+  playwrightExecutablePath: chromium.executablePath(),
+});
 const examples = [
   {
     name: "hello-world-demo",
     root: join(repoRoot, "examples", "hello-world-demo"),
     paths: ["/"],
     routes: ["/"],
+    expectedText: { "/": "Hello Ferrite" },
   },
   {
     name: "docs-workbench",
     root: join(repoRoot, "examples", "docs-workbench"),
     paths: ["/", "/guides/getting-started", "/reference/runtime"],
     routes: ["/", "/guides/*slug", "/reference/:id"],
+    expectedText: {
+      "/": "Documentation that",
+      "/guides/getting-started": "Getting started",
+      "/reference/runtime": "Runtime facade",
+    },
   },
 ];
 const maxOutput = 256 * 1024;
@@ -281,6 +269,11 @@ async function verifyManifest(example) {
     assert.equal(bytes.byteLength, file.size, `${example.name} size mismatch for ${file.path}`);
     assert.equal(createHash("sha256").update(bytes).digest("hex"), file.sha256, `${example.name} hash mismatch for ${file.path}`);
   }
+  assert.deepEqual(
+    await listArtifactFiles(artifact),
+    expectedArtifactFiles(serverManifest.files),
+    `${example.name} artifact contains undeclared or missing files`,
+  );
   const routes = serverManifest.routes.map((route) => route.path);
   assert.deepEqual(routes, example.routes, `${example.name} manifest route table`);
   return {
@@ -295,6 +288,7 @@ async function verifyManifest(example) {
 async function buildExample(example) {
   await access(join(example.root, "package.json"));
   await access(join(example.root, "app"));
+  await rm(join(example.root, ".ferrite", "build"), { recursive: true, force: true });
   assertSuccess(await command("cargo", ["run", "--manifest-path", "Cargo.toml", "-q", "-p", "ferrite-cli", "--", "build", "--project", example.root, "--page-renderer", join(repoRoot, "packages/runtime/bin/render-page.mjs"), "--client-bundler", join(repoRoot, "packages/runtime/bin/build-client.mjs")], { timeoutMs: 120_000 }), `build ${example.name}`);
   return verifyManifest(example);
 }
@@ -318,12 +312,15 @@ async function verifyHttp(example, manifest) {
     assert.equal(first.status, 200, `${example.name} root status`);
     const root = await first.text();
     assert.ok(root.includes("Ferrite"), `${example.name} root response lacks product text`);
+    assert.ok(root.includes(example.expectedText["/"]), `${example.name} root response is not from the current demo source`);
     const query = await fetch(`http://127.0.0.1:${port}/?proof=query`);
     assert.equal(query.status, 200, `${example.name} query status`);
     for (const path of example.paths.slice(1)) {
       const response = await fetch(`http://127.0.0.1:${port}${path}`);
       assert.equal(response.status, 200, `${example.name} ${path} status`);
-      assert.ok((await response.text()).length > 80, `${example.name} ${path} response too small`);
+      const body = await response.text();
+      assert.ok(body.length > 80, `${example.name} ${path} response too small`);
+      assert.ok(body.includes(example.expectedText[path]), `${example.name} ${path} response is not from the current demo source`);
     }
     const missing = await fetch(`http://127.0.0.1:${port}/__ferrite_missing_route__`);
     assert.equal(missing.status, 404, `${example.name} missing route status`);
@@ -361,18 +358,35 @@ async function verifyTamper(example, manifest) {
   }
 }
 
+async function verifyUndeclaredFileIgnored(example, manifest) {
+  const scratch = await mkdtemp(join(tmpdir(), "ferrite-demo-undeclared-"));
+  const artifact = join(scratch, "build");
+  let server;
+  try {
+    await cp(manifest.artifact, artifact, { recursive: true });
+    await mkdir(join(artifact, "_ferrite", "static"), { recursive: true });
+    await writeFile(join(artifact, "_ferrite", "static", "undeclared.js"), "console.log('not trusted');\n");
+    const port = await reservePort();
+    server = startServer(example, artifact, port);
+    await waitForServer(server, port);
+    const response = await fetch(`http://127.0.0.1:${port}/_ferrite/static/undeclared.js`);
+    assert.equal(response.status, 404, `${example.name} served an undeclared artifact file`);
+  } finally {
+    await stopServer(server);
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
 async function verifyBrowser(example, manifest) {
-  assert.ok(
-    browserExecutable,
-    `A Chromium browser is required for demo runtime proof. Set FERRITE_BROWSER_EXECUTABLE or install one of: ${browserExecutableCandidates.join(", ")}`,
-  );
   const port = await reservePort();
   const server = startServer(example, manifest.artifact, port);
   let browser;
+  let browserProof;
   let page;
   let proofError;
   try {
-    browser = await chromium.launch({ executablePath: browserExecutable, headless: true });
+    browserProof = await launchVerifiedBrowser({ chromium, ...browserSelection });
+    browser = browserProof.browser;
     const pageErrors = [];
     const failedRequests = [];
     const badResponses = [];
@@ -389,10 +403,12 @@ async function verifyBrowser(example, manifest) {
     assert.equal(response?.status(), 200, `${example.name} browser root status`);
     assert.match(await page.title(), /Ferrite/i, `${example.name} browser title`);
     assert.ok(await page.locator("h1").count() > 0, `${example.name} browser root has no h1`);
+    assert.ok((await page.locator("body").textContent())?.includes(example.expectedText["/"]), `${example.name} browser root is not from the current demo source`);
     if (example.name === "docs-workbench") {
       assert.deepEqual(pageErrors, [], `${example.name} browser hydration errors before interaction`);
       const menu = page.locator("button.menu-toggle");
       assert.equal(await menu.count(), 1, `${example.name} browser menu control missing`);
+      assert.equal(await menu.getAttribute("aria-expanded"), "false", `${example.name} menu did not expose its initial collapsed state`);
       await menu.click();
       assert.equal(await menu.getAttribute("aria-expanded"), "true", `${example.name} menu did not update aria-expanded`);
       assert.equal(await page.locator("nav.nav-open").count(), 1, `${example.name} menu did not open navigation`);
@@ -432,6 +448,7 @@ async function verifyBrowser(example, manifest) {
       `${example.name} browser proof or cleanup failed`,
     );
   }
+  return { executablePath: browserProof.executablePath, version: browserProof.version };
 }
 
 async function main() {
@@ -454,10 +471,11 @@ async function main() {
   for (const { example, manifest } of available) {
     await verifyHttp(example, manifest);
     await verifyTamper(example, manifest);
-    await verifyBrowser(example, manifest);
+    await verifyUndeclaredFileIgnored(example, manifest);
+    const browser = await verifyBrowser(example, manifest);
     const deepRouteCount = example.paths.length - 1;
     console.log(
-      `${example.name}: build ${manifest.buildId}; ${manifest.files} verified files; HTTP normal/query/${deepRouteCount} deep/404, browser, and tamper fail-closed passed`,
+      `${example.name}: build ${manifest.buildId}; ${manifest.files} verified files; HTTP normal/query/${deepRouteCount} deep/404, browser ${browser.version}, undeclared-file 404, and tamper fail-closed passed`,
     );
   }
 }

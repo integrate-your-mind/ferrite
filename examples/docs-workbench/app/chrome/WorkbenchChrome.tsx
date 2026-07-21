@@ -10,7 +10,7 @@ export default function WorkbenchNavigation() {
       <button
         className="menu-toggle"
         type="button"
-        aria-expanded={menuOpen}
+        aria-expanded={menuOpen ? "true" : "false"}
         aria-controls="primary-navigation"
         onClick={() => setMenuOpen(!menuOpen)}
       >
