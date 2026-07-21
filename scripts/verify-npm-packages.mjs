@@ -425,7 +425,7 @@ export async function verifyCleanDeveloperWorkflow(
     cliPath,
     ["serve", "--project", project, "--artifact", ".ferrite/build", "--page-renderer", join(runtimeBin, "render-artifact.mjs"), "--once"],
     { cwd: project, capture: true },
-    /artifact directory/i,
+    /artifact directory[\s\S]*\bos error (?:2|3)\b/i,
     "clean install serve must reject a missing build artifact",
   );
   await runCommand(cliPath, ["check", "--project", project], { cwd: project, capture: true });

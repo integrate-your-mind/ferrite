@@ -25,7 +25,9 @@ test("clean developer workflow rejects a missing artifact before building and th
       runCommand: async (command, args, options) => {
         calls.push({ command, args, cwd: options.cwd });
         if (args[0] === "serve" && calls.filter((call) => call.args[0] === "serve").length === 1) {
-          throw new Error("artifact directory does not exist");
+          throw new Error(
+            "artifact directory /tmp/starter/.ferrite/build is unavailable: No such file or directory (os error 2)",
+          );
         }
         return args[0] === "serve" ? "<p>Rust-first application runtime.</p>" : "";
       },
@@ -50,12 +52,14 @@ test("clean developer workflow rejects an unrelated initial serve failure", asyn
         cliSource,
         runCommand: async (_command, args) => {
           if (args[0] === "serve") {
-            throw new Error("permission denied");
+            throw new Error(
+              "artifact directory /tmp/starter/.ferrite/build is unavailable: Permission denied (os error 13)",
+            );
           }
           return "";
         },
       }),
-      /missing build artifact: unexpected failure: permission denied/,
+      /missing build artifact: unexpected failure: artifact directory[\s\S]*Permission denied \(os error 13\)/,
     );
   } finally {
     await rm(root, { force: true, recursive: true });
@@ -73,7 +77,9 @@ test("clean developer workflow fails when artifact serve does not render the fix
         cliSource,
         runCommand: async (_command, args) => {
           if (args[0] === "serve" && serveCalls++ === 0) {
-            throw new Error("artifact directory does not exist");
+            throw new Error(
+              "artifact directory C:\\starter\\.ferrite\\build is unavailable: The system cannot find the path specified. (os error 3)",
+            );
           }
           return args[0] === "serve" ? "wrong page" : "";
         },
