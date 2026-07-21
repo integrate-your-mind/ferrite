@@ -1,0 +1,6 @@
+# Exclude non-distributed source and development files.
+# Published content is controlled explicitly by package.json "files".
+src/
+test/
+scripts/
+*.log
