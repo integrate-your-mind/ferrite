@@ -143,6 +143,8 @@ export type ServerPayloadNavigateOptions = {
   fallbackOnError?: boolean;
 };
 
+type InternalServerPayloadNavigateOptions = ServerPayloadNavigateOptions & { history?: boolean };
+
 export type ServerPayloadNavigator = {
   prefetch(input: string | URL): Promise<ServerPayloadPacket | null>;
   navigate(input: string | URL, options?: ServerPayloadNavigateOptions): Promise<ServerPayloadPacket | null>;
@@ -692,7 +694,10 @@ export function createServerPayloadNavigator(
     return packet;
   };
 
-  const fetchApplyNavigationStream = async (url: URL): Promise<ServerPayloadPacket> => {
+  const fetchApplyNavigationStream = async (
+    url: URL,
+    onShellCommit?: () => void,
+  ): Promise<ServerPayloadPacket> => {
     let shellCommitted = false;
     const guardedRoot: RootHandle = {
       update(nextChild) {
@@ -712,6 +717,7 @@ export function createServerPayloadNavigator(
         reconcileHead: options.reconcileHead,
         onShell: () => {
           shellCommitted = true;
+          onShellCommit?.();
         },
       });
     } catch (error) {
@@ -759,7 +765,10 @@ export function createServerPayloadNavigator(
     return prefetched;
   };
 
-  const applyNavigationUrl = async (url: URL): Promise<ServerPayloadPacket> => {
+  const applyNavigationUrl = async (
+    url: URL,
+    onShellCommit?: () => void,
+  ): Promise<ServerPayloadPacket> => {
     const prefetched = takePrefetchedNavigationPacket(url);
     if (prefetched) {
       const packet = await prefetched;
@@ -768,7 +777,7 @@ export function createServerPayloadNavigator(
     }
 
     if (options.stream === true) {
-      return fetchApplyNavigationStream(url);
+      return fetchApplyNavigationStream(url, onShellCommit);
     }
 
     return fetchApplyNavigationPacket(url);
@@ -784,8 +793,16 @@ export function createServerPayloadNavigator(
     }
 
     try {
-      const packet = await applyNavigationUrl(url);
-      updateNavigationHistory(navigationWindow, url, navigateOptions.replace === true);
+      const internalOptions = navigateOptions as InternalServerPayloadNavigateOptions;
+      let historyCommitted = false;
+      const commitHistory = (): void => {
+        if (!historyCommitted && internalOptions.history !== false) {
+          updateNavigationHistory(navigationWindow, url, navigateOptions.replace === true);
+          historyCommitted = true;
+        }
+      };
+      const packet = await applyNavigationUrl(url, commitHistory);
+      commitHistory();
       return packet;
     } catch (error) {
       options.onError?.(error, url);

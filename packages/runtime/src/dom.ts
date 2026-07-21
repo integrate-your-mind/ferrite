@@ -198,6 +198,7 @@ export function createServerPayloadNavigator(
   const navigate = async (
     input: string | URL,
     navigateOptions: ServerPayloadNavigateOptions = {},
+    updateHistory = true,
   ): Promise<ServerPayloadPacket | null> => {
     assertNavigatorAlive(destroyed);
     const url = navigationUrl(input, navigationWindow);
@@ -211,7 +212,7 @@ export function createServerPayloadNavigator(
     nextNavigationId += 1;
     activeNavigation = { id, controller };
     const unlink = linkAbortSignal(controller, options.requestInit?.signal);
-    const prefetched = options.stream === true ? undefined : takePrefetch(url);
+    const prefetched = takePrefetch(url);
     const unlinkPrefetch = prefetched ? linkAbortSignal(prefetched.controller, controller.signal) : () => undefined;
 
     const guardedRoot: RootHandle = {
@@ -231,7 +232,7 @@ export function createServerPayloadNavigator(
       assertActive(id);
       const fetchImpl: ServerPayloadFetch = packet
         ? async () => packetResponse(packet)
-        : boundedFetch(options.fetch ?? globalThis.fetch, safety, options.stream === true ? "stream" : "packet");
+        : boundedFetch(options.fetch ?? globalThis.fetch, safety, "auto");
       transient = baseCreateServerPayloadNavigator(guardedRoot, {
         window: navigationWindow,
         eventRoot: navigationWindow.document.createDocumentFragment(),
@@ -246,7 +247,8 @@ export function createServerPayloadNavigator(
       const result = await transient.navigate(url, {
         replace: navigateOptions.replace,
         fallbackOnError: false,
-      });
+        history: updateHistory,
+      } as ServerPayloadNavigateOptions & { history: boolean });
       assertActive(id);
       return result;
     } catch (error) {
@@ -286,7 +288,7 @@ export function createServerPayloadNavigator(
   const handlePopState = (event: PopStateEvent): void => {
     const url = restoredNavigationUrl(event.state, navigationWindow);
     if (url) {
-      void navigate(url, { replace: true, fallbackOnError: true });
+      void navigate(url, { replace: true, fallbackOnError: true }, false);
     }
   };
 
@@ -357,28 +359,33 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
 function boundedFetch(
   fetchImpl: ServerPayloadFetch,
   safety: ResolvedSafetyOptions,
-  mode: "packet" | "stream",
+  mode: "auto" | "packet" | "stream",
 ): ServerPayloadFetch {
   if (typeof fetchImpl !== "function") {
     throw new TypeError("Ferrite server payload fetch requires a fetch implementation.");
   }
   return async (input, init) => {
     const response = await fetchImpl(input, init);
+    const responseMode = mode === "auto" ? payloadResponseMode(input) : mode;
     const length = Number(response.headers?.get?.("content-length"));
     if (Number.isFinite(length) && length > safety.maxResponseBytes) {
+      if (response.body && typeof response.body.cancel === "function") {
+        await response.body.cancel("Ferrite response byte budget exceeded.").catch(() => undefined);
+      }
       throw new RangeError("Ferrite server payload response exceeds maxResponseBytes.");
     }
     if (!response.body || typeof response.body.getReader !== "function") {
-      if (mode === "packet" && typeof response.json === "function") {
+      if (responseMode === "packet" && typeof response.json === "function") {
         return plainResponse(response, null, async () => {
           const payload = await response.json();
+          assertSerializedPacketBudget(payload, safety.maxResponseBytes);
           assertUnknownPacketBudget(payload, safety);
           return payload;
         });
       }
       return response;
     }
-    if (mode === "packet") {
+    if (responseMode === "packet") {
       const bytes = await readBoundedBody(response.body, safety.maxResponseBytes);
       const text = new TextDecoder().decode(bytes);
       return plainResponse(response, null, async () => {
@@ -389,6 +396,14 @@ function boundedFetch(
     }
     return plainResponse(response, boundedFrameStream(response.body, safety), response.json?.bind(response));
   };
+}
+
+function payloadResponseMode(input: string): "packet" | "stream" {
+  try {
+    return new URL(input).searchParams.get("__ferrite_payload") === "stream" ? "stream" : "packet";
+  } catch {
+    return "packet";
+  }
 }
 
 function plainResponse(
@@ -441,63 +456,116 @@ function boundedFrameStream(
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
+  let currentChunk: Uint8Array<ArrayBufferLike> = new Uint8Array();
+  let currentOffset = 0;
+  let frameParts: Uint8Array[] = [];
   let totalBytes = 0;
   let frameBytes = 0;
   let frameCount = 0;
   let treeNodes = 0;
-  let textBuffer = "";
+  let sourceDone = false;
+  let readerReleased = false;
+
+  const releaseReader = (): void => {
+    if (!readerReleased) {
+      readerReleased = true;
+      reader.releaseLock();
+    }
+  };
+
+  const nextFrameBytes = async (): Promise<Uint8Array | null> => {
+    for (;;) {
+      if (currentOffset < currentChunk.byteLength) {
+        const newline = currentChunk.indexOf(10, currentOffset);
+        const end = newline === -1 ? currentChunk.byteLength : newline;
+        const part = currentChunk.subarray(currentOffset, end);
+        const consumedBytes = part.byteLength + (newline === -1 ? 0 : 1);
+        totalBytes += consumedBytes;
+        if (totalBytes > safety.maxResponseBytes) {
+          throw new RangeError("Ferrite server payload stream exceeds maxResponseBytes.");
+        }
+        frameBytes += part.byteLength;
+        if (frameBytes > safety.maxFrameBytes) {
+          throw new RangeError("Ferrite server payload stream frame exceeds maxFrameBytes.");
+        }
+        if (part.byteLength > 0) {
+          frameParts.push(part);
+        }
+        currentOffset = newline === -1 ? end : end + 1;
+        if (newline !== -1) {
+          const frame = concatenateBytes(frameParts, frameBytes);
+          frameParts = [];
+          frameBytes = 0;
+          return frame;
+        }
+        continue;
+      }
+
+      if (sourceDone) {
+        if (frameBytes === 0) {
+          return null;
+        }
+        const frame = concatenateBytes(frameParts, frameBytes);
+        frameParts = [];
+        frameBytes = 0;
+        return frame;
+      }
+
+      const { value, done } = await reader.read();
+      if (done) {
+        sourceDone = true;
+        continue;
+      }
+      currentChunk = value;
+      currentOffset = 0;
+    }
+  };
 
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
+    async pull(controller) {
       try {
         for (;;) {
-          const { value, done } = await reader.read();
-          if (done) {
-            break;
+          const frame = await nextFrameBytes();
+          if (frame === null) {
+            releaseReader();
+            controller.close();
+            return;
           }
-          totalBytes += value.byteLength;
-          if (totalBytes > safety.maxResponseBytes) {
-            throw new RangeError("Ferrite server payload stream exceeds maxResponseBytes.");
+          const line = decoder.decode(frame).replace(/\r$/, "");
+          ({ frameCount, treeNodes } = inspectFrameLine(line, frameCount, treeNodes, safety));
+          if (line.trim().length === 0) {
+            continue;
           }
-          for (const byte of value) {
-            if (byte === 10) {
-              if (frameBytes > safety.maxFrameBytes) {
-                throw new RangeError("Ferrite server payload stream frame exceeds maxFrameBytes.");
-              }
-              frameBytes = 0;
-            } else {
-              frameBytes += 1;
-              if (frameBytes > safety.maxFrameBytes) {
-                throw new RangeError("Ferrite server payload stream frame exceeds maxFrameBytes.");
-              }
-            }
-          }
-          textBuffer += decoder.decode(value, { stream: true });
-          let newline = textBuffer.indexOf("\n");
-          while (newline !== -1) {
-            const line = textBuffer.slice(0, newline).replace(/\r$/, "");
-            textBuffer = textBuffer.slice(newline + 1);
-            ({ frameCount, treeNodes } = inspectFrameLine(line, frameCount, treeNodes, safety));
-            newline = textBuffer.indexOf("\n");
-          }
-          controller.enqueue(value);
+          const output = new Uint8Array(frame.byteLength + 1);
+          output.set(frame);
+          output[frame.byteLength] = 10;
+          controller.enqueue(output);
+          return;
         }
-        textBuffer += decoder.decode();
-        if (textBuffer.trim().length > 0) {
-          ({ frameCount, treeNodes } = inspectFrameLine(textBuffer, frameCount, treeNodes, safety));
-        }
-        controller.close();
       } catch (error) {
         await reader.cancel(error).catch(() => undefined);
+        releaseReader();
         controller.error(error);
-      } finally {
-        reader.releaseLock();
       }
     },
-    cancel(reason) {
-      return reader.cancel(reason);
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        releaseReader();
+      }
     },
   });
+}
+
+function concatenateBytes(parts: Uint8Array[], length: number): Uint8Array {
+  const output = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
 }
 
 function inspectFrameLine(
@@ -543,6 +611,9 @@ function assertUnknownPacketBudget(payload: unknown, safety: ResolvedSafetyOptio
     throw new RangeError("Ferrite server payload exceeds maxFrames.");
   }
   let nodes = compactTreeSize(record.shell, safety.maxTreeDepth);
+  if (nodes > safety.maxTreeNodes) {
+    throw new RangeError("Ferrite server payload exceeds maxTreeNodes.");
+  }
   for (const chunk of chunks) {
     if (chunk !== null && typeof chunk === "object" && !Array.isArray(chunk)) {
       nodes += compactTreeSize((chunk as Record<string, unknown>).root, safety.maxTreeDepth);
@@ -558,11 +629,21 @@ function assertPacketBudget(packet: ServerPayloadPacket, safety: ResolvedSafetyO
     throw new RangeError("Ferrite server payload exceeds maxFrames.");
   }
   let nodes = compactTreeSize(packet.shell, safety.maxTreeDepth);
+  if (nodes > safety.maxTreeNodes) {
+    throw new RangeError("Ferrite server payload exceeds maxTreeNodes.");
+  }
   for (const chunk of packet.chunks) {
     nodes += compactTreeSize(chunk.root, safety.maxTreeDepth);
     if (nodes > safety.maxTreeNodes) {
       throw new RangeError("Ferrite server payload exceeds maxTreeNodes.");
     }
+  }
+}
+
+function assertSerializedPacketBudget(payload: unknown, maximum: number): void {
+  const serialized = JSON.stringify(payload);
+  if (serialized !== undefined && new TextEncoder().encode(serialized).byteLength > maximum) {
+    throw new RangeError("Ferrite server payload response exceeds maxResponseBytes.");
   }
 }
 

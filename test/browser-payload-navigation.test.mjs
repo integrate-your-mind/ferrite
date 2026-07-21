@@ -187,6 +187,87 @@ test("server payload navigator falls back from malformed clicked payloads in Chr
   );
 });
 
+test("stream budgets and superseded navigation ownership remain consistent in Chromium", async (t) => {
+  if (!chromeAvailable) {
+    t.skip(`Chrome executable not found at ${chromeExecutable}`);
+    return;
+  }
+
+  const project = await createPayloadNavigationFixture();
+  t.after(async () => {
+    await rm(project, { recursive: true, force: true });
+  });
+
+  const { server, origin, requests } = await servePayloadNavigationFixture(join(project, "public"));
+  t.after(async () => {
+    await new Promise((resolveClose) => server.close(resolveClose));
+  });
+
+  const context = await browser.newContext();
+  t.after(async () => {
+    await context.close();
+  });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  t.after(async () => {
+    await page.close();
+  });
+
+  const response = await page.goto(origin, { waitUntil: "networkidle" });
+  assert.equal(response?.status(), 200);
+  await page.waitForFunction(() => Boolean(globalThis.ferriteRuntimeTest));
+
+  await page.evaluate(() => {
+    globalThis.ferriteRuntimeTest.slowNavigation = globalThis.ferriteRuntimeTest.navigator.navigate("/posts/slow");
+  });
+  await waitForRequest(requests, "/posts/slow?__ferrite_payload=stream");
+  await page.getByRole("heading", { name: "Slow route" }).waitFor();
+  assert.equal(page.url(), `${origin}/posts/slow`);
+
+  await page.evaluate(() => {
+    globalThis.ferriteRuntimeTest.fastNavigation = globalThis.ferriteRuntimeTest.navigator.navigate("/posts/fast");
+  });
+  await waitForRequest(requests, "/posts/fast?__ferrite_payload=stream");
+  await page.getByRole("heading", { name: "Fast route" }).waitFor();
+  await page.getByText("Loaded fast details").waitFor();
+  assert.equal(await page.evaluate(() => globalThis.ferriteRuntimeTest.fastNavigation.then(() => "resolved")), "resolved");
+  assert.equal(await page.evaluate(() => globalThis.ferriteRuntimeTest.slowNavigation), null);
+  await page.waitForTimeout(300);
+  assert.equal(page.url(), `${origin}/posts/fast`);
+  assert.equal(await page.getByRole("heading").textContent(), "Fast route");
+  assert.equal(await page.getByText("Loaded slow details").count(), 0);
+
+  await page.evaluate(() => {
+    const budgetNavigator = globalThis.ferriteRuntimeTest.createBudgetNavigator();
+    globalThis.ferriteRuntimeTest.budgetNavigator = budgetNavigator;
+    globalThis.ferriteRuntimeTest.budgetNavigation = budgetNavigator.navigate("/posts/over-budget").then(
+      () => "resolved",
+      (error) => (error instanceof Error ? error.message : String(error)),
+    );
+  });
+  await waitForRequest(requests, "/posts/over-budget?__ferrite_payload=stream");
+  await page.getByRole("heading", { name: "Over budget route" }).waitFor();
+  assert.equal(page.url(), `${origin}/posts/over-budget`);
+  const budgetError = await page.evaluate(() => globalThis.ferriteRuntimeTest.budgetNavigation);
+  assert.match(budgetError, /maxFrames/);
+  assert.equal(await page.getByRole("heading").textContent(), "Over budget route");
+  assert.equal(await page.getByText("Rejected over budget details").count(), 0);
+  assert.deepEqual(
+    await page.evaluate(() => globalThis.ferriteRuntimeTest.budgetErrors),
+    ["Ferrite server payload stream exceeds maxFrames."],
+  );
+
+  await page.evaluate(() => {
+    globalThis.ferriteRuntimeTest.budgetNavigator.destroy();
+    history.back();
+  });
+  await page.getByRole("heading", { name: "Fast route" }).waitFor();
+  await page.getByText("Loaded fast details").waitFor();
+  assert.equal(page.url(), `${origin}/posts/fast`);
+  assert.deepEqual(pageErrors.map((error) => error.message), []);
+});
+
 async function createPayloadNavigationFixture() {
   const project = await mkdtemp(join(tmpdir(), "ferrite-browser-payload-nav-"));
   const publicDir = join(project, "public");
@@ -222,12 +303,19 @@ async function createPayloadNavigationFixture() {
       `  container,`,
       `);`,
       `const errors = [];`,
+      `const budgetErrors = [];`,
       `const navigator = createServerPayloadNavigator(root, {`,
       `  prefetch: true,`,
       `  stream: true,`,
       `  onError(error) { errors.push(error instanceof Error ? error.message : String(error)); },`,
       `});`,
-      `globalThis.ferriteRuntimeTest = { navigator, errors };`,
+      `const createBudgetNavigator = () => createServerPayloadNavigator(root, {`,
+      `  eventRoot: document.createDocumentFragment(),`,
+      `  stream: true,`,
+      `  maxFrames: 1,`,
+      `  onError(error) { budgetErrors.push(error instanceof Error ? error.message : String(error)); },`,
+      `});`,
+      `globalThis.ferriteRuntimeTest = { navigator, errors, budgetErrors, createBudgetNavigator };`,
       ``,
     ].join("\n"),
   );
@@ -312,6 +400,28 @@ async function servePayloadNavigationFixture(publicDir) {
         setTimeout(() => {
           response.end(`${JSON.stringify(serverPayloadStreamFrame("chunk"))}\n`);
         }, 500);
+        return;
+      }
+
+      if (url.pathname === "/posts/slow" && url.searchParams.get("__ferrite_payload") === "stream") {
+        response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8" });
+        response.write(`${JSON.stringify(routeStreamFrame("slow", "shell"))}\n`);
+        endWithDelayedFrame(response, routeStreamFrame("slow", "chunk"), 250);
+        return;
+      }
+
+      if (url.pathname === "/posts/fast" && url.searchParams.get("__ferrite_payload") === "stream") {
+        response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8" });
+        response.end(
+          `${JSON.stringify(routeStreamFrame("fast", "shell"))}\n${JSON.stringify(routeStreamFrame("fast", "chunk"))}\n`,
+        );
+        return;
+      }
+
+      if (url.pathname === "/posts/over-budget" && url.searchParams.get("__ferrite_payload") === "stream") {
+        response.writeHead(200, { "content-type": "application/x-ndjson; charset=utf-8" });
+        response.write(`${JSON.stringify(routeStreamFrame("over-budget", "shell"))}\n`);
+        endWithDelayedFrame(response, routeStreamFrame("over-budget", "chunk"), 100);
         return;
       }
 
@@ -421,10 +531,54 @@ function serverPayloadStreamFrame(kind) {
   };
 }
 
-function documentPayloadShell({ route, title, heading, fallback, linkHref, linkId, linkText }) {
+function routeStreamFrame(route, kind) {
+  const words = route.replaceAll("-", " ");
+  const label = `${words[0].toUpperCase()}${words.slice(1)}`;
+  if (kind === "shell") {
+    return {
+      ferrite: "server-payload-frame",
+      version: 1,
+      kind: "shell",
+      shell: documentPayloadShell({
+        route: `/posts/${route}`,
+        title: `${label} title`,
+        heading: `${label} route`,
+        fallback: `Loading ${route} details`,
+        boundaryId: `${route}-details`,
+      }),
+      clientReferences: [],
+    };
+  }
+  return {
+    ferrite: "server-payload-frame",
+    version: 1,
+    kind: "chunk",
+    chunk: {
+      id: `${route}-details`,
+      root: [2, "strong", {}, [[0, route === "over-budget" ? "Rejected over budget details" : `Loaded ${route} details`]]],
+      clientReferences: [],
+    },
+  };
+}
+
+function endWithDelayedFrame(response, frame, delayMs) {
+  const timer = setTimeout(() => {
+    if (!response.destroyed && !response.writableEnded) {
+      response.end(`${JSON.stringify(frame)}\n`);
+    }
+  }, delayMs);
+  response.once("close", () => clearTimeout(timer));
+}
+
+function documentPayloadShell({ route, title, heading, fallback, linkHref, linkId, linkText, boundaryId }) {
   const children = [
     [2, "h1", {}, [[0, heading]]],
-    [2, "div", { "data-ferrite-suspense-boundary": route.includes("stream") ? "stream-details" : "prefetched-details" }, [[0, fallback]]],
+    [
+      2,
+      "div",
+      { "data-ferrite-suspense-boundary": boundaryId ?? (route.includes("stream") ? "stream-details" : "prefetched-details") },
+      [[0, fallback]],
+    ],
   ];
   if (linkHref) {
     children.push([2, "a", { href: linkHref, id: linkId }, [[0, linkText]]]);
