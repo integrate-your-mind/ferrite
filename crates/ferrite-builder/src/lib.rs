@@ -12,10 +12,10 @@ pub use legacy::{
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use ferrite_router::{Route, find_document_file, scan_app_dir};
+use ferrite_router::{Route, find_document_file, scan_app_dir, validate_route_types_output};
 use serde::{Deserialize, Serialize};
 
 use source_snapshot::ProjectSourceSnapshot;
@@ -59,6 +59,7 @@ struct ServerBuildInputRoute {
 }
 
 pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
+    validate_build_output_ownership(config)?;
     let initial_contract = capture_build_input_contract(config)?;
     let out_parent = config.out_dir.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(out_parent)?;
@@ -79,6 +80,110 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
     }
     rebase_build_report(&mut report, &candidate_path, &config.out_dir)?;
     Ok(report)
+}
+
+fn validate_build_output_ownership(config: &BuildConfig) -> Result<()> {
+    let project = normalized_path(&config.project)?;
+    let app_dir = normalized_path(&config.app_dir)?;
+    let out_dir = normalized_path(&config.out_dir)?;
+    let types_out = normalized_path(&config.types_out)?;
+
+    if out_dir == project || project.starts_with(&out_dir) || paths_overlap(&out_dir, &app_dir) {
+        return Err(invalid_output_path(format!(
+            "refusing build output `{}` because it overlaps Ferrite project source `{}`",
+            config.out_dir.display(),
+            config.app_dir.display()
+        )));
+    }
+    if types_out == project
+        || project.starts_with(&types_out)
+        || paths_overlap(&types_out, &app_dir)
+    {
+        return Err(invalid_output_path(format!(
+            "refusing route types output `{}` because it overlaps Ferrite project source `{}`",
+            config.types_out.display(),
+            config.app_dir.display()
+        )));
+    }
+    if paths_overlap(&out_dir, &types_out) {
+        return Err(invalid_output_path(format!(
+            "refusing overlapping build output `{}` and route types output `{}`",
+            config.out_dir.display(),
+            config.types_out.display()
+        )));
+    }
+
+    validate_existing_build_destination(&project, &out_dir)?;
+    validate_route_types_output(&config.types_out)?;
+    Ok(())
+}
+
+fn validate_existing_build_destination(project: &Path, out_dir: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(out_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid_output_path(format!(
+            "refusing to replace non-build output `{}`",
+            out_dir.display()
+        )));
+    }
+
+    let generated_root = normalized_path(&project.join(".ferrite"))?;
+    if out_dir.starts_with(&generated_root) || fs::read_dir(out_dir)?.next().is_none() {
+        return Ok(());
+    }
+    if load_production_artifact(out_dir).is_ok() {
+        return Ok(());
+    }
+
+    Err(invalid_output_path(format!(
+        "refusing to replace non-build output `{}`",
+        out_dir.display()
+    )))
+}
+
+fn normalized_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("path escapes its filesystem root: {}", path.display()),
+                    ));
+                }
+            }
+            Component::Normal(part) => {
+                let candidate = resolved.join(part);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(_) => resolved = fs::canonicalize(candidate)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => resolved.push(part),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn invalid_output_path(message: String) -> BuildError {
+    io::Error::new(io::ErrorKind::InvalidInput, message).into()
 }
 
 fn capture_build_input_contract(config: &BuildConfig) -> Result<BuildInputContract> {
@@ -270,4 +375,101 @@ fn rebase_build_path(path: &Path, from: &Path, to: &Path) -> Result<PathBuf> {
         )))
     })?;
     Ok(to.join(relative))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrite_router::GENERATED_ROUTE_TYPES_HEADER;
+
+    fn test_config(root: &Path) -> BuildConfig {
+        let app_dir = root.join("app");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("page.tsx"),
+            "export default function Page() {}\n",
+        )
+        .unwrap();
+        BuildConfig::new(
+            root.to_path_buf(),
+            app_dir,
+            root.join(".ferrite/build"),
+            root.join(".ferrite/types/routes.d.ts"),
+            root.join("render-page.mjs"),
+            root.join("build-client.mjs"),
+        )
+    }
+
+    #[test]
+    fn rejects_build_output_that_overlaps_app_source() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        let page = config.app_dir.join("page.tsx");
+        config.out_dir = config.app_dir.clone();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("overlaps Ferrite project source")
+        );
+        assert_eq!(
+            fs::read_to_string(page).unwrap(),
+            "export default function Page() {}\n"
+        );
+    }
+
+    #[test]
+    fn rejects_existing_non_generated_route_types_output() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.types_out = project.path().join("notes.txt");
+        fs::write(&config.types_out, "keep this source file\n").unwrap();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("non-generated route types output")
+        );
+        assert_eq!(
+            fs::read_to_string(&config.types_out).unwrap(),
+            "keep this source file\n"
+        );
+    }
+
+    #[test]
+    fn rejects_existing_non_build_destination() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("docs");
+        fs::create_dir_all(&config.out_dir).unwrap();
+        fs::write(config.out_dir.join("owned.md"), "keep\n").unwrap();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(error.to_string().contains("non-build output"));
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("owned.md")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn accepts_empty_custom_build_output_and_owned_route_types() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("dist");
+        fs::create_dir_all(&config.out_dir).unwrap();
+        fs::create_dir_all(config.types_out.parent().unwrap()).unwrap();
+        fs::write(
+            &config.types_out,
+            format!("{GENERATED_ROUTE_TYPES_HEADER}\nstale\n"),
+        )
+        .unwrap();
+
+        validate_build_output_ownership(&config).unwrap();
+    }
 }
