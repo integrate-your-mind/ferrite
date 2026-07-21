@@ -36,7 +36,7 @@ test("server-renders the source-backed Ferrite site", async () => {
   assert.match(html, /<title>Ferrite[^<]*Rust-first application framework<\/title>/i);
   assert.match(html, /Rust owns the control plane/);
   assert.match(html, /<h1[^>]*>Ferrite<\/h1>/);
-  assert.match(html, /Private alpha/);
+  assert.match(html, /Open-source private-alpha preview/);
   assert.match(html, />509<\/strong>/);
   assert.match(html, />10<\/strong>/);
   assert.match(html, />Captured<\/strong><span>Rust dev-server coverage report<\/span>/);
