@@ -2,6 +2,9 @@
   "name": "@ferrite/runtime",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "description": "TypeScript JSX runtime, DOM helpers, and server facade for the Rust-first Ferrite framework.",
   "license": "MIT",
   "repository": {

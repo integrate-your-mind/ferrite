@@ -17,13 +17,33 @@ import {
 test("clean developer workflow rejects a missing artifact before building and then serves it", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-clean-workflow-"));
   const cliSource = join(root, "source-ferrite");
+  const protocolTarball = join(root, "protocol.tgz");
+  const runtimeTarball = join(root, "runtime.tgz");
   const calls = [];
   try {
     await writeFile(cliSource, "candidate cli");
+    await writeFile(protocolTarball, "protocol candidate");
+    await writeFile(runtimeTarball, "runtime candidate");
     await verifyCleanDeveloperWorkflow(root, {
       cliSource,
+      packages: [
+        { name: "@ferrite/protocol", tarballPath: protocolTarball },
+        { name: "@ferrite/runtime", tarballPath: runtimeTarball },
+      ],
       runCommand: async (command, args, options) => {
         calls.push({ command, args, cwd: options.cwd });
+        if (command === cliSource && args[0] === "init") {
+          await mkdir(args[1], { recursive: true });
+          await writeFile(
+            join(args[1], "package.json"),
+            `${JSON.stringify({
+              private: true,
+              scripts: { check: "ferrite check", build: "ferrite build" },
+              dependencies: { "@ferrite/runtime": "0.1.0" },
+            })}\n`,
+          );
+          await writeFile(join(args[1], ".gitignore"), "node_modules/\n");
+        }
         if (args[0] === "serve" && calls.filter((call) => call.args[0] === "serve").length === 1) {
           throw new Error("build artifact does not exist");
         }
@@ -31,10 +51,10 @@ test("clean developer workflow rejects a missing artifact before building and th
       },
     });
 
-    assert.deepEqual(calls.map((call) => call.args[0]), ["init", "serve", "check", "build", "serve"]);
+    assert.deepEqual(calls.map((call) => call.args[0]), ["init", "install", "run", "serve", "build", "serve"]);
     assert.equal(calls[0].cwd, root);
     assert.ok(calls.slice(1).every((call) => call.cwd === join(root, "starter")));
-    assert.ok(calls[3].args.includes(join(root, "starter", "node_modules", "@ferrite", "runtime", "bin", "render-page.mjs")));
+    assert.ok(calls[4].args.includes(join(root, "starter", "node_modules", "@ferrite", "runtime", "bin", "render-page.mjs")));
   } finally {
     await rm(root, { force: true, recursive: true });
   }
@@ -43,13 +63,33 @@ test("clean developer workflow rejects a missing artifact before building and th
 test("clean developer workflow fails when artifact serve does not render the fixture", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-clean-workflow-failure-"));
   const cliSource = join(root, "source-ferrite");
+  const protocolTarball = join(root, "protocol.tgz");
+  const runtimeTarball = join(root, "runtime.tgz");
   let serveCalls = 0;
   try {
     await writeFile(cliSource, "candidate cli");
+    await writeFile(protocolTarball, "protocol candidate");
+    await writeFile(runtimeTarball, "runtime candidate");
     await assert.rejects(
       verifyCleanDeveloperWorkflow(root, {
         cliSource,
-        runCommand: async (_command, args) => {
+        packages: [
+          { name: "@ferrite/protocol", tarballPath: protocolTarball },
+          { name: "@ferrite/runtime", tarballPath: runtimeTarball },
+        ],
+        runCommand: async (command, args) => {
+          if (command === cliSource && args[0] === "init") {
+            await mkdir(args[1], { recursive: true });
+            await writeFile(
+              join(args[1], "package.json"),
+              `${JSON.stringify({
+                private: true,
+                scripts: { check: "ferrite check", build: "ferrite build" },
+                dependencies: { "@ferrite/runtime": "0.1.0" },
+              })}\n`,
+            );
+            await writeFile(join(args[1], ".gitignore"), "node_modules/\n");
+          }
           if (args[0] === "serve" && serveCalls++ === 0) {
             throw new Error("build artifact does not exist");
           }
@@ -141,6 +181,18 @@ test("metadata validation reports missing local metadata", () => {
         },
       }),
     /@ferrite\/protocol: package description is required/,
+  );
+
+  const sourceManifest = completeSourceManifest("@ferrite/protocol");
+  delete sourceManifest.engines;
+  assert.throws(
+    () =>
+      validateManifestMetadata({
+        packageName: "@ferrite/protocol",
+        sourceManifest,
+        releaseManifest: completeReleaseManifest("@ferrite/protocol"),
+      }),
+    /@ferrite\/protocol: engines\.node is required/,
   );
 });
 
@@ -246,6 +298,7 @@ test("verifier validates packages and writes the inspected report", async () => 
             private: true,
             description: "Ferrite protocol package.",
             license: "UNLICENSED",
+            engines: { node: ">=22" },
             keywords: ["ferrite"],
             files: ["dist"],
             exports: { ".": "./dist/index.js" },
@@ -303,6 +356,7 @@ test("verifier packs a staged release manifest instead of the source manifest", 
           private: true,
           description: "Ferrite protocol package.",
           license: "UNLICENSED",
+          engines: { node: ">=22" },
           keywords: ["ferrite"],
           files: ["dist"],
           exports: { ".": "./dist/index.js" },
@@ -321,6 +375,7 @@ test("verifier packs a staged release manifest instead of the source manifest", 
           private: true,
           description: "Ferrite runtime package.",
           license: "UNLICENSED",
+          engines: { node: ">=22" },
           keywords: ["ferrite"],
           files: ["dist"],
           exports: { ".": "./dist/index.js" },
@@ -403,6 +458,7 @@ test("verifier installs all generated local tarballs together in a clean project
           private: true,
           description: "Ferrite protocol package.",
           license: "UNLICENSED",
+          engines: { node: ">=22" },
           keywords: ["ferrite"],
           files: ["dist"],
           exports: { ".": "./dist/index.js" },
@@ -421,6 +477,7 @@ test("verifier installs all generated local tarballs together in a clean project
           private: true,
           description: "Ferrite runtime package.",
           license: "UNLICENSED",
+          engines: { node: ">=22" },
           keywords: ["ferrite"],
           files: ["dist"],
           exports: { ".": "./dist/index.js" },
@@ -487,6 +544,7 @@ function completeSourceManifest(name) {
     private: true,
     description: "Ferrite test package.",
     license: "UNLICENSED",
+    engines: { node: ">=22" },
     keywords: ["ferrite"],
     files: ["dist"],
     exports: { ".": "./dist/index.js" },

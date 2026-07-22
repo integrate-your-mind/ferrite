@@ -1,6 +1,9 @@
 {
   "name": "ferrite-basic-example",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "dependencies": {
     "@ferrite/runtime": "workspace:*"

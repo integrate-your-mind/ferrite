@@ -45,7 +45,7 @@ body:
       description: Include OS, architecture, Rust, Node.js, pnpm, browser, and proxy versions that matter.
       placeholder: |
         OS: macOS 26 arm64
-        Rust: 1.85.0
+        Rust: 1.95.0
         Node.js: 22.x
         pnpm: 11.7.0
     validations:

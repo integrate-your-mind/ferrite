@@ -2446,10 +2446,10 @@ impl ProductionWorkerPool {
                         break;
                     };
                     let _in_flight_guard = ProductionInFlightGuard(Arc::clone(&in_flight));
-                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project)
-                        && is_response_write_deadline_error(&error)
-                    {
-                        eprintln!("Ferrite production response write deadline exceeded");
+                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project) {
+                        if is_response_write_deadline_error(&error) {
+                            eprintln!("Ferrite production response write deadline exceeded");
+                        }
                     }
                 }
             }));
@@ -3450,7 +3450,7 @@ fn is_valid_origin_form_target(path: &str) -> bool {
             let Some(low) = bytes.get(index + 2).copied().and_then(http_hex_value) else {
                 return false;
             };
-            let decoded = high << 4 | low;
+            let decoded = (high << 4) | low;
             if index < path_bytes && matches!(decoded, b'.' | b'/' | b'\\') {
                 return false;
             }

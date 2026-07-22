@@ -2,6 +2,9 @@
   "name": "@ferrite/protocol",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Browser-safe Ferrite protocol markers, builders, and validators generated from the Rust protocol crate.",
   "license": "MIT",
   "repository": {

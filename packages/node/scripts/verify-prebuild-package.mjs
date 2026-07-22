@@ -78,6 +78,11 @@ async function assertPackageManifest(root, manifest, target) {
   if (manifest.license !== nodePackage.license) {
     throw new Error(`${root}: package license must match @ferrite/node.`);
   }
+  for (const field of ["repository", "homepage", "bugs", "engines"]) {
+    if (JSON.stringify(manifest[field]) !== JSON.stringify(nodePackage[field])) {
+      throw new Error(`${root}: package ${field} must match @ferrite/node.`);
+    }
+  }
   assertArrayIncludes(root, manifest.keywords, "ferrite", "keywords");
   if (manifest.publishConfig?.access !== "public") {
     throw new Error(`${root}: package publishConfig.access must be public.`);

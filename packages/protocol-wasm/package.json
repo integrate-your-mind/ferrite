@@ -2,6 +2,9 @@
   "name": "@ferrite/protocol-wasm",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Rust-backed WASM validation for Ferrite server payload protocol packets.",
   "license": "MIT",
   "repository": {
