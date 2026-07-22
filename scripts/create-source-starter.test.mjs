@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,7 +23,7 @@ async function fixture(t) {
 }
 function commandMock({ failInstall = false } = {}) {
   return async (command, args) => {
-    if (command.endsWith("ferrite")) {
+    if (command.endsWith("ferrite") && args[0] === "init") {
       await mkdir(args[1], { recursive: true });
       await writeFile(
         join(args[1], "package.json"),
@@ -33,6 +33,15 @@ function commandMock({ failInstall = false } = {}) {
         }),
       );
       await writeFile(join(args[1], ".gitignore"), "node_modules/\n");
+    }
+    if (command.endsWith("ferrite") && args[0] === "internal-publish-dir") {
+      try {
+        await lstat(args[2]);
+        throw new Error(`starter target appeared during creation: ${args[2]}`);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      await rename(args[1], args[2]);
     }
     if (command === "npm" && args[0] === "install" && failInstall) {
       throw new Error("injected install failure");
@@ -102,16 +111,30 @@ test("cleans a newly created target after install failure", async (t) => {
   await assert.rejects(() => stat(target), { code: "ENOENT" });
 });
 
-test("restores an existing empty target after install failure", async (t) => {
+test("refuses an existing empty target before setup and preserves its identity", async (t) => {
   const f = await fixture(t);
   const target = join(f.root, "app");
   await mkdir(target);
+  const initial = await lstat(target);
+  let commandCalled = false;
 
   await assert.rejects(
-    () => createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand: commandMock({ failInstall: true }) }),
-    /injected install failure/,
+    () =>
+      createSourceStarter({
+        target,
+        packages: f.packages,
+        cliSource: f.cli,
+        runCommand: async () => {
+          commandCalled = true;
+        },
+      }),
+    /existing directory.*absent target/,
   );
   assert.deepEqual(await readdir(target), []);
+  const final = await lstat(target);
+  assert.equal(final.dev, initial.dev);
+  assert.equal(final.ino, initial.ino);
+  assert.equal(commandCalled, false);
 });
 
 test("cleans unexpected files created inside private staging after failed setup", async (t) => {
@@ -158,7 +181,6 @@ test("does not delete a victim when an accepted target is swapped to a symlink d
   const target = join(f.root, "app");
   await mkdir(victim);
   await writeFile(join(victim, "keep"), "safe");
-  await mkdir(target);
   const runCommand = async (command, args) => {
     if (command.endsWith("ferrite") && args[0] === "init") {
       await rm(target, { recursive: true, force: true });
@@ -184,12 +206,27 @@ test("publishes into an absent target", async (t) => {
   assert.equal((await stat(join(target, "package.json"))).isFile(), true);
 });
 
-test("publishes into an existing empty target", async (t) => {
+test("does not replace an empty target that appears during exclusive publication", async (t) => {
   const f = await fixture(t);
   const target = join(f.root, "app");
-  await mkdir(target);
-  await createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand: commandMock() });
-  assert.equal((await stat(join(target, "package.json"))).isFile(), true);
+  let concurrentIdentity;
+  const runCommand = async (command, args, options) => {
+    if (command.endsWith("ferrite") && args[0] === "internal-publish-dir") {
+      await mkdir(target);
+      concurrentIdentity = await lstat(target);
+    }
+    return commandMock()(command, args, options);
+  };
+
+  await assert.rejects(
+    () => createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand }),
+    /target appeared/,
+  );
+  const finalIdentity = await lstat(target);
+  assert.equal(finalIdentity.dev, concurrentIdentity.dev);
+  assert.equal(finalIdentity.ino, concurrentIdentity.ino);
+  assert.deepEqual(await readdir(target), []);
+  assert.deepEqual((await readdir(f.root)).filter((entry) => entry.startsWith(".app.ferrite-starter-")), []);
 });
 
 test("fails final publish when target becomes non-empty and preserves the concurrent file", async (t) => {

@@ -56,12 +56,21 @@ enum Commands {
 
     #[command(about = "Build an immutable Ferrite production artifact")]
     Build(BuildArgs),
+
+    #[command(hide = true)]
+    InternalPublishDir(InternalPublishDirArgs),
 }
 
 #[derive(Debug, Args)]
 struct InitArgs {
     #[arg(default_value = ".", help = "Directory to initialize")]
     project: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct InternalPublishDirArgs {
+    source: PathBuf,
+    target: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -460,6 +469,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 println!("next: npm install && npm run dev");
             }
         }
+        Commands::InternalPublishDir(args) => {
+            publish_directory_no_replace(&args.source, &args.target)?;
+        }
         Commands::Routes(args) => {
             let project = normalize_project_path(&args.project)?;
             let app_dir = resolve_project_path(&project, &args.app);
@@ -728,6 +740,76 @@ fn run_cli(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn publish_directory_no_replace(source: &Path, target: &Path) -> Result<()> {
+    let source_metadata = fs::symlink_metadata(source)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(CliError::Config(format!(
+            "starter publication source is not a directory: {}",
+            source.display()
+        )));
+    }
+
+    let source_parent = source.parent().ok_or_else(|| {
+        CliError::Config(format!(
+            "starter publication source has no parent: {}",
+            source.display()
+        ))
+    })?;
+    let target_parent = target.parent().ok_or_else(|| {
+        CliError::Config(format!(
+            "starter publication target has no parent: {}",
+            target.display()
+        ))
+    })?;
+    if fs::canonicalize(source_parent)? != fs::canonicalize(target_parent)? {
+        return Err(CliError::Config(
+            "starter publication source and target must be siblings".to_string(),
+        ));
+    }
+
+    rename_directory_no_replace(source, target).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            CliError::Config(format!(
+                "starter target appeared during creation: {}",
+                target.display()
+            ))
+        } else {
+            CliError::Io(error)
+        }
+    })
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn rename_directory_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        target,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+fn rename_directory_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    // Windows directory renames already fail when the destination exists.
+    fs::rename(source, target)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
+fn rename_directory_no_replace(_source: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "exclusive starter publication is unavailable on this platform",
+    ))
 }
 
 fn initialize_project(project: &Path) -> Result<PathBuf> {
@@ -1316,6 +1398,57 @@ mod tests {
 
         assert!(error.to_string().contains("not a directory"));
         assert_eq!(fs::read_to_string(target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn internal_publish_moves_a_staged_directory_to_an_absent_sibling() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join(".app.staging");
+        let target = parent.path().join("app");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("package.json"), "{}\n").unwrap();
+
+        publish_directory_no_replace(&source, &target).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(target.join("package.json")).unwrap(),
+            "{}\n"
+        );
+    }
+
+    #[test]
+    fn internal_publish_does_not_replace_an_existing_empty_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join(".app.staging");
+        let target = parent.path().join("app");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("package.json"), "{}\n").unwrap();
+        fs::create_dir(&target).unwrap();
+
+        let error = publish_directory_no_replace(&source, &target).unwrap_err();
+
+        assert!(matches!(error, CliError::Config(_)));
+        assert!(error.to_string().contains("target appeared"));
+        assert!(source.join("package.json").is_file());
+        assert!(target.is_dir());
+        assert!(target.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn internal_publish_requires_a_sibling_target() {
+        let source_parent = tempfile::tempdir().unwrap();
+        let target_parent = tempfile::tempdir().unwrap();
+        let source = source_parent.path().join(".app.staging");
+        let target = target_parent.path().join("app");
+        fs::create_dir(&source).unwrap();
+
+        let error = publish_directory_no_replace(&source, &target).unwrap_err();
+
+        assert!(matches!(error, CliError::Config(_)));
+        assert!(error.to_string().contains("must be siblings"));
+        assert!(source.is_dir());
+        assert!(!target.exists());
     }
 
     #[test]

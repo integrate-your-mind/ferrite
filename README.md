@@ -97,7 +97,7 @@ cd ../my-ferrite-app
 npm run dev
 ```
 
-`starter:create` builds the candidate CLI and release-shaped packages, verifies package metadata, initializes a private sibling staging directory, vendors the protocol/runtime tarballs and CLI under the ignored `.ferrite-source/` directory, installs from those local artifacts, and runs `npm run check`. The target's parent must already exist. Ferrite rejects files, symbolic links, and non-empty directories, revalidates an existing empty target before publication, and never recursively cleans the user target.
+`starter:create` builds the candidate CLI and release-shaped packages, verifies package metadata, initializes a private sibling staging directory, vendors the protocol/runtime tarballs and CLI under the ignored `.ferrite-source/` directory, installs from those local artifacts, and runs `npm run check`. The target's parent must already exist and the target itself must be absent. Ferrite publishes with an operating-system no-replace rename and never recursively cleans the user target.
 
 Exercise the production path:
 

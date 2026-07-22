@@ -29,7 +29,7 @@ These commands build the Rust workspace, TypeScript protocol/runtime packages, p
 
 ## Create an application
 
-Choose a target outside the Ferrite checkout. Its parent must already exist, and the target must be absent or an empty, non-symbolic-link directory.
+Choose a target outside the Ferrite checkout. Its parent must already exist, and the target itself must be absent.
 
 ```sh
 pnpm starter:create -- ../my-ferrite-app
@@ -46,9 +46,9 @@ The starter command performs one fail-closed transaction:
 5. rewrites dependencies to durable target-local `file:` tarball paths;
 6. installs with lifecycle scripts disabled; and
 7. runs the real Ferrite/TypeScript check; and
-8. revalidates the target's identity and emptiness before publishing the complete staged directory.
+8. revalidates target absence and publishes the complete staged directory with an operating-system no-replace rename.
 
-`.ferrite-source/`, `.ferrite/`, and `node_modules/` are ignored. Before publication, failures remove only the private staging directory and do not clean the user target. A target that appears, becomes non-empty, changes identity, or becomes a symbolic link during creation causes publication to fail without deleting its contents.
+`.ferrite-source/`, `.ferrite/`, and `node_modules/` are ignored. Before publication, failures remove only the private staging directory and do not clean the user target. A target that appears during creation causes the exclusive publication step to fail without replacing or deleting it.
 
 ## Normal workflow
 
@@ -79,7 +79,7 @@ Source package manifests stay `private: true` and retain workspace dependencies.
 - `ferrite: command not found`: the registry-shaped skeleton expects a distributed CLI. A source-backed starter uses `.ferrite-source/run-ferrite.mjs` instead.
 - Missing Corepack: install Corepack for your Node distribution, then rerun `corepack enable`.
 - Missing Chromium: run `pnpm exec playwright-core install chromium` in the Ferrite checkout and set `FERRITE_BROWSER_EXECUTABLE` as shown in the README.
-- Non-empty target refusal: choose an absent or empty directory. Ferrite will not overwrite existing files.
+- Existing target refusal: choose an absent path. Ferrite will not replace an existing file, directory, or symbolic link.
 
 ## Unproven release surfaces
 

@@ -207,6 +207,7 @@ dependencies = [
  "ferrite-dev-server",
  "ferrite-router",
  "ferrite-ssr",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

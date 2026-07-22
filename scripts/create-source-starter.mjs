@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { argv, exit, platform } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -48,7 +48,9 @@ async function inspectTarget(target) {
   const parentInfo = await lstat(parent);
   if (!parentInfo.isDirectory()) throw new Error(`starter target parent is not a directory: ${parent}`);
   const targetPath = join(parent, targetName);
-  return { path: targetPath, state: await readTargetState(targetPath) };
+  const state = await readTargetState(targetPath);
+  if (state.exists) throw new Error(`refusing to initialize existing directory; choose an absent target: ${targetPath}`);
+  return { path: targetPath };
 }
 
 export async function validateSourceStarterTarget(target) {
@@ -131,7 +133,7 @@ export async function createSourceStarter({ target, packages, cliSource, runComm
     }
     await runCommand("npm", ["install", "--ignore-scripts", "--no-audit", "--fund=false"], { cwd: stagingPath });
     await runCommand("npm", ["run", "check"], { cwd: stagingPath });
-    await publishStagedStarter({ stagingPath, targetPath, initialState: targetDescriptor.state });
+    await publishStagedStarter({ stagingPath, targetPath, cliPath, runCommand });
     return { target: targetPath, sourceDir: join(targetPath, ".ferrite-source") };
   } catch (error) {
     try {
@@ -143,32 +145,12 @@ export async function createSourceStarter({ target, packages, cliSource, runComm
   }
 }
 
-async function publishStagedStarter({ stagingPath, targetPath, initialState }) {
+async function publishStagedStarter({ stagingPath, targetPath, cliPath, runCommand }) {
   const currentState = await readTargetState(targetPath);
-  if (initialState.exists) {
-    if (!currentState.exists || currentState.device !== initialState.device || currentState.inode !== initialState.inode) {
-      throw new Error(`starter target changed during creation: ${targetPath}`);
-    }
-  } else if (currentState.exists) {
+  if (currentState.exists) {
     throw new Error(`starter target appeared during creation: ${targetPath}`);
   }
-
-  let removedExistingTarget = false;
-  if (initialState.exists) {
-    await rmdir(targetPath);
-    removedExistingTarget = true;
-  }
-
-  try {
-    await rename(stagingPath, targetPath);
-  } catch (error) {
-    if (removedExistingTarget) {
-      await mkdir(targetPath).catch((restoreError) => {
-        if (restoreError.code !== "EEXIST") throw restoreError;
-      });
-    }
-    throw error;
-  }
+  await runCommand(cliPath, ["internal-publish-dir", stagingPath, targetPath], { cwd: dirname(cliPath) });
 }
 
 async function cleanupOwnedStaging(stagingPath, expectedInfo) {
