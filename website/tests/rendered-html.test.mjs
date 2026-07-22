@@ -11,10 +11,6 @@ const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
 let renderSequence = 0;
 const execFileAsync = promisify(execFile);
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 async function render(headers = { accept: "text/html" }, pathname = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${renderSequence++}`);
@@ -197,7 +193,10 @@ test("embeds an explicitly configured public origin in the real site build", asy
     assert.equal(response.status, 200);
     const html = await response.text();
     const canonical = new URL(pathname, `${configuredOrigin}/`).toString();
-    assert.match(html, new RegExp(`<link rel="canonical" href="${escapeRegExp(canonical)}"\\s*\\/?>`));
+    const canonicalUrls = [...html.matchAll(/<link rel="canonical" href="([^"]+)"\s*\/?>/g)].map(
+      (match) => match[1],
+    );
+    assert.deepEqual(canonicalUrls, [canonical]);
     assert.match(html, /https:\/\/configured-preview\.example\.test\/og\.png/);
     assert.match(html, /https:\/\/configured-preview\.example\.test\/favicon\.svg/);
     assert.doesNotMatch(html, /http:\/\/localhost:3000\/favicon\.svg/);
