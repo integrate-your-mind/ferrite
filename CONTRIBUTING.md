@@ -36,7 +36,7 @@ To validate the contributor-facing source starter without using unpublished regi
 pnpm starter:create -- ../ferrite-starter-check
 ```
 
-The target must be absent or empty. Remove the generated external fixture when the review is complete.
+The target's parent must exist, and the target itself must be absent or an empty, non-symbolic-link directory. Remove the generated external fixture when the review is complete.
 
 ## Required checks
 

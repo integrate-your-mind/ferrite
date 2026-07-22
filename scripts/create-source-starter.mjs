@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmod, cp, mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { argv, exit, platform } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -25,17 +25,34 @@ function run(command, args, options = {}) {
   });
 }
 
-async function assertEmptyTarget(target) {
-  let existing = false;
+async function readTargetState(target) {
   try {
-    const info = await stat(target);
-    existing = true;
+    const info = await lstat(target);
+    if (info.isSymbolicLink()) throw new Error(`refusing symbolic-link starter target: ${target}`);
     if (!info.isDirectory()) throw new Error(`starter target is not a directory: ${target}`);
     if ((await readdir(target)).length > 0) throw new Error(`refusing to initialize non-empty directory: ${target}`);
+    return { exists: true, device: info.dev, inode: info.ino };
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
+    return { exists: false };
   }
-  return existing;
+}
+
+async function inspectTarget(target) {
+  const requestedPath = resolve(target);
+  const targetName = basename(requestedPath);
+  if (!targetName) throw new Error(`starter target must name a directory below an existing parent: ${target}`);
+  const parent = await realpath(dirname(requestedPath)).catch((error) => {
+    throw new Error(`starter target parent must already exist: ${dirname(requestedPath)} (${error.message})`);
+  });
+  const parentInfo = await lstat(parent);
+  if (!parentInfo.isDirectory()) throw new Error(`starter target parent is not a directory: ${parent}`);
+  const targetPath = join(parent, targetName);
+  return { path: targetPath, state: await readTargetState(targetPath) };
+}
+
+export async function validateSourceStarterTarget(target) {
+  return (await inspectTarget(target)).path;
 }
 
 function validatePackages(packages) {
@@ -74,7 +91,6 @@ async function rewriteManifest(target, packages) {
 
 export async function createSourceStarter({ target, packages, cliSource, runCommand = run }) {
   if (!target || !cliSource) throw new Error("target and cliSource are required");
-  const targetPath = resolve(target);
   const cliPath = resolve(cliSource);
   const packageMap = validatePackages(packages);
   const cliInfo = await stat(cliPath);
@@ -83,11 +99,14 @@ export async function createSourceStarter({ target, packages, cliSource, runComm
     const tarballInfo = await stat(resolve(descriptor.tarballPath));
     if (!tarballInfo.isFile()) throw new Error(`package tarball is not a file: ${descriptor.tarballPath}`);
   }
-  const targetExisted = await assertEmptyTarget(targetPath);
-  const created = !targetExisted;
+  const targetDescriptor = await inspectTarget(target);
+  const targetPath = targetDescriptor.path;
+  const stagingPath = await mkdtemp(join(dirname(targetPath), `.${basename(targetPath)}.ferrite-starter-`));
+  await chmod(stagingPath, 0o700);
+  const stagingInfo = await lstat(stagingPath);
   try {
-    await runCommand(cliPath, ["init", targetPath], { cwd: dirname(cliPath) });
-    const sourceDir = join(targetPath, ".ferrite-source");
+    await runCommand(cliPath, ["init", stagingPath], { cwd: dirname(cliPath) });
+    const sourceDir = join(stagingPath, ".ferrite-source");
     const packageDir = join(sourceDir, "packages");
     const binDir = join(sourceDir, "bin");
     await mkdir(packageDir, { recursive: true });
@@ -104,18 +123,19 @@ export async function createSourceStarter({ target, packages, cliSource, runComm
       join(sourceDir, "run-ferrite.mjs"),
       `import { spawnSync } from "node:child_process";\nimport { join } from "node:path";\nimport { fileURLToPath } from "node:url";\n\nconst bin = process.platform === "win32" ? "ferrite.exe" : "ferrite";\nconst result = spawnSync(join(fileURLToPath(new URL(".", import.meta.url)), "bin", bin), process.argv.slice(2), { stdio: "inherit" });\nif (result.error) throw result.error;\nprocess.exit(result.status ?? 1);\n`,
     );
-    await rewriteManifest(targetPath, packageMap);
-    const gitignorePath = join(targetPath, ".gitignore");
+    await rewriteManifest(stagingPath, packageMap);
+    const gitignorePath = join(stagingPath, ".gitignore");
     const gitignore = await readFile(gitignorePath, "utf8").catch(() => "");
     if (!gitignore.split(/\r?\n/).includes(".ferrite-source/")) {
       await writeFile(gitignorePath, `${gitignore}${gitignore.endsWith("\n") || !gitignore ? "" : "\n"}.ferrite-source/\n`);
     }
-    await runCommand("npm", ["install", "--ignore-scripts", "--no-audit", "--fund=false"], { cwd: targetPath });
-    await runCommand("npm", ["run", "check"], { cwd: targetPath });
-    return { target: targetPath, sourceDir };
+    await runCommand("npm", ["install", "--ignore-scripts", "--no-audit", "--fund=false"], { cwd: stagingPath });
+    await runCommand("npm", ["run", "check"], { cwd: stagingPath });
+    await publishStagedStarter({ stagingPath, targetPath, initialState: targetDescriptor.state });
+    return { target: targetPath, sourceDir: join(targetPath, ".ferrite-source") };
   } catch (error) {
     try {
-      await cleanupFailedStarter(targetPath, { removeTarget: created });
+      await cleanupOwnedStaging(stagingPath, stagingInfo);
     } catch (cleanupError) {
       throw new AggregateError([error, cleanupError], "source starter failed and cleanup was incomplete");
     }
@@ -123,29 +143,57 @@ export async function createSourceStarter({ target, packages, cliSource, runComm
   }
 }
 
-async function cleanupFailedStarter(target, { removeTarget }) {
-  for (const entry of [".ferrite-source", ".ferrite", "node_modules"]) {
-    await rm(join(target, entry), { recursive: true, force: true });
+async function publishStagedStarter({ stagingPath, targetPath, initialState }) {
+  const currentState = await readTargetState(targetPath);
+  if (initialState.exists) {
+    if (!currentState.exists || currentState.device !== initialState.device || currentState.inode !== initialState.inode) {
+      throw new Error(`starter target changed during creation: ${targetPath}`);
+    }
+  } else if (currentState.exists) {
+    throw new Error(`starter target appeared during creation: ${targetPath}`);
   }
-  for (const entry of ["package-lock.json", "package.json", "tsconfig.json", ".gitignore"]) {
-    await rm(join(target, entry), { force: true });
+
+  let removedExistingTarget = false;
+  if (initialState.exists) {
+    await rmdir(targetPath);
+    removedExistingTarget = true;
   }
-  await rm(join(target, "app", "page.tsx"), { force: true });
-  await rmdir(join(target, "app")).catch((error) => {
-    if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error;
-  });
-  if (removeTarget) {
-    await rmdir(target).catch((error) => {
-      if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error;
-    });
+
+  try {
+    await rename(stagingPath, targetPath);
+  } catch (error) {
+    if (removedExistingTarget) {
+      await mkdir(targetPath).catch((restoreError) => {
+        if (restoreError.code !== "EEXIST") throw restoreError;
+      });
+    }
+    throw error;
   }
+}
+
+async function cleanupOwnedStaging(stagingPath, expectedInfo) {
+  let currentInfo;
+  try {
+    currentInfo = await lstat(stagingPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  if (
+    currentInfo.isSymbolicLink() ||
+    !currentInfo.isDirectory() ||
+    currentInfo.dev !== expectedInfo.dev ||
+    currentInfo.ino !== expectedInfo.ino
+  ) {
+    throw new Error(`refusing to clean replaced starter staging directory: ${stagingPath}`);
+  }
+  await rm(stagingPath, { recursive: true, force: false });
 }
 
 async function main() {
   const target = parseStarterArgs(argv.slice(2));
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  const targetPath = resolve(target);
-  await assertEmptyTarget(targetPath);
+  const targetPath = await validateSourceStarterTarget(target);
   const { verifyNpmPackages } = await import("./verify-npm-packages.mjs");
   let starter;
   await verifyNpmPackages({

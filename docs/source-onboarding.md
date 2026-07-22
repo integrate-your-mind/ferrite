@@ -29,7 +29,7 @@ These commands build the Rust workspace, TypeScript protocol/runtime packages, p
 
 ## Create an application
 
-Choose a target outside the Ferrite checkout. It must be absent or empty.
+Choose a target outside the Ferrite checkout. Its parent must already exist, and the target must be absent or an empty, non-symbolic-link directory.
 
 ```sh
 pnpm starter:create -- ../my-ferrite-app
@@ -41,13 +41,14 @@ The starter command performs one fail-closed transaction:
 
 1. validates the target and source-built CLI before changing the target;
 2. builds release-shaped npm candidates with no `private` or `workspace:*` fields;
-3. initializes the TypeScript application;
+3. initializes the TypeScript application in a private sibling staging directory;
 4. copies only `@ferrite/protocol`, `@ferrite/runtime`, and the CLI into `.ferrite-source/`;
 5. rewrites dependencies to durable target-local `file:` tarball paths;
 6. installs with lifecycle scripts disabled; and
-7. runs the real Ferrite/TypeScript check.
+7. runs the real Ferrite/TypeScript check; and
+8. revalidates the target's identity and emptiness before publishing the complete staged directory.
 
-`.ferrite-source/`, `.ferrite/`, and `node_modules/` are ignored. If creation fails, a newly created target is removed; an existing empty target is restored to empty. A non-empty target is never modified.
+`.ferrite-source/`, `.ferrite/`, and `node_modules/` are ignored. Before publication, failures remove only the private staging directory and do not clean the user target. A target that appears, becomes non-empty, changes identity, or becomes a symbolic link during creation causes publication to fail without deleting its contents.
 
 ## Normal workflow
 

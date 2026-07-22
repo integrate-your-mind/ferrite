@@ -53,7 +53,10 @@ test("clean developer workflow rejects a missing artifact before building and th
 
     assert.deepEqual(calls.map((call) => call.args[0]), ["init", "install", "run", "serve", "build", "serve"]);
     assert.equal(calls[0].cwd, root);
-    assert.ok(calls.slice(1).every((call) => call.cwd === join(root, "starter")));
+    assert.match(calls[0].args[1], /\.starter\.ferrite-starter-/);
+    assert.equal(calls[1].cwd, calls[0].args[1]);
+    assert.equal(calls[2].cwd, calls[0].args[1]);
+    assert.ok(calls.slice(3).every((call) => call.cwd === join(root, "starter")));
     assert.ok(calls[4].args.includes(join(root, "starter", "node_modules", "@ferrite", "runtime", "bin", "render-page.mjs")));
   } finally {
     await rm(root, { force: true, recursive: true });

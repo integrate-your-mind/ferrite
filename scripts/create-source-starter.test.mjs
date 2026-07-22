@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -65,6 +65,7 @@ test("fails before mutation when required tarball is missing", async (t) => {
     /missing required tarball/,
   );
   await assert.rejects(() => stat(target), { code: "ENOENT" });
+  assert.deepEqual((await readdir(f.root)).filter((entry) => entry.startsWith(".app.ferrite-starter-")), []);
 });
 test("refuses non-empty target without changing it", async (t) => {
   const f = await fixture(t);
@@ -76,6 +77,20 @@ test("refuses non-empty target without changing it", async (t) => {
     /non-empty/,
   );
   assert.equal(await readFile(join(target, "keep"), "utf8"), "yes");
+});
+
+test("refuses an initial symlink target without mutating its victim", async (t) => {
+  const f = await fixture(t);
+  const victim = join(f.root, "victim");
+  const target = join(f.root, "app");
+  await mkdir(victim);
+  await symlink(victim, target, "dir");
+
+  await assert.rejects(
+    () => createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand: commandMock() }),
+  );
+  assert.deepEqual(await readdir(victim), []);
+  assert.equal((await lstat(target)).isSymbolicLink(), true);
 });
 test("cleans a newly created target after install failure", async (t) => {
   const f = await fixture(t);
@@ -99,11 +114,11 @@ test("restores an existing empty target after install failure", async (t) => {
   assert.deepEqual(await readdir(target), []);
 });
 
-test("does not delete an unexpected file created during a failed setup", async (t) => {
+test("cleans unexpected files created inside private staging after failed setup", async (t) => {
   const f = await fixture(t);
   const target = join(f.root, "app");
   const runCommand = async (command, args, options) => {
-    if (command === "npm" && args[0] === "install") {
+    if (command === "npm" && args[0] === "run" && args[1] === "check") {
       await writeFile(join(options.cwd, "external.txt"), "preserve me");
       throw new Error("injected install failure");
     }
@@ -114,5 +129,83 @@ test("does not delete an unexpected file created during a failed setup", async (
     () => createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand }),
     /injected install failure/,
   );
-  assert.equal(await readFile(join(target, "external.txt"), "utf8"), "preserve me");
+  await assert.rejects(() => stat(target), { code: "ENOENT" });
+  assert.deepEqual((await readdir(f.root)).filter((entry) => entry.startsWith(".app.ferrite-starter-")), []);
+});
+
+test("preserves a target/package.json created concurrently during failing init", async (t) => {
+  const f = await fixture(t);
+  const target = join(f.root, "app");
+  const runCommand = async (command, args) => {
+    if (command.endsWith("ferrite") && args[0] === "init") {
+      await mkdir(target);
+      await writeFile(join(target, "package.json"), '{"created":"concurrently"}\n');
+      throw new Error("injected init failure");
+    }
+    return commandMock()(command, args);
+  };
+
+  await assert.rejects(
+    () => createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand }),
+    /injected init failure/,
+  );
+  assert.equal(await readFile(join(target, "package.json"), "utf8"), '{"created":"concurrently"}\n');
+});
+
+test("does not delete a victim when an accepted target is swapped to a symlink during failure", async (t) => {
+  const f = await fixture(t);
+  const victim = join(f.root, "victim");
+  const target = join(f.root, "app");
+  await mkdir(victim);
+  await writeFile(join(victim, "keep"), "safe");
+  await mkdir(target);
+  const runCommand = async (command, args) => {
+    if (command.endsWith("ferrite") && args[0] === "init") {
+      await rm(target, { recursive: true, force: true });
+      await symlink(victim, target, "dir");
+      throw new Error("injected init failure");
+    }
+    return commandMock()(command, args);
+  };
+
+  await assert.rejects(
+    () => createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand }),
+    /injected init failure/,
+  );
+  assert.equal(await readFile(join(victim, "keep"), "utf8"), "safe");
+  assert.equal((await lstat(target)).isSymbolicLink(), true);
+});
+
+test("publishes into an absent target", async (t) => {
+  const f = await fixture(t);
+  const target = join(f.root, "app");
+  await createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand: commandMock() });
+  assert.equal((await stat(target)).isDirectory(), true);
+  assert.equal((await stat(join(target, "package.json"))).isFile(), true);
+});
+
+test("publishes into an existing empty target", async (t) => {
+  const f = await fixture(t);
+  const target = join(f.root, "app");
+  await mkdir(target);
+  await createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand: commandMock() });
+  assert.equal((await stat(join(target, "package.json"))).isFile(), true);
+});
+
+test("fails final publish when target becomes non-empty and preserves the concurrent file", async (t) => {
+  const f = await fixture(t);
+  const target = join(f.root, "app");
+  const runCommand = async (command, args) => {
+    if (command === "npm" && args[0] === "install") {
+      await mkdir(target, { recursive: true });
+      await writeFile(join(target, "concurrent.txt"), "preserve before publish");
+    }
+    return commandMock()(command, args);
+  };
+
+  await assert.rejects(
+    () => createSourceStarter({ target, packages: f.packages, cliSource: f.cli, runCommand }),
+    /non-empty|concurrent|target/i,
+  );
+  assert.equal(await readFile(join(target, "concurrent.txt"), "utf8"), "preserve before publish");
 });
