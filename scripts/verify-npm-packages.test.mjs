@@ -77,12 +77,32 @@ test("clean developer workflow rejects a missing artifact before building and th
 test("clean developer workflow rejects an unrelated initial serve failure", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-clean-workflow-wrong-failure-"));
   const cliSource = join(root, "source-ferrite");
+  const protocolTarball = join(root, "protocol.tgz");
+  const runtimeTarball = join(root, "runtime.tgz");
   try {
     await writeFile(cliSource, "candidate cli");
+    await writeFile(protocolTarball, "protocol candidate");
+    await writeFile(runtimeTarball, "runtime candidate");
     await assert.rejects(
       verifyCleanDeveloperWorkflow(root, {
         cliSource,
-        runCommand: async (_command, args) => {
+        packages: [
+          { name: "@ferrite/protocol", tarballPath: protocolTarball },
+          { name: "@ferrite/runtime", tarballPath: runtimeTarball },
+        ],
+        runCommand: async (command, args) => {
+          if (command === cliSource && args[0] === "init") {
+            await mkdir(args[1], { recursive: true });
+            await writeFile(
+              join(args[1], "package.json"),
+              `${JSON.stringify({
+                private: true,
+                scripts: { check: "ferrite check", build: "ferrite build" },
+                dependencies: { "@ferrite/runtime": "0.1.0" },
+              })}\n`,
+            );
+            await writeFile(join(args[1], ".gitignore"), "node_modules/\n");
+          }
           if (args[0] === "serve") {
             throw new Error(
               "artifact directory /tmp/starter/.ferrite/build is unavailable: Permission denied (os error 13)",
