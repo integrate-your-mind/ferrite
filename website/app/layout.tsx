@@ -57,6 +57,9 @@ export function generateMetadata(): Metadata {
     metadataBase,
     title,
     description,
+    alternates: {
+      canonical: "/",
+    },
     icons: {
       icon: "/favicon.svg",
       shortcut: "/favicon.svg",

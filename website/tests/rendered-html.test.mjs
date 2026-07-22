@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const templateRoot = new URL("../", import.meta.url);
 const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
 let renderSequence = 0;
+const execFileAsync = promisify(execFile);
 
 async function render(headers = { accept: "text/html" }) {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -174,4 +178,21 @@ test("every on-page navigation link has a matching section", async () => {
   for (const id of anchors) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
+});
+
+test("embeds an explicitly configured public origin in the real site build", async () => {
+  const configuredOrigin = "https://configured-preview.example.test";
+  await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
+    cwd: fileURLToPath(templateRoot),
+    env: { ...process.env, FERRITE_SITE_ORIGIN: configuredOrigin },
+    maxBuffer: 10 * 1024 * 1024,
+  });
+
+  const response = await render();
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /<link rel="canonical" href="https:\/\/configured-preview\.example\.test\/"\s*\/?>/);
+  assert.match(html, /https:\/\/configured-preview\.example\.test\/og\.png/);
+  assert.match(html, /https:\/\/configured-preview\.example\.test\/favicon\.svg/);
+  assert.doesNotMatch(html, /http:\/\/localhost:3000\/favicon\.svg/);
 });

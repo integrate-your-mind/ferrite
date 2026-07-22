@@ -18,10 +18,11 @@ through ChatGPT Sites; it is not a public Ferrite demo or production
 deployment.
 
 Set `FERRITE_SITE_ORIGIN` to the site's verified public HTTP or HTTPS origin
-when deploying. It is not a secret. The value must contain only the origin,
-without credentials, a path, query, or fragment. When it is unset, canonical
-and social metadata use `http://localhost:3000`; request `Host` and proxy
-headers are deliberately ignored.
+when building or starting a deployment. It is not a secret. The value is
+captured by the vinext build and must contain only the origin, without
+credentials, a path, query, or fragment. Rebuild after changing it. When it is
+unset, canonical and social metadata use `http://localhost:3000`; request
+`Host` and proxy headers are deliberately ignored.
 
 ## Validate
 
