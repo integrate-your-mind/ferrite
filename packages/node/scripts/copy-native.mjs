@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { copyFile, mkdir, rm, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { copyFile, mkdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { platform } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -15,8 +16,10 @@ export async function copyNativeBinding({
   platformName = platform,
   copyFileImpl = copyFile,
   mkdirImpl = mkdir,
+  renameImpl = rename,
   removeImpl = rm,
   signDarwinImpl = signDarwinNativeBinding,
+  stagingPathFactory = (path) => `${path}.${process.pid}.${randomUUID()}.staged`,
   statImpl = stat,
   logger = console,
 } = {}) {
@@ -27,18 +30,30 @@ export async function copyNativeBinding({
   });
 
   await mkdirImpl(dirname(destination), { recursive: true });
-  await copyFileImpl(source, destination);
 
   if (platformName === "darwin") {
+    const staging = stagingPathFactory(destination);
     try {
-      await signDarwinImpl(destination);
+      await copyFileImpl(source, staging);
+      await signDarwinImpl(staging);
+      await renameImpl(staging, destination);
     } catch (error) {
-      await removeImpl(destination, { force: true }).catch(() => {});
+      let cleanupError;
+      try {
+        await removeImpl(staging, { force: true });
+      } catch (cleanupFailure) {
+        cleanupError = cleanupFailure;
+      }
+      const cleanupMessage = cleanupError
+        ? ` Cleanup of ${staging} also failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}.`
+        : "";
       throw new Error(
-        `Ferrite could not ad-hoc sign the copied macOS native binding at ${destination}: ${error instanceof Error ? error.message : String(error)}`,
+        `Ferrite could not stage and ad-hoc sign the copied macOS native binding for ${destination}: ${error instanceof Error ? error.message : String(error)}.${cleanupMessage}`,
         { cause: error },
       );
     }
+  } else {
+    await copyFileImpl(source, destination);
   }
 
   logger.log(`Ferrite native binding copied to ${destination}`);
