@@ -6,10 +6,12 @@
   },
   "type": "module",
   "dependencies": {
-    "@ferrite/runtime": "workspace:*"
+    "@ferrite/runtime": "workspace:*",
+    "three": "^0.179.1"
   },
   "devDependencies": {
     "@types/node": "26.0.1",
+    "@types/three": "0.179.0",
     "typescript": "6.0.3"
   },
   "scripts": {

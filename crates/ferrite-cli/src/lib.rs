@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -11,10 +13,12 @@ use ferrite_builder::{BuildConfig, BuildReport};
 use ferrite_dev_server::{
     DevProject, DevResponse, DevServerConfig, ProductionActionEvent, ProductionActionOutcome,
     ProductionProject, ProductionRequestEvent, ProductionServerConfig,
-    ProductionTrustedProxyConfig,
+    ProductionShutdownController, ProductionTrustedProxyConfig,
 };
 use ferrite_router::{Route, scan_app_dir, write_route_types};
 use serde::Serialize;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::flag;
 
 #[derive(Debug, Parser)]
 #[command(name = "ferrite")]
@@ -231,7 +235,7 @@ struct ServeArgs {
     #[arg(
         long,
         default_value_t = 5_000,
-        help = "Maximum milliseconds to wait while reading each production HTTP request"
+        help = "Maximum total milliseconds allowed to read each production HTTP request"
     )]
     request_read_timeout_ms: u64,
 
@@ -712,7 +716,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         production_limits.max_in_flight_requests
                     );
                 }
-                ferrite_dev_server::serve_production(addr, production_project)?;
+                serve_production_until_signal(addr, production_project)?;
             }
         }
         Commands::Build(args) => {
@@ -722,6 +726,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             let types_out = resolve_project_path(&project, &args.types_out);
             let page_renderer = normalize_current_path(&args.page_renderer)?;
             let client_bundler = normalize_current_path(&args.client_bundler)?;
+            let _signal_guard = BuildSignalGuard::register()?;
             let report = ferrite_builder::build_project(&BuildConfig::new(
                 project,
                 app_dir,
@@ -810,6 +815,72 @@ fn rename_directory_no_replace(_source: &Path, _target: &Path) -> std::io::Resul
         std::io::ErrorKind::Unsupported,
         "exclusive starter publication is unavailable on this platform",
     ))
+}
+
+struct BuildSignalGuard {
+    cancellation_flag: Arc<AtomicBool>,
+    registrations: Vec<signal_hook::SigId>,
+}
+
+impl BuildSignalGuard {
+    fn register() -> Result<Self> {
+        let cancellation_flag = ferrite_builder::build_cancellation_flag();
+        cancellation_flag.store(false, Ordering::Release);
+        let mut registrations = Vec::new();
+        let registration_result = (|| -> std::io::Result<()> {
+            registrations.push(flag::register_conditional_shutdown(
+                SIGINT,
+                130,
+                Arc::clone(&cancellation_flag),
+            )?);
+            registrations.push(flag::register(SIGINT, Arc::clone(&cancellation_flag))?);
+            registrations.push(flag::register_conditional_shutdown(
+                SIGTERM,
+                143,
+                Arc::clone(&cancellation_flag),
+            )?);
+            registrations.push(flag::register(SIGTERM, Arc::clone(&cancellation_flag))?);
+            Ok(())
+        })();
+        if let Err(error) = registration_result {
+            for registration in registrations {
+                signal_hook::low_level::unregister(registration);
+            }
+            cancellation_flag.store(false, Ordering::Release);
+            return Err(error.into());
+        }
+        Ok(Self {
+            cancellation_flag,
+            registrations,
+        })
+    }
+}
+
+impl Drop for BuildSignalGuard {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+        self.cancellation_flag.store(false, Ordering::Release);
+    }
+}
+
+fn serve_production_until_signal(addr: String, project: ProductionProject) -> Result<()> {
+    let (controller, shutdown) = ProductionShutdownController::new_pair();
+    let shutdown_flag = controller.shutdown_flag();
+    let sigint = flag::register(SIGINT, Arc::clone(&shutdown_flag))?;
+    let sigterm = match flag::register(SIGTERM, shutdown_flag) {
+        Ok(sigterm) => sigterm,
+        Err(error) => {
+            signal_hook::low_level::unregister(sigint);
+            return Err(error.into());
+        }
+    };
+
+    let result = ferrite_dev_server::serve_production_with_shutdown(addr, project, shutdown);
+    signal_hook::low_level::unregister(sigint);
+    signal_hook::low_level::unregister(sigterm);
+    result.map_err(CliError::from)
 }
 
 fn initialize_project(project: &Path) -> Result<PathBuf> {

@@ -5,3 +5,16 @@
   background-position: right 1rem top 1rem;
 }
 
+.home-demos-list {
+  padding-left: 1rem;
+  margin-top: 0.45rem;
+}
+
+.home-demos-list a {
+  color: #0f172a;
+  text-decoration: underline;
+}
+
+.home-demo-intro {
+  margin-top: 1rem;
+}

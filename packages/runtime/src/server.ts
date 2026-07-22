@@ -175,6 +175,24 @@ export type ServerActionInvokeOptions = {
   routePattern?: string;
 };
 
+export class FerriteActionError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(code)) {
+      throw new TypeError(
+        "FerriteActionError code must be 1-64 uppercase ASCII letters, digits, or underscores and start with a letter.",
+      );
+    }
+    if (message.length === 0) {
+      throw new TypeError("FerriteActionError message must be non-empty.");
+    }
+    super(message);
+    this.name = "FerriteActionError";
+    this.code = code;
+  }
+}
+
 export type ServerActionManifest = {
   routePath: string;
   routePattern?: string;
@@ -363,9 +381,13 @@ export async function invokeServerActionFromPageModule(
           data: result === undefined ? null : serializeClientReferenceValue(result, "server action result"),
         });
       } catch (error) {
-        return createServerActionErrorResponse({
-          message: error instanceof Error ? error.message : String(error),
-        });
+        if (error instanceof FerriteActionError) {
+          return createServerActionErrorResponse({
+            code: error.code,
+            message: error.message,
+          });
+        }
+        throw error;
       }
     },
   );
@@ -868,25 +890,27 @@ function renderServerChildMaybe(
     throw new TypeError("Cannot serialize unsupported Ferrite element type.");
   }
 
-  if (child.type === "form" && isServerActionReference(child.props.action)) {
+  const tag = child.type.toLowerCase();
+
+  if (tag === "form" && isServerActionReference(child.props.action)) {
     return renderServerActionFormMaybe(child.props, context);
   }
 
-  assertNoServerActionProps(child.type, child.props);
+  assertNoServerActionProps(tag, child.props);
   const children = renderServerChildrenMaybe(child.props.children, context);
   if (isPromiseLike(children)) {
     return children.then((resolvedChildren) => ({
       kind: "element",
-      tag: child.type as string,
-      props: serializeServerProps(child.props),
+      tag,
+      props: serializeServerProps(tag, child.props),
       children: resolvedChildren,
     }));
   }
 
   return {
     kind: "element",
-    tag: child.type,
-    props: serializeServerProps(child.props),
+    tag,
+    props: serializeServerProps(tag, child.props),
     children,
   };
 }
@@ -1109,7 +1133,7 @@ function createHiddenServerActionInput(name: string, value: string): Serializabl
 
 function serializeServerActionFormProps(props: Record<string, unknown>): Record<string, string | number | boolean> {
   const { action: _action, children: _children, key: _key, method: _method, ...rest } = props;
-  return serializeServerProps({
+  return serializeServerProps("form", {
     ...rest,
     action: SERVER_ACTION_URL,
     method: "post",
@@ -1147,7 +1171,7 @@ function assertNoReservedServerActionFields(nodes: SerializableNode[]): void {
     }
 
     if (
-      node.tag === "input" &&
+      node.tag.toLowerCase() === "input" &&
       typeof node.props.name === "string" &&
       RESERVED_SERVER_ACTION_FIELDS.has(node.props.name)
     ) {
@@ -1166,11 +1190,18 @@ function isServerActionReference(value: unknown): value is ServerActionReference
   );
 }
 
-function serializeServerProps(props: Record<string, unknown>): Record<string, string | number | boolean> {
+function serializeServerProps(
+  tag: string,
+  props: Record<string, unknown>,
+): Record<string, string | number | boolean> {
   const serialized: Record<string, string | number | boolean> = {};
 
   for (const [key, value] of Object.entries(props)) {
     if (key === "children" || key === "key" || key.startsWith("on")) {
+      continue;
+    }
+
+    if (inputDefaultPropIsShadowed(tag, key, props)) {
       continue;
     }
 
@@ -1179,7 +1210,7 @@ function serializeServerProps(props: Record<string, unknown>): Record<string, st
     }
 
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      serialized[serializablePropName(key)] = value;
+      serialized[serializablePropName(tag, key)] = value;
       continue;
     }
 
@@ -1187,6 +1218,19 @@ function serializeServerProps(props: Record<string, unknown>): Record<string, st
   }
 
   return serialized;
+}
+
+function inputDefaultPropIsShadowed(tag: string, name: string, props: Record<string, unknown>): boolean {
+  if (tag.toLowerCase() !== "input") {
+    return false;
+  }
+  if (name === "defaultValue") {
+    return props.value !== null && props.value !== undefined;
+  }
+  if (name === "defaultChecked") {
+    return props.checked !== null && props.checked !== undefined;
+  }
+  return false;
 }
 
 function serializeClientReferenceProps(props: Record<string, unknown>): ClientReferenceSerializedProps {
@@ -1235,13 +1279,21 @@ function serializeClientReferenceValue(value: unknown, path: string): ClientRefe
   throw new TypeError(`Ferrite client reference ${path} must be JSON-serializable.`);
 }
 
-function serializablePropName(name: string): string {
+function serializablePropName(tag: string, name: string): string {
   if (name === "className") {
     return "class";
   }
 
   if (name === "htmlFor") {
     return "for";
+  }
+
+  if (tag.toLowerCase() === "input" && name === "defaultValue") {
+    return "value";
+  }
+
+  if (tag.toLowerCase() === "input" && name === "defaultChecked") {
+    return "checked";
   }
 
   return name;

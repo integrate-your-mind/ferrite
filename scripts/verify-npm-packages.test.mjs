@@ -45,7 +45,9 @@ test("clean developer workflow rejects a missing artifact before building and th
           await writeFile(join(args[1], ".gitignore"), "node_modules/\n");
         }
         if (args[0] === "serve" && calls.filter((call) => call.args[0] === "serve").length === 1) {
-          throw new Error("build artifact does not exist");
+          throw new Error(
+            "artifact directory /tmp/starter/.ferrite/build is unavailable: No such file or directory (os error 2)",
+          );
         }
         return args[0] === "serve" ? "<p>Rust-first application runtime.</p>" : "";
       },
@@ -67,6 +69,30 @@ test("clean developer workflow rejects a missing artifact before building and th
     assert.equal(calls[3].cwd, root);
     assert.ok(calls.slice(4).every((call) => call.cwd === join(root, "starter")));
     assert.ok(calls[5].args.includes(join(root, "starter", "node_modules", "@ferrite", "runtime", "bin", "render-page.mjs")));
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("clean developer workflow rejects an unrelated initial serve failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-clean-workflow-wrong-failure-"));
+  const cliSource = join(root, "source-ferrite");
+  try {
+    await writeFile(cliSource, "candidate cli");
+    await assert.rejects(
+      verifyCleanDeveloperWorkflow(root, {
+        cliSource,
+        runCommand: async (_command, args) => {
+          if (args[0] === "serve") {
+            throw new Error(
+              "artifact directory /tmp/starter/.ferrite/build is unavailable: Permission denied (os error 13)",
+            );
+          }
+          return "";
+        },
+      }),
+      /missing build artifact: unexpected failure: artifact directory[\s\S]*Permission denied \(os error 13\)/,
+    );
   } finally {
     await rm(root, { force: true, recursive: true });
   }
@@ -103,7 +129,9 @@ test("clean developer workflow fails when artifact serve does not render the fix
             await writeFile(join(args[1], ".gitignore"), "node_modules/\n");
           }
           if (args[0] === "serve" && serveCalls++ === 0) {
-            throw new Error("build artifact does not exist");
+            throw new Error(
+              "artifact directory C:\\starter\\.ferrite\\build is unavailable: The system cannot find the path specified. (os error 3)",
+            );
           }
           return args[0] === "serve" ? "wrong page" : "";
         },

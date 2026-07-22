@@ -875,7 +875,7 @@ test("fetchAndApplyServerPayload updates a mounted root from shell and chunks", 
   assert.equal(container.querySelector("main")?.getAttribute("data-route"), "/posts/alpha");
   assert.equal(container.querySelector("h1")?.textContent, "Post alpha");
   assert.equal(container.querySelector("strong")?.textContent, "Loaded chunk");
-  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "");
+  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "true");
   assert.equal(container.textContent, "Post alphaLoaded chunk");
 });
 
@@ -1355,7 +1355,7 @@ test("server action form bootstrap is idempotent for generated entrypoints", asy
   assert.deepEqual(submissions, ["submit"]);
 });
 
-test("server payload navigator streams shell before chunks and updates history after completion", async () => {
+test("server payload navigator commits history with the streamed shell", async () => {
   const { window, container } = createContainer("https://example.com/posts/old");
   window.document.head.innerHTML = "<title>Old title</title>";
   const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
@@ -1422,7 +1422,7 @@ test("server payload navigator streams shell before chunks and updates history a
   await flushScheduledWork();
 
   assert.deepEqual(requests, ["https://example.com/posts/stream?__ferrite_payload=stream"]);
-  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(window.location.href, "https://example.com/posts/stream");
   assert.equal(window.document.title, "Stream title");
   assert.equal(container.textContent, "Stream routeLoading chunk");
 
@@ -2315,6 +2315,77 @@ test("toRenderPacket emits compact text, fragment, and element nodes", () => {
     version: 1,
     root: [1, [[2, "h1", { class: "title" }, [[0, "Ferrite"]]], [0, " bridge"]]],
   });
+});
+
+test("form defaults serialize to effective HTML attributes", () => {
+  const packet = toRenderPacket(
+    createElement("input", {
+      name: "title",
+      type: "checkbox",
+      defaultValue: "Draft",
+      defaultChecked: true,
+    }),
+  );
+
+  assert.deepEqual(packet, {
+    ferrite: "render-packet",
+    version: 1,
+    root: [2, "input", { name: "title", type: "checkbox", value: "Draft", checked: true }, []],
+  });
+});
+
+test("controlled input props deterministically override default aliases", () => {
+  for (const props of [
+    { value: "Controlled", defaultValue: "Fallback", checked: false, defaultChecked: true },
+    { defaultValue: "Fallback", value: "Controlled", defaultChecked: true, checked: false },
+  ]) {
+    const packet = toRenderPacket(createElement("input", props));
+    assert.deepEqual(packet.root, [2, "input", { value: "Controlled" }, []]);
+
+    const { container } = createContainer();
+    const root = mount(createElement("input", props), container);
+    const input = container.querySelector("input");
+    assert.equal(input?.getAttribute("value"), "Controlled");
+    assert.equal(input?.hasAttribute("checked"), false);
+    root.unmount();
+
+    const { container: hydrationContainer } = createContainer();
+    hydrationContainer.innerHTML = '<input value="Controlled">';
+    const serverInput = hydrationContainer.querySelector("input");
+    const hydratedRoot = hydrate(createElement("input", props), hydrationContainer);
+    assert.equal(hydrationContainer.querySelector("input"), serverInput);
+    hydratedRoot.unmount();
+  }
+});
+
+test("nullish controlled input props fall back to default aliases", () => {
+  for (const props of [
+    { value: null, defaultValue: "Fallback", checked: undefined, defaultChecked: true },
+    { defaultValue: "Fallback", value: null, defaultChecked: true, checked: undefined },
+  ]) {
+    const packet = toRenderPacket(createElement("input", props));
+    assert.deepEqual(packet.root, [2, "input", { value: "Fallback", checked: true }, []]);
+
+    const { container } = createContainer();
+    container.innerHTML = '<input value="Fallback" checked>';
+    const serverInput = container.querySelector("input");
+    const root = hydrate(createElement("input", props), container);
+    assert.equal(container.querySelector("input"), serverInput);
+    root.unmount();
+  }
+});
+
+test("intrinsic input tags normalize before default prop serialization", () => {
+  const element = createElement("INPUT", { defaultValue: "Draft", defaultChecked: true });
+  const packet = toRenderPacket(element);
+  assert.deepEqual(packet.root, [2, "input", { value: "Draft", checked: true }, []]);
+
+  const { container } = createContainer();
+  const root = mount(element, container);
+  const input = container.querySelector("input");
+  assert.equal(input?.getAttribute("value"), "Draft");
+  assert.equal(input?.hasAttribute("checked"), true);
+  root.unmount();
 });
 
 test("toRenderPacket uses an empty fragment for empty output", () => {

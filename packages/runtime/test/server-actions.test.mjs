@@ -197,7 +197,7 @@ test("server render serializes server action forms to POST metadata", async () =
           tag: "input",
           props: {
             name: "title",
-            defaultValue: "Draft",
+            value: "Draft",
           },
           children: [],
         },
@@ -212,6 +212,44 @@ test("server render serializes server action forms to POST metadata", async () =
       ],
     },
   );
+});
+
+test("server render gives controlled input props precedence over defaults", async () => {
+  for (const props of [
+    { value: "Controlled", defaultValue: "Fallback", checked: false, defaultChecked: true },
+    { defaultValue: "Fallback", value: "Controlled", defaultChecked: true, checked: false },
+  ]) {
+    const rendered = await renderPageModule({
+      default() {
+        return createElement("input", props);
+      },
+    });
+    assert.deepEqual(rendered, {
+      kind: "element",
+      tag: "input",
+      props: { value: "Controlled" },
+      children: [],
+    });
+  }
+});
+
+test("server render uses input defaults when controlled props are nullish", async () => {
+  const rendered = await renderPageModule({
+    default() {
+      return createElement("INPUT", {
+        value: null,
+        defaultValue: "Fallback",
+        checked: undefined,
+        defaultChecked: true,
+      });
+    },
+  });
+  assert.deepEqual(rendered, {
+    kind: "element",
+    tag: "input",
+    props: { value: "Fallback", checked: true },
+    children: [],
+  });
 });
 
 test("server render serializes configured server action CSRF tokens", async () => {
@@ -328,6 +366,26 @@ test("server action forms reject conflicting methods and reserved hidden fields"
               "form",
               { action: savePost },
               createElement("input", { type: "hidden", name: "__ferrite_nonce", value: "fake" }),
+            );
+          },
+        },
+        {},
+        [],
+        {},
+        { routePath: "/posts/abc", routePattern: "/posts/[id]" },
+      ),
+    /reserved Ferrite server action field/,
+  );
+
+  await assert.rejects(
+    () =>
+      renderPageModule(
+        {
+          default() {
+            return createElement(
+              "FORM",
+              { action: savePost },
+              createElement("INPUT", { type: "hidden", name: "__ferrite_action", value: "other" }),
             );
           },
         },

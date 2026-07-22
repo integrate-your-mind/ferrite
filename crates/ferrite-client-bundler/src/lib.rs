@@ -3,14 +3,27 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(not(windows))]
+use std::process::Child;
+
+#[cfg(windows)]
+use process_wrap::std::{JobObject, StdChildWrapper, StdCommandWrap};
 
 const BUNDLE_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_BUNDLE_COMMAND_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BUNDLE_SNAPSHOT_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,7 +54,11 @@ pub enum ClientBundleError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Protocol(ferrite_protocol::ProtocolError),
+    InvalidModuleGraph { reason: String },
+    StaleInputSnapshot { path: String },
     NodeFailed { status: Option<i32>, stderr: String },
+    Cancelled,
+    OutputLimitExceeded { limit: usize },
     TimedOut { timeout: Duration },
 }
 
@@ -51,12 +68,25 @@ impl fmt::Display for ClientBundleError {
             ClientBundleError::Io(error) => write!(f, "{error}"),
             ClientBundleError::Json(error) => write!(f, "{error}"),
             ClientBundleError::Protocol(error) => write!(f, "{error}"),
+            ClientBundleError::InvalidModuleGraph { reason } => {
+                write!(f, "invalid client module graph: {reason}")
+            }
+            ClientBundleError::StaleInputSnapshot { path } => {
+                write!(
+                    f,
+                    "client bundle input changed before Rust acceptance: {path}"
+                )
+            }
             ClientBundleError::NodeFailed { status, stderr } => match status {
                 Some(status) => {
                     write!(f, "client bundler failed with exit code {status}: {stderr}")
                 }
                 None => write!(f, "client bundler was terminated: {stderr}"),
             },
+            ClientBundleError::Cancelled => write!(f, "client bundler was cancelled"),
+            ClientBundleError::OutputLimitExceeded { limit } => {
+                write!(f, "client bundler output exceeded {limit} bytes")
+            }
             ClientBundleError::TimedOut { timeout } => {
                 write!(
                     f,
@@ -95,6 +125,7 @@ pub struct ClientBundler {
     project: PathBuf,
     script: PathBuf,
     command_timeout: Option<Duration>,
+    cancellation_flag: Option<Arc<AtomicBool>>,
 }
 
 impl ClientBundler {
@@ -103,11 +134,17 @@ impl ClientBundler {
             project,
             script,
             command_timeout: None,
+            cancellation_flag: None,
         }
     }
 
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = Some(timeout.max(Duration::from_millis(1)));
+        self
+    }
+
+    pub fn with_cancellation_flag(mut self, cancellation_flag: Arc<AtomicBool>) -> Self {
+        self.cancellation_flag = Some(cancellation_flag);
         self
     }
 
@@ -132,49 +169,67 @@ impl ClientBundler {
     }
 
     pub fn bundle_route_request(&self, request: ClientBundleRequest<'_>) -> Result<ClientBundle> {
+        self.bundle_route_request_with_snapshot_files(request, &[])
+    }
+
+    pub fn bundle_route_request_with_snapshot_files(
+        &self,
+        request: ClientBundleRequest<'_>,
+        snapshot_files: &[PathBuf],
+    ) -> Result<ClientBundle> {
         let props = ClientProps {
             params: request.params.iter().cloned().collect(),
         };
         let props_json = serde_json::to_string(&props)?;
         let layouts_json = serde_json::to_string(request.layouts)?;
-        let options_json = serde_json::to_string(&request.options)?;
-        let mut command = Command::new("node");
-        command
-            .arg(&self.script)
-            .arg(request.page_file)
-            .arg(request.out_dir)
-            .arg(request.public_path)
-            .arg(request.route_path)
-            .arg(props_json)
-            .arg(layouts_json)
-            .arg(options_json)
-            .current_dir(&self.project);
-        let output = self.run_command(command)?;
-
-        if !output.status.success() {
-            return Err(ClientBundleError::NodeFailed {
-                status: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
+        let mut options = serde_json::to_value(request.options)?;
+        if !snapshot_files.is_empty() {
+            options["snapshotFiles"] = serde_json::to_value(snapshot_files)?;
         }
+        let options_json = serde_json::to_string(&options)?;
+        let mut stale_error = None;
+        for _attempt in 0..MAX_BUNDLE_SNAPSHOT_ATTEMPTS {
+            let mut command = Command::new("node");
+            command
+                .arg(&self.script)
+                .arg(request.page_file)
+                .arg(request.out_dir)
+                .arg(request.public_path)
+                .arg(request.route_path)
+                .arg(&props_json)
+                .arg(&layouts_json)
+                .arg(&options_json)
+                .current_dir(&self.project);
+            let output = self.run_command(command)?;
 
-        let bundle: ClientBundle = serde_json::from_slice(&output.stdout)?;
-        bundle.validate()?;
-        Ok(bundle)
-    }
+            if !output.status.success() {
+                return Err(ClientBundleError::NodeFailed {
+                    status: output.status.code(),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
 
-    fn run_command(&self, mut command: Command) -> Result<BundlerOutput> {
-        match self.command_timeout {
-            Some(timeout) => run_command_with_timeout(command, timeout),
-            None => {
-                let output = command.output()?;
-                Ok(BundlerOutput {
-                    status: output.status,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                })
+            let bundle: ClientBundle = serde_json::from_slice(&output.stdout)?;
+            bundle.validate()?;
+            match bundle.validate_input_snapshot(&self.project) {
+                Ok(()) => return Ok(bundle),
+                Err(error @ ClientBundleError::StaleInputSnapshot { .. }) => {
+                    stale_error = Some(error);
+                }
+                Err(error) => return Err(error),
             }
         }
+
+        Err(stale_error.expect("a stale attempt records its validation error"))
+    }
+
+    fn run_command(&self, command: Command) -> Result<BundlerOutput> {
+        run_command_with_limits(
+            command,
+            self.command_timeout,
+            MAX_BUNDLE_COMMAND_OUTPUT_BYTES,
+            self.cancellation_flag.as_deref(),
+        )
     }
 }
 
@@ -185,44 +240,183 @@ struct BundlerOutput {
     stderr: Vec<u8>,
 }
 
-fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<BundlerOutput> {
+fn run_command_with_limits(
+    mut command: Command,
+    timeout: Option<Duration>,
+    max_output_bytes: usize,
+    cancellation_flag: Option<&AtomicBool>,
+) -> Result<BundlerOutput> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let mut stdout = child.stdout.take().expect("bundler stdout was piped");
-    let mut stderr = child.stderr.take().expect("bundler stderr was piped");
-    let stdout_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stderr.read_to_end(&mut output).map(|_| output)
-    });
+    let mut child = OwnedChild::spawn(command)?;
+    let stdout = child.take_stdout().expect("bundler stdout was piped");
+    let stderr = child.take_stderr().expect("bundler stderr was piped");
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_capped_reader(stdout, max_output_bytes, Arc::clone(&output_exceeded));
+    let stderr_reader = spawn_capped_reader(stderr, max_output_bytes, Arc::clone(&output_exceeded));
     let started = Instant::now();
 
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(BundlerOutput {
-                status,
-                stdout: stdout_reader
-                    .join()
-                    .expect("bundler stdout reader panicked")?,
-                stderr: stderr_reader
-                    .join()
-                    .expect("bundler stderr reader panicked")?,
+        if cancellation_flag.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            terminate_process_tree(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ClientBundleError::Cancelled);
+        }
+
+        if output_exceeded.load(Ordering::Acquire) {
+            terminate_process_tree(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ClientBundleError::OutputLimitExceeded {
+                limit: max_output_bytes,
             });
         }
 
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(status) = child.try_wait()? {
+            terminate_process_tree(&mut child);
+            let stdout = stdout_reader
+                .join()
+                .expect("bundler stdout reader panicked")?;
+            let stderr = stderr_reader
+                .join()
+                .expect("bundler stderr reader panicked")?;
+            if output_exceeded.load(Ordering::Acquire) {
+                return Err(ClientBundleError::OutputLimitExceeded {
+                    limit: max_output_bytes,
+                });
+            }
+            return Ok(BundlerOutput {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            let timeout = timeout.expect("timeout was checked as present");
+            terminate_process_tree(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(ClientBundleError::TimedOut { timeout });
         }
 
-        thread::sleep(BUNDLE_TIMEOUT_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+        let sleep_for = timeout
+            .map(|timeout| {
+                BUNDLE_TIMEOUT_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed()))
+            })
+            .unwrap_or(BUNDLE_TIMEOUT_POLL_INTERVAL);
+        thread::sleep(sleep_for);
     }
+}
+
+fn spawn_capped_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    max_output_bytes: usize,
+    output_exceeded: Arc<AtomicBool>,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::with_capacity(max_output_bytes.min(64 * 1024));
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                return Ok(output);
+            }
+            let remaining = max_output_bytes.saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
+            if bytes_read > remaining {
+                output_exceeded.store(true, Ordering::Release);
+            }
+        }
+    })
+}
+
+struct OwnedChild {
+    #[cfg(not(windows))]
+    inner: Child,
+    #[cfg(windows)]
+    inner: Box<dyn StdChildWrapper>,
+    armed: bool,
+}
+
+impl OwnedChild {
+    fn spawn(command: Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = command;
+            command.process_group(0);
+            command
+        };
+        #[cfg(all(not(unix), not(windows)))]
+        let mut command = command;
+
+        #[cfg(windows)]
+        {
+            let mut command = StdCommandWrap::from(command);
+            command.wrap(JobObject);
+            return Ok(Self {
+                inner: command.spawn()?,
+                armed: true,
+            });
+        }
+
+        #[cfg(not(windows))]
+        Ok(Self {
+            inner: command.spawn()?,
+            armed: true,
+        })
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        #[cfg(windows)]
+        return self.inner.stdout().take();
+
+        #[cfg(not(windows))]
+        self.inner.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        #[cfg(windows)]
+        return self.inner.stderr().take();
+
+        #[cfg(not(windows))]
+        self.inner.stderr.take()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.inner.try_wait()
+    }
+
+    fn terminate(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Ok(process_group) = i32::try_from(self.inner.id()) {
+            // SAFETY: the child was spawned as the leader of a new process group.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+
+        #[cfg(windows)]
+        let _ = self.inner.start_kill();
+        #[cfg(not(windows))]
+        let _ = self.inner.kill();
+        let _ = self.inner.wait();
+        self.armed = false;
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn terminate_process_tree(child: &mut OwnedChild) {
+    child.terminate();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +438,28 @@ pub struct ClientBundle {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub client_references: Vec<ClientReference>,
+    #[serde(default, rename = "moduleGraph", skip_serializing_if = "Vec::is_empty")]
+    pub module_graph: Vec<ModuleGraphNode>,
+    #[serde(default, rename = "inputSnapshot", skip_serializing)]
+    pub input_snapshot: Vec<ClientBundleInputSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientBundleInputSnapshot {
+    pub path: String,
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleGraphNode {
+    pub file: String,
+    #[serde(default)]
+    pub imports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,8 +490,285 @@ impl ClientBundle {
             )?;
         }
 
+        for node in &self.module_graph {
+            if !is_valid_module_graph_path(&node.file) {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "contains an invalid file path".to_owned(),
+                });
+            }
+            if node
+                .imports
+                .iter()
+                .any(|import| !is_valid_module_graph_path(import))
+            {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "contains an invalid import path".to_owned(),
+                });
+            }
+            if node.imports.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "imports must be sorted and unique".to_owned(),
+                });
+            }
+            if node
+                .watch_files
+                .iter()
+                .any(|watch_file| !is_valid_module_graph_path(watch_file))
+            {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "contains an invalid watch path".to_owned(),
+                });
+            }
+            if node.watch_files.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "watch paths must be sorted and unique".to_owned(),
+                });
+            }
+        }
+        if self
+            .module_graph
+            .windows(2)
+            .any(|pair| pair[0].file >= pair[1].file)
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "nodes must be sorted and unique".to_owned(),
+            });
+        }
+        let module_files = self
+            .module_graph
+            .iter()
+            .map(|node| node.file.as_str())
+            .collect::<BTreeSet<_>>();
+        if !module_files.is_empty()
+            && self
+                .client_references
+                .iter()
+                .any(|reference| !module_files.contains(reference.module.as_str()))
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "contains a client reference that is not a graph node".to_owned(),
+            });
+        }
+        if self
+            .module_graph
+            .iter()
+            .flat_map(|node| node.imports.iter())
+            .any(|import| !module_files.contains(import.as_str()))
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "contains an import that is not a graph node".to_owned(),
+            });
+        }
+        let graph = self
+            .module_graph
+            .iter()
+            .map(|node| {
+                (
+                    node.file.as_str(),
+                    node.imports.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect::<BTreeMap<_, Vec<_>>>();
+        let mut active = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        if graph
+            .keys()
+            .any(|file| module_graph_has_cycle(file, &graph, &mut active, &mut visited))
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "contains a cycle".to_owned(),
+            });
+        }
+
+        for input in &self.input_snapshot {
+            if input.path.is_empty() || !Path::new(&input.path).is_absolute() {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "contains a non-absolute input snapshot path".to_owned(),
+                });
+            }
+            if !matches!(input.kind.as_str(), "source" | "resolution")
+                || !is_valid_input_snapshot_value(input)
+            {
+                return Err(ClientBundleError::InvalidModuleGraph {
+                    reason: "contains an invalid input snapshot entry".to_owned(),
+                });
+            }
+        }
+        if self
+            .input_snapshot
+            .windows(2)
+            .any(|pair| (&pair[0].path, &pair[0].kind) >= (&pair[1].path, &pair[1].kind))
+        {
+            return Err(ClientBundleError::InvalidModuleGraph {
+                reason: "input snapshot entries must be sorted and unique".to_owned(),
+            });
+        }
+
         Ok(())
     }
+
+    pub fn validate_input_snapshot(&self, project: &Path) -> Result<()> {
+        let project = fs::canonicalize(project)?;
+        for input in &self.input_snapshot {
+            let current = current_input_snapshot_value(&project, input)?;
+            if current != input.value {
+                return Err(ClientBundleError::StaleInputSnapshot {
+                    path: input.path.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn fingerprint_client_bundle_inputs(
+    project: &Path,
+    inputs: &[ClientBundleInputSnapshot],
+) -> std::io::Result<String> {
+    let project = fs::canonicalize(project)?;
+    let current = inputs
+        .iter()
+        .map(|input| {
+            current_input_snapshot_value(&project, input)
+                .map(|value| ClientBundleInputSnapshot {
+                    path: input.path.clone(),
+                    kind: input.kind.clone(),
+                    value,
+                })
+                .map_err(|error| match error {
+                    ClientBundleError::Io(error) => error,
+                    other => std::io::Error::other(other.to_string()),
+                })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let encoded = serde_json::to_vec(&current).map_err(std::io::Error::other)?;
+    Ok(format!("sha256:{}", sha256_hex(&encoded)))
+}
+
+fn current_input_snapshot_value(
+    project: &Path,
+    input: &ClientBundleInputSnapshot,
+) -> Result<String> {
+    let path = Path::new(&input.path);
+    match input.kind.as_str() {
+        "source" => match fs::read(path) {
+            Ok(bytes) => Ok(format!("sha256:{}", sha256_hex(&bytes))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing".to_owned()),
+            Err(_error) => Ok("error".to_owned()),
+        },
+        "resolution" => match fs::canonicalize(path) {
+            Ok(resolved) if resolved.starts_with(project) => {
+                let relative = resolved
+                    .strip_prefix(project)
+                    .expect("contained path has a project-relative suffix")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                Ok(format!("resolved:{relative}"))
+            }
+            Ok(_resolved) if input.value == "outside-project" => Ok("outside-project".to_owned()),
+            Ok(resolved) => Ok(outside_project_resolution_value(&resolved)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing".to_owned()),
+            Err(_error) => Ok("error".to_owned()),
+        },
+        _ => Err(ClientBundleError::InvalidModuleGraph {
+            reason: "contains an invalid input snapshot kind".to_owned(),
+        }),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn outside_project_resolution_value(path: &Path) -> String {
+    let portable = portable_canonical_path(path);
+    format!("outside-project:sha256:{}", sha256_hex(portable.as_bytes()))
+}
+
+fn portable_canonical_path(path: &Path) -> String {
+    let portable = path.to_string_lossy().replace('\\', "/");
+    const EXTENDED_UNC_PREFIX: &str = "//?/UNC/";
+    if portable
+        .get(..EXTENDED_UNC_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(EXTENDED_UNC_PREFIX))
+    {
+        return format!("//{}", &portable[EXTENDED_UNC_PREFIX.len()..]);
+    }
+    if let Some(path) = portable.strip_prefix("//?/") {
+        return path.to_owned();
+    }
+    portable
+}
+
+fn module_graph_has_cycle<'a>(
+    file: &'a str,
+    graph: &BTreeMap<&'a str, Vec<&'a str>>,
+    active: &mut BTreeSet<&'a str>,
+    visited: &mut BTreeSet<&'a str>,
+) -> bool {
+    if active.contains(file) {
+        return true;
+    }
+    if visited.contains(file) {
+        return false;
+    }
+
+    active.insert(file);
+    let has_cycle = graph[file]
+        .iter()
+        .any(|import| module_graph_has_cycle(import, graph, active, visited));
+    active.remove(file);
+    visited.insert(file);
+    has_cycle
+}
+
+fn is_valid_module_graph_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && !path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+fn is_valid_input_snapshot_value(input: &ClientBundleInputSnapshot) -> bool {
+    match input.kind.as_str() {
+        "source" => {
+            matches!(input.value.as_str(), "missing" | "error")
+                || input.value.strip_prefix("sha256:").is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        }
+        "resolution" => match input.value.as_str() {
+            "missing" | "error" | "outside-project" => true,
+            value => {
+                value
+                    .strip_prefix("resolved:")
+                    .is_some_and(is_valid_module_graph_path)
+                    || value
+                        .strip_prefix("outside-project:sha256:")
+                        .is_some_and(is_valid_sha256_digest)
+            }
+        },
+        _ => false,
+    }
+}
+
+fn is_valid_sha256_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn fingerprint_client_bundle(
@@ -445,7 +938,11 @@ process.stdout.write(JSON.stringify({
   outputs: ["app.js", "app.css"],
   sourcemaps: ["app.js.map"],
   assets: ["assets/logo.svg"],
-  clientReferences: [{ id: "app/Counter.tsx#default", module: "app/Counter.tsx", exportName: "default" }]
+  clientReferences: [{ id: "app/Counter.tsx#default", module: "app/Counter.tsx", exportName: "default" }],
+  moduleGraph: [
+    { file: "app/Counter.tsx", imports: [] },
+    { file: "app/page.tsx", imports: ["app/Counter.tsx"] }
+  ]
 }));
 "#,
         );
@@ -468,6 +965,21 @@ process.stdout.write(JSON.stringify({
         assert_eq!(bundle.styles, vec!["/_ferrite/static/app.css"]);
         assert_eq!(bundle.sourcemaps, vec![PathBuf::from("app.js.map")]);
         assert_eq!(
+            bundle.module_graph,
+            vec![
+                ModuleGraphNode {
+                    file: "app/Counter.tsx".to_owned(),
+                    imports: Vec::new(),
+                    watch_files: Vec::new(),
+                },
+                ModuleGraphNode {
+                    file: "app/page.tsx".to_owned(),
+                    imports: vec!["app/Counter.tsx".to_owned()],
+                    watch_files: Vec::new(),
+                },
+            ]
+        );
+        assert_eq!(
             bundle.client_references,
             vec![ClientReference {
                 id: "app/Counter.tsx#default".to_owned(),
@@ -479,6 +991,369 @@ process.stdout.write(JSON.stringify({
                 sourcemaps: Vec::new(),
                 assets: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn rejects_a_bundle_when_its_declared_input_snapshot_is_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "new source").unwrap();
+        let page_json = serde_json::to_string(page.to_str().unwrap()).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+process.stdout.write(JSON.stringify({{
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  clientReferences: [],
+  moduleGraph: [],
+  inputSnapshot: [{{ path: {page_json}, kind: "source", value: "sha256:0000000000000000000000000000000000000000000000000000000000000000" }}]
+}}));
+"#
+            ),
+        );
+        let bundler = ClientBundler::new(temp.path().to_path_buf(), script);
+
+        let result = bundler.bundle_route(
+            &page,
+            &[],
+            "/",
+            &[],
+            &temp.path().join("out"),
+            "/_ferrite/static",
+        );
+
+        assert!(result.is_err(), "stale input snapshots must be rejected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_outside_project_resolution_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let first = external.path().join("first.json");
+        let second = external.path().join("second.json");
+        let link = project.path().join("data.json");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        symlink(&first, &link).unwrap();
+        let expected = outside_project_resolution_value(&fs::canonicalize(&first).unwrap());
+        let bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: Vec::new(),
+            input_snapshot: vec![ClientBundleInputSnapshot {
+                path: link.display().to_string(),
+                kind: "resolution".to_owned(),
+                value: expected,
+            }],
+        };
+
+        bundle.validate().unwrap();
+        bundle.validate_input_snapshot(project.path()).unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+
+        assert!(matches!(
+            bundle.validate_input_snapshot(project.path()),
+            Err(ClientBundleError::StaleInputSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_path_normalization_aligns_windows_drive_and_unc_forms() {
+        assert_eq!(
+            portable_canonical_path(Path::new(r"C:\workspace\asset.json")),
+            "C:/workspace/asset.json"
+        );
+        assert_eq!(
+            portable_canonical_path(Path::new(r"\\?\C:\workspace\asset.json")),
+            "C:/workspace/asset.json"
+        );
+        assert_eq!(
+            portable_canonical_path(Path::new(r"\\server\share\asset.json")),
+            "//server/share/asset.json"
+        );
+        assert_eq!(
+            portable_canonical_path(Path::new(r"\\?\UNC\server\share\asset.json")),
+            "//server/share/asset.json"
+        );
+        assert_eq!(
+            portable_canonical_path(Path::new(r"\\?\unc\server\share\asset.json")),
+            "//server/share/asset.json"
+        );
+    }
+
+    #[test]
+    fn retries_one_stale_rust_acceptance_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "stable source").unwrap();
+        make_script(
+            &script,
+            r#"
+const crypto = await import("node:crypto");
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const page = await fs.realpath(process.argv[2]);
+const state = path.join(path.dirname(new URL(import.meta.url).pathname), "attempts");
+let attempt = 0;
+try { attempt = Number(await fs.readFile(state, "utf8")); } catch {}
+attempt += 1;
+await fs.writeFile(state, String(attempt));
+const source = await fs.readFile(page);
+const digest = attempt === 1
+  ? "0".repeat(64)
+  : crypto.createHash("sha256").update(source).digest("hex");
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  inputSnapshot: [{ path: page, kind: "source", value: `sha256:${digest}` }]
+}));
+"#,
+        );
+        let bundler = ClientBundler::new(temp.path().to_path_buf(), script);
+
+        let bundle = bundler
+            .bundle_route(
+                &page,
+                &[],
+                "/",
+                &[],
+                &temp.path().join("out"),
+                "/_ferrite/static",
+            )
+            .unwrap();
+
+        assert_eq!(bundle.input_snapshot.len(), 1);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("attempts")).unwrap(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_module_graphs() {
+        let bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: vec![
+                ModuleGraphNode {
+                    file: "app/z.ts".to_owned(),
+                    imports: vec!["app/b.ts".to_owned(), "app/a.ts".to_owned()],
+                    watch_files: Vec::new(),
+                },
+                ModuleGraphNode {
+                    file: "app/a.ts".to_owned(),
+                    imports: vec!["../outside.ts".to_owned()],
+                    watch_files: Vec::new(),
+                },
+            ],
+            input_snapshot: Vec::new(),
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: imports must be sorted and unique"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_input_snapshot_contracts() {
+        let absolute = std::env::current_dir()
+            .unwrap()
+            .join("page.tsx")
+            .display()
+            .to_string();
+        let mut bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: Vec::new(),
+            input_snapshot: vec![ClientBundleInputSnapshot {
+                path: absolute.clone(),
+                kind: "source".to_owned(),
+                value: "sha256:not-a-digest".to_owned(),
+            }],
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an invalid input snapshot entry"
+        );
+
+        bundle.input_snapshot = vec![ClientBundleInputSnapshot {
+            path: absolute.clone(),
+            kind: "resolution".to_owned(),
+            value: "resolved:../outside.ts".to_owned(),
+        }];
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an invalid input snapshot entry"
+        );
+
+        bundle.input_snapshot = vec![ClientBundleInputSnapshot {
+            path: absolute,
+            kind: "resolution".to_owned(),
+            value: "outside-project:sha256:not-a-digest".to_owned(),
+        }];
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an invalid input snapshot entry"
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_module_graph_watch_paths() {
+        let mut bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: vec![ModuleGraphNode {
+                file: "app/page.tsx".to_owned(),
+                imports: Vec::new(),
+                watch_files: vec!["app/z.ts".to_owned(), "app/a.ts".to_owned()],
+            }],
+            input_snapshot: Vec::new(),
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: watch paths must be sorted and unique"
+        );
+
+        bundle.module_graph[0].watch_files = vec!["../outside.ts".to_owned()];
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an invalid watch path"
+        );
+    }
+
+    #[test]
+    fn rejects_module_graphs_with_missing_edges_or_cycles() {
+        let mut bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: vec![ModuleGraphNode {
+                file: "app/page.tsx".to_owned(),
+                imports: vec!["app/missing.ts".to_owned()],
+                watch_files: Vec::new(),
+            }],
+            input_snapshot: Vec::new(),
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an import that is not a graph node"
+        );
+
+        bundle.module_graph = vec![
+            ModuleGraphNode {
+                file: "app/a.ts".to_owned(),
+                imports: vec!["app/b.ts".to_owned()],
+                watch_files: Vec::new(),
+            },
+            ModuleGraphNode {
+                file: "app/b.ts".to_owned(),
+                imports: vec!["app/a.ts".to_owned()],
+                watch_files: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains a cycle"
+        );
+    }
+
+    #[test]
+    fn rejects_nonportable_module_graph_paths() {
+        let bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: Vec::new(),
+            module_graph: vec![ModuleGraphNode {
+                file: "C:\\app\\page.tsx".to_owned(),
+                imports: Vec::new(),
+                watch_files: Vec::new(),
+            }],
+            input_snapshot: Vec::new(),
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains an invalid file path"
+        );
+    }
+
+    #[test]
+    fn rejects_client_references_missing_from_a_nonempty_module_graph() {
+        let bundle = ClientBundle {
+            script: None,
+            action_bootstrap: None,
+            styles: Vec::new(),
+            outputs: Vec::new(),
+            sourcemaps: Vec::new(),
+            assets: Vec::new(),
+            client_references: vec![ClientReference {
+                id: "app/Counter.tsx#default".to_owned(),
+                module: "app/Counter.tsx".to_owned(),
+                export_name: "default".to_owned(),
+                script: None,
+                styles: Vec::new(),
+                outputs: Vec::new(),
+                sourcemaps: Vec::new(),
+                assets: Vec::new(),
+            }],
+            module_graph: vec![ModuleGraphNode {
+                file: "app/page.tsx".to_owned(),
+                imports: Vec::new(),
+                watch_files: Vec::new(),
+            }],
+            input_snapshot: Vec::new(),
+        };
+
+        assert_eq!(
+            bundle.validate().unwrap_err().to_string(),
+            "invalid client module graph: contains a client reference that is not a graph node"
         );
     }
 
@@ -541,6 +1416,8 @@ process.stdout.write(JSON.stringify({
                 sourcemaps: Vec::new(),
                 assets: Vec::new(),
             }],
+            module_graph: Vec::new(),
+            input_snapshot: Vec::new(),
         };
 
         fingerprint_client_bundle(&mut bundle, &out_dir, "/_ferrite/static").unwrap();
@@ -759,18 +1636,18 @@ export function ShareButton({ id }) {
         assert_eq!(bundle.client_references.len(), 2);
         assert_eq!(
             bundle.client_references[0].id,
-            "app/posts/[id]/PostActions.tsx#default"
+            "app/posts/[id]/PostActions.tsx#ShareButton"
         );
         assert_eq!(
-            bundle.client_references[0].script.as_deref(),
+            bundle.client_references[1].script.as_deref(),
             Some("/_ferrite/static/client-reference-app-posts-id-PostActions-tsx-default.js")
         );
-        assert!(bundle.client_references[0].outputs.contains(&PathBuf::from(
+        assert!(bundle.client_references[1].outputs.contains(&PathBuf::from(
             "client-reference-app-posts-id-PostActions-tsx-default.js"
         )));
         assert_eq!(
             bundle.client_references[1].id,
-            "app/posts/[id]/PostActions.tsx#ShareButton"
+            "app/posts/[id]/PostActions.tsx#default"
         );
         assert!(bundle.outputs.contains(&PathBuf::from(
             "client-reference-app-posts-id-PostActions-tsx-default.js"
@@ -916,7 +1793,10 @@ export default function Page() {
             .action_bootstrap
             .as_deref()
             .expect("server-only action routes emit a standalone enhancer");
-        assert!(action_bootstrap.ends_with("route-actions-action-bootstrap.js"));
+        let route_identity = &sha256_hex(b"/actions")[..16];
+        assert!(action_bootstrap.ends_with(&format!(
+            "route-actions-{route_identity}-action-bootstrap.js"
+        )));
         let action_js = fs::read_to_string(
             temp.path()
                 .join(".ferrite/build/_ferrite/static")
@@ -1052,6 +1932,214 @@ process.exit(1);
             error,
             ClientBundleError::TimedOut { timeout } if timeout == Duration::from_millis(20)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_bundler_descendants_with_inherited_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let timeout = Duration::from_millis(500);
+        let bundler =
+            ClientBundler::new(temp.path().to_path_buf(), script).with_command_timeout(timeout);
+        let started = Instant::now();
+
+        let error = bundler
+            .bundle_route(
+                &page,
+                &[],
+                "/",
+                &[],
+                &temp.path().join("out"),
+                "/_ferrite/static",
+            )
+            .unwrap_err();
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(error, ClientBundleError::TimedOut { timeout: actual } if actual == timeout)
+        );
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_bundler_cleans_descendants_before_collecting_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+descendant.unref();
+process.stdout.write(JSON.stringify({{
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  clientReferences: [],
+  moduleGraph: [],
+  inputSnapshot: [],
+}}));
+"#
+            ),
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let bundler = ClientBundler::new(temp.path().to_path_buf(), script);
+        let started = Instant::now();
+
+        let bundle = bundler
+            .bundle_route(
+                &page,
+                &[],
+                "/",
+                &[],
+                &temp.path().join("out"),
+                "/_ferrite/static",
+            )
+            .unwrap();
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(bundle.outputs.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_bundler_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        );
+        let cancellation_flag = Arc::new(AtomicBool::new(false));
+        let cancellation_writer = Arc::clone(&cancellation_flag);
+        let pid_path = descendant_pid.clone();
+        let cancellation_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !pid_path.is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "bundler descendant did not start"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            cancellation_writer.store(true, Ordering::Release);
+        });
+        let mut command = Command::new("node");
+        command.arg(script).current_dir(temp.path());
+        let started = Instant::now();
+
+        let error = run_command_with_limits(command, None, 1024, Some(cancellation_flag.as_ref()))
+            .unwrap_err();
+        cancellation_thread.join().unwrap();
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(error, ClientBundleError::Cancelled));
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[test]
+    fn bundler_output_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        make_script(&script, "process.stdout.write('x'.repeat(65));\n");
+        let mut command = Command::new("node");
+        command.arg(script).current_dir(temp.path());
+
+        let error = run_command_with_limits(command, None, 64, None).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ClientBundleError::OutputLimitExceeded { limit: 64 }
+        ));
+    }
+
+    #[cfg(unix)]
+    struct DescendantGuard(Option<i32>);
+
+    #[cfg(unix)]
+    impl Drop for DescendantGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                // SAFETY: this test records the PID of the child process it spawned.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            // SAFETY: signal 0 checks the recorded child PID without modifying it.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
     }
 
     #[test]

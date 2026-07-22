@@ -65,7 +65,10 @@ test("README keeps the unavailable registry skeleton out of the onboarding flow"
   assert.ok(productionBoundaryStart > rawInitializerStart);
   assert.match(readme, /pnpm starter:create -- \.\.\/my-ferrite-app/);
   const rawInitializerSection = readme.slice(rawInitializerStart, productionBoundaryStart);
-  assert.doesNotMatch(rawInitializerSection, /```sh[\s\S]*?ferrite init[\s\S]*?\bnpm install\b[\s\S]*?```/);
+  const shellBlocks = [...rawInitializerSection.matchAll(/```(?:sh|bash)\n([\s\S]*?)```/g)]
+    .map((match) => match[1]);
+  assert.ok(shellBlocks.some((block) => /\bferrite init\b/.test(block)));
+  assert.ok(shellBlocks.every((block) => !(/\bferrite init\b/.test(block) && /\bnpm install\b/.test(block))));
   assert.match(rawInitializerSection, /registry `404`/);
 });
 

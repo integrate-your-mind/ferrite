@@ -21,8 +21,8 @@ Ferrite can:
 - derive access-log client IPs from the TCP peer by default, or from `X-Forwarded-For` only when an explicit trusted-proxy hop count is configured
 - emit request outcome access logs and server-action audit logs to stderr in plain or JSON format
 - gzip eligible HTML and payload responses when `Accept-Encoding` allows it
-- bound request reads, request size, in-flight workers, and render subprocess timeouts
-- drain accepted production requests through the Rust shutdown-aware listener API
+- bound each request read with one absolute deadline, plus request size, in-flight workers, and render subprocess timeouts
+- stop admission and drain accepted production requests on CLI `SIGINT`/`SIGTERM` or through the Rust shutdown-aware listener API
 
 ## Release Prerequisites
 
@@ -162,13 +162,13 @@ Use command arguments for the current runtime knobs:
 - `--host`: bind address
 - `--port`: bind port
 - `--render-timeout-ms`: maximum duration for each production artifact-runner subprocess
-- `--request-read-timeout-ms`: maximum time to wait while reading each production HTTP request
+- `--request-read-timeout-ms`: absolute budget across all header and body reads for one production HTTP request; trickled bytes do not renew it and the minimum effective value is 1 ms
 - `--response-write-timeout-ms`: absolute budget across headers and all fixed, gzip, or chunked writes for one production HTTP response; the minimum effective value is 1 ms
 - `--max-request-bytes`: maximum bytes allowed for each production HTTP request header and body
 - `--max-in-flight-requests`: maximum accepted production sockets across active and queued work; excess connections receive `503 Service Unavailable`
 - `--server-action-csrf-token-env`: environment variable containing the token rendered into server-action forms and required on action POSTs
 - `--server-action-csrf-cookie-name`: optional cookie name that binds action POSTs to the configured CSRF token; it requires `--server-action-csrf-token-env`, sets `Path=/; SameSite=Lax; HttpOnly; Secure` on production route responses, and rejects action POSTs without a matching cookie value
-- `--server-action-replay-ttl-ms`: optional positive TTL for one-time server-action replay nonces rendered into production forms; it requires `--server-action-csrf-token-env`, rejects missing or reused nonces, stores nonce state in the current Ferrite process, and treats a nonce as single-use for the rendered response
+- `--server-action-replay-ttl-ms`: optional positive TTL for one-time server-action replay nonces rendered into production forms; it requires `--server-action-csrf-token-env`, rejects missing or reused nonces, stores at most 4,096 live nonces in the current Ferrite process, evicts the oldest unused nonce under capacity pressure, and treats a nonce as single-use for the rendered response
 - `--trusted-proxy-public-origin`: optional public HTTP(S) origin for server-action POST origin checks behind a trusted reverse proxy; when set, action POSTs require matching `X-Forwarded-Proto` and `X-Forwarded-Host`
 - `--trusted-proxy-client-ip-hops`: optional `X-Forwarded-For` trust policy for access-log `client_ip`; it requires `--trusted-proxy-public-origin` and selects the client IP before the configured number of trusted proxy hops. The edge proxy must overwrite client-supplied `X-Forwarded-For` before any trusted internal proxy appends to it.
 - `--access-log`: optional `plain` or `json` production request outcome logs emitted to stderr
@@ -294,7 +294,7 @@ Current production hardening is incomplete. Ferrite can require one configured h
 
 Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately. If server actions are enabled in production, set `--server-action-csrf-token-env`, prefer `--server-action-csrf-cookie-name`, and set `--server-action-replay-ttl-ms` when a single Ferrite process owns the action form and action POST path. Rotate the referenced CSRF secret as part of the deployment process. The configured token must be cookie-safe when cookie binding is enabled. If the public TLS origin differs from the upstream Ferrite bind origin, set `--trusted-proxy-public-origin` and configure the proxy to own and sanitize the forwarded proto/host headers. If access logs need public client IPs behind the proxy, set `--trusted-proxy-client-ip-hops` to the exact number of trusted proxy hops and make the edge proxy overwrite `X-Forwarded-For`.
 
-Production artifact-runner failures return generic `500` or `504` HTML. Detailed subprocess errors are written to server stderr and must be treated as potentially sensitive operational logs.
+Application code may expose an expected public action failure by throwing `FerriteActionError` from `@ferrite/runtime/server` with a stable uppercase code and a nonempty user-safe message. Any other thrown value fails the renderer and returns generic production `500` HTML. Detailed subprocess errors are written to server stderr and must be treated as potentially sensitive operational logs. Version-1 error packets without a code remain accepted for compatibility, but new application code should always use the typed error.
 
 ## Known Gaps
 
