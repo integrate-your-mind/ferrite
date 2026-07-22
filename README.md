@@ -123,19 +123,13 @@ cargo run -p ferrite-cli -- serve \
   --request-path /posts/abc
 ```
 
-A locally built `ferrite` binary can also initialize the registry-shaped project skeleton:
+A locally built `ferrite` binary can initialize the registry-shaped project skeleton for generator development and inspection:
 
 ```sh
 ferrite init my-app
-cd my-app
-npm install
-npm run check
-npm run dev
 ```
 
-Initialization refuses non-empty directories. Generated projects currently depend on locally built or staged Ferrite candidates because public registry distribution has not been proven.
-
-The plain `npm install` step above is intentionally **not available today**: `@ferrite/runtime@0.1.0` is unpublished and returns a registry `404`. Use `pnpm starter:create` for the proven source-backed workflow until registry publication and public CLI installation are separately authorized and verified.
+Initialization refuses non-empty directories, but the generated manifest references unpublished Ferrite packages and a plain `npm install` returns a registry `404`. Do not use the raw skeleton as an onboarding path. Use `pnpm starter:create` above for the proven source-backed workflow until registry publication and public CLI installation are separately authorized and verified.
 
 ## Production boundary
 

@@ -56,6 +56,19 @@ test("accepts pnpm's separator and rejects ambiguous targets", () => {
   assert.throws(() => parseStarterArgs(["one", "two"]), /usage:/);
 });
 
+test("README keeps the unavailable registry skeleton out of the onboarding flow", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+  const rawInitializerStart = readme.indexOf("A locally built `ferrite` binary");
+  const productionBoundaryStart = readme.indexOf("## Production boundary");
+
+  assert.notEqual(rawInitializerStart, -1);
+  assert.ok(productionBoundaryStart > rawInitializerStart);
+  assert.match(readme, /pnpm starter:create -- \.\.\/my-ferrite-app/);
+  const rawInitializerSection = readme.slice(rawInitializerStart, productionBoundaryStart);
+  assert.doesNotMatch(rawInitializerSection, /```sh[\s\S]*?ferrite init[\s\S]*?\bnpm install\b[\s\S]*?```/);
+  assert.match(rawInitializerSection, /registry `404`/);
+});
+
 test("creates starter, rewrites package scripts/dependencies, and copies sources", async (t) => {
   const f = await fixture(t);
   const target = join(f.root, "app");
