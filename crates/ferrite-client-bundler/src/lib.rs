@@ -1793,7 +1793,10 @@ export default function Page() {
             .action_bootstrap
             .as_deref()
             .expect("server-only action routes emit a standalone enhancer");
-        assert!(action_bootstrap.ends_with("route-actions-action-bootstrap.js"));
+        let route_identity = &sha256_hex(b"/actions")[..16];
+        assert!(action_bootstrap.ends_with(&format!(
+            "route-actions-{route_identity}-action-bootstrap.js"
+        )));
         let action_js = fs::read_to_string(
             temp.path()
                 .join(".ferrite/build/_ferrite/static")

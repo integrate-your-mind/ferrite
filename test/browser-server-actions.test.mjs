@@ -109,7 +109,7 @@ test("generated action form bootstrap submits to a fixture server for route, isl
     heading: "Client action",
     title: "Client title",
     action: "app/client-action/page.tsx#saveClient",
-    scriptExpectation: /\/_ferrite\/static\/route-client-action\.[a-f0-9]{16}\.js/,
+    scriptExpectation: /\/_ferrite\/static\/route-client-action-[a-f0-9]{16}\.[a-f0-9]{16}\.js/,
   });
   await assertEnhancedSubmission(browser, origin, receivedActions, {
     path: "/island-action",
@@ -123,8 +123,8 @@ test("generated action form bootstrap submits to a fixture server for route, isl
     heading: "Server-only action",
     title: "Server title",
     action: "app/server-action/page.tsx#saveServer",
-    scriptExpectation: /\/_ferrite\/static\/route-server-action-action-bootstrap\.[a-f0-9]{16}\.js/,
-    absentScriptExpectation: /\/_ferrite\/static\/route-server-action\.[a-f0-9]{16}\.js/,
+    scriptExpectation: /\/_ferrite\/static\/route-server-action-[a-f0-9]{16}-action-bootstrap\.[a-f0-9]{16}\.js/,
+    absentScriptExpectation: /\/_ferrite\/static\/route-server-action-[a-f0-9]{16}\.[a-f0-9]{16}\.js/,
   });
 });
 
