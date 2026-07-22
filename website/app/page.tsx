@@ -22,7 +22,7 @@ const links = [
   ["Deployment guide at demo head", repositoryUrl + "/blob/" + demoSha + "/docs/deployment.md"],
   ["PR #4 proof receipt", repositoryUrl + "/blob/" + baseSha + "/docs/proof-receipts/2026-07-18T141937Z-f7a1b1f-pr4-checkpoint.md"],
   ["Draft PR #4", repositoryUrl + "/pull/4"],
-  ["Draft demo PR #5", repositoryUrl + "/pull/5"],
+  ["Demo PR #5", repositoryUrl + "/pull/5"],
 ];
 function Status({ value }: { value: string }) { return <span className={"status status-" + value.toLowerCase()}>{value}</span>; }
 function ExternalLink({ href, children }: { href: string; children: React.ReactNode }) { return <a href={href}>{children}<span aria-hidden="true">↗</span></a>; }

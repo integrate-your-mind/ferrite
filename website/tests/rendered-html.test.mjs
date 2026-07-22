@@ -65,6 +65,8 @@ test("server-renders the source-backed Ferrite site", async () => {
   assert.match(html, /--project examples\/basic/);
   assert.doesNotMatch(html, /pnpm test:demos/);
   assert.match(html, /https:\/\/github\.com\/integrate-your-mind\/ferrite/);
+  assert.match(html, />Demo PR #5</);
+  assert.doesNotMatch(html, /Draft demo PR #5/);
   assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
   assert.doesNotMatch(html, /404 behavior|target="_blank"/i);
