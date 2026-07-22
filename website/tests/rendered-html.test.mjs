@@ -184,23 +184,47 @@ test("every on-page navigation link has a matching section", async () => {
 
 test("embeds an explicitly configured public origin in the real site build", async () => {
   const configuredOrigin = "https://configured-preview.example.test";
-  await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
-    cwd: fileURLToPath(templateRoot),
-    env: { ...process.env, FERRITE_SITE_ORIGIN: configuredOrigin },
-    maxBuffer: 10 * 1024 * 1024,
-  });
+  const previousOrigin = process.env.FERRITE_SITE_ORIGIN;
 
-  for (const pathname of ["/", "/blog", "/blog/tic-tac-toe", "/blog/tic-tac-toe-3d"]) {
-    const response = await render({ accept: "text/html" }, pathname);
+  try {
+    await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
+      cwd: fileURLToPath(templateRoot),
+      env: { ...process.env, FERRITE_SITE_ORIGIN: configuredOrigin },
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    for (const pathname of ["/", "/blog", "/blog/tic-tac-toe", "/blog/tic-tac-toe-3d"]) {
+      const response = await render({ accept: "text/html" }, pathname);
+      assert.equal(response.status, 200);
+      const html = await response.text();
+      const canonical = new URL(pathname, `${configuredOrigin}/`).toString();
+      const canonicalUrls = [...html.matchAll(/<link rel="canonical" href="([^"]+)"\s*\/?>/g)].map(
+        (match) => match[1],
+      );
+      assert.deepEqual(canonicalUrls, [canonical]);
+      assert.match(html, /https:\/\/configured-preview\.example\.test\/og\.png/);
+      assert.match(html, /https:\/\/configured-preview\.example\.test\/favicon\.svg/);
+      assert.doesNotMatch(html, /http:\/\/localhost:3000\/favicon\.svg/);
+    }
+  } finally {
+    const restoreEnv = { ...process.env };
+    if (previousOrigin === undefined) {
+      delete restoreEnv.FERRITE_SITE_ORIGIN;
+    } else {
+      restoreEnv.FERRITE_SITE_ORIGIN = previousOrigin;
+    }
+    await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
+      cwd: fileURLToPath(templateRoot),
+      env: restoreEnv,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  }
+
+  if (previousOrigin === undefined) {
+    const response = await render();
     assert.equal(response.status, 200);
     const html = await response.text();
-    const canonical = new URL(pathname, `${configuredOrigin}/`).toString();
-    const canonicalUrls = [...html.matchAll(/<link rel="canonical" href="([^"]+)"\s*\/?>/g)].map(
-      (match) => match[1],
-    );
-    assert.deepEqual(canonicalUrls, [canonical]);
-    assert.match(html, /https:\/\/configured-preview\.example\.test\/og\.png/);
-    assert.match(html, /https:\/\/configured-preview\.example\.test\/favicon\.svg/);
-    assert.doesNotMatch(html, /http:\/\/localhost:3000\/favicon\.svg/);
+    assert.match(html, /http:\/\/localhost(?::\d+)?\/favicon\.svg/);
+    assert.doesNotMatch(html, /configured-preview\.example\.test/);
   }
 });
