@@ -1872,7 +1872,7 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
     }
 
     #[test]
-    fn rejects_duplicate_static_outputs_across_routes() {
+    fn rejects_overlapping_route_patterns_before_rendering() {
         let temp = tempfile::tempdir().unwrap();
         write(
             &temp.path().join("app/docs/[id]/page.tsx"),
@@ -1886,22 +1886,8 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
         make_script(
             &config.page_renderer,
             r#"
-if (process.argv[2] === "--static-params") {
-  const page = process.argv[3];
-  const params = page.includes("[...slug]")
-    ? [{ slug: ["api"] }]
-    : [{ id: "api" }];
-  process.stdout.write(JSON.stringify({
-    has_generate_static_params: true,
-    params
-  }));
-  process.exit(0);
-}
-if (process.argv[2] === "--server-action-manifest") {
-  process.stdout.write(JSON.stringify({ routePath: "/docs/api", actions: [] }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
+process.stderr.write("page renderer must not run for an ambiguous route table");
+process.exit(99);
 "#,
         );
 
@@ -1909,7 +1895,7 @@ process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
 
         assert!(matches!(
             error,
-            BuildError::DuplicateStaticOutput { route_path } if route_path == "/docs/api"
+            BuildError::Router(error) if error.to_string().contains("ambiguous route patterns")
         ));
     }
 

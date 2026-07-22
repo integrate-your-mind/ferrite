@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use ferrite_client_bundler::ClientBundle;
-use ferrite_router::RouteParam;
+use ferrite_router::{Route, RouteParam, validate_route_table};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -290,20 +290,23 @@ fn validate_manifest_fields(
         }
     }
 
-    let mut route_paths = BTreeSet::new();
+    let route_table = manifest
+        .routes
+        .iter()
+        .map(|route| Route {
+            path: route.path.clone(),
+            file: PathBuf::from(&route.server_module),
+            layouts: Vec::new(),
+            loading: None,
+            error: None,
+            params: route.params.clone(),
+        })
+        .collect::<Vec<_>>();
+    validate_route_table(&route_table).map_err(|error| {
+        ProductionArtifactError::Invalid(format!("route table validation failed: {error}"))
+    })?;
+
     for route in &manifest.routes {
-        if !is_route_pattern(&route.path) {
-            return Err(ProductionArtifactError::Invalid(format!(
-                "route path `{}` must be an absolute URL path pattern",
-                route.path
-            )));
-        }
-        if !route_paths.insert(route.path.as_str()) {
-            return Err(ProductionArtifactError::Invalid(format!(
-                "duplicate route path `{}`",
-                route.path
-            )));
-        }
         validate_relative_path(&route.server_module)?;
         require_file(&file_paths, &route.server_module, "server module")?;
         validate_client_bundle_paths(route, &manifest.client_public_path, &file_paths)?;
@@ -425,34 +428,6 @@ fn validate_relative_path(path: &str) -> Result<(), ProductionArtifactError> {
         )));
     }
     Ok(())
-}
-
-fn is_route_pattern(path: &str) -> bool {
-    if path == "/" {
-        return true;
-    }
-    if !path.starts_with('/') || path.ends_with('/') || path.contains('#') {
-        return false;
-    }
-    path[1..].split('/').all(|segment| {
-        if let Some(name) = segment.strip_prefix(':') {
-            !name.is_empty()
-                && !name
-                    .chars()
-                    .any(|character| matches!(character, ':' | '*' | '?'))
-        } else if let Some(name) = segment.strip_prefix('*') {
-            let name = name.strip_suffix('?').unwrap_or(name);
-            !name.is_empty()
-                && !name
-                    .chars()
-                    .any(|character| matches!(character, ':' | '*' | '?'))
-        } else {
-            !segment.is_empty()
-                && !segment
-                    .chars()
-                    .any(|character| matches!(character, ':' | '*' | '?'))
-        }
-    })
 }
 
 fn resolve_verified_file(
@@ -646,6 +621,33 @@ mod tests {
         let mut manifest = valid_manifest(root.path());
         manifest.routes[0].server_module = "../outside.mjs".to_owned();
         assert!(finalize_production_artifact_manifest(&mut manifest).is_err());
+    }
+
+    #[test]
+    fn rejects_ambiguous_and_malformed_route_tables() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manifest = valid_manifest(root.path());
+        manifest.routes[0].path = "/docs/:id".to_owned();
+        manifest.routes[0].params = vec![RouteParam {
+            name: "id".to_owned(),
+            kind: ferrite_router::RouteParamKind::Dynamic,
+        }];
+        let mut static_route = manifest.routes[0].clone();
+        static_route.path = "/docs/about".to_owned();
+        static_route.params.clear();
+        manifest.routes.push(static_route);
+
+        let error = finalize_production_artifact_manifest(&mut manifest).unwrap_err();
+        assert!(error.to_string().contains("ambiguous route patterns"));
+
+        let mut manifest = valid_manifest(root.path());
+        manifest.routes[0].path = "/*slug??".to_owned();
+        manifest.routes[0].params = vec![RouteParam {
+            name: "slug?".to_owned(),
+            kind: ferrite_router::RouteParamKind::OptionalCatchAll,
+        }];
+        let error = finalize_production_artifact_manifest(&mut manifest).unwrap_err();
+        assert!(error.to_string().contains("invalid parameter"));
     }
 
     #[cfg(any(unix, windows))]

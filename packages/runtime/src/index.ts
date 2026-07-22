@@ -1,194 +1,60 @@
+export * from "./index-base.js";
+
 import {
-  COMPACT_ELEMENT_OPCODE,
-  COMPACT_FRAGMENT_OPCODE,
-  COMPACT_TEXT_OPCODE,
-  RENDER_PACKET_MARKER,
-  RENDER_PACKET_VERSION,
-} from "./protocol.js";
-import type { CompactNode, RenderPacket, SerializableNode, SerializableProp } from "./protocol.js";
+  ErrorBoundary,
+  Fragment,
+  Suspense,
+  isVNode,
+  serializableNodeToRenderPacket,
+  toSerializableNode as baseToSerializableNode,
+  type Child,
+  type Component,
+  type ErrorBoundaryFallback,
+  type ErrorBoundaryProps,
+  type RenderPacket,
+  type SerializableNode,
+  type SuspenseProps,
+  type VNode,
+} from "./index-base.js";
 
-export {
-  CLIENT_REFERENCE_MARKER,
-  CLIENT_REFERENCE_VERSION,
-  COMPACT_ELEMENT_OPCODE,
-  COMPACT_FRAGMENT_OPCODE,
-  COMPACT_TEXT_OPCODE,
-  RENDER_PACKET_MARKER,
-  RENDER_PACKET_VERSION,
-  RENDER_STREAM_MARKER,
-  SERVER_ACTION_REFERENCE_MARKER,
-  SERVER_ACTION_REFERENCE_VERSION,
-  SERVER_ACTION_REQUEST_MARKER,
-  SERVER_ACTION_REQUEST_VERSION,
-  SERVER_ACTION_RESPONSE_MARKER,
-  SERVER_ACTION_RESPONSE_VERSION,
-  SERVER_PAYLOAD_MARKER,
-  SERVER_PAYLOAD_STREAM_FRAME_MARKER,
-  SERVER_PAYLOAD_STREAM_FRAME_VERSION,
-  SERVER_PAYLOAD_VERSION,
-  createClientReferencePayload,
-  createServerActionErrorResponse,
-  createServerActionOkResponse,
-  createServerActionPayloadResponse,
-  createServerActionRedirectResponse,
-  createServerActionReferencePayload,
-  createServerActionRequest,
-  parseClientReferenceId,
-  validateClientReferenceParts,
-  validateClientReferencePayload,
-  validateServerActionReferencePayload,
-  validateServerActionRequest,
-  validateServerActionResponse,
-  validateServerPayloadPacket,
-  validateServerPayloadStreamFrame,
-} from "./protocol.js";
-export type {
-  ClientReferencePayload,
-  ClientReferenceSerializableValue,
-  CompactNode,
-  RenderPacket,
-  RenderStreamChunk,
-  RenderStreamPacket,
-  ServerActionErrorResponse,
-  ServerActionFormValue,
-  ServerActionOkResponse,
-  ServerActionPayloadResponse,
-  ServerActionRedirectResponse,
-  ServerActionReferencePayload,
-  ServerActionRequest,
-  ServerActionResponse,
-  ServerPayloadChunk,
-  ServerPayloadPacket,
-  ServerPayloadStreamChunkFrame,
-  ServerPayloadStreamFrame,
-  ServerPayloadStreamShellFrame,
-  SerializableNode,
-  SerializableProp,
-} from "./protocol.js";
-
-export const Fragment = Symbol.for("ferrite.fragment");
-
-const VNODE = Symbol.for("ferrite.vnode");
-
-export type Key = string | number;
-export type PrimitiveChild = string | number | boolean | null | undefined;
-export type Child = PrimitiveChild | VNode | Child[] | Promise<Child>;
-export type AsyncChild = Child | Promise<Child>;
-export type Component<P = Record<string, never>> = (props: P & { children?: Child }) => AsyncChild;
-export type ElementType<P = Record<string, unknown>> = string | Component<P> | typeof Fragment;
-
-export type ErrorBoundaryFallbackProps = {
-  error: unknown;
-  reset: () => void;
-};
-export type ErrorBoundaryFallback = Child | ((props: ErrorBoundaryFallbackProps) => Child);
-export type ErrorBoundaryProps = {
-  fallback: ErrorBoundaryFallback;
-  children?: Child;
-};
-export type SuspenseProps = {
-  fallback: Child;
-  children?: Child;
-};
-
-export interface VNode<P = Record<string, unknown>> {
-  readonly $$typeof: typeof VNODE;
-  readonly type: ElementType<P>;
-  readonly key: Key | null;
-  readonly props: P & { children?: Child };
-}
-
-export function createElement<P extends Record<string, unknown>>(
-  type: ElementType<P>,
-  props: (P & { key?: Key | null; children?: Child }) | null,
-  ...children: Child[]
-): VNode<P> {
-  const inputProps = props ?? ({} as P & { key?: Key | null; children?: Child });
-  const { key = null, children: propChildren, ...rest } = inputProps;
-  const normalizedChildren = children.length === 0 ? propChildren : children.length === 1 ? children[0] : children;
-
-  return {
-    $$typeof: VNODE,
-    type,
-    key,
-    props: {
-      ...(rest as P),
-      ...(normalizedChildren === undefined ? {} : { children: normalizedChildren }),
-    },
-  };
-}
-
-export function ErrorBoundary(props: ErrorBoundaryProps): VNode {
-  return createElement(Fragment, null, props.children);
-}
-
-export function Suspense(props: SuspenseProps): VNode {
-  return createElement(Fragment, null, props.children);
-}
-
-export function isVNode(value: unknown): value is VNode {
-  return Boolean(value && typeof value === "object" && (value as { $$typeof?: symbol }).$$typeof === VNODE);
-}
+const componentWrappers = new WeakMap<Component<Record<string, unknown>>, Component<Record<string, unknown>>>();
+const htmlBooleanAttributes = new Set([
+  "allowfullscreen",
+  "async",
+  "autofocus",
+  "autoplay",
+  "capture",
+  "checked",
+  "controls",
+  "credentialless",
+  "default",
+  "defer",
+  "disabled",
+  "disablepictureinpicture",
+  "disableremoteplayback",
+  "download",
+  "formnovalidate",
+  "hidden",
+  "inert",
+  "ismap",
+  "itemscope",
+  "loop",
+  "multiple",
+  "muted",
+  "nomodule",
+  "novalidate",
+  "open",
+  "playsinline",
+  "readonly",
+  "required",
+  "reversed",
+  "scoped",
+  "seamless",
+  "selected",
+]);
 
 export function toSerializableNode(child: Child): SerializableNode | null {
-  if (child === null || child === undefined || typeof child === "boolean") {
-    return null;
-  }
-
-  if (isPromiseLike(child)) {
-    throw new TypeError("Cannot serialize async Ferrite children with the synchronous serializer.");
-  }
-
-  if (typeof child === "string" || typeof child === "number") {
-    return { kind: "text", value: String(child) };
-  }
-
-  if (Array.isArray(child)) {
-    return {
-      kind: "fragment",
-      children: child.flatMap((item) => {
-        const serialized = toSerializableNode(item);
-        return serialized === null ? [] : [serialized];
-      }),
-    };
-  }
-
-  if (!isVNode(child)) {
-    throw new TypeError("Cannot serialize non-VNode child.");
-  }
-
-  if (child.type === Fragment) {
-    return toSerializableNode(child.props.children ?? []);
-  }
-
-  if (child.type === ErrorBoundary) {
-    return toSerializableErrorBoundary(child.props as ErrorBoundaryProps);
-  }
-
-  if (child.type === Suspense) {
-    return toSerializableNode((child.props as SuspenseProps).children);
-  }
-
-  if (typeof child.type === "function") {
-    const rendered = child.type(child.props);
-    if (isPromiseLike(rendered)) {
-      throw new TypeError("Cannot serialize async Ferrite components with the synchronous serializer.");
-    }
-    return toSerializableNode(rendered);
-  }
-
-  if (typeof child.type !== "string") {
-    throw new TypeError("Cannot serialize unsupported Ferrite element type.");
-  }
-
-  const tag = child.type.toLowerCase();
-
-  return {
-    kind: "element",
-    tag,
-    props: serializeProps(tag, child.props),
-    children: flattenChildren(child.props.children),
-  };
+  return baseToSerializableNode(__normalizeAttributeChild(child));
 }
 
 export function toRenderPacket(child: Child): RenderPacket {
@@ -196,382 +62,136 @@ export function toRenderPacket(child: Child): RenderPacket {
   return serializableNodeToRenderPacket(serializable);
 }
 
-export function serializableNodeToRenderPacket(node: SerializableNode): RenderPacket {
+export function __normalizeAttributeChild(child: Child): Child {
+  if (child === null || child === undefined || typeof child === "boolean") {
+    return child;
+  }
+  if (typeof child === "string" || typeof child === "number") {
+    return child;
+  }
+  if (isPromiseLike(child)) {
+    return child.then(__normalizeAttributeChild);
+  }
+  if (Array.isArray(child)) {
+    return child.map(__normalizeAttributeChild);
+  }
+  if (!isVNode(child)) {
+    return child;
+  }
+  return normalizeVNode(child);
+}
+
+function normalizeVNode(vnode: VNode): VNode {
+  if (typeof vnode.type === "string") {
+    return cloneVNode(vnode, vnode.type, normalizeElementProps(vnode.type, vnode.props));
+  }
+  if (vnode.type === Fragment) {
+    return cloneVNode(vnode, Fragment, normalizeChildrenOnly(vnode.props));
+  }
+  if (vnode.type === Suspense) {
+    const props = vnode.props as SuspenseProps;
+    return cloneVNode(vnode, Suspense, {
+      ...props,
+      fallback: __normalizeAttributeChild(props.fallback),
+      children: __normalizeAttributeChild(props.children),
+    });
+  }
+  if (vnode.type === ErrorBoundary) {
+    const props = vnode.props as ErrorBoundaryProps;
+    return cloneVNode(vnode, ErrorBoundary, {
+      ...props,
+      fallback: normalizeErrorBoundaryFallback(props.fallback),
+      children: __normalizeAttributeChild(props.children),
+    });
+  }
+  if (typeof vnode.type === "function") {
+    const component = vnode.type as Component<Record<string, unknown>>;
+    return cloneVNode(vnode, normalizedComponent(component), normalizeChildrenOnly(vnode.props));
+  }
+  return vnode;
+}
+
+function normalizedComponent(component: Component<Record<string, unknown>>): Component<Record<string, unknown>> {
+  const existing = componentWrappers.get(component);
+  if (existing) {
+    return existing;
+  }
+  const wrapped: Component<Record<string, unknown>> = (props) => {
+    const rendered = component(props);
+    return isPromiseLike(rendered)
+      ? rendered.then(__normalizeAttributeChild)
+      : __normalizeAttributeChild(rendered);
+  };
+  Object.defineProperty(wrapped, "name", {
+    configurable: true,
+    value: component.name || "Component",
+  });
+  componentWrappers.set(component, wrapped);
+  return wrapped;
+}
+
+function normalizeErrorBoundaryFallback(fallback: ErrorBoundaryFallback): ErrorBoundaryFallback {
+  if (typeof fallback !== "function") {
+    return __normalizeAttributeChild(fallback);
+  }
+  return (props) => __normalizeAttributeChild(fallback(props));
+}
+
+function normalizeChildrenOnly(props: Record<string, unknown>): Record<string, unknown> {
+  if (!("children" in props)) {
+    return props;
+  }
   return {
-    ferrite: RENDER_PACKET_MARKER,
-    version: RENDER_PACKET_VERSION,
-    root: toCompactNode(node),
+    ...props,
+    children: __normalizeAttributeChild(props.children as Child),
   };
 }
 
-function toCompactNode(node: SerializableNode): CompactNode {
-  if (node.kind === "text") {
-    return [COMPACT_TEXT_OPCODE, node.value];
-  }
-
-  if (node.kind === "fragment") {
-    return [COMPACT_FRAGMENT_OPCODE, node.children.map(toCompactNode)];
-  }
-
-  return [COMPACT_ELEMENT_OPCODE, node.tag, node.props, node.children.map(toCompactNode)];
-}
-
-function toSerializableErrorBoundary(props: ErrorBoundaryProps): SerializableNode | null {
-  if (!("fallback" in props)) {
-    throw new TypeError("Ferrite ErrorBoundary requires a fallback prop.");
-  }
-
-  try {
-    return toSerializableNode(props.children);
-  } catch (error) {
-    return toSerializableNode(renderErrorBoundaryFallback(props.fallback, error, () => undefined));
-  }
-}
-
-export function renderErrorBoundaryFallback(
-  fallback: ErrorBoundaryFallback,
-  error: unknown,
-  reset: () => void,
-): Child {
-  if (typeof fallback === "function") {
-    return fallback({ error, reset });
-  }
-
-  return fallback;
-}
-
-function flattenChildren(child: Child): SerializableNode[] {
-  const serialized = toSerializableNode(child);
-  if (serialized === null) {
-    return [];
-  }
-  if (serialized.kind === "fragment") {
-    return serialized.children;
-  }
-  return [serialized];
-}
-
-function serializeProps(tag: string, props: Record<string, unknown>): Record<string, SerializableProp> {
-  const serialized: Record<string, SerializableProp> = {};
-
-  for (const [key, value] of Object.entries(props)) {
-    if (key === "children" || key === "key" || key.startsWith("on")) {
+function normalizeElementProps(tag: string, props: Record<string, unknown>): Record<string, unknown> {
+  const normalized: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(props)) {
+    if (name === "children") {
+      normalized.children = __normalizeAttributeChild(value as Child);
       continue;
     }
-
-    if (inputDefaultPropIsShadowed(tag, key, props)) {
+    if (typeof value === "boolean" && !isHtmlBooleanProp(tag, name)) {
+      normalized[name] = String(value);
       continue;
     }
-
-    if (value === null || value === undefined || value === false) {
-      continue;
-    }
-
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      serialized[serializablePropName(tag, key)] = value;
-      continue;
-    }
-
-    throw new TypeError(`Cannot serialize prop "${key}" with type "${typeof value}".`);
+    normalized[name] = value;
   }
-
-  return serialized;
+  return normalized;
 }
 
-function inputDefaultPropIsShadowed(tag: string, name: string, props: Record<string, unknown>): boolean {
-  if (tag.toLowerCase() !== "input") {
-    return false;
-  }
-  if (name === "defaultValue") {
-    return props.value !== null && props.value !== undefined;
-  }
-  if (name === "defaultChecked") {
-    return props.checked !== null && props.checked !== undefined;
-  }
-  return false;
+function isHtmlBooleanProp(tag: string, name: string): boolean {
+  const attribute = serializableAttributeName(tag, name).toLowerCase();
+  return htmlBooleanAttributes.has(attribute);
 }
 
-function serializablePropName(tag: string, name: string): string {
+function serializableAttributeName(tag: string, name: string): string {
   if (name === "className") {
     return "class";
   }
-
   if (name === "htmlFor") {
     return "for";
   }
-
   if (tag.toLowerCase() === "input" && name === "defaultValue") {
     return "value";
   }
-
   if (tag.toLowerCase() === "input" && name === "defaultChecked") {
     return "checked";
   }
-
   return name;
 }
 
-function isPromiseLike(value: unknown): value is Promise<unknown> {
+function cloneVNode(vnode: VNode, type: unknown, props: Record<string, unknown>): VNode {
+  return {
+    ...vnode,
+    type,
+    props,
+  } as VNode;
+}
+
+function isPromiseLike(value: unknown): value is Promise<Child> {
   return Boolean(value && typeof value === "object" && typeof (value as { then?: unknown }).then === "function");
-}
-
-export type StateUpdater<S> = (next: S | ((previous: S) => S)) => void;
-export type EffectCleanup = void | (() => void);
-export type EffectCallback = () => EffectCleanup;
-export type EffectDependencyList = readonly unknown[];
-export type MemoDependencyList = readonly unknown[];
-export type TransitionScope = () => void;
-export type TransitionStartFunction = (scope: TransitionScope) => void;
-export type SchedulerPriority = "sync" | "transition";
-export type SchedulerCallback = () => void;
-
-export interface RefObject<T> {
-  current: T;
-}
-
-export interface HookDispatcher {
-  useState<S>(initial: S | (() => S)): [S, StateUpdater<S>];
-  useEffect(effect: EffectCallback, deps?: EffectDependencyList): void;
-  useLayoutEffect(effect: EffectCallback, deps?: EffectDependencyList): void;
-  useRef<T>(initial: T): RefObject<T>;
-  useMemo<T>(factory: () => T, deps?: MemoDependencyList): T;
-  useTransition(): [boolean, TransitionStartFunction];
-  useDeferredValue<T>(value: T): T;
-}
-
-let currentDispatcher: HookDispatcher | null = null;
-let transitionScopeDepth = 0;
-let nextSchedulerTaskId = 1;
-let schedulerHostCallbackScheduled = false;
-let schedulerRenderPriority: SchedulerPriority = "sync";
-let schedulerRenderDeadline = 0;
-let schedulerYieldIntervalMs = 5;
-let schedulerForcedRenderBudget: number | null = null;
-const scheduledTasks: ScheduledTask[] = [];
-
-type ScheduledTask = {
-  id: number;
-  priority: SchedulerPriority;
-  callback: SchedulerCallback;
-  cancelled: boolean;
-};
-
-export function withHookDispatcher<T>(dispatcher: HookDispatcher, render: () => T): T {
-  const previousDispatcher = currentDispatcher;
-  currentDispatcher = dispatcher;
-  try {
-    return render();
-  } finally {
-    currentDispatcher = previousDispatcher;
-  }
-}
-
-export function useState<S>(initial: S | (() => S)): [S, StateUpdater<S>] {
-  if (!currentDispatcher) {
-    throw new Error("Ferrite useState can only be called while rendering a component.");
-  }
-
-  return currentDispatcher.useState(initial);
-}
-
-export function useEffect(effect: EffectCallback, deps?: EffectDependencyList): void {
-  if (!currentDispatcher) {
-    throw new Error("Ferrite useEffect can only be called while rendering a component.");
-  }
-
-  currentDispatcher.useEffect(effect, deps);
-}
-
-export function useLayoutEffect(effect: EffectCallback, deps?: EffectDependencyList): void {
-  if (!currentDispatcher) {
-    throw new Error("Ferrite useLayoutEffect can only be called while rendering a component.");
-  }
-
-  currentDispatcher.useLayoutEffect(effect, deps);
-}
-
-export function useRef<T>(initial: T): RefObject<T> {
-  if (!currentDispatcher) {
-    throw new Error("Ferrite useRef can only be called while rendering a component.");
-  }
-
-  return currentDispatcher.useRef(initial);
-}
-
-export function useMemo<T>(factory: () => T, deps?: MemoDependencyList): T {
-  if (!currentDispatcher) {
-    throw new Error("Ferrite useMemo can only be called while rendering a component.");
-  }
-
-  return currentDispatcher.useMemo(factory, deps);
-}
-
-export function useCallback<T extends (...args: never[]) => unknown>(callback: T, deps?: MemoDependencyList): T {
-  return useMemo(() => callback, deps);
-}
-
-export function startTransition(scope: TransitionScope): void {
-  if (typeof scope !== "function") {
-    throw new TypeError("Ferrite startTransition requires a function.");
-  }
-
-  transitionScopeDepth += 1;
-  try {
-    scope();
-  } finally {
-    transitionScopeDepth -= 1;
-  }
-}
-
-export function useTransition(): [boolean, TransitionStartFunction] {
-  if (!currentDispatcher) {
-    throw new Error("Ferrite useTransition can only be called while rendering a component.");
-  }
-
-  return currentDispatcher.useTransition();
-}
-
-export function useDeferredValue<T>(value: T): T {
-  if (!currentDispatcher) {
-    throw new Error("Ferrite useDeferredValue can only be called while rendering a component.");
-  }
-
-  return currentDispatcher.useDeferredValue(value);
-}
-
-export function __isTransitionScopeActive(): boolean {
-  return transitionScopeDepth > 0;
-}
-
-export function unstable_scheduleCallback(priority: SchedulerPriority, callback: SchedulerCallback): () => void {
-  assertSchedulerPriority(priority);
-  if (typeof callback !== "function") {
-    throw new TypeError("Ferrite scheduler callback must be a function.");
-  }
-
-  if (priority === "sync") {
-    callback();
-    return () => undefined;
-  }
-
-  const task: ScheduledTask = {
-    id: nextSchedulerTaskId,
-    priority,
-    callback,
-    cancelled: false,
-  };
-  nextSchedulerTaskId += 1;
-  scheduledTasks.push(task);
-  scheduledTasks.sort(compareScheduledTasks);
-  requestSchedulerHostCallback();
-
-  return () => {
-    task.cancelled = true;
-  };
-}
-
-export function unstable_shouldYield(): boolean {
-  if (schedulerRenderPriority !== "transition") {
-    return false;
-  }
-
-  if (schedulerForcedRenderBudget !== null) {
-    schedulerForcedRenderBudget -= 1;
-    return schedulerForcedRenderBudget < 0;
-  }
-
-  return schedulerRenderDeadline !== 0 && schedulerNow() >= schedulerRenderDeadline;
-}
-
-export function unstable_setSchedulerRenderBudget(units: number | null): void {
-  if (units === null) {
-    schedulerForcedRenderBudget = null;
-    return;
-  }
-
-  if (!Number.isInteger(units)) {
-    throw new TypeError("Ferrite scheduler render budget must be an integer or null.");
-  }
-
-  if (units < 0) {
-    throw new RangeError("Ferrite scheduler render budget must be non-negative.");
-  }
-
-  schedulerForcedRenderBudget = units;
-}
-
-export function unstable_setSchedulerYieldInterval(ms: number): void {
-  if (!Number.isFinite(ms)) {
-    throw new TypeError("Ferrite scheduler yield interval must be a finite number.");
-  }
-
-  if (ms < 0) {
-    throw new RangeError("Ferrite scheduler yield interval must be non-negative.");
-  }
-
-  schedulerYieldIntervalMs = ms;
-}
-
-export function __withSchedulerRender<T>(priority: SchedulerPriority, render: () => T): T {
-  assertSchedulerPriority(priority);
-  const previousPriority = schedulerRenderPriority;
-  const previousDeadline = schedulerRenderDeadline;
-  schedulerRenderPriority = priority;
-  schedulerRenderDeadline = priority === "transition" ? schedulerNow() + schedulerYieldIntervalMs : 0;
-  try {
-    return render();
-  } finally {
-    schedulerRenderPriority = previousPriority;
-    schedulerRenderDeadline = previousDeadline;
-  }
-}
-
-function compareScheduledTasks(left: ScheduledTask, right: ScheduledTask): number {
-  const priorityDelta = schedulerPriorityRank(left.priority) - schedulerPriorityRank(right.priority);
-  if (priorityDelta !== 0) {
-    return priorityDelta;
-  }
-
-  return left.id - right.id;
-}
-
-function schedulerPriorityRank(priority: SchedulerPriority): number {
-  return priority === "sync" ? 0 : 1;
-}
-
-function requestSchedulerHostCallback(): void {
-  if (schedulerHostCallbackScheduled) {
-    return;
-  }
-
-  schedulerHostCallbackScheduled = true;
-  setTimeout(flushScheduledTasks, 0);
-}
-
-function flushScheduledTasks(): void {
-  schedulerHostCallbackScheduled = false;
-
-  while (scheduledTasks.length > 0) {
-    const task = scheduledTasks.shift();
-    if (!task || task.cancelled) {
-      continue;
-    }
-
-    task.callback();
-    break;
-  }
-
-  if (scheduledTasks.some((task) => !task.cancelled)) {
-    requestSchedulerHostCallback();
-  }
-}
-
-function schedulerNow(): number {
-  return typeof performance !== "undefined" ? performance.now() : Date.now();
-}
-
-function assertSchedulerPriority(priority: SchedulerPriority): void {
-  if (priority !== "sync" && priority !== "transition") {
-    throw new TypeError(`Ferrite scheduler priority "${String(priority)}" is not supported.`);
-  }
 }
