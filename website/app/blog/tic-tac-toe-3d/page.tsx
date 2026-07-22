@@ -1,6 +1,9 @@
 export const metadata = {
   title: "Ferrite 3D Tic Tac Toe with Three.js",
   description: "A Ferrite walkthrough for importing and mounting Three.js in a client route.",
+  alternates: {
+    canonical: "/blog/tic-tac-toe-3d",
+  },
 };
 
 const exampleRoute = "/tic-tac-toe-3d";

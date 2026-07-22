@@ -11,13 +11,17 @@ const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
 let renderSequence = 0;
 const execFileAsync = promisify(execFile);
 
-async function render(headers = { accept: "text/html" }) {
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function render(headers = { accept: "text/html" }, pathname = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${renderSequence++}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("http://localhost/", {
+    new Request(new URL(pathname, "http://localhost/"), {
       headers,
     }),
     {
@@ -188,11 +192,14 @@ test("embeds an explicitly configured public origin in the real site build", asy
     maxBuffer: 10 * 1024 * 1024,
   });
 
-  const response = await render();
-  assert.equal(response.status, 200);
-  const html = await response.text();
-  assert.match(html, /<link rel="canonical" href="https:\/\/configured-preview\.example\.test\/"\s*\/?>/);
-  assert.match(html, /https:\/\/configured-preview\.example\.test\/og\.png/);
-  assert.match(html, /https:\/\/configured-preview\.example\.test\/favicon\.svg/);
-  assert.doesNotMatch(html, /http:\/\/localhost:3000\/favicon\.svg/);
+  for (const pathname of ["/", "/blog", "/blog/tic-tac-toe", "/blog/tic-tac-toe-3d"]) {
+    const response = await render({ accept: "text/html" }, pathname);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    const canonical = new URL(pathname, `${configuredOrigin}/`).toString();
+    assert.match(html, new RegExp(`<link rel="canonical" href="${escapeRegExp(canonical)}"\\s*\\/?>`));
+    assert.match(html, /https:\/\/configured-preview\.example\.test\/og\.png/);
+    assert.match(html, /https:\/\/configured-preview\.example\.test\/favicon\.svg/);
+    assert.doesNotMatch(html, /http:\/\/localhost:3000\/favicon\.svg/);
+  }
 });

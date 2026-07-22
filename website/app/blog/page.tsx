@@ -3,6 +3,9 @@ import Link from "next/link";
 export const metadata = {
   title: "Ferrite Blog",
   description: "Proof-oriented Ferrite updates and examples.",
+  alternates: {
+    canonical: "/blog",
+  },
 };
 
 export default function BlogIndexPage() {
