@@ -41,17 +41,23 @@ Ferrite is not a drop-in React or Next.js replacement. It does not yet provide a
 
 The repository currently targets:
 
-- Rust 1.85 or newer;
-- Node.js 22 or newer;
+- Git and network access to the Cargo and npm registries;
+- rustup with Rust 1.95, as declared by `rust-toolchain.toml`; the Cargo crates retain Rust 1.85 as their minimum supported compiler version;
+- a native compiler/linker toolchain supported by Rust on the host platform;
+- Node.js 22 or newer, with Node 24 used by the primary verification workflow;
 - pnpm 11.7.0 through Corepack;
 - a Chromium-family browser for the full browser proof;
 - Docker for the nginx and container checks.
 
-Some checks need platform tools that are not available on every workstation.
+The `.node-version` file selects Node 24 for version managers that support it. Some Node distributions do not bundle Corepack; install Corepack before running `corepack enable` in that case. Docker and Chromium are required only for their matching proof gates.
 
 ## Build from source
 
+Run these commands from the repository root:
+
 ```sh
+rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+rustup target add wasm32-unknown-unknown --toolchain 1.95.0
 corepack enable
 pnpm install --frozen-lockfile
 cargo build --workspace
@@ -73,6 +79,35 @@ pnpm release:verify:npm
 pnpm release:verify:cargo
 ```
 
+For the browser gate, install the matching browser and expose its executable:
+
+```sh
+pnpm exec playwright-core install chromium
+export FERRITE_BROWSER_EXECUTABLE="$(node --input-type=module -e 'import { chromium } from "playwright-core"; process.stdout.write(chromium.executablePath())')"
+pnpm test:browser
+```
+
+## Create a source-backed starter
+
+Public packages and a public CLI are not available yet. From a clean Ferrite source checkout, create a working local starter with:
+
+```sh
+pnpm starter:create -- ../my-ferrite-app
+cd ../my-ferrite-app
+npm run dev
+```
+
+`starter:create` builds the candidate CLI and release-shaped packages, verifies package metadata, initializes an empty target, vendors the protocol/runtime tarballs and CLI under the ignored `.ferrite-source/` directory, installs from those local artifacts, and runs `npm run check`. It refuses files and non-empty directories without changing them.
+
+Exercise the production path:
+
+```sh
+npm run build
+npm run start -- --once --request-path /
+```
+
+The generated app is tied to the source checkout and host platform that created `.ferrite-source/`. Recreate it from source on another machine. This workflow is for developer-preview evaluation; it is not a substitute for registry packages or a supported CLI release. See [Source onboarding](docs/source-onboarding.md) for the exact boundary and troubleshooting steps.
+
 ## Exercise the included application
 
 ```sh
@@ -88,7 +123,7 @@ cargo run -p ferrite-cli -- serve \
   --request-path /posts/abc
 ```
 
-A locally built or installed `ferrite` binary can initialize a small application:
+A locally built `ferrite` binary can also initialize the registry-shaped project skeleton:
 
 ```sh
 ferrite init my-app
@@ -99,6 +134,8 @@ npm run dev
 ```
 
 Initialization refuses non-empty directories. Generated projects currently depend on locally built or staged Ferrite candidates because public registry distribution has not been proven.
+
+The plain `npm install` step above is intentionally **not available today**: `@ferrite/runtime@0.1.0` is unpublished and returns a registry `404`. Use `pnpm starter:create` for the proven source-backed workflow until registry publication and public CLI installation are separately authorized and verified.
 
 ## Production boundary
 
@@ -114,9 +151,9 @@ Use the deployment guide and checked templates for proxy, TLS, process supervisi
 
 ## Proof and limits
 
-The repository records exact-source local proof for linting, type checks, builds, tests, browser flows, package candidates, artifact integrity, request framing, overload, timeouts, cleanup, and rollback behavior.
+The repository records exact-source local proof for linting, type checks, builds, tests, browser flows, source-backed starter creation, package candidates, artifact integrity, request framing, overload, timeouts, cleanup, and rollback behavior.
 
-Hosted GitHub Actions has recently failed before job allocation, so local proof must not be represented as hosted CI proof. Registry publication, clean public installation, hosted deployment, long-duration production soak, and broad external platform evidence remain release gates.
+Hosted GitHub Actions has recently failed before job allocation, so local proof must not be represented as hosted CI proof. Registry publication, registry-backed clean installation, hosted deployment, long-duration production soak, and broad external platform evidence remain release gates. Native package loading is locally proven only for the current host; every advertised target still requires hosted artifact proof.
 
 ## Contributions
 

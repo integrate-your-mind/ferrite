@@ -1,5 +1,7 @@
 # Milestone 097: Generated starter path
 
+> **Current status (2026-07-21):** The original registry-shaped `ferrite init` contract below remains unpublished. The repository now exposes the same staged-package path as `pnpm starter:create -- <empty-directory>` and verifies that implementation through real package installation, check, build, pre-build rejection, and artifact serve. See `docs/source-onboarding.md`.
+
 ## Outcome
 
 `ferrite init <directory>` creates a minimal TypeScript Ferrite application whose package scripts use build and runtime files from installed packages rather than monorepo paths.
@@ -20,4 +22,5 @@ The npm candidate verifier initializes the starter with the copied candidate CLI
 
 - A public or staging-registry CLI installation is not proven.
 - Ferrite npm packages are local candidates, not published packages.
-- Package-manager choice and interactive starter options are deferred until the minimal path is externally validated.
+- The source-backed starter vendors host-local artifacts under `.ferrite-source/`; it is not a portable published release.
+- Package-manager choice and interactive starter options remain deferred until the minimal path is externally validated.

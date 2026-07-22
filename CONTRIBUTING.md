@@ -12,14 +12,31 @@ Ferrite is an experimental developer preview. The public source is open for tech
 
 ## Development setup
 
-Ferrite uses Rust, Node.js, TypeScript, and pnpm. Use the versions declared by the repository where present.
+Ferrite uses Rust, Node.js, TypeScript, and pnpm. Use `rust-toolchain.toml`, `.node-version`, and the root `packageManager` field as the reproducible defaults. The package manifests support Node.js 22 or newer; the primary source workflow uses Node 24.
 
 ```sh
+rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+rustup target add wasm32-unknown-unknown --toolchain 1.95.0
 corepack enable
 pnpm install --frozen-lockfile
 cargo build --workspace
 pnpm build
 ```
+
+The full browser proof also needs Chromium:
+
+```sh
+pnpm exec playwright-core install chromium
+export FERRITE_BROWSER_EXECUTABLE="$(node --input-type=module -e 'import { chromium } from "playwright-core"; process.stdout.write(chromium.executablePath())')"
+```
+
+To validate the contributor-facing source starter without using unpublished registry packages:
+
+```sh
+pnpm starter:create -- ../ferrite-starter-check
+```
+
+The target must be absent or empty. Remove the generated external fixture when the review is complete.
 
 ## Required checks
 
