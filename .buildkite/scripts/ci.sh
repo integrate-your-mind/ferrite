@@ -133,9 +133,7 @@ packages() {
 }
 
 coverage() {
-  local rustc_path
-  rustc_path="$(rustup which --toolchain stable rustc)"
-  run_gate coverage-rust env RUSTC="${rustc_path}" rustup run stable cargo llvm-cov \
+  run_gate coverage-rust rustup run stable cargo llvm-cov \
     --workspace \
     --all-targets \
     --summary-only \

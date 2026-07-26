@@ -82,6 +82,15 @@ fn child_stderr(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| format!("<unreadable stderr: {error}>"))
 }
 
+fn read_positive_pid(path: &std::path::Path) -> Option<u32> {
+    fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
 fn spawn_hanging_build() -> HangingBuild {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("app");
@@ -140,7 +149,10 @@ setInterval(() => {{}}, 1000);
     let mut child = spawn_guarded(&mut command).unwrap();
 
     let verifier_deadline = Instant::now() + Duration::from_secs(10);
-    while !verifier_pid_path.is_file() {
+    let verifier_process_group = loop {
+        if let Some(pid) = read_positive_pid(&verifier_pid_path) {
+            break pid;
+        }
         if let Some(status) = child.child.try_wait().unwrap() {
             panic!(
                 "Ferrite build exited before starting verifier with {status}: {}",
@@ -153,15 +165,14 @@ setInterval(() => {{}}, 1000);
             child_stderr(&stderr_path)
         );
         thread::sleep(Duration::from_millis(5));
-    }
-    let verifier_process_group = fs::read_to_string(&verifier_pid_path)
-        .unwrap()
-        .parse::<u32>()
-        .unwrap();
+    };
     let verifier_guard = ProcessGroupGuard(Some(verifier_process_group));
 
     let descendant_deadline = Instant::now() + Duration::from_secs(10);
-    while !descendant_pid_path.is_file() {
+    let descendant_pid = loop {
+        if let Some(pid) = read_positive_pid(&descendant_pid_path) {
+            break pid;
+        }
         if let Some(status) = child.child.try_wait().unwrap() {
             panic!(
                 "Ferrite build exited before starting verifier descendant with {status}: {}",
@@ -174,11 +185,7 @@ setInterval(() => {{}}, 1000);
             child_stderr(&stderr_path)
         );
         thread::sleep(Duration::from_millis(5));
-    }
-    let descendant_pid = fs::read_to_string(descendant_pid_path)
-        .unwrap()
-        .parse::<u32>()
-        .unwrap();
+    };
     assert!(process_exists(verifier_process_group));
     assert!(process_exists(descendant_pid));
 
@@ -456,18 +463,16 @@ setInterval(() => {{}}, 1_000);
     let guard = spawn_guarded(&mut command).unwrap();
 
     let pid_deadline = Instant::now() + Duration::from_secs(5);
-    while !grandchild_pid_path.is_file() {
+    let grandchild_pid = loop {
+        if let Some(pid) = read_positive_pid(&grandchild_pid_path) {
+            break pid;
+        }
         assert!(
             Instant::now() < pid_deadline,
             "fixture did not report its grandchild process"
         );
         thread::sleep(Duration::from_millis(10));
-    }
-    let grandchild_pid = fs::read_to_string(&grandchild_pid_path)
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
+    };
     assert!(process_exists(grandchild_pid));
 
     drop(guard);

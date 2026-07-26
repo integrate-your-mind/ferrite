@@ -1972,10 +1972,7 @@ setInterval(() => {{}}, 1000);
                 "/_ferrite/static",
             )
             .unwrap_err();
-        let pid = fs::read_to_string(descendant_pid)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = wait_for_pid_file(&descendant_pid, Duration::from_secs(2));
         let mut guard = DescendantGuard(Some(pid));
 
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -2032,10 +2029,7 @@ process.stdout.write(JSON.stringify({{
                 "/_ferrite/static",
             )
             .unwrap();
-        let pid = fs::read_to_string(descendant_pid)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = wait_for_pid_file(&descendant_pid, Duration::from_secs(2));
         let mut guard = DescendantGuard(Some(pid));
 
         assert!(bundle.outputs.is_empty());
@@ -2069,15 +2063,9 @@ setInterval(() => {{}}, 1000);
         let cancellation_writer = Arc::clone(&cancellation_flag);
         let pid_path = descendant_pid.clone();
         let cancellation_thread = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !pid_path.is_file() {
-                assert!(
-                    Instant::now() < deadline,
-                    "bundler descendant did not start"
-                );
-                thread::sleep(Duration::from_millis(5));
-            }
+            let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
             cancellation_writer.store(true, Ordering::Release);
+            pid
         });
         let mut command = Command::new("node");
         command.arg(script).current_dir(temp.path());
@@ -2085,11 +2073,7 @@ setInterval(() => {{}}, 1000);
 
         let error = run_command_with_limits(command, None, 1024, Some(cancellation_flag.as_ref()))
             .unwrap_err();
-        cancellation_thread.join().unwrap();
-        let pid = fs::read_to_string(descendant_pid)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = cancellation_thread.join().unwrap();
         let mut guard = DescendantGuard(Some(pid));
 
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -2126,6 +2110,25 @@ setInterval(() => {{}}, 1000);
                     libc::kill(pid, libc::SIGKILL);
                 }
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(path: &Path, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(value) = fs::read_to_string(path) {
+                if let Ok(pid) = value.trim().parse::<i32>() {
+                    if pid > 0 {
+                        return pid;
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bundler descendant did not publish a valid pid"
+            );
+            thread::sleep(Duration::from_millis(5));
         }
     }
 

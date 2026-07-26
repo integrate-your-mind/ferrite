@@ -1707,10 +1707,7 @@ setInterval(() => {{}}, 1000);
         let started = Instant::now();
 
         let error = renderer.render_page_to_html(&page, &[], &[]).unwrap_err();
-        let pid = fs::read_to_string(descendant_pid)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = wait_for_pid_file(&descendant_pid, Duration::from_secs(2));
         let mut guard = DescendantGuard(Some(pid));
 
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -1749,10 +1746,7 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "complete" }}));
         let started = Instant::now();
 
         let html = renderer.render_page_to_html(&page, &[], &[]).unwrap();
-        let pid = fs::read_to_string(descendant_pid)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = wait_for_pid_file(&descendant_pid, Duration::from_secs(2));
         let mut guard = DescendantGuard(Some(pid));
 
         assert_eq!(html, "complete");
@@ -1786,15 +1780,9 @@ setInterval(() => {{}}, 1000);
         let cancellation_writer = Arc::clone(&cancellation_flag);
         let pid_path = descendant_pid.clone();
         let cancellation_thread = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !pid_path.is_file() {
-                assert!(
-                    Instant::now() < deadline,
-                    "renderer descendant did not start"
-                );
-                thread::sleep(Duration::from_millis(5));
-            }
+            let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
             cancellation_writer.store(true, Ordering::Release);
+            pid
         });
         let mut command = Command::new("node");
         command.arg(script).current_dir(temp.path());
@@ -1803,11 +1791,7 @@ setInterval(() => {{}}, 1000);
         let error =
             run_command_with_limits(command, None, None, 1024, Some(cancellation_flag.as_ref()))
                 .unwrap_err();
-        cancellation_thread.join().unwrap();
-        let pid = fs::read_to_string(descendant_pid)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let pid = cancellation_thread.join().unwrap();
         let mut guard = DescendantGuard(Some(pid));
 
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -1845,6 +1829,43 @@ setInterval(() => {{}}, 1000);
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(path: &Path, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(value) = fs::read_to_string(path) {
+                if let Ok(pid) = value.trim().parse::<i32>() {
+                    if pid > 0 {
+                        return pid;
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "renderer descendant did not publish a valid pid"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_waiter_ignores_incomplete_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("descendant.pid");
+        fs::write(&pid_path, "").unwrap();
+        let writer_path = pid_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            fs::write(&writer_path, "not-a-pid").unwrap();
+            thread::sleep(Duration::from_millis(10));
+            fs::write(&writer_path, " 42\n").unwrap();
+        });
+
+        assert_eq!(wait_for_pid_file(&pid_path, Duration::from_secs(1)), 42);
+        writer.join().unwrap();
     }
 
     #[cfg(unix)]

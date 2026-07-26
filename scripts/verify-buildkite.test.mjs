@@ -60,6 +60,8 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /pnpm_version="\$\(pnpm --version\)"/);
   assert.match(source, /rustup target list --toolchain stable --installed/);
   assert.match(source, /wasm32-unknown-unknown/);
+  assert.match(source, /run_gate coverage-rust rustup run stable cargo llvm-cov/);
+  assert.doesNotMatch(source, /coverage-rust env RUSTC=/);
   assert.doesNotMatch(source, /corepack pnpm/);
   assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
 });

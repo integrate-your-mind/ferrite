@@ -40,7 +40,8 @@ It runs, in order:
 3. lint, typecheck, build, and the full Rust/Node/browser/demo test suite;
 4. npm/Cargo package verification, dependency audits, site validation, pipeline
    validation, and a committed-head secret scan;
-5. measured Rust/runtime/native coverage reports without inventing a threshold;
+5. measured Rust/runtime/native coverage reports without inventing a threshold
+   or overriding `cargo-llvm-cov`'s instrumentation compiler;
 6. the current macOS arm64 native-prebuild package and checksum verifier; and
 7. the pinned nginx stack.
 
