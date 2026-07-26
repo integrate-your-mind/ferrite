@@ -15,6 +15,20 @@ import {
   verifyNpmPackages,
 } from "./verify-npm-packages.mjs";
 
+const testReportIdentity = {
+  sourceIdentity: {
+    commit: "a".repeat(40),
+    tree: "b".repeat(40),
+  },
+  buildIdentity: {
+    provider: "buildkite",
+    buildId: "build-123",
+    buildNumber: "123",
+    jobId: "job-456",
+    url: "https://buildkite.example.test/ferrite/builds/123",
+  },
+};
+
 test("clean developer workflow rejects a missing artifact before building and then serves it", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-clean-workflow-"));
   const cliSource = join(root, "source-ferrite");
@@ -340,6 +354,7 @@ test("verifier validates packages and writes the inspected report", async () => 
   const packCalls = [];
   try {
     const results = await verifyNpmPackages({
+      ...testReportIdentity,
       releasePackages: [
         {
           name: "@ferrite/protocol",
@@ -393,7 +408,11 @@ test("verifier validates packages and writes the inspected report", async () => 
     ]);
     assert.equal(packCalls.length, 1);
     assert.notEqual(packCalls[0], join(process.cwd(), "packages/protocol"));
-    assert.deepEqual(report, results);
+    assert.equal(report.schemaVersion, 1);
+    assert.deepEqual(report.source, testReportIdentity.sourceIdentity);
+    assert.deepEqual(report.build, testReportIdentity.buildIdentity);
+    assert.match(report.packageSetSha256, /^[a-f0-9]{64}$/);
+    assert.deepEqual(report.packages, results);
   } finally {
     await rm(root, { force: true, recursive: true });
   }
@@ -451,6 +470,7 @@ test("verifier packs a staged release manifest instead of the source manifest", 
     );
 
     const results = await verifyNpmPackages({
+      ...testReportIdentity,
       releasePackages: [
         {
           name: "@ferrite/protocol",
@@ -510,6 +530,7 @@ test("verifier persists tarball identity without temporary paths", async () => {
     await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
     await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
     const results = await verifyNpmPackages({
+      ...testReportIdentity,
       releasePackages: [
         {
           name: "@ferrite/protocol",
@@ -547,8 +568,8 @@ test("verifier persists tarball identity without temporary paths", async () => {
       sha256: createHash("sha256").update(tarballBytes).digest("hex"),
     };
     assert.deepEqual(results[0].tarball, identity);
-    assert.deepEqual(report[0].tarball, identity);
-    assert.deepEqual(report[0].publishArtifact, {
+    assert.deepEqual(report.packages[0].tarball, identity);
+    assert.deepEqual(report.packages[0].publishArtifact, {
       path: "tarballs/protocol-0.1.0.tgz",
       ...identity,
     });
@@ -572,6 +593,7 @@ test("verifier rejects inconsistent npm tarball size metadata", async () => {
     await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
     await assert.rejects(
       verifyNpmPackages({
+        ...testReportIdentity,
         releasePackages: [
           {
             name: "@ferrite/protocol",
@@ -617,6 +639,7 @@ test("verifier rejects tarballs outside its staging directory", async () => {
     await writeFile(outsideTarballPath, "outside bytes\n");
     await assert.rejects(
       verifyNpmPackages({
+        ...testReportIdentity,
         releasePackages: [
           {
             name: "@ferrite/protocol",
@@ -655,6 +678,7 @@ test("verifier rejects staged tarball symlinks that resolve outside staging", as
     await writeFile(outsideTarballPath, "outside bytes\n");
     await assert.rejects(
       verifyNpmPackages({
+        ...testReportIdentity,
         releasePackages: [
           {
             name: "@ferrite/protocol",
@@ -742,6 +766,7 @@ test("verifier installs all generated local tarballs together in a clean project
 
     const installCalls = [];
     await verifyNpmPackages({
+      ...testReportIdentity,
       releasePackages: [
         {
           name: "@ferrite/protocol",

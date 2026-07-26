@@ -57,8 +57,9 @@ values in `dist/ci/environment.txt`. Do not bypass this guard to turn an
 1. exact-commit, clean-checkout, host, and toolchain preflight;
 2. frozen dependency installation;
 3. lint, typecheck, build, and the full Rust/Node/browser/demo test suite;
-4. npm/Cargo package verification, dependency audits, site validation, pipeline
-   validation, and a committed-head secret scan;
+4. npm/Cargo package verification, a source/build-bound portable npm release
+   plan, dependency audits, site validation, pipeline validation, and a
+   committed-head secret scan;
 5. measured Rust/runtime/native coverage reports without inventing a threshold
    or overriding `cargo-llvm-cov`'s instrumentation compiler;
 6. the current macOS arm64 native-prebuild package and checksum verifier; and

@@ -43,10 +43,13 @@ Bind every receipt to the exact candidate commit and tree.
   `coverage-rust`, `coverage-js`, and applicable native/runtime gates.
 - `pnpm release:verify:npm` preserves the verified tarballs under
   `dist/npm-packages/tarballs/`. Every preserved file must match the filename,
-  byte size, and SHA-256 value in `npm-package-report.json`.
+  byte size, and SHA-256 value in `npm-package-report.json`. The report envelope
+  must bind the exact Git commit/tree, Buildkite build/job, and complete package
+  set digest.
 - `pnpm release:plan:npm` succeeds and emits the portable dependency order
-  from those exact retained bytes. The command validates but never authenticates
-  or publishes.
+  from those exact retained bytes. The planner reopens each gzip/tar archive and
+  compares its real file list and `package/package.json` with the report. The
+  command validates but never authenticates or publishes.
 - A clean directory installs those exact tarballs and passes the package smoke
   and starter workflow before any registry mutation.
 - The authenticated npm identity owns or may create every intended scoped
@@ -81,8 +84,21 @@ gap.
 3. Verify report identities against the retained files.
 4. Authenticate to npm interactively without recording credentials.
 5. Confirm package ownership and that no intended version already exists.
-6. Publish the portable packages in dependency order with `--access public`
-   and `--tag next`. Never repack between proof and publication.
+6. Run the guarded publication driver with the explicit execution flag:
+
+   ```sh
+   node scripts/publish-npm-release.mjs \
+     --report dist/npm-packages/npm-package-report.json \
+     --version 0.1.0-alpha.0 \
+     --tag next \
+     --execute
+   ```
+
+   The driver revalidates source, Buildkite identity, report, archive contents,
+   and digest before every package, copies the verified bytes into a private
+   read-only staging directory, then publishes in dependency order with
+   `--access public --tag next`. It stops at the first failure and removes its
+   staging directory. Never repack between proof and publication.
 7. Read each version and dist-tag back from the registry.
 8. Install the exact registry versions in a clean directory and rerun the
    portable package smoke.

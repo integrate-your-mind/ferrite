@@ -4,6 +4,15 @@ import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { argv, exit } from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import {
+  inspectNpmTarball,
+  packageSetIdentity,
+  readGitIdentity,
+  validateTarballAgainstReport,
+} from "./verify-npm-packages.mjs";
+
+const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
 export const PORTABLE_RELEASE_PACKAGES = Object.freeze([
   "@ferrite/protocol",
   "@ferrite/protocol-wasm",
@@ -14,6 +23,8 @@ export async function prepareNpmRelease({
   reportPath,
   version = "0.1.0-alpha.0",
   tag = "next",
+  sourceIdentity,
+  requireBuildkite = true,
 } = {}) {
   if (!reportPath) {
     throw new Error("npm release planning requires --report.");
@@ -28,11 +39,32 @@ export async function prepareNpmRelease({
   const resolvedReport = resolve(reportPath);
   const reportRoot = dirname(resolvedReport);
   const report = JSON.parse(await readFile(resolvedReport, "utf8"));
-  if (!Array.isArray(report)) {
-    throw new Error("npm package report must be an array.");
+  if (
+    !report ||
+    report.schemaVersion !== 1 ||
+    !Array.isArray(report.packages) ||
+    typeof report.packageSetSha256 !== "string"
+  ) {
+    throw new Error("npm package report must be a version 1 release envelope.");
+  }
+  const currentSource = sourceIdentity ?? (await readGitIdentity(workspaceRoot));
+  if (
+    report.source?.commit !== currentSource.commit ||
+    report.source?.tree !== currentSource.tree
+  ) {
+    throw new Error("npm package report source commit/tree does not match the current checkout.");
+  }
+  if (requireBuildkite && report.build?.provider !== "buildkite") {
+    throw new Error("npm release planning requires an exact Buildkite package report.");
+  }
+  const packageSetSha256 = createHash("sha256")
+    .update(JSON.stringify(packageSetIdentity(report.packages)))
+    .digest("hex");
+  if (report.packageSetSha256 !== packageSetSha256) {
+    throw new Error("npm package report package-set digest does not match.");
   }
   const byName = new Map();
-  for (const entry of report) {
+  for (const entry of report.packages) {
     if (!entry || typeof entry.name !== "string" || byName.has(entry.name)) {
       throw new Error(`npm package report contains an invalid or duplicate package name.`);
     }
@@ -47,6 +79,7 @@ export async function prepareNpmRelease({
     }
     validateManifest(name, entry, version);
     const artifact = await validateArtifact(name, entry.publishArtifact, reportRoot);
+    validateTarballAgainstReport(name, entry, await inspectNpmTarball(artifact.path));
     packages.push({
       name,
       version,
@@ -59,6 +92,9 @@ export async function prepareNpmRelease({
   return {
     version,
     tag,
+    source: report.source,
+    build: report.build,
+    packageSetSha256,
     packages,
     excluded: [
       {

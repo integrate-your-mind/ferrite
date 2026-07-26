@@ -3,9 +3,9 @@ import { createHash } from "node:crypto";
 import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { argv, cwd, exit } from "node:process";
+import { argv, cwd, env, exit } from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { gunzip as gunzipCallback } from "node:zlib";
 
 import {
@@ -173,6 +173,8 @@ export async function verifyNpmPackages({
   packNativePackage = npmPackPackage,
   prepareNativePackage = packCurrentNativePrebuild,
   installPackageSet = installPackedPackageSet,
+  sourceIdentity,
+  buildIdentity,
 } = {}) {
   const packageVerifier = packPackage ?? npmPackPackage;
   const packageVersions = new Map();
@@ -270,12 +272,95 @@ export async function verifyNpmPackages({
       await rm(packageReportDir, { force: true, recursive: true });
       await mkdir(packageReportDir, { recursive: true });
       await persistVerifiedTarballs(results, installablePackages, packageReportDir);
-      await writeFile(join(packageReportDir, "npm-package-report.json"), `${JSON.stringify(results, null, 2)}\n`);
+      const report = createPackageReport({
+        packages: results,
+        source: sourceIdentity ?? (await readGitIdentity(packageWorkspaceRoot)),
+        build: buildIdentity ?? readBuildIdentity(env),
+      });
+      await writeFile(join(packageReportDir, "npm-package-report.json"), `${JSON.stringify(report, null, 2)}\n`);
     }
 
     return results;
   } finally {
     await rm(stageRoot, { force: true, recursive: true });
+  }
+}
+
+export function createPackageReport({ packages, source, build }) {
+  validateSourceIdentity(source);
+  validateBuildIdentity(build);
+  const packageSet = packageSetIdentity(packages);
+  return {
+    schemaVersion: 1,
+    source: structuredClone(source),
+    build: structuredClone(build),
+    packageSetSha256: createHash("sha256").update(JSON.stringify(packageSet)).digest("hex"),
+    packages,
+  };
+}
+
+export function packageSetIdentity(packages) {
+  if (!Array.isArray(packages)) {
+    throw new Error("npm package report packages must be an array.");
+  }
+  return packages
+    .map((pkg) => ({
+      name: pkg?.name,
+      version: pkg?.version,
+      publishArtifact: pkg?.publishArtifact ?? null,
+    }))
+    .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+}
+
+export async function readGitIdentity(root = workspaceRoot) {
+  const [commit, tree, status] = await Promise.all([
+    run("git", ["rev-parse", "HEAD"], { cwd: root, capture: true }),
+    run("git", ["rev-parse", "HEAD^{tree}"], { cwd: root, capture: true }),
+    run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: root, capture: true }),
+  ]);
+  if (status.trim() !== "") {
+    throw new Error("npm package report requires a clean tracked and untracked Git worktree.");
+  }
+  const source = { commit: commit.trim(), tree: tree.trim() };
+  validateSourceIdentity(source);
+  return source;
+}
+
+export function readBuildIdentity(environment = env) {
+  if (environment.BUILDKITE === "true") {
+    const build = {
+      provider: "buildkite",
+      buildId: environment.BUILDKITE_BUILD_ID,
+      buildNumber: environment.BUILDKITE_BUILD_NUMBER,
+      jobId: environment.BUILDKITE_JOB_ID,
+      url: environment.BUILDKITE_BUILD_URL,
+    };
+    validateBuildIdentity(build);
+    return build;
+  }
+  return { provider: "local" };
+}
+
+function validateSourceIdentity(source) {
+  if (
+    !source ||
+    !/^[0-9a-f]{40}$/.test(source.commit ?? "") ||
+    !/^[0-9a-f]{40}$/.test(source.tree ?? "")
+  ) {
+    throw new Error("npm package report requires exact 40-character Git commit and tree identities.");
+  }
+}
+
+function validateBuildIdentity(build) {
+  if (!build || !["local", "buildkite"].includes(build.provider)) {
+    throw new Error("npm package report requires an explicit local or Buildkite build identity.");
+  }
+  if (build.provider === "buildkite") {
+    for (const field of ["buildId", "buildNumber", "jobId", "url"]) {
+      if (typeof build[field] !== "string" || build[field].trim() === "") {
+        throw new Error(`npm package report Buildkite identity requires ${field}.`);
+      }
+    }
   }
 }
 
@@ -738,17 +823,37 @@ if (packageNames.has("@ferrite/node")) {
 `;
 }
 
-async function readTarballPackageManifest(tarballPath) {
-  const archive = await gunzip(await readFile(tarballPath));
+export async function inspectNpmTarball(tarballPath) {
+  let archive;
+  try {
+    archive = await gunzip(await readFile(tarballPath));
+  } catch (error) {
+    throw new Error(`${tarballPath}: npm artifact is not a valid gzip archive: ${error.message}`);
+  }
+  const files = [];
+  const paths = new Set();
+  let manifest;
   let offset = 0;
   while (offset + 512 <= archive.length) {
     const header = archive.subarray(offset, offset + 512);
     if (header.every((byte) => byte === 0)) {
       break;
     }
+    validateTarHeaderChecksum(tarballPath, header);
     const name = readTarString(header, 0, 100);
     const prefix = readTarString(header, 345, 155);
     const path = prefix ? `${prefix}/${name}` : name;
+    if (
+      !path.startsWith("package/") ||
+      path.startsWith("/") ||
+      path.split("/").some((segment) => segment === ".." || segment === "")
+    ) {
+      throw new Error(`${tarballPath}: unsafe npm tar entry ${path || "<empty>"}.`);
+    }
+    if (paths.has(path)) {
+      throw new Error(`${tarballPath}: duplicate npm tar entry ${path}.`);
+    }
+    paths.add(path);
     const sizeText = readTarString(header, 124, 12).trim();
     const size = Number.parseInt(sizeText || "0", 8);
     if (!Number.isFinite(size) || size < 0) {
@@ -759,12 +864,55 @@ async function readTarballPackageManifest(tarballPath) {
     if (dataEnd > archive.length) {
       throw new Error(`${tarballPath}: truncated tar entry for ${path}.`);
     }
-    if (path === "package/package.json") {
-      return JSON.parse(archive.subarray(dataStart, dataEnd).toString("utf8"));
+    const type = header[156];
+    const regularFile = type === 0 || type === 48;
+    if (regularFile) {
+      files.push(path.slice("package/".length));
+      if (path === "package/package.json") {
+        try {
+          manifest = JSON.parse(archive.subarray(dataStart, dataEnd).toString("utf8"));
+        } catch (error) {
+          throw new Error(`${tarballPath}: package/package.json is invalid JSON: ${error.message}`);
+        }
+      }
+    } else if (type !== 53) {
+      throw new Error(`${tarballPath}: unsupported npm tar entry type ${type} for ${path}.`);
     }
     offset = dataStart + Math.ceil(size / 512) * 512;
   }
-  throw new Error(`${tarballPath}: package/package.json was not found.`);
+  if (!manifest) {
+    throw new Error(`${tarballPath}: package/package.json was not found.`);
+  }
+  return { manifest, files: files.sort() };
+}
+
+async function readTarballPackageManifest(tarballPath) {
+  return (await inspectNpmTarball(tarballPath)).manifest;
+}
+
+function validateTarHeaderChecksum(tarballPath, header) {
+  const checksumText = readTarString(header, 148, 8).trim();
+  const expected = Number.parseInt(checksumText || "0", 8);
+  if (!Number.isFinite(expected)) {
+    throw new Error(`${tarballPath}: invalid tar header checksum.`);
+  }
+  let actual = 0;
+  for (let index = 0; index < header.length; index += 1) {
+    actual += index >= 148 && index < 156 ? 32 : header[index];
+  }
+  if (actual !== expected) {
+    throw new Error(`${tarballPath}: tar header checksum does not match.`);
+  }
+}
+
+export function validateTarballAgainstReport(packageName, entry, inspected) {
+  if (!isDeepStrictEqual(inspected.manifest, entry.packedManifest)) {
+    throw new Error(`${packageName}: retained tarball manifest does not match the package report.`);
+  }
+  const reportedFiles = [...(entry.files ?? [])].sort();
+  if (!isDeepStrictEqual(inspected.files, reportedFiles)) {
+    throw new Error(`${packageName}: retained tarball file list does not match the package report.`);
+  }
 }
 
 function readTarString(buffer, start, length) {

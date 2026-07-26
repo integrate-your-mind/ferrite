@@ -94,6 +94,7 @@ test("local CI retains the host-executable validation gate categories", async ()
     "pnpm build",
     "pnpm test",
     "pnpm release:verify:npm",
+    "pnpm release:plan:npm",
     "pnpm release:verify:cargo",
     "cargo llvm-cov",
     "--experimental-test-coverage",

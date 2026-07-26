@@ -8,7 +8,7 @@ Rust owns the boundaries that need strict validation: module graphs, routing, re
 
 Ferrite's source is published for technical evaluation, research, issue reporting, and focused contributions. It is not ready for unmanaged public production use, authenticated mutation-heavy workloads, or compatibility-sensitive deployments.
 
-Expect breaking changes, incomplete packages, unsupported platforms, and revisions to public APIs. The npm packages and public CLI distribution are not yet available. A public repository does not mean that Ferrite has reached a supported public release.
+Expect breaking changes, incomplete packages, unsupported platforms, and revisions to public APIs. Ferrite's first registry boundary is limited to the portable protocol, protocol-WASM, and runtime prerelease packages; the public CLI and native package set are not distributed by that release. Until a GitHub release links verified registry versions, use the source-backed workflow below.
 
 Before contributing, read:
 
@@ -36,7 +36,7 @@ pnpm test:demos
 starts the actual `ferrite serve` adapter, exercises normal, query, deep-route,
 and 404 requests, drives the hydrated Docs Workbench in Chrome, and proves a
 tampered artifact is rejected before the server binds. The examples still
-require a source checkout; public packages and hosted deployment are not part
+require a source checkout; registry installation and hosted deployment are not part
 of this proof.
 
 ## Current model
@@ -119,7 +119,7 @@ pnpm test:browser
 
 ## Create a source-backed starter
 
-Public packages and a public CLI are not available yet. From a clean Ferrite source checkout, create a working local starter with:
+The portable npm prerelease does not provide the Rust CLI or a registry-only application starter. From a clean Ferrite source checkout, create a working local starter with:
 
 ```sh
 pnpm starter:create -- ../my-ferrite-app

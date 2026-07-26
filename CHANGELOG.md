@@ -1,8 +1,9 @@
 # Changelog
 
-Ferrite has no published release. All entries remain under **Unreleased** until
-an exact package set, CLI, native artifacts, and hosted release workflow pass
-the documented release gates.
+Ferrite has no published release at this candidate. The first permitted release
+is the exact portable npm prerelease set documented in
+`docs/npm-release.md`; the CLI and native package matrix remain separate release
+units rather than hidden prerequisites for those three packages.
 
 ## Unreleased
 

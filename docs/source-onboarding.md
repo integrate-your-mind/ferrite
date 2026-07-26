@@ -1,6 +1,9 @@
 # Source onboarding
 
-Ferrite's supported developer-preview entry point is a source checkout. The npm packages and CLI are not published, so `npm install @ferrite/runtime` and a registry-only `ferrite init` workflow are not currently available.
+Ferrite's supported end-to-end developer-preview entry point is a source
+checkout. The portable npm prerelease is limited to protocol, protocol-WASM,
+and runtime packages; it does not distribute the Rust CLI or a registry-only
+`ferrite init` workflow.
 
 ## Prerequisites
 
