@@ -119,10 +119,7 @@ test("server payload navigator handles prefetch, stream navigation, and popstate
 });
 
 test("server payload navigator falls back from malformed clicked payloads in Chromium", async (t) => {
-  if (!existsSync(chromeExecutable)) {
-    t.skip(`Chrome executable not found at ${chromeExecutable}`);
-    return;
-  }
+  if (!requireBrowser(t, chromeExecutable)) return;
 
   const project = await createPayloadNavigationFixture();
   t.after(async () => {
