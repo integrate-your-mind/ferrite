@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaceRoot = resolve(packageRoot, "../..");
 const execFile = promisify(execFileCallback);
+const darwinAdHocIdentifier = "ferrite-node";
 
 export async function copyNativeBinding({
   source = join(cargoTargetRoot(), process.env.PROFILE || "debug", nativeLibraryName()),
@@ -61,10 +62,19 @@ export async function copyNativeBinding({
 }
 
 export async function signDarwinNativeBinding(destination, { execFileImpl = execFile } = {}) {
-  // This restores loader validity after copying; release identity signing and notarization stay separate.
+  // The fixed identifier keeps the UUID staging filename out of the signed bytes.
+  // This only restores loader validity; release signing and notarization stay separate.
   await execFileImpl(
     "/usr/bin/codesign",
-    ["--force", "--sign", "-", "--timestamp=none", destination],
+    [
+      "--force",
+      "--sign",
+      "-",
+      "--identifier",
+      darwinAdHocIdentifier,
+      "--timestamp=none",
+      destination,
+    ],
     { encoding: "utf8" },
   );
 }

@@ -109,7 +109,7 @@ test("reports staging cleanup failure without replacing the prior binding", asyn
   assert.equal(await readFile(staging, "utf8"), "native-binding");
 });
 
-test("invokes the absolute codesign binary without a timestamp or shell", async () => {
+test("invokes codesign with a deterministic identifier, no timestamp, and no shell", async () => {
   const calls = [];
 
   await signDarwinNativeBinding("/tmp/ferrite node.node", {
@@ -121,7 +121,15 @@ test("invokes the absolute codesign binary without a timestamp or shell", async 
   assert.deepEqual(calls, [
     [
       "/usr/bin/codesign",
-      ["--force", "--sign", "-", "--timestamp=none", "/tmp/ferrite node.node"],
+      [
+        "--force",
+        "--sign",
+        "-",
+        "--identifier",
+        "ferrite-node",
+        "--timestamp=none",
+        "/tmp/ferrite node.node",
+      ],
       { encoding: "utf8" },
     ],
   ]);
