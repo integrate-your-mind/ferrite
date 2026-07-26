@@ -9,6 +9,10 @@ a branch, or open a pull request.
 node tools/ferrite-migrate/scan.mjs --project /path/to/react-app --output plan.json
 ```
 
+`--output` must resolve outside the scanned project. This includes paths that
+enter the project through a symbolic link; the scanner rejects them before it
+creates directories or writes a report.
+
 The JSON report names its compatibility tier, observed facts, proposed future
 workflow steps, and manual blockers. A `TIER_1_STRUCTURAL` report is an
 automation candidate only: no migration is called automatic until a future

@@ -1,20 +1,21 @@
 #!/usr/bin/env node
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, extname, join, relative, resolve } from "node:path";
+import { mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 
 const SOURCE_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]);
 const SKIP_DIRECTORIES = new Set([".git", ".ferrite", ".next", "dist", "build", "coverage", "node_modules"]);
 const SEVERITY = { info: 0, assisted: 1, manual: 2, unsupported: 3 };
 
 export async function scanProject(projectPath) {
-  const root = resolve(projectPath);
-  const manifestPath = join(root, "package.json");
+  const requestedRoot = resolve(projectPath);
+  const manifestPath = join(requestedRoot, "package.json");
   let manifest;
   try {
     manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   } catch (error) {
     throw new Error(`Ferrite migration scanner requires a readable package.json at ${manifestPath}: ${error.message}`);
   }
+  const root = await realpath(requestedRoot);
 
   const files = await sourceFiles(root);
   const dependencies = { ...manifest.dependencies, ...manifest.devDependencies, ...manifest.peerDependencies };
@@ -94,12 +95,38 @@ export async function run(argv) {
   if (outputFlag !== -1) {
     if (!args[outputFlag + 1]) throw new Error("--output requires a path");
     const output = resolve(args[outputFlag + 1]);
+    await rejectProjectOutput(report.project.root, output);
     await mkdir(dirname(output), { recursive: true });
     await writeFile(output, json, "utf8");
   } else {
     process.stdout.write(json);
   }
   return report;
+}
+
+async function rejectProjectOutput(projectRoot, output) {
+  const canonicalProjectRoot = await realpath(projectRoot);
+  const canonicalOutput = await canonicalPath(output);
+  const pathFromProject = relative(canonicalProjectRoot, canonicalOutput);
+  if (pathFromProject === "" || (!pathFromProject.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && pathFromProject !== ".." && !isAbsolute(pathFromProject))) {
+    throw new Error(`Refusing to write --output inside scanned project: ${output}. Choose a path outside ${canonicalProjectRoot}.`);
+  }
+}
+
+async function canonicalPath(path) {
+  let candidate = resolve(path);
+  const missing = [];
+  while (true) {
+    try {
+      return resolve(await realpath(candidate), ...missing.reverse());
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) throw error;
+      missing.push(basename(candidate));
+      candidate = parent;
+    }
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
