@@ -114,6 +114,13 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /export CARGO_INCREMENTAL=0/);
   assert.match(source, /export CARGO_PROFILE_DEV_DEBUG=0/);
   assert.match(source, /export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off/);
+  assert.match(source, /MIN_FREE_KIB=20971520/);
+  assert.match(source, /\/bin\/df -Pk "\$\{ROOT\}"/);
+  assert.match(source, /storage admission requires at least/);
+  assert.ok(
+    source.indexOf("/bin/df -Pk") < source.indexOf('mkdir -p "${REPORT_DIR}"'),
+    "storage admission must run before CI creates report output",
+  );
   assert.match(source, /run_gate coverage-rust rustup run stable cargo llvm-cov/);
   assert.match(
     source,

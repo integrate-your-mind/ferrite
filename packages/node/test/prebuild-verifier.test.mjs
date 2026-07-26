@@ -204,7 +204,7 @@ async function writePrebuildPackage(
     `${JSON.stringify(
       {
         name: packageName,
-        version: "0.1.0",
+        version: nodePackage.version,
         description: `Ferrite native Node.js binding for ${os}/${cpu}.`,
         license,
         keywords: ["ferrite", "node-api", "native", "ssr", "rust"],

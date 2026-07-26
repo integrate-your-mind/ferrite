@@ -7,6 +7,8 @@ REPORT_DIR="${ROOT}/dist/ci"
 readonly REPORT_DIR
 MODE="${1:-}"
 readonly MODE
+MIN_FREE_KIB=20971520
+readonly MIN_FREE_KIB
 
 # Keep clean local-agent jobs reproducible and bound Rust's generated output.
 export CARGO_BUILD_JOBS=1
@@ -37,6 +39,13 @@ run_gate() {
 }
 
 preflight() {
+  local available_kib
+  available_kib="$(/bin/df -Pk "${ROOT}" | /usr/bin/awk 'NR == 2 { print $4 }')"
+  [[ "${available_kib}" =~ ^[0-9]+$ ]] ||
+    fail "could not determine available storage for ${ROOT}"
+  (( available_kib >= MIN_FREE_KIB )) ||
+    fail "storage admission requires at least ${MIN_FREE_KIB} KiB free; found ${available_kib} KiB"
+
   mkdir -p "${REPORT_DIR}"
   : > "${REPORT_DIR}/results.tsv"
 
@@ -93,6 +102,8 @@ preflight() {
     printf 'cargo_profile_dev_debug=%s\n' "${CARGO_PROFILE_DEV_DEBUG}"
     printf 'cargo_profile_dev_split_debuginfo=%s\n' \
       "${CARGO_PROFILE_DEV_SPLIT_DEBUGINFO}"
+    printf 'storage_available_kib=%s\n' "${available_kib}"
+    printf 'storage_minimum_kib=%s\n' "${MIN_FREE_KIB}"
   } > "${REPORT_DIR}/environment.txt"
 }
 

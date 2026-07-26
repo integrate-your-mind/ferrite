@@ -548,6 +548,14 @@ test("verifier persists tarball identity without temporary paths", async () => {
     };
     assert.deepEqual(results[0].tarball, identity);
     assert.deepEqual(report[0].tarball, identity);
+    assert.deepEqual(report[0].publishArtifact, {
+      path: "tarballs/protocol-0.1.0.tgz",
+      ...identity,
+    });
+    assert.deepEqual(
+      await readFile(join(root, "reports", "tarballs", "protocol-0.1.0.tgz")),
+      tarballBytes,
+    );
     assert.equal(reportText.includes(root), false);
     assert.equal(reportText.includes(tarballPath), false);
     assert.doesNotMatch(reportText, /real tarball bytes/);

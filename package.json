@@ -12,6 +12,7 @@
     "dev:once": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- dev --project examples/basic --once --request-path /posts/abc",
     "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/protocol-wasm typecheck && pnpm --filter @ferrite/runtime typecheck && pnpm --filter @ferrite/node typecheck",
     "release:verify:npm": "cargo build -p ferrite-cli && node scripts/verify-npm-packages.mjs --publish-manifest --repository-url https://github.com/integrate-your-mind/ferrite",
+    "release:plan:npm": "node scripts/prepare-npm-release.mjs --report dist/npm-packages/npm-package-report.json --version 0.1.0-alpha.0 --tag next",
     "release:verify:cargo": "cargo package --workspace --allow-dirty --no-verify",
     "starter:create": "cargo build -p ferrite-cli && node scripts/create-source-starter.mjs",
     "render:fixture": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && node examples/basic/render.mjs | cargo run -p ferrite-cli -- render --input -",

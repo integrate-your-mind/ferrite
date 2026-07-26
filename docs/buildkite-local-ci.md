@@ -48,6 +48,12 @@ builds only its ignored runtime and native prerequisites, copies their
 distributable artifacts, then removes the prerequisite Rust target before
 starting the Node coverage runs.
 
+Every command step checks storage before creating reports, installing
+dependencies, or building source. It fails closed unless the checkout volume
+has at least 20 GiB available, then records the observed and required KiB
+values in `dist/ci/environment.txt`. Do not bypass this guard to turn an
+`ENOSPC` failure into a nominal CI result.
+
 1. exact-commit, clean-checkout, host, and toolchain preflight;
 2. frozen dependency installation;
 3. lint, typecheck, build, and the full Rust/Node/browser/demo test suite;

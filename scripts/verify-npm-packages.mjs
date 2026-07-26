@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { argv, cwd, exit } from "node:process";
@@ -269,12 +269,50 @@ export async function verifyNpmPackages({
     if (writeReports) {
       await rm(packageReportDir, { force: true, recursive: true });
       await mkdir(packageReportDir, { recursive: true });
+      await persistVerifiedTarballs(results, installablePackages, packageReportDir);
       await writeFile(join(packageReportDir, "npm-package-report.json"), `${JSON.stringify(results, null, 2)}\n`);
     }
 
     return results;
   } finally {
     await rm(stageRoot, { force: true, recursive: true });
+  }
+}
+
+async function persistVerifiedTarballs(results, installablePackages, packageReportDir) {
+  const tarballDir = join(packageReportDir, "tarballs");
+  const filenames = new Set();
+
+  for (const pkg of installablePackages) {
+    if (!pkg.tarball || typeof pkg.tarballPath !== "string") {
+      continue;
+    }
+    if (filenames.has(pkg.tarball.filename)) {
+      throw new Error(`${pkg.name}: duplicate verified tarball filename ${pkg.tarball.filename}.`);
+    }
+    filenames.add(pkg.tarball.filename);
+    await mkdir(tarballDir, { recursive: true });
+    const destination = join(tarballDir, pkg.tarball.filename);
+    await copyFile(pkg.tarballPath, destination);
+    const copiedIdentity = await inspectTarballIdentity(
+      pkg.name,
+      {
+        tarballPath: destination,
+        npmReportedSize: pkg.tarball.size,
+      },
+      tarballDir,
+    );
+    if (copiedIdentity.sha256 !== pkg.tarball.sha256) {
+      throw new Error(`${pkg.name}: persisted tarball digest does not match the verified source tarball.`);
+    }
+    const result = results.find((candidate) => candidate.name === pkg.name);
+    if (!result) {
+      throw new Error(`${pkg.name}: verified tarball has no report entry.`);
+    }
+    result.publishArtifact = {
+      path: `tarballs/${pkg.tarball.filename}`,
+      ...copiedIdentity,
+    };
   }
 }
 

@@ -103,6 +103,12 @@ pnpm release:verify:npm
 pnpm release:verify:cargo
 ```
 
+The verified npm tarballs are retained under
+`dist/npm-packages/tarballs/` with their identities in
+`dist/npm-packages/npm-package-report.json`. See the
+[npm release runbook](docs/npm-release.md) for the prerelease package boundary,
+approval, provenance, publication, and rollback gates.
+
 For the browser gate, install the matching browser and expose its executable:
 
 ```sh
