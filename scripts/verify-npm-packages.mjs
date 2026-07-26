@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { argv, cwd, exit } from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -213,6 +214,7 @@ export async function verifyNpmPackages({
         releaseManifest,
       });
       const packResult = normalizePackResult(config.name, await packageVerifier(stagedPackageDir));
+      const tarball = await inspectTarballIdentity(config.name, packResult, stageRoot);
       validatePackFiles({
         packageName: config.name,
         files: packResult.files,
@@ -236,6 +238,9 @@ export async function verifyNpmPackages({
       if (packResult.packedManifest) {
         result.packedManifest = packResult.packedManifest;
       }
+      if (tarball) {
+        result.tarball = tarball;
+      }
       results.push(result);
       installablePackages.push({
         ...result,
@@ -250,7 +255,11 @@ export async function verifyNpmPackages({
         publishManifestMode,
         stageRoot,
       });
-      const { tarballPath: _tarballPath, ...nativeReport } = nativeResult;
+      const { tarball: nativeTarball, tarballPath: _tarballPath, ...nativeReport } = nativeResult;
+      const tarball = nativeTarball ?? (await inspectTarballIdentity(nativeResult.name, nativeResult, stageRoot));
+      if (tarball) {
+        nativeReport.tarball = tarball;
+      }
       results.push(nativeReport);
       installablePackages.push(nativeResult);
     }
@@ -298,6 +307,7 @@ export async function packCurrentNativePrebuild({
     publishManifestMode,
   });
   const packResult = normalizePackResult(packageName, await packPackage(directory));
+  const tarball = await inspectTarballIdentity(packageName, packResult, stageRoot);
   validatePackFiles({
     packageName,
     files: packResult.files,
@@ -315,6 +325,7 @@ export async function packCurrentNativePrebuild({
     files: packResult.files,
     releaseManifest,
     ...(packResult.packedManifest ? { packedManifest: packResult.packedManifest } : {}),
+    ...(tarball ? { tarball } : {}),
     tarballPath: packResult.tarballPath,
     kind: "native-prebuild",
   };
@@ -401,7 +412,7 @@ function sanitizePackageName(packageName) {
 
 function normalizePackResult(packageName, packResult) {
   if (Array.isArray(packResult)) {
-    return { files: packResult, packedManifest: undefined };
+    return { files: packResult, packedManifest: undefined, npmReportedSize: undefined };
   }
   if (!packResult || typeof packResult !== "object" || !Array.isArray(packResult.files)) {
     throw new Error(`${packageName}: package verifier did not return a packed file list.`);
@@ -410,7 +421,61 @@ function normalizePackResult(packageName, packResult) {
     files: packResult.files,
     packedManifest: packResult.packedManifest,
     tarballPath: packResult.tarballPath,
+    npmReportedSize: packResult.npmReportedSize ?? packResult.size,
   };
+}
+
+async function inspectTarballIdentity(packageName, { tarballPath, npmReportedSize } = {}, allowedRoot) {
+  if (typeof tarballPath !== "string" || tarballPath.trim() === "") {
+    return undefined;
+  }
+
+  const filename = basename(tarballPath);
+  assertSafeTarballFilename(packageName, filename);
+  const [resolvedAllowedRoot, resolvedTarballPath] = await Promise.all([
+    realpath(allowedRoot),
+    realpath(tarballPath),
+  ]);
+  const relativeTarballPath = relative(resolvedAllowedRoot, resolvedTarballPath);
+  if (
+    relativeTarballPath === "" ||
+    relativeTarballPath === ".." ||
+    relativeTarballPath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+    isAbsolute(relativeTarballPath)
+  ) {
+    throw new Error(`${packageName}: packed tarball resolves outside the staging directory.`);
+  }
+
+  const bytes = await readFile(resolvedTarballPath);
+  if (typeof npmReportedSize !== "undefined") {
+    if (!Number.isSafeInteger(npmReportedSize) || npmReportedSize < 0) {
+      throw new Error(`${packageName}: npm pack returned an invalid tarball size.`);
+    }
+    if (npmReportedSize !== bytes.byteLength) {
+      throw new Error(
+        `${packageName}: npm pack reported tarball size ${npmReportedSize}, actual bytes are ${bytes.byteLength}.`,
+      );
+    }
+  }
+
+  return {
+    filename,
+    size: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+
+function assertSafeTarballFilename(packageName, filename) {
+  if (
+    typeof filename !== "string" ||
+    filename.trim() === "" ||
+    filename === "." ||
+    filename === ".." ||
+    filename !== filename.split(/[\\/]/).at(-1) ||
+    /[\u0000-\u001f\u007f]/.test(filename)
+  ) {
+    throw new Error(`${packageName}: npm pack returned an unsafe tarball filename.`);
+  }
 }
 
 async function npmPackPackage(packageDir) {
@@ -430,12 +495,17 @@ async function npmPackPackage(packageDir) {
   if (typeof entry.filename !== "string" || entry.filename.trim() === "") {
     throw new Error(`${packageDir}: npm pack output did not include a tarball filename.`);
   }
+  assertSafeTarballFilename(packageDir, entry.filename);
+  if (!Number.isSafeInteger(entry.size) || entry.size < 0) {
+    throw new Error(`${packageDir}: npm pack output did not include a valid tarball size.`);
+  }
   const tarballPath = join(tarballDir, entry.filename);
   const packedManifest = await readTarballPackageManifest(tarballPath);
   return {
     files: entry.files.map((file) => file.path),
     packedManifest,
     tarballPath,
+    npmReportedSize: entry.size,
   };
 }
 

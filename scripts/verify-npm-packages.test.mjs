@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -500,6 +501,186 @@ test("verifier packs a staged release manifest instead of the source manifest", 
   }
 });
 
+test("verifier persists tarball identity without temporary paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-identity-"));
+  const tarballBytes = Buffer.from("real tarball bytes\n");
+  let tarballPath;
+  try {
+    await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
+    const results = await verifyNpmPackages({
+      releasePackages: [
+        {
+          name: "@ferrite/protocol",
+          directory: "packages/protocol",
+          build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+          requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+          forbiddenFiles: ["src/index.ts", "test"],
+        },
+      ],
+      nativePackageNames: [],
+      packageManifests: new Map([["@ferrite/protocol", completeSourceManifest("@ferrite/protocol")]]),
+      workspaceRoot: root,
+      reportDir: join(root, "reports"),
+      runCommand: async () => "",
+      packPackage: async (packageDir) => {
+        const tarballDir = join(dirname(packageDir), ".tarballs");
+        tarballPath = join(tarballDir, "protocol-0.1.0.tgz");
+        await mkdir(tarballDir, { recursive: true });
+        await writeFile(tarballPath, tarballBytes);
+        return {
+          files: ["package/dist/index.js", "package/dist/index.d.ts"],
+          packedManifest: completeReleaseManifest("@ferrite/protocol"),
+          tarballPath,
+          size: tarballBytes.byteLength,
+        };
+      },
+      installPackageSet: async () => {},
+    });
+
+    const reportText = await readFile(join(root, "reports", "npm-package-report.json"), "utf8");
+    const report = JSON.parse(reportText);
+    const identity = {
+      filename: "protocol-0.1.0.tgz",
+      size: tarballBytes.byteLength,
+      sha256: createHash("sha256").update(tarballBytes).digest("hex"),
+    };
+    assert.deepEqual(results[0].tarball, identity);
+    assert.deepEqual(report[0].tarball, identity);
+    assert.equal(reportText.includes(root), false);
+    assert.equal(reportText.includes(tarballPath), false);
+    assert.doesNotMatch(reportText, /real tarball bytes/);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("verifier rejects inconsistent npm tarball size metadata", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-size-"));
+  try {
+    await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
+    await assert.rejects(
+      verifyNpmPackages({
+        releasePackages: [
+          {
+            name: "@ferrite/protocol",
+            directory: "packages/protocol",
+            build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+            requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+            forbiddenFiles: ["src/index.ts", "test"],
+          },
+        ],
+        nativePackageNames: [],
+        packageManifests: new Map([["@ferrite/protocol", completeSourceManifest("@ferrite/protocol")]]),
+        workspaceRoot: root,
+        reportDir: join(root, "reports"),
+        runCommand: async () => "",
+        packPackage: async (packageDir) => {
+          const tarballDir = join(dirname(packageDir), ".tarballs");
+          const tarballPath = join(tarballDir, "protocol-0.1.0.tgz");
+          await mkdir(tarballDir, { recursive: true });
+          await writeFile(tarballPath, "actual tarball\n");
+          return {
+            files: ["package/dist/index.js", "package/dist/index.d.ts"],
+            packedManifest: completeReleaseManifest("@ferrite/protocol"),
+            tarballPath,
+            size: 999,
+          };
+        },
+        installPackageSet: async () => {},
+      }),
+      /@ferrite\/protocol: npm pack reported tarball size 999, actual bytes are 15/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("verifier rejects tarballs outside its staging directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-containment-"));
+  const outsideTarballPath = join(root, "outside.tgz");
+  try {
+    await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
+    await writeFile(outsideTarballPath, "outside bytes\n");
+    await assert.rejects(
+      verifyNpmPackages({
+        releasePackages: [
+          {
+            name: "@ferrite/protocol",
+            directory: "packages/protocol",
+            build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+            requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+            forbiddenFiles: ["src/index.ts", "test"],
+          },
+        ],
+        nativePackageNames: [],
+        packageManifests: new Map([["@ferrite/protocol", completeSourceManifest("@ferrite/protocol")]]),
+        workspaceRoot: root,
+        reportDir: join(root, "reports"),
+        runCommand: async () => "",
+        packPackage: async () => ({
+          files: ["package/dist/index.js", "package/dist/index.d.ts"],
+          packedManifest: completeReleaseManifest("@ferrite/protocol"),
+          tarballPath: outsideTarballPath,
+        }),
+        installPackageSet: async () => {},
+      }),
+      /@ferrite\/protocol: packed tarball resolves outside the staging directory/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("verifier rejects staged tarball symlinks that resolve outside staging", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-symlink-"));
+  const outsideTarballPath = join(root, "outside.tgz");
+  try {
+    await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
+    await writeFile(outsideTarballPath, "outside bytes\n");
+    await assert.rejects(
+      verifyNpmPackages({
+        releasePackages: [
+          {
+            name: "@ferrite/protocol",
+            directory: "packages/protocol",
+            build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+            requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+            forbiddenFiles: ["src/index.ts", "test"],
+          },
+        ],
+        nativePackageNames: [],
+        packageManifests: new Map([["@ferrite/protocol", completeSourceManifest("@ferrite/protocol")]]),
+        workspaceRoot: root,
+        reportDir: join(root, "reports"),
+        runCommand: async () => "",
+        packPackage: async (packageDir) => {
+          const tarballDir = join(dirname(packageDir), ".tarballs");
+          const tarballPath = join(tarballDir, "protocol-0.1.0.tgz");
+          await mkdir(tarballDir, { recursive: true });
+          await symlink(outsideTarballPath, tarballPath);
+          return {
+            files: ["package/dist/index.js", "package/dist/index.d.ts"],
+            packedManifest: completeReleaseManifest("@ferrite/protocol"),
+            tarballPath,
+          };
+        },
+        installPackageSet: async () => {},
+      }),
+      /@ferrite\/protocol: packed tarball resolves outside the staging directory/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("verifier installs all generated local tarballs together in a clean project", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-npm-install-"));
   try {
@@ -575,10 +756,14 @@ test("verifier installs all generated local tarballs together in a clean project
       runCommand: async () => "",
       packPackage: async (packageDir) => {
         const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
+        const tarballDir = join(dirname(packageDir), ".tarballs");
+        const tarballPath = join(tarballDir, `${manifest.name.replace("@ferrite/", "")}.tgz`);
+        await mkdir(tarballDir, { recursive: true });
+        await writeFile(tarballPath, `${manifest.name} tarball\n`);
         return {
           files: ["package/dist/index.js", "package/dist/index.d.ts", "package/package.json"],
           packedManifest: manifest,
-          tarballPath: join(root, `${manifest.name.replace("@ferrite/", "")}.tgz`),
+          tarballPath,
         };
       },
       installPackageSet: async (packages) => {
@@ -586,12 +771,17 @@ test("verifier installs all generated local tarballs together in a clean project
       },
     });
 
-    assert.deepEqual(installCalls, [
+    assert.deepEqual(
+      installCalls.map((packages) =>
+        packages.map(({ name, tarballPath }) => ({ name, filename: basename(tarballPath) })),
+      ),
       [
-        { name: "@ferrite/protocol", tarballPath: join(root, "protocol.tgz") },
-        { name: "@ferrite/runtime", tarballPath: join(root, "runtime.tgz") },
+        [
+          { name: "@ferrite/protocol", filename: "protocol.tgz" },
+          { name: "@ferrite/runtime", filename: "runtime.tgz" },
+        ],
       ],
-    ]);
+    );
   } finally {
     await rm(root, { force: true, recursive: true });
   }
