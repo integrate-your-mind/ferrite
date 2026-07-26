@@ -1,7 +1,63 @@
 steps:
-  - label: "Ferrite local proof"
-    key: "ferrite-local-proof"
-    command: "./.buildkite/scripts/ci.sh all"
+  - label: "Ferrite verify"
+    key: "ferrite-verify"
+    command: "./.buildkite/scripts/ci.sh verify"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite packages"
+    key: "ferrite-packages"
+    command: "./.buildkite/scripts/ci.sh packages"
+    depends_on: "ferrite-verify"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite coverage"
+    key: "ferrite-coverage"
+    command: "./.buildkite/scripts/ci.sh coverage"
+    depends_on: "ferrite-packages"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite native"
+    key: "ferrite-native"
+    command: "./.buildkite/scripts/ci.sh native"
+    depends_on: "ferrite-coverage"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite nginx"
+    key: "ferrite-nginx"
+    command: "./.buildkite/scripts/ci.sh nginx"
+    depends_on: "ferrite-native"
     agents:
       queue: "ferrite-local"
       project: "ferrite"

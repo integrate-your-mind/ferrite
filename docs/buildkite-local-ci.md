@@ -27,13 +27,19 @@ artifacts from another toolchain.
 
 ## Pipeline
 
-The Buildkite pipeline has one bounded command:
+The Buildkite pipeline has five bounded, dependency-ordered commands:
 
 ```sh
-./.buildkite/scripts/ci.sh all
+./.buildkite/scripts/ci.sh verify
+./.buildkite/scripts/ci.sh packages
+./.buildkite/scripts/ci.sh coverage
+./.buildkite/scripts/ci.sh native
+./.buildkite/scripts/ci.sh nginx
 ```
 
-It runs, in order:
+Each job starts from the agent's clean exact-commit checkout. Splitting the
+existing modes prevents generated output from one gate from accumulating into
+the next gate while preserving this order:
 
 1. exact-commit, clean-checkout, host, and toolchain preflight;
 2. frozen dependency installation;
@@ -45,10 +51,10 @@ It runs, in order:
 6. the current macOS arm64 native-prebuild package and checksum verifier; and
 7. the pinned nginx stack.
 
-The nginx stage fails closed when Docker or its daemon is unavailable. Reports
-and package candidates are uploaded from `dist/ci/` and `dist/npm-packages/`.
-No deploy, publish, release, registry credential, or production-data command is
-present.
+The next job is not scheduled when its dependency fails. The nginx stage fails
+closed when Docker or its daemon is unavailable. Each job uploads its reports
+and package candidates from `dist/ci/` and `dist/npm-packages/`. No deploy,
+publish, release, registry credential, or production-data command is present.
 
 ## Trust boundary
 
@@ -79,7 +85,7 @@ The external hooks:
 - reject fork pull requests;
 - require the job SHA to equal an operator-approved SHA;
 - reject common application and registry credentials;
-- allow only the pipeline upload and full proof commands;
+- allow only the pipeline upload and five proof-mode commands;
 - clear interactive Git/SSH credential helpers before project commands; and
 - force checkout cleanup, allowlist inherited environment variables, disable
   repository-local hooks, plugins, and submodules, and disconnect after five
@@ -100,9 +106,9 @@ buildkite-agent start \
   --config deploy/buildkite/ferrite-agent.cfg.example
 ```
 
-The first job uploads the repository pipeline and the second runs the proof.
-The same agent remains available for both, then exits on the configured idle
-or uptime bound.
+The first job uploads the repository pipeline and the five dependency-ordered
+proof jobs reuse the same bounded agent. The agent then exits on the configured
+idle or uptime bound.
 
 Supply the agent token through the process environment or an external
 credential store. Never add it to this repository, the pipeline YAML, a hook,

@@ -22,10 +22,25 @@ function runHook(url, env) {
   });
 }
 
-test("Buildkite pipeline runs one bounded command on the dedicated local queue", async () => {
+test("Buildkite pipeline runs dependency-ordered clean-checkout gates on the dedicated local queue", async () => {
   const source = await readFile(pipelineUrl, "utf8");
 
-  assert.match(source, /command: "\.\/\.buildkite\/scripts\/ci\.sh all"/);
+  for (const [mode, dependency] of [
+    ["verify", null],
+    ["packages", "verify"],
+    ["coverage", "packages"],
+    ["native", "coverage"],
+    ["nginx", "native"],
+  ]) {
+    assert.ok(
+      source.includes(`command: "./.buildkite/scripts/ci.sh ${mode}"`),
+      `pipeline does not run the ${mode} gate`,
+    );
+    if (dependency) {
+      assert.match(source, new RegExp(`depends_on: "ferrite-${dependency}"`));
+    }
+  }
+  assert.doesNotMatch(source, /command: "\.\/\.buildkite\/scripts\/ci\.sh all"/);
   assert.match(source, /queue: "ferrite-local"/);
   assert.match(source, /project: "ferrite"/);
   assert.match(source, /os: "darwin"/);
@@ -142,7 +157,15 @@ test("external command hook rejects arbitrary commands", async () => {
     }).status,
     0,
   );
-  assert.equal(
+  for (const mode of ["verify", "packages", "coverage", "native", "nginx"]) {
+    assert.equal(
+      runHook(preCommandHookUrl, {
+        BUILDKITE_COMMAND: `./.buildkite/scripts/ci.sh ${mode}`,
+      }).status,
+      0,
+    );
+  }
+  assert.notEqual(
     runHook(preCommandHookUrl, {
       BUILDKITE_COMMAND: "./.buildkite/scripts/ci.sh all",
     }).status,

@@ -3,7 +3,11 @@ set -euo pipefail
 
 case "${BUILDKITE_COMMAND:-}" in
   "./.buildkite/scripts/upload-pipeline.sh" | \
-  "./.buildkite/scripts/ci.sh all")
+  "./.buildkite/scripts/ci.sh verify" | \
+  "./.buildkite/scripts/ci.sh packages" | \
+  "./.buildkite/scripts/ci.sh coverage" | \
+  "./.buildkite/scripts/ci.sh native" | \
+  "./.buildkite/scripts/ci.sh nginx")
     ;;
   *)
     printf 'Ferrite Buildkite trust check: command is not allowlisted\n' >&2
