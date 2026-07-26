@@ -220,28 +220,35 @@ const assertCommandSucceeded = (result, label) => {
 };
 
 export const formatProofError = (error) => {
-  const seen = new Set();
+  const active = new Set();
 
   const render = (value, label = "", indent = "") => {
     const prefix = label ? `${indent}${label}: ` : indent;
     if (!(value instanceof Error)) return `${prefix}${String(value)}`;
-    if (seen.has(value)) return `${prefix}[circular ${value.name}]`;
-    seen.add(value);
+    if (active.has(value)) return `${prefix}[circular ${value.name}]`;
+    active.add(value);
 
-    const stack = value.stack ?? `${value.name}: ${value.message}`;
-    const [summary, ...frames] = stack.split("\n");
-    const frameIndent = `${indent}${label ? "  " : ""}`;
-    const lines = [`${prefix}${summary}`, ...frames.map((frame) => `${frameIndent}${frame}`)];
+    try {
+      const stack = value.stack ?? `${value.name}: ${value.message}`;
+      const [summary, ...frames] = stack.split("\n");
+      const frameIndent = `${indent}${label ? "  " : ""}`;
+      const lines = [
+        `${prefix}${summary}`,
+        ...frames.map((frame) => `${frameIndent}${frame}`),
+      ];
 
-    if (value.cause !== undefined) {
-      lines.push(render(value.cause, "cause", `${indent}  `));
+      if (value.cause !== undefined) {
+        lines.push(render(value.cause, "cause", `${indent}  `));
+      }
+      if (value instanceof AggregateError) {
+        value.errors.forEach((nested, index) => {
+          lines.push(render(nested, `errors[${index}]`, `${indent}  `));
+        });
+      }
+      return lines.join("\n");
+    } finally {
+      active.delete(value);
     }
-    if (value instanceof AggregateError) {
-      value.errors.forEach((nested, index) => {
-        lines.push(render(nested, `errors[${index}]`, `${indent}  `));
-      });
-    }
-    return lines.join("\n");
   };
 
   return render(error);

@@ -229,6 +229,13 @@ test("proof error output preserves primary, cleanup, and nested cause details", 
   circular.cause = circular;
   assert.match(formatProofError(circular), /cause: \[circular Error\]/);
   assert.equal(formatProofError("non-error failure"), "non-error failure");
+
+  const shared = new Error("shared cleanup failure");
+  const sharedOutput = formatProofError(
+    new AggregateError([shared, shared], "repeated cleanup failure"),
+  );
+  assert.equal(sharedOutput.match(/Error: shared cleanup failure/g)?.length, 2);
+  assert.doesNotMatch(sharedOutput, /\[circular Error\]/);
 });
 
 test("expected-failure controls reject success, outer timeout, and wrong failure causes", () => {
