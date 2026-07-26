@@ -828,8 +828,20 @@ fn print_routes(project: &Path, app_dir: &Path, types_out: Option<&Path>, routes
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
+    let mut stdout = std::io::stdout().lock();
+    write_json_to(&mut stdout, value)
+}
+
+fn write_json_to<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
+    let output = serde_json::to_vec_pretty(value)?;
+    match writer
+        .write_all(&output)
+        .and_then(|_| writer.write_all(b"\n"))
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn print_build_report(report: &BuildReport) {
@@ -1270,6 +1282,35 @@ enum TypecheckStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_output_treats_broken_pipe_as_clean_termination() {
+        let mut writer = FailingWriter(std::io::ErrorKind::BrokenPipe);
+
+        write_json_to(&mut writer, &serde_json::json!({ "ok": true })).unwrap();
+    }
+
+    #[test]
+    fn json_output_preserves_non_pipe_write_errors() {
+        let mut writer = FailingWriter(std::io::ErrorKind::PermissionDenied);
+
+        let error = write_json_to(&mut writer, &serde_json::json!({ "ok": true })).unwrap_err();
+        assert!(
+            matches!(error, CliError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
 
     #[test]
     fn initializes_a_minimal_typescript_project() {
