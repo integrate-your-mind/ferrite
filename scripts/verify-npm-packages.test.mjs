@@ -27,7 +27,7 @@ const testReportIdentity = {
     buildId: "build-123",
     buildNumber: "123",
     jobId: "job-456",
-    url: "https://buildkite.example.test/ferrite/builds/123",
+    url: "https://buildkite.com/roman-mondello/ferrite/builds/123",
   },
 };
 

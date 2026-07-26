@@ -10,7 +10,9 @@ import { prepareNpmRelease } from "./prepare-npm-release.mjs";
 import {
   parsePublishArgs,
   publishNpmRelease,
+  removeStagingDirectory,
   stageVerifiedArtifact,
+  writePublicationReceipt,
 } from "./publish-npm-release.mjs";
 import { createPackageReport } from "./verify-npm-packages.mjs";
 
@@ -23,7 +25,7 @@ const build = {
   buildId: "build-123",
   buildNumber: "123",
   jobId: "job-456",
-  url: "https://buildkite.example.test/ferrite/builds/123",
+  url: "https://buildkite.com/roman-mondello/ferrite/builds/123",
 };
 const names = ["@ferrite/protocol", "@ferrite/protocol-wasm", "@ferrite/runtime"];
 const acceptBuildkite = async () => {};
@@ -44,15 +46,20 @@ test("requires an explicit execute flag", async () => {
 });
 
 test("revalidates and publishes immutable staged bytes in dependency order", async () => {
-  await withReleaseReport(async ({ reportPath }) => {
+  await withReleaseReport(async ({ reportPath, root }) => {
     const calls = [];
+    const receiptPath = join(root, "complete-publication.json");
     const result = await publishNpmRelease({
       reportPath,
+      receiptPath,
       execute: true,
       sourceIdentity: source,
       verifyBuildkite: acceptBuildkite,
       runCommand: async (command, args, options) => {
         const bytes = await readFile(args[1]);
+        const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+        assert.equal(receipt.status, "in_progress");
+        assert.equal(receipt.attempting.name, names[calls.length]);
         calls.push({
           command,
           args: [args[0], args.slice(2)],
@@ -78,7 +85,7 @@ test("revalidates and publishes immutable staged bytes in dependency order", asy
   });
 });
 
-test("stops at the first publication failure and preserves partial state", async () => {
+test("records a response-loss failure as ambiguous instead of failed", async () => {
   await withReleaseReport(async ({ reportPath, root }) => {
     let calls = 0;
     const receiptPath = join(root, "partial-publication.json");
@@ -94,16 +101,78 @@ test("stops at the first publication failure and preserves partial state", async
           if (calls === 2) throw new Error("registry rejected package");
         },
       }),
-      /registry rejected package.*published before failure: @ferrite\/protocol/,
+      /registry rejected package.*confirmed published: @ferrite\/protocol.*ambiguous registry outcome/,
     );
     assert.equal(calls, 2);
     const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
     assert.equal(receipt.status, "partial");
     assert.deepEqual(receipt.published.map(({ name }) => name), ["@ferrite/protocol"]);
-    assert.deepEqual(receipt.failed, {
+    assert.equal(receipt.failed, undefined);
+    assert.deepEqual(receipt.ambiguous, {
       name: "@ferrite/protocol-wasm",
-      reason: "package publication did not complete",
+      phase: "registry_publish",
+      reason: "registry outcome must be read back before retry",
     });
+  });
+});
+
+test("keeps confirmed publication disjoint from a cleanup failure", async () => {
+  await withReleaseReport(async ({ reportPath, root }) => {
+    const receiptPath = join(root, "cleanup-failure.json");
+    await assert.rejects(
+      publishNpmRelease({
+        reportPath,
+        receiptPath,
+        execute: true,
+        sourceIdentity: source,
+        verifyBuildkite: acceptBuildkite,
+        runCommand: async () => {},
+        cleanupStaging: async (stagingRoot) => {
+          await removeStagingDirectory(stagingRoot);
+          throw new Error("cleanup failed");
+        },
+      }),
+      /confirmed published: @ferrite\/protocol.*confirmed published before a local cleanup_after_confirmed_publish failure/,
+    );
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.status, "partial");
+    assert.deepEqual(receipt.published.map(({ name }) => name), ["@ferrite/protocol"]);
+    assert.equal(receipt.failed, undefined);
+    assert.equal(receipt.ambiguous, undefined);
+    assert.deepEqual(receipt.postPublicationFailure, {
+      name: "@ferrite/protocol",
+      phase: "cleanup_after_confirmed_publish",
+      reason: "registry success was confirmed but local completion did not finish",
+    });
+  });
+});
+
+test("recovers a post-success receipt write failure without relabeling success", async () => {
+  await withReleaseReport(async ({ reportPath, root }) => {
+    const receiptPath = join(root, "receipt-write-failure.json");
+    let writes = 0;
+    await assert.rejects(
+      publishNpmRelease({
+        reportPath,
+        receiptPath,
+        execute: true,
+        sourceIdentity: source,
+        verifyBuildkite: acceptBuildkite,
+        runCommand: async () => {},
+        writeReceipt: async (...args) => {
+          writes += 1;
+          if (writes === 3) throw new Error("receipt write failed");
+          await writePublicationReceipt(...args);
+        },
+      }),
+      /confirmed published: @ferrite\/protocol.*confirmed published before a local receipt_after_confirmed_publish failure/,
+    );
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.status, "partial");
+    assert.deepEqual(receipt.published.map(({ name }) => name), ["@ferrite/protocol"]);
+    assert.equal(receipt.failed, undefined);
+    assert.equal(receipt.ambiguous, undefined);
+    assert.equal(receipt.postPublicationFailure.phase, "receipt_after_confirmed_publish");
   });
 });
 

@@ -17,6 +17,8 @@ export async function publishNpmRelease({
   runCommand = run,
   receiptPath,
   verifyBuildkite,
+  writeReceipt = writePublicationReceipt,
+  cleanupStaging = removeStagingDirectory,
 } = {}) {
   if (!execute) {
     throw new Error("npm publication requires the explicit --execute flag.");
@@ -46,16 +48,20 @@ export async function publishNpmRelease({
       sha256: artifact.sha256,
     })),
   };
-  await writePublicationReceipt(resolvedReceipt, {
+  await writeReceipt(resolvedReceipt, {
     ...baseReceipt,
     status: "started",
     published,
   });
 
   let currentName = firstPlan.packages[0]?.name;
+  let phase = "revalidation";
+  let registryConfirmed = false;
   try {
     for (const [index, expected] of firstPlan.packages.entries()) {
       currentName = expected.name;
+      phase = "revalidation";
+      registryConfirmed = false;
       const currentPlan = await prepareNpmRelease({
         reportPath,
         version,
@@ -79,10 +85,12 @@ export async function publishNpmRelease({
         throw new Error(`${expected.name}: artifact identity changed after publication started.`);
       }
 
+      phase = "staging";
       const stagingRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-publish-"));
       try {
         const stagedArtifact = await stageVerifiedArtifact(current, stagingRoot);
-        await writePublicationReceipt(resolvedReceipt, {
+        phase = "receipt_before_publish";
+        await writeReceipt(resolvedReceipt, {
           ...baseReceipt,
           status: "in_progress",
           published,
@@ -91,11 +99,13 @@ export async function publishNpmRelease({
             sha256: current.artifact.sha256,
           },
         });
+        phase = "registry_publish";
         await runCommand(
           "npm",
           ["publish", stagedArtifact, "--access", "public", "--tag", tag],
           { cwd: stagingRoot },
         );
+        registryConfirmed = true;
         published.push({
           name: current.name,
           version,
@@ -103,32 +113,86 @@ export async function publishNpmRelease({
           sha256: current.artifact.sha256,
         });
       } finally {
-        await chmod(stagingRoot, 0o700).catch(() => {});
-        await rm(stagingRoot, { recursive: true, force: true });
+        phase = registryConfirmed
+          ? "cleanup_after_confirmed_publish"
+          : phase === "registry_publish"
+            ? "cleanup_after_ambiguous_publish"
+            : "cleanup_before_publish";
+        await cleanupStaging(stagingRoot);
       }
-      await writePublicationReceipt(resolvedReceipt, {
+      phase = "receipt_after_confirmed_publish";
+      await writeReceipt(resolvedReceipt, {
         ...baseReceipt,
         status: index === firstPlan.packages.length - 1 ? "complete" : "in_progress",
         published,
       });
+      phase = "idle";
     }
   } catch (error) {
-    const status = published.length > 0 ? "partial" : "failed";
-    await writePublicationReceipt(resolvedReceipt, {
+    const ambiguous =
+      !registryConfirmed &&
+      (phase === "registry_publish" || phase === "cleanup_after_ambiguous_publish");
+    const status = registryConfirmed
+      ? published.length === firstPlan.packages.length
+        ? "complete_with_error"
+        : "partial"
+      : ambiguous
+        ? published.length > 0
+          ? "partial"
+          : "ambiguous"
+        : published.length > 0
+          ? "partial"
+          : "failed";
+    const failure = registryConfirmed
+      ? {
+          postPublicationFailure: {
+            name: currentName,
+            phase,
+            reason: "registry success was confirmed but local completion did not finish",
+          },
+        }
+      : ambiguous
+        ? {
+            ambiguous: {
+              name: currentName,
+              phase: "registry_publish",
+              reason: "registry outcome must be read back before retry",
+            },
+          }
+        : {
+            failed: {
+              name: currentName,
+              phase,
+              reason: "failure occurred before registry success was confirmed",
+            },
+          };
+    const failureReceipt = {
       ...baseReceipt,
       status,
       published,
-      failed: {
-        name: currentName,
-        reason: "package publication did not complete",
-      },
-    });
+      ...failure,
+    };
+    try {
+      await writeReceipt(resolvedReceipt, failureReceipt);
+    } catch (receiptError) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)} ` +
+          `Publication receipt update also failed at ${resolvedReceipt}; ` +
+          "the last durable pre-mutation receipt must be treated as ambiguous.",
+        { cause: new AggregateError([error, receiptError]) },
+      );
+    }
     const summary = published.length > 0
       ? published.map(({ name }) => name).join(", ")
       : "none";
+    const outcome = ambiguous
+      ? `${currentName} has an ambiguous registry outcome`
+      : registryConfirmed
+        ? `${currentName} was confirmed published before a local ${phase} failure`
+        : `${currentName} failed before publication was confirmed`;
     throw new Error(
       `${error instanceof Error ? error.message : String(error)} ` +
-        `Publication receipt: ${resolvedReceipt}; published before failure: ${summary}.`,
+        `Publication receipt: ${resolvedReceipt}; confirmed published: ${summary}; ${outcome}.`,
       { cause: error },
     );
   }
@@ -151,6 +215,11 @@ export async function writePublicationReceipt(receiptPath, receipt) {
   } finally {
     await rm(temporary, { force: true });
   }
+}
+
+export async function removeStagingDirectory(stagingRoot) {
+  await chmod(stagingRoot, 0o700).catch(() => {});
+  await rm(stagingRoot, { recursive: true, force: true });
 }
 
 export async function stageVerifiedArtifact(pkg, stagingRoot) {

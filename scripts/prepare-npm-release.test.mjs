@@ -26,7 +26,7 @@ const build = {
   buildId: "build-123",
   buildNumber: "123",
   jobId: "job-456",
-  url: "https://buildkite.example.test/ferrite/builds/123",
+  url: "https://buildkite.com/roman-mondello/ferrite/builds/123",
 };
 const acceptBuildkite = async () => {};
 
@@ -195,6 +195,27 @@ test("rejects fabricated or failed Buildkite build identity", async () => {
   });
 });
 
+test("rejects a Buildkite build returned from a different organization", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    await writeReport(reportPath, report);
+    const runCommand = await buildkiteEvidence(reportPath, report, {
+      build: {
+        pipeline: {
+          slug: "ferrite",
+          url: "https://api.buildkite.com/v2/organizations/other/pipelines/ferrite",
+          web_url: "https://buildkite.com/other/ferrite",
+          repository: "git@github.com:integrate-your-mind/ferrite.git",
+        },
+      },
+    });
+
+    await assert.rejects(
+      verifyBuildkiteReport({ report, reportPath, runCommand }),
+      /not a passed exact-source build/,
+    );
+  });
+});
+
 test("rejects a report that names the wrong Buildkite package job", async () => {
   await withReport(async ({ reportPath, report }) => {
     await writeReport(reportPath, report);
@@ -254,6 +275,12 @@ test("rejects unsafe report artifact paths before reading Buildkite-bound files"
             return [];
           }
           return {
+            pipeline: {
+              slug: "ferrite",
+              url: "https://api.buildkite.com/v2/organizations/roman-mondello/pipelines/ferrite",
+              web_url: "https://buildkite.com/roman-mondello/ferrite",
+              repository: "git@github.com:integrate-your-mind/ferrite.git",
+            },
             id: build.buildId,
             number: Number(build.buildNumber),
             web_url: build.url,
@@ -329,6 +356,12 @@ async function buildkiteEvidence(
   { build: buildOverrides = {}, job: jobOverrides = {}, mutateArtifacts } = {},
 ) {
   const buildResponse = {
+    pipeline: {
+      slug: "ferrite",
+      url: "https://api.buildkite.com/v2/organizations/roman-mondello/pipelines/ferrite",
+      web_url: "https://buildkite.com/roman-mondello/ferrite",
+      repository: "git@github.com:integrate-your-mind/ferrite.git",
+    },
     id: build.buildId,
     number: Number(build.buildNumber),
     web_url: build.url,

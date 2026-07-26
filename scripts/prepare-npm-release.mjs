@@ -126,13 +126,22 @@ export async function verifyBuildkiteReport({
   }
   const buildEndpoint =
     `/pipelines/${buildIdentity.pipeline}/builds/${buildIdentity.buildNumber}`;
+  const pipelineApiUrl =
+    "https://api.buildkite.com/v2/organizations/roman-mondello/pipelines/ferrite";
+  const pipelineWebUrl = "https://buildkite.com/roman-mondello/ferrite";
+  const buildWebUrl = `${pipelineWebUrl}/builds/${buildIdentity.buildNumber}`;
   const build = await runCommand([
     "api",
     buildEndpoint,
   ]);
   if (
+    build?.pipeline?.slug !== "ferrite" ||
+    build?.pipeline?.url !== pipelineApiUrl ||
+    build?.pipeline?.web_url !== pipelineWebUrl ||
+    build?.pipeline?.repository !== "git@github.com:integrate-your-mind/ferrite.git" ||
     build?.id !== buildIdentity.buildId ||
     String(build?.number) !== buildIdentity.buildNumber ||
+    buildIdentity.url !== buildWebUrl ||
     build?.web_url !== buildIdentity.url ||
     build?.commit !== report.source?.commit ||
     build?.state !== "passed"

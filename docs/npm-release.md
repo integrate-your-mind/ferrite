@@ -105,7 +105,9 @@ gap.
    `--access public --tag next`. It stops at the first failure and removes its
    staging directory. It atomically writes the exact source, build, package set,
    successful packages, and any partial failure to the publication receipt
-   immediately before and after each registry mutation. An interrupted receipt
+   immediately before and after each registry mutation. Confirmed successes,
+   deterministic pre-publish failures, ambiguous registry outcomes, and local
+   cleanup/receipt failures are disjoint receipt fields. An interrupted receipt
    retains the package whose registry state must be read back before retry.
    Never repack between proof and publication.
 7. Read each version and dist-tag back from the registry.
@@ -127,6 +129,6 @@ gap.
 - Prefer deprecation over unpublish. Treat unpublish as a separate destructive
   registry action subject to npm policy and explicit maintainer approval.
 - Preserve `npm-publication-receipt.json` after every attempt. A `partial`
-  receipt names the successfully published packages and the first package that
-  did not complete; read those exact versions back before deciding whether to
-  retry.
+  receipt names confirmed published packages separately from any ambiguous
+  in-flight package or post-publication local failure. Read ambiguous and
+  confirmed versions back from the registry before deciding whether to retry.
