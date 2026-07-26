@@ -1,5 +1,7 @@
 # Ferrite Production Readiness Review
 
+> **Historical review:** This document preserves the assessment through 2026-07-18. The later developer-preview candidate adds an MIT license, repository metadata, governance documents, and a real source-backed starter command. Statements below that say those artifacts are absent are superseded; registry publication, hosted CI execution, public CLI distribution, and hosted production proof remain unproven.
+
 Updated: 2026-07-18
 
 ## Decision

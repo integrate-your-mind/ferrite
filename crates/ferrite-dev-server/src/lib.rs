@@ -3615,7 +3615,7 @@ fn is_valid_origin_form_target(path: &str) -> bool {
             let Some(low) = bytes.get(index + 2).copied().and_then(http_hex_value) else {
                 return false;
             };
-            let decoded = high << 4 | low;
+            let decoded = (high << 4) | low;
             if index < path_bytes && matches!(decoded, b'.' | b'/' | b'\\') {
                 return false;
             }

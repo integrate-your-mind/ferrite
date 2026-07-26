@@ -1,6 +1,10 @@
 {
   "name": "@ferrite/node",
   "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Native Node.js bindings for Ferrite Rust server-side rendering.",
   "license": "MIT",
   "repository": {

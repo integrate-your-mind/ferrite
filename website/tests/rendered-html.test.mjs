@@ -1,19 +1,24 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const templateRoot = new URL("../", import.meta.url);
 const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
+let renderSequence = 0;
+const execFileAsync = promisify(execFile);
 
-async function render() {
+async function render(headers = { accept: "text/html" }, pathname = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${renderSequence++}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("http://localhost/", {
-      headers: { accept: "text/html" },
+    new Request(new URL(pathname, "http://localhost/"), {
+      headers,
     }),
     {
       ASSETS: {
@@ -36,8 +41,7 @@ test("server-renders the source-backed Ferrite site", async () => {
   assert.match(html, /<title>Ferrite[^<]*Rust-first application framework<\/title>/i);
   assert.match(html, /Rust owns the control plane/);
   assert.match(html, /<h1[^>]*>Ferrite<\/h1>/);
-  assert.match(html, /open-source private[- ]alpha/i);
-  assert.match(html, /Draft delivery unit/i);
+  assert.match(html, /Open-source developer preview/);
   assert.match(html, />509<\/strong>/);
   assert.match(html, />10<\/strong>/);
   assert.match(html, />Captured<\/strong><span>Rust dev-server coverage report<\/span>/);
@@ -57,10 +61,59 @@ test("server-renders the source-backed Ferrite site", async () => {
   assert.match(html, /id="content" tabindex="-1"/);
   assert.match(html, /FERRITE_ACTION_CSRF/);
   assert.match(html, /FERRITE_PUBLIC_ORIGIN/);
+  assert.match(html, /pnpm install --frozen-lockfile/);
+  assert.match(html, /--project examples\/basic/);
+  assert.doesNotMatch(html, /pnpm test:demos/);
   assert.match(html, /https:\/\/github\.com\/integrate-your-mind\/ferrite/);
+  assert.match(html, />Demo PR #5</);
+  assert.doesNotMatch(html, /Draft demo PR #5/);
   assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
   assert.doesNotMatch(html, /404 behavior|target="_blank"/i);
+});
+
+test("does not derive public metadata from request-controlled proxy headers", async () => {
+  const response = await render({
+    accept: "text/html",
+    host: "attacker.example",
+    "x-forwarded-host": "attacker.example",
+    "x-forwarded-proto": "javascript",
+  });
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
+  assert.doesNotMatch(html, /attacker\.example|javascript:/);
+});
+
+test("accepts only an explicit HTTP or HTTPS origin for public metadata", async () => {
+  const previousOrigin = process.env.FERRITE_SITE_ORIGIN;
+
+  try {
+    process.env.FERRITE_SITE_ORIGIN = "https://preview.example.test";
+    const response = await render();
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /https:\/\/preview\.example\.test\/og\.png/);
+
+    for (const invalidOrigin of [
+      "preview.example.test",
+      "javascript:alert(1)",
+      "https://user:secret@preview.example.test",
+      "https://preview.example.test/path/..",
+      "https://preview.example.test/%2e",
+      "https://preview.example.test?query=1",
+      "https://preview.example.test#fragment",
+    ]) {
+      process.env.FERRITE_SITE_ORIGIN = invalidOrigin;
+      await assert.rejects(render(), /FERRITE_SITE_ORIGIN must be/);
+    }
+  } finally {
+    if (previousOrigin === undefined) {
+      delete process.env.FERRITE_SITE_ORIGIN;
+    } else {
+      process.env.FERRITE_SITE_ORIGIN = previousOrigin;
+    }
+  }
 });
 
 test("keeps the published source free of initializer artifacts", async () => {
@@ -126,5 +179,52 @@ test("every on-page navigation link has a matching section", async () => {
   assert.ok(anchors.length > 0);
   for (const id of anchors) {
     assert.match(html, new RegExp(`id="${id}"`));
+  }
+});
+
+test("embeds an explicitly configured public origin in the real site build", async () => {
+  const configuredOrigin = "https://configured-preview.example.test";
+  const previousOrigin = process.env.FERRITE_SITE_ORIGIN;
+
+  try {
+    await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
+      cwd: fileURLToPath(templateRoot),
+      env: { ...process.env, FERRITE_SITE_ORIGIN: configuredOrigin },
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    for (const pathname of ["/", "/blog", "/blog/tic-tac-toe", "/blog/tic-tac-toe-3d"]) {
+      const response = await render({ accept: "text/html" }, pathname);
+      assert.equal(response.status, 200);
+      const html = await response.text();
+      const canonical = new URL(pathname, `${configuredOrigin}/`).toString();
+      const canonicalUrls = [...html.matchAll(/<link rel="canonical" href="([^"]+)"\s*\/?>/g)].map(
+        (match) => match[1],
+      );
+      assert.deepEqual(canonicalUrls, [canonical]);
+      assert.match(html, /https:\/\/configured-preview\.example\.test\/og\.png/);
+      assert.match(html, /https:\/\/configured-preview\.example\.test\/favicon\.svg/);
+      assert.doesNotMatch(html, /http:\/\/localhost:3000\/favicon\.svg/);
+    }
+  } finally {
+    const restoreEnv = { ...process.env };
+    if (previousOrigin === undefined) {
+      delete restoreEnv.FERRITE_SITE_ORIGIN;
+    } else {
+      restoreEnv.FERRITE_SITE_ORIGIN = previousOrigin;
+    }
+    await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
+      cwd: fileURLToPath(templateRoot),
+      env: restoreEnv,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  }
+
+  if (previousOrigin === undefined) {
+    const response = await render();
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, /http:\/\/localhost(?::\d+)?\/favicon\.svg/);
+    assert.doesNotMatch(html, /configured-preview\.example\.test/);
   }
 });

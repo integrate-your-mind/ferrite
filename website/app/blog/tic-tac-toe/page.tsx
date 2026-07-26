@@ -4,6 +4,9 @@ export const metadata = {
   title: "Ferrite Tic Tac Toe | Ferrite Blog",
   description:
     "A Ferrite walk-through modeled after the React Tic Tac Toe tutorial, using the same interactive game loop with Ferrite runtime primitives.",
+  alternates: {
+    canonical: "/blog/tic-tac-toe",
+  },
 };
 
 export default function BlogTicTacToePost() {

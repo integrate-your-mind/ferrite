@@ -1,2 +1,7 @@
-# Require review routing for key areas.
 * @integrate-your-mind
+
+/.github/** @integrate-your-mind
+/crates/** @integrate-your-mind
+/packages/** @integrate-your-mind
+/deploy/** @integrate-your-mind
+/docs/** @integrate-your-mind

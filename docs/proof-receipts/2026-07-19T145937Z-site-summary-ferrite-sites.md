@@ -3,8 +3,8 @@
 - **Status:** Working private alpha
 - **Deployment target:** Ferrite (ChatGPT Sites, owner-only)
 - **Repository:** `integrate-your-mind/ferrite`
-- **Audited source:** [`pr4-backlog` worktree](/Users/romanmondello/Documents/Codex/2026-06-29/i-m-thinking-a-lot-about-2/.worktrees/pr4-backlog)
-- **Site source:** [`website`](/Users/romanmondello/Documents/Codex/2026-06-29/i-m-thinking-a-lot-about-2/.worktrees/pr4-backlog/website)
+- **Audited source:** [repository root](../..)
+- **Site source:** [`website`](../../website)
 - **Site commit:** `906b2558b02f8a9c47bed324cc3a6c9e76a6e176` (reported by deployment metadata as pushed and matched)
 
 ## Feature labels

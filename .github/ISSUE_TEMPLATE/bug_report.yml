@@ -1,0 +1,105 @@
+name: Bug report
+description: Report a reproducible Ferrite defect
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Ferrite defect. Do not include secrets, personal data, private URLs, or vulnerability details. Use the security process in `SECURITY.md` for security reports.
+
+  - type: input
+    id: revision
+    attributes:
+      label: Ferrite revision
+      description: Commit SHA, tag, or branch used when the problem occurred.
+      placeholder: e.g. 1bebfcbd45dcf77cb941a9a04b3492b14f96a3fd
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - Router
+        - Compiler or module graph
+        - Rust SSR
+        - Browser runtime or hydration
+        - Server actions
+        - Development server
+        - Production build or serve
+        - Protocol or WASM
+        - Native Node package
+        - Packaging or release verification
+        - Deployment or proxy
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, Rust, Node.js, pnpm, browser, and proxy versions that matter.
+      placeholder: |
+        OS: macOS 26 arm64
+        Rust: 1.95.0
+        Node.js: 22.x
+        pnpm: 11.7.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Give exact commands, files, requests, and steps. Link a small public reproduction when practical.
+      placeholder: |
+        1. Run ...
+        2. Request ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: State what happened, including exact errors or status codes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: State the result you expected and why.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or evidence
+      description: Paste the smallest useful, sanitized log, stack trace, packet, or screenshot.
+      render: text
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Include regressions, workarounds, frequency, cleanup state, or related issues.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and pull requests for this problem.
+          required: true
+        - label: I removed credentials, personal data, private URLs, and unrelated sensitive information.
+          required: true
+        - label: This is not a vulnerability report that should use the private security process.
+          required: true

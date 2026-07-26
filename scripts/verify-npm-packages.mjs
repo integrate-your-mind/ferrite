@@ -7,7 +7,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { gunzip as gunzipCallback } from "node:zlib";
 
-import { SUPPORTED_NATIVE_PREBUILD_TARGETS } from "../packages/node/binding.js";
+import {
+  SUPPORTED_NATIVE_PREBUILD_TARGETS,
+  nativePrebuildPackageName,
+} from "../packages/node/binding.js";
+import { createPrebuildPackage } from "../packages/node/scripts/create-prebuild-package.mjs";
+import { verifyPrebuildPackageDirs } from "../packages/node/scripts/verify-prebuild-package.mjs";
+import { createSourceStarter } from "./create-source-starter.mjs";
 
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const reportDir = join(workspaceRoot, "dist", "npm-packages");
@@ -103,6 +109,7 @@ export function validateManifestMetadata({
 }) {
   assertString(sourceManifest.description, `${packageName}: package description is required.`);
   assertString(sourceManifest.license, `${packageName}: package license is required.`);
+  assertString(sourceManifest.engines?.node, `${packageName}: engines.node is required.`);
   assertArray(sourceManifest.keywords, `${packageName}: package keywords are required.`);
   assertArray(sourceManifest.files, `${packageName}: package files are required.`);
   if (!sourceManifest.exports || typeof sourceManifest.exports !== "object") {
@@ -162,6 +169,8 @@ export async function verifyNpmPackages({
   reportDir: packageReportDir = reportDir,
   runCommand = run,
   packPackage,
+  packNativePackage = npmPackPackage,
+  prepareNativePackage = packCurrentNativePrebuild,
   installPackageSet = installPackedPackageSet,
 } = {}) {
   const packageVerifier = packPackage ?? npmPackPackage;
@@ -234,6 +243,18 @@ export async function verifyNpmPackages({
       });
     }
 
+    if (manifests.has("@ferrite/node")) {
+      const nativeResult = await prepareNativePackage({
+        packageWorkspaceRoot,
+        packPackage: packNativePackage,
+        publishManifestMode,
+        stageRoot,
+      });
+      const { tarballPath: _tarballPath, ...nativeReport } = nativeResult;
+      results.push(nativeReport);
+      installablePackages.push(nativeResult);
+    }
+
     await installPackageSet(installablePackages, { runCommand });
 
     if (writeReports) {
@@ -246,6 +267,57 @@ export async function verifyNpmPackages({
   } finally {
     await rm(stageRoot, { force: true, recursive: true });
   }
+}
+
+export async function packCurrentNativePrebuild({
+  packageWorkspaceRoot = workspaceRoot,
+  packPackage = npmPackPackage,
+  publishManifestMode = false,
+  stageRoot,
+} = {}) {
+  if (!stageRoot) {
+    throw new Error("Current native prebuild packaging requires a staging directory.");
+  }
+  const packageName = nativePrebuildPackageName();
+  if (!packageName) {
+    throw new Error(`No Ferrite native prebuild package is supported on ${process.platform}/${process.arch}.`);
+  }
+
+  const directory = join(stageRoot, sanitizePackageName(packageName));
+  await createPrebuildPackage({
+    packageRoot: join(packageWorkspaceRoot, "packages", "node"),
+    destinationRoot: directory,
+  });
+  await verifyPrebuildPackageDirs([directory], { expectedPackages: [packageName] });
+
+  const releaseManifest = await readJson(join(directory, "package.json"));
+  validateManifestMetadata({
+    packageName,
+    sourceManifest: releaseManifest,
+    releaseManifest,
+    publishManifestMode,
+  });
+  const packResult = normalizePackResult(packageName, await packPackage(directory));
+  validatePackFiles({
+    packageName,
+    files: packResult.files,
+    requiredFiles: ["ferrite-node.node", "ferrite-node.sha256.json"],
+    forbiddenFiles: [],
+  });
+  if (packResult.packedManifest) {
+    validatePackedManifest({ packageName, releaseManifest, packedManifest: packResult.packedManifest });
+  }
+
+  return {
+    name: packageName,
+    directory: "packages/node/dist/prebuild",
+    version: releaseManifest.version,
+    files: packResult.files,
+    releaseManifest,
+    ...(packResult.packedManifest ? { packedManifest: packResult.packedManifest } : {}),
+    tarballPath: packResult.tarballPath,
+    kind: "native-prebuild",
+  };
 }
 
 function rewriteWorkspaceDependencies(manifest, packageVersions) {
@@ -407,27 +479,19 @@ export async function verifyCleanDeveloperWorkflow(
   installRoot,
   { packages = [], runCommand = run, cliSource = join(workspaceRoot, "target", "debug", process.platform === "win32" ? "ferrite.exe" : "ferrite") } = {},
 ) {
-  const cliPath = join(installRoot, process.platform === "win32" ? "ferrite.exe" : "ferrite");
   const project = join(installRoot, "starter");
+  await createSourceStarter({ target: project, packages, cliSource, runCommand });
+  const cliPath = join(project, ".ferrite-source", "bin", process.platform === "win32" ? "ferrite.exe" : "ferrite");
   const runtimeBin = join(project, "node_modules", "@ferrite", "runtime", "bin");
-  await cp(cliSource, cliPath);
-  await runCommand(cliPath, ["init", project], { cwd: installRoot, capture: true });
-  if (packages.length > 0) {
-    await runCommand(
-      "npm",
-      ["install", "--ignore-scripts", "--package-lock=false", "--no-audit", "--fund=false", ...packages.map((pkg) => pkg.tarballPath)],
-      { cwd: project, capture: true },
-    );
-  }
 
   await assertCommandFails(
     runCommand,
     cliPath,
     ["serve", "--project", project, "--artifact", ".ferrite/build", "--page-renderer", join(runtimeBin, "render-artifact.mjs"), "--once"],
     { cwd: project, capture: true },
+    /artifact directory[\s\S]*\bos error (?:2|3)\b/i,
     "clean install serve must reject a missing build artifact",
   );
-  await runCommand(cliPath, ["check", "--project", project], { cwd: project, capture: true });
   await runCommand(
     cliPath,
     ["build", "--project", project, "--page-renderer", join(runtimeBin, "render-page.mjs"), "--client-bundler", join(runtimeBin, "build-client.mjs")],
@@ -443,11 +507,15 @@ export async function verifyCleanDeveloperWorkflow(
   }
 }
 
-async function assertCommandFails(runCommand, command, args, options, message) {
+async function assertCommandFails(runCommand, command, args, options, expectedError, message) {
   try {
     await runCommand(command, args, options);
-  } catch {
-    return;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (expectedError.test(errorMessage)) {
+      return;
+    }
+    throw new Error(`${message}: unexpected failure: ${errorMessage}`, { cause: error });
   }
   throw new Error(message);
 }
@@ -477,6 +545,25 @@ if (packageNames.has("@ferrite/protocol")) {
   if (typeof protocol.validateServerPayloadPacket !== "function") {
     throw new TypeError("@ferrite/protocol did not expose validateServerPayloadPacket.");
   }
+  const validPayload = {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [0, "packed protocol"],
+    clientReferences: [],
+    chunks: [],
+  };
+  if (protocol.validateServerPayloadPacket(validPayload) !== validPayload) {
+    throw new TypeError("@ferrite/protocol did not validate the packaged protocol payload.");
+  }
+  let invalidPayloadRejected = false;
+  try {
+    protocol.validateServerPayloadPacket({ ...validPayload, version: 99 });
+  } catch {
+    invalidPayloadRejected = true;
+  }
+  if (!invalidPayloadRejected) {
+    throw new TypeError("@ferrite/protocol accepted an unsupported payload version.");
+  }
 }
 
 if (packageNames.has("@ferrite/protocol-wasm")) {
@@ -484,19 +571,60 @@ if (packageNames.has("@ferrite/protocol-wasm")) {
   if (typeof wasm.instantiateFerriteProtocolWasm !== "function") {
     throw new TypeError("@ferrite/protocol-wasm did not expose instantiateFerriteProtocolWasm.");
   }
+  const wasmBytes = await readFile("node_modules/@ferrite/protocol-wasm/dist/ferrite_protocol_wasm.wasm");
+  const protocolWasm = await wasm.instantiateFerriteProtocolWasm(wasmBytes);
+  const validPayload = {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [0, "packed wasm"],
+    clientReferences: [],
+    chunks: [],
+  };
+  if (protocolWasm.validateServerPayload(validPayload) !== validPayload) {
+    throw new TypeError("@ferrite/protocol-wasm did not validate the packaged WASM payload.");
+  }
+  let invalidPayloadRejected = false;
+  try {
+    protocolWasm.validateServerPayload({ ...validPayload, version: 99 });
+  } catch {
+    invalidPayloadRejected = true;
+  }
+  if (!invalidPayloadRejected) {
+    throw new TypeError("@ferrite/protocol-wasm packaged WASM accepted an unsupported payload version.");
+  }
 }
 
 if (packageNames.has("@ferrite/runtime")) {
   const runtime = await import("@ferrite/runtime");
+  const dom = await import("@ferrite/runtime/dom");
+  const jsxRuntime = await import("@ferrite/runtime/jsx-runtime");
+  const server = await import("@ferrite/runtime/server");
   if (typeof runtime.createElement !== "function") {
     throw new TypeError("@ferrite/runtime did not expose createElement.");
+  }
+  if (typeof dom.mount !== "function" || typeof jsxRuntime.jsx !== "function" || typeof server.renderPageModule !== "function") {
+    throw new TypeError("@ferrite/runtime package subpath exports are incomplete.");
   }
 }
 
 if (packageNames.has("@ferrite/node")) {
-  const manifest = JSON.parse(await readFile("node_modules/@ferrite/node/package.json", "utf8"));
-  if (manifest.name !== "@ferrite/node") {
-    throw new TypeError("@ferrite/node was not installed from the local tarball set.");
+  const node = await import("@ferrite/node");
+  const html = node.renderJsonToHtml(JSON.stringify({
+    ferrite: "render-packet",
+    version: 1,
+    root: [2, "main", {}, [[0, "packed native"]]],
+  }));
+  if (html !== "<main>packed native</main>") {
+    throw new TypeError("@ferrite/node did not load and render through the packaged native prebuild.");
+  }
+  let invalidPacketRejected = false;
+  try {
+    node.renderJsonToHtml(JSON.stringify({ ferrite: "render-packet", version: 99, root: [0, "bad"] }));
+  } catch {
+    invalidPacketRejected = true;
+  }
+  if (!invalidPacketRejected) {
+    throw new TypeError("@ferrite/node accepted an unsupported render packet version.");
   }
 }
 `;

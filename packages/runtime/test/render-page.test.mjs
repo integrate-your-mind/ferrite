@@ -875,12 +875,14 @@ test("build-client rejects symlinked output files", { skip: platform === "win32"
     await withTempProject(async (projectRoot) => {
       const pageFile = join(projectRoot, "app/page.tsx");
       const outDir = join(projectRoot, "out");
-      const outsideFile = join(outside, "route-index.js");
+      const routeIdentity = createHash("sha256").update("/").digest("hex").slice(0, 16);
+      const routeOutput = `route-index-${routeIdentity}.js`;
+      const outsideFile = join(outside, routeOutput);
       await mkdir(dirname(pageFile), { recursive: true });
       await writeFile(pageFile, `"use client"; export default function Page() { return null; }\n`);
       await mkdir(outDir);
       await writeFile(outsideFile, "sentinel\n");
-      await symlink(outsideFile, join(outDir, "route-index.js"));
+      await symlink(outsideFile, join(outDir, routeOutput));
 
       await assert.rejects(
         buildClientTo(projectRoot, pageFile, outDir),
@@ -893,6 +895,44 @@ test("build-client rejects symlinked output files", { skip: platform === "win32"
   } finally {
     await rm(outside, { recursive: true, force: true });
   }
+});
+
+test("build-client preserves every prior output when a later destination is invalid", { skip: platform === "win32" }, async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const styleFile = join(projectRoot, "app/page.css");
+    const outDir = join(projectRoot, "out");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(styleFile, ".label { color: red; }\n");
+    await writeFile(
+      pageFile,
+      `"use client"; import "./page.css"; export default function Page() { return <p className="label">first</p>; }\n`,
+    );
+
+    const initial = await buildClientTo(projectRoot, pageFile, outDir);
+    assert.ok(initial.outputs.length >= 2, "fixture must exercise multi-output publication");
+    const initialOutputs = await readBundleOutputs(outDir, initial);
+    const blockedOutput = initial.outputs.at(-1);
+    const protectedFile = join(projectRoot, "protected-output");
+    await writeFile(protectedFile, "sentinel\n");
+    await rm(join(outDir, blockedOutput), { force: true });
+    await symlink(protectedFile, join(outDir, blockedOutput));
+    await writeFile(
+      pageFile,
+      `"use client"; import "./page.css"; export default function Page() { return <p className="label">second</p>; }\n`,
+    );
+
+    await assert.rejects(
+      buildClientTo(projectRoot, pageFile, outDir),
+      /output destination is not a regular file/,
+    );
+    for (const output of initial.outputs.slice(0, -1)) {
+      assert.deepEqual((await readFile(join(outDir, output))).toString("base64"), initialOutputs[output]);
+    }
+    assert.equal(await readFile(protectedFile, "utf8"), "sentinel\n");
+    assert.equal((await readdir(projectRoot)).some((entry) => entry.startsWith(".out.ferrite-client-build-")), false);
+    assert.equal((await readdir(outDir)).some((entry) => entry.startsWith(".ferrite-publish-")), false);
+  });
 });
 
 test("build-client includes two-argument dynamic imports in the runtime graph", async () => {

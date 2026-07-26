@@ -875,7 +875,7 @@ test("fetchAndApplyServerPayload updates a mounted root from shell and chunks", 
   assert.equal(container.querySelector("main")?.getAttribute("data-route"), "/posts/alpha");
   assert.equal(container.querySelector("h1")?.textContent, "Post alpha");
   assert.equal(container.querySelector("strong")?.textContent, "Loaded chunk");
-  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "");
+  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "true");
   assert.equal(container.textContent, "Post alphaLoaded chunk");
 });
 
@@ -1355,7 +1355,7 @@ test("server action form bootstrap is idempotent for generated entrypoints", asy
   assert.deepEqual(submissions, ["submit"]);
 });
 
-test("server payload navigator streams shell before chunks and updates history after completion", async () => {
+test("server payload navigator commits history with the streamed shell", async () => {
   const { window, container } = createContainer("https://example.com/posts/old");
   window.document.head.innerHTML = "<title>Old title</title>";
   const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
@@ -1422,7 +1422,7 @@ test("server payload navigator streams shell before chunks and updates history a
   await flushScheduledWork();
 
   assert.deepEqual(requests, ["https://example.com/posts/stream?__ferrite_payload=stream"]);
-  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(window.location.href, "https://example.com/posts/stream");
   assert.equal(window.document.title, "Stream title");
   assert.equal(container.textContent, "Stream routeLoading chunk");
 

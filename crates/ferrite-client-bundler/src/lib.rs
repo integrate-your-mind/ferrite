@@ -3,7 +3,9 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,7 +13,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(not(windows))]
+use std::process::Child;
+
+#[cfg(windows)]
+use process_wrap::std::{JobObject, StdChildWrapper, StdCommandWrap};
+
 const BUNDLE_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_BUNDLE_COMMAND_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BUNDLE_SNAPSHOT_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -46,6 +57,8 @@ pub enum ClientBundleError {
     InvalidModuleGraph { reason: String },
     StaleInputSnapshot { path: String },
     NodeFailed { status: Option<i32>, stderr: String },
+    Cancelled,
+    OutputLimitExceeded { limit: usize },
     TimedOut { timeout: Duration },
 }
 
@@ -70,6 +83,10 @@ impl fmt::Display for ClientBundleError {
                 }
                 None => write!(f, "client bundler was terminated: {stderr}"),
             },
+            ClientBundleError::Cancelled => write!(f, "client bundler was cancelled"),
+            ClientBundleError::OutputLimitExceeded { limit } => {
+                write!(f, "client bundler output exceeded {limit} bytes")
+            }
             ClientBundleError::TimedOut { timeout } => {
                 write!(
                     f,
@@ -108,6 +125,7 @@ pub struct ClientBundler {
     project: PathBuf,
     script: PathBuf,
     command_timeout: Option<Duration>,
+    cancellation_flag: Option<Arc<AtomicBool>>,
 }
 
 impl ClientBundler {
@@ -116,11 +134,17 @@ impl ClientBundler {
             project,
             script,
             command_timeout: None,
+            cancellation_flag: None,
         }
     }
 
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = Some(timeout.max(Duration::from_millis(1)));
+        self
+    }
+
+    pub fn with_cancellation_flag(mut self, cancellation_flag: Arc<AtomicBool>) -> Self {
+        self.cancellation_flag = Some(cancellation_flag);
         self
     }
 
@@ -199,18 +223,13 @@ impl ClientBundler {
         Err(stale_error.expect("a stale attempt records its validation error"))
     }
 
-    fn run_command(&self, mut command: Command) -> Result<BundlerOutput> {
-        match self.command_timeout {
-            Some(timeout) => run_command_with_timeout(command, timeout),
-            None => {
-                let output = command.output()?;
-                Ok(BundlerOutput {
-                    status: output.status,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                })
-            }
-        }
+    fn run_command(&self, command: Command) -> Result<BundlerOutput> {
+        run_command_with_limits(
+            command,
+            self.command_timeout,
+            MAX_BUNDLE_COMMAND_OUTPUT_BYTES,
+            self.cancellation_flag.as_deref(),
+        )
     }
 }
 
@@ -221,44 +240,183 @@ struct BundlerOutput {
     stderr: Vec<u8>,
 }
 
-fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<BundlerOutput> {
+fn run_command_with_limits(
+    mut command: Command,
+    timeout: Option<Duration>,
+    max_output_bytes: usize,
+    cancellation_flag: Option<&AtomicBool>,
+) -> Result<BundlerOutput> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let mut stdout = child.stdout.take().expect("bundler stdout was piped");
-    let mut stderr = child.stderr.take().expect("bundler stderr was piped");
-    let stdout_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stderr.read_to_end(&mut output).map(|_| output)
-    });
+    let mut child = OwnedChild::spawn(command)?;
+    let stdout = child.take_stdout().expect("bundler stdout was piped");
+    let stderr = child.take_stderr().expect("bundler stderr was piped");
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_capped_reader(stdout, max_output_bytes, Arc::clone(&output_exceeded));
+    let stderr_reader = spawn_capped_reader(stderr, max_output_bytes, Arc::clone(&output_exceeded));
     let started = Instant::now();
 
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(BundlerOutput {
-                status,
-                stdout: stdout_reader
-                    .join()
-                    .expect("bundler stdout reader panicked")?,
-                stderr: stderr_reader
-                    .join()
-                    .expect("bundler stderr reader panicked")?,
+        if cancellation_flag.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            terminate_process_tree(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ClientBundleError::Cancelled);
+        }
+
+        if output_exceeded.load(Ordering::Acquire) {
+            terminate_process_tree(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ClientBundleError::OutputLimitExceeded {
+                limit: max_output_bytes,
             });
         }
 
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(status) = child.try_wait()? {
+            terminate_process_tree(&mut child);
+            let stdout = stdout_reader
+                .join()
+                .expect("bundler stdout reader panicked")?;
+            let stderr = stderr_reader
+                .join()
+                .expect("bundler stderr reader panicked")?;
+            if output_exceeded.load(Ordering::Acquire) {
+                return Err(ClientBundleError::OutputLimitExceeded {
+                    limit: max_output_bytes,
+                });
+            }
+            return Ok(BundlerOutput {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            let timeout = timeout.expect("timeout was checked as present");
+            terminate_process_tree(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(ClientBundleError::TimedOut { timeout });
         }
 
-        thread::sleep(BUNDLE_TIMEOUT_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+        let sleep_for = timeout
+            .map(|timeout| {
+                BUNDLE_TIMEOUT_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed()))
+            })
+            .unwrap_or(BUNDLE_TIMEOUT_POLL_INTERVAL);
+        thread::sleep(sleep_for);
     }
+}
+
+fn spawn_capped_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    max_output_bytes: usize,
+    output_exceeded: Arc<AtomicBool>,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::with_capacity(max_output_bytes.min(64 * 1024));
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                return Ok(output);
+            }
+            let remaining = max_output_bytes.saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
+            if bytes_read > remaining {
+                output_exceeded.store(true, Ordering::Release);
+            }
+        }
+    })
+}
+
+struct OwnedChild {
+    #[cfg(not(windows))]
+    inner: Child,
+    #[cfg(windows)]
+    inner: Box<dyn StdChildWrapper>,
+    armed: bool,
+}
+
+impl OwnedChild {
+    fn spawn(command: Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = command;
+            command.process_group(0);
+            command
+        };
+        #[cfg(all(not(unix), not(windows)))]
+        let mut command = command;
+
+        #[cfg(windows)]
+        {
+            let mut command = StdCommandWrap::from(command);
+            command.wrap(JobObject);
+            return Ok(Self {
+                inner: command.spawn()?,
+                armed: true,
+            });
+        }
+
+        #[cfg(not(windows))]
+        Ok(Self {
+            inner: command.spawn()?,
+            armed: true,
+        })
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        #[cfg(windows)]
+        return self.inner.stdout().take();
+
+        #[cfg(not(windows))]
+        self.inner.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        #[cfg(windows)]
+        return self.inner.stderr().take();
+
+        #[cfg(not(windows))]
+        self.inner.stderr.take()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.inner.try_wait()
+    }
+
+    fn terminate(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Ok(process_group) = i32::try_from(self.inner.id()) {
+            // SAFETY: the child was spawned as the leader of a new process group.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+
+        #[cfg(windows)]
+        let _ = self.inner.start_kill();
+        #[cfg(not(windows))]
+        let _ = self.inner.kill();
+        let _ = self.inner.wait();
+        self.armed = false;
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn terminate_process_tree(child: &mut OwnedChild) {
+    child.terminate();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1635,7 +1793,10 @@ export default function Page() {
             .action_bootstrap
             .as_deref()
             .expect("server-only action routes emit a standalone enhancer");
-        assert!(action_bootstrap.ends_with("route-actions-action-bootstrap.js"));
+        let route_identity = &sha256_hex(b"/actions")[..16];
+        assert!(action_bootstrap.ends_with(&format!(
+            "route-actions-{route_identity}-action-bootstrap.js"
+        )));
         let action_js = fs::read_to_string(
             temp.path()
                 .join(".ferrite/build/_ferrite/static")
@@ -1771,6 +1932,214 @@ process.exit(1);
             error,
             ClientBundleError::TimedOut { timeout } if timeout == Duration::from_millis(20)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_bundler_descendants_with_inherited_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let timeout = Duration::from_millis(500);
+        let bundler =
+            ClientBundler::new(temp.path().to_path_buf(), script).with_command_timeout(timeout);
+        let started = Instant::now();
+
+        let error = bundler
+            .bundle_route(
+                &page,
+                &[],
+                "/",
+                &[],
+                &temp.path().join("out"),
+                "/_ferrite/static",
+            )
+            .unwrap_err();
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(error, ClientBundleError::TimedOut { timeout: actual } if actual == timeout)
+        );
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_bundler_cleans_descendants_before_collecting_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+descendant.unref();
+process.stdout.write(JSON.stringify({{
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  clientReferences: [],
+  moduleGraph: [],
+  inputSnapshot: [],
+}}));
+"#
+            ),
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let bundler = ClientBundler::new(temp.path().to_path_buf(), script);
+        let started = Instant::now();
+
+        let bundle = bundler
+            .bundle_route(
+                &page,
+                &[],
+                "/",
+                &[],
+                &temp.path().join("out"),
+                "/_ferrite/static",
+            )
+            .unwrap();
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(bundle.outputs.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_bundler_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        );
+        let cancellation_flag = Arc::new(AtomicBool::new(false));
+        let cancellation_writer = Arc::clone(&cancellation_flag);
+        let pid_path = descendant_pid.clone();
+        let cancellation_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !pid_path.is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "bundler descendant did not start"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            cancellation_writer.store(true, Ordering::Release);
+        });
+        let mut command = Command::new("node");
+        command.arg(script).current_dir(temp.path());
+        let started = Instant::now();
+
+        let error = run_command_with_limits(command, None, 1024, Some(cancellation_flag.as_ref()))
+            .unwrap_err();
+        cancellation_thread.join().unwrap();
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(error, ClientBundleError::Cancelled));
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[test]
+    fn bundler_output_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build-client.mjs");
+        make_script(&script, "process.stdout.write('x'.repeat(65));\n");
+        let mut command = Command::new("node");
+        command.arg(script).current_dir(temp.path());
+
+        let error = run_command_with_limits(command, None, 64, None).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ClientBundleError::OutputLimitExceeded { limit: 64 }
+        ));
+    }
+
+    #[cfg(unix)]
+    struct DescendantGuard(Option<i32>);
+
+    #[cfg(unix)]
+    impl Drop for DescendantGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                // SAFETY: this test records the PID of the child process it spawned.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            // SAFETY: signal 0 checks the recorded child PID without modifying it.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
     }
 
     #[test]

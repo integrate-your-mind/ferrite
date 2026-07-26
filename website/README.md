@@ -1,6 +1,6 @@
 # Ferrite developer preview site
 
-This is the publicly viewable, source-backed Ferrite showcase. It documents the current
+This is the source-backed Ferrite developer-preview showcase. It documents the current
 Rust-first framework experiment and embeds real captures from the
 `examples/docs-workbench` artifact-backed serve.
 
@@ -13,7 +13,16 @@ npm install
 npm run dev
 ```
 
-Open the local URL printed by vinext. The site can be published for public access from the ChatGPT Sites deployment connected to this repository. This preview is source-backed and clearly marks pre-production scope.
+Open the local URL printed by vinext. The site is owner-only when deployed
+through ChatGPT Sites; it is not a public Ferrite demo or production
+deployment.
+
+Set `FERRITE_SITE_ORIGIN` to the site's verified public HTTP or HTTPS origin
+when building or starting a deployment. It is not a secret. The value is
+captured by the vinext build and must contain only the origin, without
+credentials, a path, query, or fragment. Rebuild after changing it. When it is
+unset, canonical and social metadata use `http://localhost:3000`; request
+`Host` and proxy headers are deliberately ignored.
 
 ## Validate
 
@@ -40,14 +49,14 @@ Docs Workbench app at exact demo head
 `public/demos/CAPTURE_RECEIPT.md` for the sanitized capture procedure and
 source checks.
 
-The page reports local proof only: full lint/typecheck/build/test and the
-ferrite-dev-server coverage report completed, alongside ten repository Chrome
-scenarios plus the exact demo browser run. No coverage threshold was enforced.
-The page deliberately omits one coverage
-percentage because the prior PR #4 receipt and the exact-head rerun report
-different scopes. Hosted Actions remains unavailable because it fails during
-startup before job allocation. Cargo release verification passes with warnings
-that workspace manifests still need repository/homepage/docs metadata.
+The page reports local proof only. Its numeric test and browser counts are tied
+to the reviewed PR #4 checkpoint, while its screenshots are independently tied
+to the exact demo head above. Neither is presented as current integrated-head
+hosted proof. No coverage threshold was enforced. The page deliberately omits
+one coverage percentage because the historical receipts report different
+scopes. Hosted Actions remains unavailable because it fails during startup
+before job allocation. Package and Cargo metadata checks are part of the
+repository release-verification commands.
 
 ## Content boundaries
 
