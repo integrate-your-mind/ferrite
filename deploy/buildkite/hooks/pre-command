@@ -13,4 +13,11 @@ esac
 
 # Checkout may need the agent account's read-only Git credential. The project
 # command does not; remove common interactive credential helpers before it runs.
-unset SSH_AUTH_SOCK GIT_ASKPASS SSH_ASKPASS
+unset \
+  BASH_ENV \
+  CDPATH \
+  ENV \
+  GIT_ASKPASS \
+  GIT_SSH_COMMAND \
+  SSH_ASKPASS \
+  SSH_AUTH_SOCK

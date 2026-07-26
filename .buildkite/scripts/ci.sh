@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly ROOT="$(git rev-parse --show-toplevel)"
-readonly REPORT_DIR="${ROOT}/dist/ci"
-readonly MODE="${1:-}"
+ROOT="$(git rev-parse --show-toplevel)"
+readonly ROOT
+REPORT_DIR="${ROOT}/dist/ci"
+readonly REPORT_DIR
+MODE="${1:-}"
+readonly MODE
 
 cd "${ROOT}"
 

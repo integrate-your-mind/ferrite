@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly VERSION="$(buildkite-agent --version)"
+VERSION="$(buildkite-agent --version)"
+readonly VERSION
 [[ "${VERSION}" == "buildkite-agent version 3.127."* ]] || {
   printf 'Ferrite local CI: Buildkite Agent 3.127.x is required, found %s\n' "${VERSION}" >&2
   exit 1

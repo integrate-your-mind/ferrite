@@ -9,6 +9,12 @@ This is local-agent evidence, not hosted-runner or production proof. One Mac
 cannot establish Linux, Windows, Intel macOS, or clean external-machine
 compatibility.
 
+This is a deliberate coverage reduction from the removed workflows: the local
+lane retains every source-validation category and the current-host native
+package check, but it cannot run the previous Linux verification or Darwin
+x64, Linux arm64/x64, and Windows x64 native artifact jobs. Those platforms and
+the aggregate five-artifact check remain unproven release gates.
+
 The current pipeline is pinned to Buildkite Agent 3.127.x because it uses the
 v3 `pipeline upload --reject-secrets` fail-closed check. Upgrading to another
 agent series requires reviewing that command and this trust contract first.
@@ -68,9 +74,10 @@ The external hooks:
 - reject common application and registry credentials;
 - allow only the pipeline upload and full proof commands;
 - clear interactive Git/SSH credential helpers before project commands; and
-- force checkout cleanup, disable repository-local hooks, plugins, and
-  submodules, and disconnect after five idle minutes or 135 minutes of uptime
-  through the dedicated agent configuration.
+- force checkout cleanup, allowlist inherited environment variables, disable
+  repository-local hooks, plugins, and submodules, and disconnect after five
+  idle minutes or 135 minutes of uptime through the dedicated agent
+  configuration.
 
 Buildkite's `no-command-eval` mode is intentionally not enabled because it
 rejects the argument-bearing `./.buildkite/scripts/ci.sh all` command. The
@@ -93,6 +100,12 @@ or uptime bound.
 Supply the agent token through the process environment or an external
 credential store. Never add it to this repository, the pipeline YAML, a hook,
 or a build artifact.
+
+The example allowlist keeps only the local toolchain, temporary-directory,
+locale, read-only checkout credential, and approved-commit inputs. Buildkite's
+own job variables are permitted by the agent. Project commands clear the
+checkout credential plus `BASH_ENV`, `ENV`, `CDPATH`, `GIT_ASKPASS`, and
+`GIT_SSH_COMMAND`.
 
 ## Buildkite pipeline settings
 

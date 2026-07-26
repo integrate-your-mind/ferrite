@@ -35,7 +35,7 @@ test("Buildkite pipeline runs one bounded command on the dedicated local queue",
   assert.doesNotMatch(source, /plugins:|deploy|publish|release/);
 });
 
-test("local CI preserves build, test, package, coverage, native, and nginx gates", async () => {
+test("local CI retains the host-executable validation gate categories", async () => {
   const source = await readFile(ciUrl, "utf8");
 
   for (const expected of [
@@ -79,6 +79,9 @@ test("dedicated agent configuration disables plugins and local hooks", async () 
   assert.match(source, /git-clean-flags="-ffxdq"/);
   assert.match(source, /disconnect-after-idle-timeout=300/);
   assert.match(source, /disconnect-after-uptime=8100/);
+  assert.match(source, /enable-environment-variable-allowlist=true/);
+  assert.match(source, /allowed-environment-variables=/);
+  assert.doesNotMatch(source, /BASH_ENV|GIT_SSH_COMMAND|NODE_OPTIONS|RUSTFLAGS/);
   assert.doesNotMatch(source, /no-command-eval=true|disconnect-after-job=true/);
   assert.doesNotMatch(source, /^token\s*=/m);
 });
@@ -144,7 +147,17 @@ test("external command hook rejects arbitrary commands", async () => {
   );
 
   const source = await readFile(preCommandHookUrl, "utf8");
-  assert.match(source, /unset SSH_AUTH_SOCK GIT_ASKPASS SSH_ASKPASS/);
+  for (const name of [
+    "BASH_ENV",
+    "CDPATH",
+    "ENV",
+    "GIT_ASKPASS",
+    "GIT_SSH_COMMAND",
+    "SSH_ASKPASS",
+    "SSH_AUTH_SOCK",
+  ]) {
+    assert.match(source, new RegExp(name));
+  }
 });
 
 test("CI script rejects unknown modes before running project commands", () => {

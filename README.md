@@ -191,7 +191,7 @@ Production deployments should put Ferrite behind a mature edge such as nginx, En
 
 The repository records exact-source local proof for linting, type checks, builds, tests, browser flows, source-backed starter creation, package candidates, module-graph invalidation, artifact integrity, request framing, overload, timeouts, cleanup, and rollback behavior.
 
-The active CI definition is a [dedicated local Buildkite agent lane](docs/buildkite-local-ci.md). It preserves the repository gates without depending on GitHub-hosted runners, but it is still trusted local-machine execution: it is not GitHub-hosted CI, independent review, or merge-readiness proof. Registry publication, registry-backed clean installation, hosted deployment, long-duration production soak, and broad external platform evidence remain release gates. Native package loading is locally proven only for the current host; every advertised target still requires platform-specific artifact proof.
+The active CI definition is a [dedicated local Buildkite agent lane](docs/buildkite-local-ci.md). It preserves the build, lint, test, package, coverage, current-host native, and Docker-backed nginx gate categories that this macOS arm64 machine can execute without GitHub-hosted runners. It does not preserve the removed Linux verification or five-platform native artifact matrix. The lane is trusted local-machine execution: it is not GitHub-hosted CI, independent review, cross-platform evidence, or merge-readiness proof. Registry publication, registry-backed clean installation, hosted deployment, long-duration production soak, and broad external platform evidence remain release gates.
 
 ## Contributions
 
