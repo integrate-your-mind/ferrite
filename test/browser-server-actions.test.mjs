@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import test from "node:test";
@@ -10,14 +10,13 @@ import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright-core";
 
+import { requireBrowser } from "./browser-test-support.mjs";
+
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const chromeExecutable = process.env.FERRITE_BROWSER_EXECUTABLE ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 test("generated action form bootstrap works in Chromium for route, island, and server-only assets", async (t) => {
-  if (!existsSync(chromeExecutable)) {
-    t.skip(`Chrome executable not found at ${chromeExecutable}`);
-    return;
-  }
+  if (!requireBrowser(t, chromeExecutable)) return;
 
   const project = await createBrowserFixtureProject();
   t.after(async () => {
