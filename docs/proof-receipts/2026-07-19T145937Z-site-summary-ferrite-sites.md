@@ -1,5 +1,9 @@
 # Ferrite Site proof receipt
 
+> Historical receipt: its owner-only access label is no longer current. See
+> [the 2026-07-26 state correction](2026-07-26T164220Z-site-state-correction.md)
+> for the latest inspected Sites access, provenance, and route results.
+
 - **Status:** Working private alpha
 - **Deployment target:** Ferrite (ChatGPT Sites, owner-only)
 - **Repository:** `integrate-your-mind/ferrite`

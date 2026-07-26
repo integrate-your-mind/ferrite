@@ -13,9 +13,12 @@ npm install
 npm run dev
 ```
 
-Open the local URL printed by vinext. The site is owner-only when deployed
-through ChatGPT Sites; it is not a public Ferrite demo or production
-deployment.
+Open the local URL printed by vinext. The current ChatGPT Sites project is
+public, but its production deployment is stale: only `/` serves successfully
+while the repository's `/blog` and demo article routes return `404`. Treat it
+as a project-information preview, not a live Ferrite application demo or a
+supported production endpoint. Recheck the Sites access mode and deployed
+source identity before changing that claim.
 
 Set `FERRITE_SITE_ORIGIN` to the site's verified public HTTP or HTTPS origin
 when building or starting a deployment. It is not a secret. The value is
