@@ -119,7 +119,8 @@ administrative action. Configure it separately with:
 - queue `ferrite-local` with `project=ferrite`, `os=darwin`, and `arch=arm64`.
 
 Before enabling automatic builds, manually review and pin the exact commit,
-start a one-job agent, and verify that the Buildkite build reports that SHA.
+start the bounded reusable agent described above, and verify that both the
+pipeline-upload job and proof job report that SHA.
 
 ## Local validation
 
