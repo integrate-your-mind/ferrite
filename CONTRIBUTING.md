@@ -58,6 +58,8 @@ pnpm release:verify:cargo
 
 For nginx, proxy, or deployment changes, run the matching checks documented in `docs/deployment.md` when your system supports them. State any check you could not run and why.
 
+Maintainer CI uses Buildkite with a dedicated local macOS arm64 agent. The repository pipeline and trust-boundary setup are documented in [`docs/buildkite-local-ci.md`](docs/buildkite-local-ci.md). A local-agent pass does not substitute for independent review or cross-platform proof.
+
 ## Pull request rules
 
 1. Fork the repository and create a branch from `main`.

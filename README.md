@@ -70,9 +70,10 @@ The repository currently targets:
 - Node.js 22 or newer, with Node 24 selected by `.node-version`;
 - pnpm 11.7.0 through Corepack;
 - a Chromium-family browser for the full browser proof;
-- Docker for the nginx and container checks.
+- Docker for the nginx and container checks;
+- Buildkite Agent for the dedicated local CI lane.
 
-Some Node distributions do not bundle Corepack; install Corepack before running `corepack enable` in that case. Docker and Chromium are required only for their matching proof gates.
+Some Node distributions do not bundle Corepack; install Corepack before running `corepack enable` in that case. Docker, Chromium, and Buildkite Agent are required only for their matching proof gates.
 
 ## Build from source
 
@@ -190,7 +191,7 @@ Production deployments should put Ferrite behind a mature edge such as nginx, En
 
 The repository records exact-source local proof for linting, type checks, builds, tests, browser flows, source-backed starter creation, package candidates, module-graph invalidation, artifact integrity, request framing, overload, timeouts, cleanup, and rollback behavior.
 
-Hosted GitHub Actions has recently failed before job allocation, so local proof must not be represented as hosted CI proof. Registry publication, registry-backed clean installation, hosted deployment, long-duration production soak, and broad external platform evidence remain release gates. Native package loading is locally proven only for the current host; every advertised target still requires hosted artifact proof.
+The active CI definition is a [dedicated local Buildkite agent lane](docs/buildkite-local-ci.md). It preserves the repository gates without depending on GitHub-hosted runners, but it is still trusted local-machine execution: it is not GitHub-hosted CI, independent review, or merge-readiness proof. Registry publication, registry-backed clean installation, hosted deployment, long-duration production soak, and broad external platform evidence remain release gates. Native package loading is locally proven only for the current host; every advertised target still requires platform-specific artifact proof.
 
 ## Contributions
 

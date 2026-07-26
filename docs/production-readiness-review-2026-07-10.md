@@ -1,6 +1,6 @@
 # Ferrite Production Readiness Review
 
-> **Historical review:** This document preserves the assessment through 2026-07-18. The later developer-preview candidate adds an MIT license, repository metadata, governance documents, and a real source-backed starter command. Statements below that say those artifacts are absent are superseded; registry publication, hosted CI execution, public CLI distribution, and hosted production proof remain unproven.
+> **Historical review:** This document preserves the assessment through 2026-07-18. The later developer-preview candidate adds an MIT license, repository metadata, governance documents, and a real source-backed starter command. Statements below that say those artifacts are absent are superseded. GitHub Actions was subsequently removed from the active CI path and replaced with a dedicated local Buildkite-agent definition; the workflow and Actions-startup details below are historical. Exact-pushed-SHA Buildkite execution, cross-platform proof, registry publication, public CLI distribution, and hosted production proof remain unproven.
 
 Updated: 2026-07-18
 

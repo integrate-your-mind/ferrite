@@ -62,8 +62,9 @@ to the reviewed PR #4 checkpoint, while its screenshots are independently tied
 to the exact demo head above. Neither is presented as current integrated-head
 hosted proof. No coverage threshold was enforced. The page deliberately omits
 one coverage percentage because the historical receipts report different
-scopes. Hosted Actions remains unavailable because it fails during startup
-before job allocation. Package and Cargo metadata checks are part of the
+scopes. GitHub Actions is no longer the active CI path. A dedicated local
+Buildkite-agent lane is configured, but no exact-head Buildkite execution is
+claimed by this page. Package and Cargo metadata checks are part of the
 repository release-verification commands.
 
 ## Content boundaries

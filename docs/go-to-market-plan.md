@@ -1,7 +1,7 @@
 # Ferrite Go-to-Market Plan (Private Beta Readiness)
 
 **Updated:** July 13, 2026
-**Current project state:** The GitHub repository and PR path now exist, and the local checkout has an artifact-backed, source-independent build/serve path with fail-closed integrity, strict HTTP request-framing, a 43-case nginx HTTP/1 TLS verifier plus seven negotiated HTTP/2 edge cases, concurrent execution, and bounded sustained-load proof. Clean proxy evidence is built from an immutable exact Git archive and requires five ambiguous framing probes plus nine raw-target probes to show no upstream status; dirty-worktree runs are development evidence only. Hosted Actions lacks job-level proof, and no hosted deployment has been proven. This plan assumes a narrow private beta only after explicit delivery gates are met.
+**Current project state:** The GitHub repository and PR path now exist, and the local checkout has an artifact-backed, source-independent build/serve path with fail-closed integrity, strict HTTP request-framing, a 43-case nginx HTTP/1 TLS verifier plus seven negotiated HTTP/2 edge cases, concurrent execution, and bounded sustained-load proof. Clean proxy evidence is built from an immutable exact Git archive and requires five ambiguous framing probes plus nine raw-target probes to show no upstream status; dirty-worktree runs are development evidence only. GitHub Actions is no longer the active CI path. A dedicated local Buildkite-agent lane is defined, but exact-pushed-SHA Buildkite execution and hosted deployment have not been proven. This plan assumes a narrow private beta only after explicit delivery gates are met.
 
 ## Positioning
 
@@ -40,7 +40,7 @@ Current demoable scope is the local `examples/basic` end-to-end path:
 - Production HTTP boundary: exact HTTP/1.1 origin-form requests, fail-closed framing and authority validation, one request per closed connection, and an authority-rejecting buffering nginx template with a self-contained, exact-source raw-TLS matrix.
 
 Not sellable yet as a hosted platform:
-- No npm publish in this checkout, no hosted CI job-level run, no hosted staging run of the deployment templates, and only local/prototype operational proof.
+- No npm publish in this checkout, no exact-pushed-SHA Buildkite job, no hosted staging run of the deployment templates, and only local/prototype operational proof. A trusted local Buildkite run would still not establish independent hosted-runner or cross-platform evidence.
 - Server-action security remains incomplete for real mutable user flows.
 
 ## Fastest Path To Market

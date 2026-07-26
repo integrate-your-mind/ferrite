@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  printf 'Ferrite Buildkite trust check: %s\n' "$*" >&2
+  exit 1
+}
+
+is_ferrite_repo() {
+  case "$1" in
+    git@github.com:integrate-your-mind/ferrite.git | \
+    https://github.com/integrate-your-mind/ferrite | \
+    https://github.com/integrate-your-mind/ferrite.git)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_ferrite_repo "${BUILDKITE_REPO:-}" ||
+  fail "job repository is not integrate-your-mind/ferrite"
+
+[[ "${FERRITE_BUILDKITE_APPROVED_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] ||
+  fail "FERRITE_BUILDKITE_APPROVED_COMMIT must be set outside the checkout"
+[[ "${BUILDKITE_COMMIT:-}" == "${FERRITE_BUILDKITE_APPROVED_COMMIT}" ]] ||
+  fail "job commit does not match the operator-approved commit"
+
+if [[ -n "${BUILDKITE_PULL_REQUEST_REPO:-}" ]] &&
+   [[ "${BUILDKITE_PULL_REQUEST_REPO}" != "false" ]]; then
+  is_ferrite_repo "${BUILDKITE_PULL_REQUEST_REPO}" ||
+    fail "fork pull-request jobs are not allowed on the local agent"
+fi
+
+for name in \
+  AWS_SECRET_ACCESS_KEY \
+  GOOGLE_APPLICATION_CREDENTIALS \
+  GITHUB_TOKEN \
+  NPM_TOKEN \
+  NODE_AUTH_TOKEN \
+  OPENAI_API_KEY; do
+  if [[ -n "${!name:-}" ]]; then
+    fail "${name} must not be exposed to Ferrite validation jobs"
+  fi
+done
+
+export BUILDKITE_GIT_SUBMODULES=false
+export PATH="${HOME}/bin:/opt/homebrew/bin:/opt/homebrew/sbin:${HOME}/Library/pnpm:/usr/bin:/bin:/usr/sbin:/sbin"

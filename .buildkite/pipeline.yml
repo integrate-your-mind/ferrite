@@ -1,0 +1,13 @@
+steps:
+  - label: "Ferrite local proof"
+    key: "ferrite-local-proof"
+    command: "./.buildkite/scripts/ci.sh all"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"

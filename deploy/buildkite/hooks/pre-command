@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${BUILDKITE_COMMAND:-}" in
+  "./.buildkite/scripts/upload-pipeline.sh" | \
+  "./.buildkite/scripts/ci.sh all")
+    ;;
+  *)
+    printf 'Ferrite Buildkite trust check: command is not allowlisted\n' >&2
+    exit 1
+    ;;
+esac
+
+# Checkout may need the agent account's read-only Git credential. The project
+# command does not; remove common interactive credential helpers before it runs.
+unset SSH_AUTH_SOCK GIT_ASKPASS SSH_ASKPASS

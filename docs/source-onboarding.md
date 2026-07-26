@@ -86,5 +86,6 @@ Source package manifests stay `private: true` and retain workspace dependencies.
 - npm, Cargo, CLI, native-prebuild, and container publication
 - registry-backed installation on a clean external machine
 - native artifact loading on every advertised platform
-- hosted GitHub Actions execution for the candidate
+- exact-pushed-SHA execution on the dedicated local Buildkite agent
+- Linux, Windows, and Intel macOS execution outside the local arm64 lane
 - hosted deployment, public edge support, or a production SLA
