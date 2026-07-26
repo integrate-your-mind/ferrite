@@ -38,6 +38,15 @@ pnpm starter:create -- ../ferrite-starter-check
 
 The target's parent must exist, and the target itself must be absent. Remove the generated external fixture when the review is complete.
 
+Do not use a raw `ferrite init` directory as the contributor onboarding path yet.
+That command intentionally creates a registry-shaped skeleton whose Ferrite
+packages are not published; a plain `npm install` will therefore fail with a
+registry `404` until the release gate is complete. Use `pnpm starter:create`
+above instead. It stages the source-built CLI and release-shaped package
+tarballs, installs them without workspace links, and runs the real `check`
+workflow before publishing into the absent target directory. An existing or
+non-empty target is rejected without replacing it.
+
 ## Required checks
 
 Run the checks that apply to your change before opening a pull request:
