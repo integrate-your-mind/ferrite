@@ -109,7 +109,11 @@ gap.
    deterministic pre-publish failures, ambiguous registry outcomes, and local
    cleanup/receipt failures are disjoint receipt fields. An interrupted receipt
    retains the package whose registry state must be read back before retry.
-   Never repack between proof and publication.
+   The driver assigns every attempt a unique ID, creates the first receipt
+   exclusively, refuses to overwrite an earlier attempt, and syncs receipt files
+   plus their parent directory around atomic replacement. Reconcile or archive
+   an existing receipt before choosing a new receipt path. Never repack between
+   proof and publication.
 7. Read each version and dist-tag back from the registry.
 8. Install the exact registry versions in a clean directory and rerun the
    portable package smoke.

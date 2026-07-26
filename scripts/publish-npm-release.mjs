@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { argv, exit } from "node:process";
@@ -18,6 +18,7 @@ export async function publishNpmRelease({
   receiptPath,
   verifyBuildkite,
   writeReceipt = writePublicationReceipt,
+  createReceipt = createPublicationReceipt,
   cleanupStaging = removeStagingDirectory,
 } = {}) {
   if (!execute) {
@@ -38,6 +39,7 @@ export async function publishNpmRelease({
   const published = [];
   const baseReceipt = {
     schemaVersion: 1,
+    attemptId: randomUUID(),
     source: firstPlan.source,
     build: firstPlan.build,
     packageSetSha256: firstPlan.packageSetSha256,
@@ -48,7 +50,7 @@ export async function publishNpmRelease({
       sha256: artifact.sha256,
     })),
   };
-  await writeReceipt(resolvedReceipt, {
+  await createReceipt(resolvedReceipt, {
     ...baseReceipt,
     status: "started",
     published,
@@ -207,13 +209,45 @@ export async function publishNpmRelease({
 export async function writePublicationReceipt(receiptPath, receipt) {
   const temporary = `${receiptPath}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, {
-      flag: "wx",
-      mode: 0o600,
-    });
+    await writeSyncedJson(temporary, receipt, "wx");
     await rename(temporary, receiptPath);
+    await syncParentDirectory(receiptPath);
   } finally {
     await rm(temporary, { force: true });
+  }
+}
+
+export async function createPublicationReceipt(receiptPath, receipt) {
+  try {
+    await writeSyncedJson(receiptPath, receipt, "wx");
+    await syncParentDirectory(receiptPath);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new Error(
+        `Publication receipt already exists at ${receiptPath}; reconcile or archive it before starting another attempt.`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+async function writeSyncedJson(path, value, flag) {
+  const handle = await open(path, flag, 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncParentDirectory(path) {
+  const directory = await open(dirname(path), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
   }
 }
 

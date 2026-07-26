@@ -8,6 +8,7 @@ import { gzipSync } from "node:zlib";
 
 import { prepareNpmRelease } from "./prepare-npm-release.mjs";
 import {
+  createPublicationReceipt,
   parsePublishArgs,
   publishNpmRelease,
   removeStagingDirectory,
@@ -42,6 +43,37 @@ test("requires an explicit execute flag", async () => {
     reportPath: "report.json",
     receiptPath: "receipt.json",
     execute: true,
+  });
+});
+
+test("refuses to overwrite an existing publication receipt", async () => {
+  await withReleaseReport(async ({ reportPath, root }) => {
+    const receiptPath = join(root, "existing-publication.json");
+    const existing = {
+      schemaVersion: 1,
+      attemptId: "prior-attempt",
+      status: "ambiguous",
+      published: [{ name: "@ferrite/protocol" }],
+      ambiguous: { name: "@ferrite/protocol-wasm" },
+    };
+    await createPublicationReceipt(receiptPath, existing);
+    let registryCalls = 0;
+
+    await assert.rejects(
+      publishNpmRelease({
+        reportPath,
+        receiptPath,
+        execute: true,
+        sourceIdentity: source,
+        verifyBuildkite: acceptBuildkite,
+        runCommand: async () => {
+          registryCalls += 1;
+        },
+      }),
+      /receipt already exists.*reconcile or archive/,
+    );
+    assert.equal(registryCalls, 0);
+    assert.deepEqual(JSON.parse(await readFile(receiptPath, "utf8")), existing);
   });
 });
 
@@ -80,6 +112,7 @@ test("revalidates and publishes immutable staged bytes in dependency order", asy
       result.published.map(({ sha256 }) => sha256),
     );
     const receipt = JSON.parse(await readFile(result.receiptPath, "utf8"));
+    assert.match(receipt.attemptId, /^[0-9a-f-]{36}$/);
     assert.equal(receipt.status, "complete");
     assert.deepEqual(receipt.published.map(({ name }) => name), names);
   });
@@ -161,7 +194,7 @@ test("recovers a post-success receipt write failure without relabeling success",
         runCommand: async () => {},
         writeReceipt: async (...args) => {
           writes += 1;
-          if (writes === 3) throw new Error("receipt write failed");
+          if (writes === 2) throw new Error("receipt write failed");
           await writePublicationReceipt(...args);
         },
       }),
