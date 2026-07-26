@@ -5,7 +5,8 @@ case "${BUILDKITE_COMMAND:-}" in
   "./.buildkite/scripts/upload-pipeline.sh" | \
   "./.buildkite/scripts/ci.sh verify" | \
   "./.buildkite/scripts/ci.sh packages" | \
-  "./.buildkite/scripts/ci.sh coverage" | \
+  "./.buildkite/scripts/ci.sh coverage-rust" | \
+  "./.buildkite/scripts/ci.sh coverage-js" | \
   "./.buildkite/scripts/ci.sh native" | \
   "./.buildkite/scripts/ci.sh nginx")
     ;;

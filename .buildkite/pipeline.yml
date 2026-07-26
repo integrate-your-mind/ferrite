@@ -7,7 +7,7 @@ steps:
       project: "ferrite"
       os: "darwin"
       arch: "arm64"
-    timeout_in_minutes: 120
+    timeout_in_minutes: 30
     artifact_paths:
       - "dist/ci/**/*"
       - "dist/npm-packages/**/*"
@@ -21,21 +21,35 @@ steps:
       project: "ferrite"
       os: "darwin"
       arch: "arm64"
-    timeout_in_minutes: 120
+    timeout_in_minutes: 30
     artifact_paths:
       - "dist/ci/**/*"
       - "dist/npm-packages/**/*"
 
-  - label: "Ferrite coverage"
-    key: "ferrite-coverage"
-    command: "./.buildkite/scripts/ci.sh coverage"
+  - label: "Ferrite Rust coverage"
+    key: "ferrite-coverage-rust"
+    command: "./.buildkite/scripts/ci.sh coverage-rust"
     depends_on: "ferrite-packages"
     agents:
       queue: "ferrite-local"
       project: "ferrite"
       os: "darwin"
       arch: "arm64"
-    timeout_in_minutes: 120
+    timeout_in_minutes: 45
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite JavaScript coverage"
+    key: "ferrite-coverage-js"
+    command: "./.buildkite/scripts/ci.sh coverage-js"
+    depends_on: "ferrite-coverage-rust"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 30
     artifact_paths:
       - "dist/ci/**/*"
       - "dist/npm-packages/**/*"
@@ -43,13 +57,13 @@ steps:
   - label: "Ferrite native"
     key: "ferrite-native"
     command: "./.buildkite/scripts/ci.sh native"
-    depends_on: "ferrite-coverage"
+    depends_on: "ferrite-coverage-js"
     agents:
       queue: "ferrite-local"
       project: "ferrite"
       os: "darwin"
       arch: "arm64"
-    timeout_in_minutes: 120
+    timeout_in_minutes: 30
     artifact_paths:
       - "dist/ci/**/*"
       - "dist/npm-packages/**/*"
@@ -63,7 +77,7 @@ steps:
       project: "ferrite"
       os: "darwin"
       arch: "arm64"
-    timeout_in_minutes: 120
+    timeout_in_minutes: 45
     artifact_paths:
       - "dist/ci/**/*"
       - "dist/npm-packages/**/*"

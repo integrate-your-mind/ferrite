@@ -143,20 +143,29 @@ packages() {
   run_gate secret-scan gitleaks git --no-banner --redact --log-opts=-1
 }
 
-coverage() {
-  # Clean jobs cannot inherit the generated JS/WASM/native artifacts from verify.
-  run_gate coverage-prerequisites pnpm build
-  run_gate coverage-prerequisites-clean cargo clean
+coverage_rust() {
   run_gate coverage-rust rustup run stable cargo llvm-cov \
     --workspace \
     --all-targets \
     --summary-only \
     -- \
     --test-threads=1
+}
+
+coverage_js() {
+  # Clean jobs cannot inherit ignored runtime/native artifacts from verify.
+  run_gate coverage-runtime-prerequisites pnpm --filter @ferrite/runtime build
+  run_gate coverage-native-prerequisites pnpm --filter @ferrite/node build
+  run_gate coverage-prerequisites-clean cargo clean
   run_gate coverage-runtime bash -c \
     'cd packages/runtime && exec node --test --experimental-test-coverage test/*.test.mjs'
   run_gate coverage-native bash -c \
     'cd packages/node && exec node --test --experimental-test-coverage test/*.test.mjs'
+}
+
+coverage() {
+  coverage_rust
+  coverage_js
 }
 
 native_current_host() {
@@ -195,6 +204,16 @@ case "${MODE}" in
     bootstrap
     coverage
     ;;
+  coverage-rust)
+    preflight
+    bootstrap
+    coverage_rust
+    ;;
+  coverage-js)
+    preflight
+    bootstrap
+    coverage_js
+    ;;
   native)
     preflight
     bootstrap
@@ -215,7 +234,7 @@ case "${MODE}" in
     nginx
     ;;
   *)
-    printf 'usage: %s {preflight|verify|packages|coverage|native|nginx|all}\n' "$0" >&2
+    printf 'usage: %s {preflight|verify|packages|coverage|coverage-rust|coverage-js|native|nginx|all}\n' "$0" >&2
     exit 64
     ;;
 esac

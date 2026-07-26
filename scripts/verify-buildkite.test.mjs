@@ -22,32 +22,67 @@ function runHook(url, env) {
   });
 }
 
+function pipelineStep(source, key) {
+  const marker = `    key: "${key}"`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `pipeline does not define ${key}`);
+  const end = source.indexOf("\n  - label:", start);
+  return source.slice(start, end === -1 ? source.length : end);
+}
+
 test("Buildkite pipeline runs dependency-ordered clean-checkout gates on the dedicated local queue", async () => {
   const source = await readFile(pipelineUrl, "utf8");
 
-  for (const [mode, dependency] of [
-    ["verify", null],
-    ["packages", "verify"],
-    ["coverage", "packages"],
-    ["native", "coverage"],
-    ["nginx", "native"],
+  for (const [key, mode, dependency, timeout] of [
+    ["ferrite-verify", "verify", null, 30],
+    ["ferrite-packages", "packages", "ferrite-verify", 30],
+    ["ferrite-coverage-rust", "coverage-rust", "ferrite-packages", 45],
+    ["ferrite-coverage-js", "coverage-js", "ferrite-coverage-rust", 30],
+    ["ferrite-native", "native", "ferrite-coverage-js", 30],
+    ["ferrite-nginx", "nginx", "ferrite-native", 45],
   ]) {
-    assert.ok(
-      source.includes(`command: "./.buildkite/scripts/ci.sh ${mode}"`),
-      `pipeline does not run the ${mode} gate`,
+    const step = pipelineStep(source, key);
+    assert.match(
+      step,
+      new RegExp(`command: "\\./\\.buildkite/scripts/ci\\.sh ${mode}"`),
     );
     if (dependency) {
-      assert.match(source, new RegExp(`depends_on: "ferrite-${dependency}"`));
+      assert.match(step, new RegExp(`depends_on: "${dependency}"`));
+    } else {
+      assert.doesNotMatch(step, /depends_on:/);
     }
+    assert.match(step, new RegExp(`timeout_in_minutes: ${timeout}`));
+    assert.match(step, /queue: "ferrite-local"/);
+    assert.match(step, /project: "ferrite"/);
+    assert.match(step, /os: "darwin"/);
+    assert.match(step, /arch: "arm64"/);
   }
   assert.doesNotMatch(source, /command: "\.\/\.buildkite\/scripts\/ci\.sh all"/);
-  assert.match(source, /queue: "ferrite-local"/);
-  assert.match(source, /project: "ferrite"/);
-  assert.match(source, /os: "darwin"/);
-  assert.match(source, /arch: "arm64"/);
-  assert.match(source, /timeout_in_minutes: 120/);
   assert.match(source, /dist\/ci\/\*\*\/\*/);
   assert.doesNotMatch(source, /plugins:|deploy|publish|release/);
+});
+
+test("bounded agent uptime covers the complete serial job timeout envelope", async () => {
+  const [pipeline, config] = await Promise.all([
+    readFile(pipelineUrl, "utf8"),
+    readFile(configUrl, "utf8"),
+  ]);
+  const timeouts = [...pipeline.matchAll(/timeout_in_minutes: (\d+)/g)].map(
+    ([, value]) => Number(value),
+  );
+  const uptime = Number(
+    config.match(/disconnect-after-uptime=(\d+)/)?.[1] ?? Number.NaN,
+  );
+  const pipelineUploadTimeoutSeconds = 10 * 60;
+
+  assert.equal(timeouts.length, 6);
+  assert.ok(Number.isFinite(uptime));
+  assert.ok(
+    uptime >=
+      pipelineUploadTimeoutSeconds +
+        timeouts.reduce((total, minutes) => total + minutes * 60, 0),
+    "agent uptime must cover pipeline upload plus every serial job timeout",
+  );
 });
 
 test("local CI retains the host-executable validation gate categories", async () => {
@@ -80,16 +115,31 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /export CARGO_PROFILE_DEV_DEBUG=0/);
   assert.match(source, /export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off/);
   assert.match(source, /run_gate coverage-rust rustup run stable cargo llvm-cov/);
-  assert.ok(
-    source.indexOf("run_gate coverage-prerequisites pnpm build") <
-      source.indexOf("run_gate coverage-rust rustup run stable cargo llvm-cov"),
-    "coverage must build ignored runtime/native prerequisites first",
+  assert.match(
+    source,
+    /run_gate coverage-runtime-prerequisites pnpm --filter @ferrite\/runtime build/,
   );
-  assert.ok(
-    source.indexOf("run_gate coverage-prerequisites-clean cargo clean") <
-      source.indexOf("run_gate coverage-rust rustup run stable cargo llvm-cov"),
-    "coverage must release the prerequisite Rust target before instrumentation",
+  assert.match(
+    source,
+    /run_gate coverage-native-prerequisites pnpm --filter @ferrite\/node build/,
   );
+  assert.match(source, /run_gate coverage-prerequisites-clean cargo clean/);
+  assert.doesNotMatch(source, /run_gate coverage-prerequisites pnpm build/);
+  const coverageJs = source.slice(
+    source.indexOf("coverage_js()"),
+    source.indexOf("native_current_host()"),
+  );
+  for (const [first, second] of [
+    ["coverage-runtime-prerequisites", "coverage-native-prerequisites"],
+    ["coverage-native-prerequisites", "coverage-prerequisites-clean"],
+    ["coverage-prerequisites-clean", "coverage-runtime bash"],
+    ["coverage-runtime bash", "coverage-native bash"],
+  ]) {
+    assert.ok(
+      coverageJs.indexOf(first) < coverageJs.indexOf(second),
+      `${first} must run before ${second}`,
+    );
+  }
   assert.doesNotMatch(source, /coverage-rust env RUSTC=/);
   assert.doesNotMatch(source, /corepack pnpm/);
   assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
@@ -114,7 +164,7 @@ test("dedicated agent configuration disables plugins and local hooks", async () 
   assert.match(source, /no-local-hooks=true/);
   assert.match(source, /git-clean-flags="-ffxdq"/);
   assert.match(source, /disconnect-after-idle-timeout=300/);
-  assert.match(source, /disconnect-after-uptime=8100/);
+  assert.match(source, /disconnect-after-uptime=14400/);
   assert.match(source, /enable-environment-variable-allowlist=true/);
   assert.match(source, /allowed-environment-variables=/);
   assert.doesNotMatch(source, /BASH_ENV|GIT_SSH_COMMAND|NODE_OPTIONS|RUSTFLAGS/);
@@ -171,7 +221,14 @@ test("external command hook rejects arbitrary commands", async () => {
     }).status,
     0,
   );
-  for (const mode of ["verify", "packages", "coverage", "native", "nginx"]) {
+  for (const mode of [
+    "verify",
+    "packages",
+    "coverage-rust",
+    "coverage-js",
+    "native",
+    "nginx",
+  ]) {
     assert.equal(
       runHook(preCommandHookUrl, {
         BUILDKITE_COMMAND: `./.buildkite/scripts/ci.sh ${mode}`,
@@ -179,6 +236,12 @@ test("external command hook rejects arbitrary commands", async () => {
       0,
     );
   }
+  assert.notEqual(
+    runHook(preCommandHookUrl, {
+      BUILDKITE_COMMAND: "./.buildkite/scripts/ci.sh coverage",
+    }).status,
+    0,
+  );
   assert.notEqual(
     runHook(preCommandHookUrl, {
       BUILDKITE_COMMAND: "./.buildkite/scripts/ci.sh all",

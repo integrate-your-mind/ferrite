@@ -27,12 +27,13 @@ artifacts from another toolchain.
 
 ## Pipeline
 
-The Buildkite pipeline has five bounded, dependency-ordered commands:
+The Buildkite pipeline has six bounded, dependency-ordered commands:
 
 ```sh
 ./.buildkite/scripts/ci.sh verify
 ./.buildkite/scripts/ci.sh packages
-./.buildkite/scripts/ci.sh coverage
+./.buildkite/scripts/ci.sh coverage-rust
+./.buildkite/scripts/ci.sh coverage-js
 ./.buildkite/scripts/ci.sh native
 ./.buildkite/scripts/ci.sh nginx
 ```
@@ -41,10 +42,11 @@ Each job starts from the agent's clean exact-commit checkout. Splitting the
 existing modes prevents generated output from one gate from accumulating into
 the next gate while preserving this order. The CI script disables incremental
 Rust output, strips development debug information, and uses one Cargo build
-job so a clean proof has a bounded generated-output footprint. The clean
-coverage job builds its ignored runtime, WASM, and native prerequisites, copies
-their distributable artifacts, then removes the prerequisite Rust target
-before starting instrumentation.
+job so a clean proof has a bounded generated-output footprint. Rust and
+JavaScript coverage run in separate clean jobs. The JavaScript coverage job
+builds only its ignored runtime and native prerequisites, copies their
+distributable artifacts, then removes the prerequisite Rust target before
+starting the Node coverage runs.
 
 1. exact-commit, clean-checkout, host, and toolchain preflight;
 2. frozen dependency installation;
@@ -90,17 +92,17 @@ The external hooks:
 - reject fork pull requests;
 - require the job SHA to equal an operator-approved SHA;
 - reject common application and registry credentials;
-- allow only the pipeline upload and five proof-mode commands;
+- allow only the pipeline upload and six proof-mode commands;
 - clear interactive Git/SSH credential helpers before project commands; and
 - force checkout cleanup, allowlist inherited environment variables, disable
   repository-local hooks, plugins, and submodules, and disconnect after five
-  idle minutes or 135 minutes of uptime through the dedicated agent
+  idle minutes or 240 minutes of uptime through the dedicated agent
   configuration.
 
 Buildkite's `no-command-eval` mode is intentionally not enabled because it
-rejects the argument-bearing `./.buildkite/scripts/ci.sh all` command. The
-external `pre-command` hook is the command allowlist and must be installed
-before this queue is used.
+rejects the argument-bearing proof-mode commands. The external `pre-command`
+hook is the exact command allowlist and must be installed before this queue is
+used.
 
 The existing shared `default` queue and its global hooks are not suitable for
 Ferrite. Use the dedicated configuration and queue:
@@ -111,9 +113,15 @@ buildkite-agent start \
   --config deploy/buildkite/ferrite-agent.cfg.example
 ```
 
-The first job uploads the repository pipeline and the five dependency-ordered
+The first job uploads the repository pipeline and the six dependency-ordered
 proof jobs reuse the same bounded agent. The agent then exits on the configured
 idle or uptime bound.
+
+Rolling this change back requires restoring both sides of the trust boundary:
+stop the bounded agent, restore the previous repository pipeline and external
+hook from the same commit, verify their hashes, then restart the agent against
+the approved SHA. Reverting only the repository or only the installed hook
+leaves the job commands incompatible.
 
 Supply the agent token through the process environment or an external
 credential store. Never add it to this repository, the pipeline YAML, a hook,
@@ -155,7 +163,8 @@ Run individual stages for diagnosis:
 ```sh
 ./.buildkite/scripts/ci.sh verify
 ./.buildkite/scripts/ci.sh packages
-./.buildkite/scripts/ci.sh coverage
+./.buildkite/scripts/ci.sh coverage-rust
+./.buildkite/scripts/ci.sh coverage-js
 ./.buildkite/scripts/ci.sh native
 ./.buildkite/scripts/ci.sh nginx
 ```
