@@ -39,7 +39,12 @@ The Buildkite pipeline has five bounded, dependency-ordered commands:
 
 Each job starts from the agent's clean exact-commit checkout. Splitting the
 existing modes prevents generated output from one gate from accumulating into
-the next gate while preserving this order:
+the next gate while preserving this order. The CI script disables incremental
+Rust output, strips development debug information, and uses one Cargo build
+job so a clean proof has a bounded generated-output footprint. The clean
+coverage job builds its ignored runtime, WASM, and native prerequisites, copies
+their distributable artifacts, then removes the prerequisite Rust target
+before starting instrumentation.
 
 1. exact-commit, clean-checkout, host, and toolchain preflight;
 2. frozen dependency installation;

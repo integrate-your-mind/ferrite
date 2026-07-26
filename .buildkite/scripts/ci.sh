@@ -8,6 +8,12 @@ readonly REPORT_DIR
 MODE="${1:-}"
 readonly MODE
 
+# Keep clean local-agent jobs reproducible and bound Rust's generated output.
+export CARGO_BUILD_JOBS=1
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off
+
 cd "${ROOT}"
 
 fail() {
@@ -82,6 +88,11 @@ preflight() {
     printf 'buildkite_agent=%s\n' "${buildkite_version}"
     printf 'host_os=%s\n' "$(uname -s)"
     printf 'host_arch=%s\n' "$(uname -m)"
+    printf 'cargo_build_jobs=%s\n' "${CARGO_BUILD_JOBS}"
+    printf 'cargo_incremental=%s\n' "${CARGO_INCREMENTAL}"
+    printf 'cargo_profile_dev_debug=%s\n' "${CARGO_PROFILE_DEV_DEBUG}"
+    printf 'cargo_profile_dev_split_debuginfo=%s\n' \
+      "${CARGO_PROFILE_DEV_SPLIT_DEBUGINFO}"
   } > "${REPORT_DIR}/environment.txt"
 }
 
@@ -133,6 +144,9 @@ packages() {
 }
 
 coverage() {
+  # Clean jobs cannot inherit the generated JS/WASM/native artifacts from verify.
+  run_gate coverage-prerequisites pnpm build
+  run_gate coverage-prerequisites-clean cargo clean
   run_gate coverage-rust rustup run stable cargo llvm-cov \
     --workspace \
     --all-targets \

@@ -75,7 +75,21 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /pnpm_version="\$\(pnpm --version\)"/);
   assert.match(source, /rustup target list --toolchain stable --installed/);
   assert.match(source, /wasm32-unknown-unknown/);
+  assert.match(source, /export CARGO_BUILD_JOBS=1/);
+  assert.match(source, /export CARGO_INCREMENTAL=0/);
+  assert.match(source, /export CARGO_PROFILE_DEV_DEBUG=0/);
+  assert.match(source, /export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off/);
   assert.match(source, /run_gate coverage-rust rustup run stable cargo llvm-cov/);
+  assert.ok(
+    source.indexOf("run_gate coverage-prerequisites pnpm build") <
+      source.indexOf("run_gate coverage-rust rustup run stable cargo llvm-cov"),
+    "coverage must build ignored runtime/native prerequisites first",
+  );
+  assert.ok(
+    source.indexOf("run_gate coverage-prerequisites-clean cargo clean") <
+      source.indexOf("run_gate coverage-rust rustup run stable cargo llvm-cov"),
+    "coverage must release the prerequisite Rust target before instrumentation",
+  );
   assert.doesNotMatch(source, /coverage-rust env RUSTC=/);
   assert.doesNotMatch(source, /corepack pnpm/);
   assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
