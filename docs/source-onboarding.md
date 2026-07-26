@@ -68,17 +68,17 @@ npm run start -- --once --request-path /
 
 | Package | Release-shaped proof | Current limit |
 | --- | --- | --- |
-| `@ferrite/protocol` | Packed, installed, imported, and protocol API checked | Not published |
-| `@ferrite/protocol-wasm` | Packed WASM instantiated; valid input accepted and invalid input rejected | Not needed by the minimal starter; not published |
-| `@ferrite/runtime` | Root and all public subpath exports imported; starter check/build/serve exercised | Not published |
-| `@ferrite/node` | Installed with the current host's native prebuild and used for real render success/failure | Other platforms require their own hosted proof; not published |
+| `@ferrite/protocol` | Packed, installed, imported, and protocol API checked | Portable alpha candidate; registry availability must match a verified release receipt |
+| `@ferrite/protocol-wasm` | Packed WASM instantiated; valid input accepted and invalid input rejected | Not needed by the minimal starter; portable alpha candidate |
+| `@ferrite/runtime` | Root and all public subpath exports imported; starter check/build/serve exercised | Portable alpha candidate; registry availability must match a verified release receipt |
+| `@ferrite/node` | Installed with the current host's native prebuild and used for real render success/failure | Separate native release unit; other platforms require their own hosted proof |
 | Current native prebuild | Metadata, file set, checksum, install, resolution, and native load verified | Only the current host artifact is built locally |
 
-Source package manifests stay `private: true` and retain workspace dependencies. The verifier stages separate release manifests, rewrites internal versions, checks metadata and file allowlists, creates tarballs, and installs those tarballs together. It does not publish them.
+Source package manifests stay `private: true` and retain workspace dependencies. The verifier stages separate release manifests, rewrites internal versions, checks metadata and file allowlists, creates tarballs, and installs those tarballs together. The guarded publication driver is a separate explicit step; verification alone never publishes.
 
 ## Troubleshooting
 
-- Registry `404` for `@ferrite/runtime`: use `pnpm starter:create`; direct registry installation is not available.
+- Registry `404` for `@ferrite/runtime`, or no matching release receipt: use `pnpm starter:create`. Direct registry installation is available only after a verified release receipt confirms the exact version and dist-tag.
 - `ferrite: command not found`: the registry-shaped skeleton expects a distributed CLI. A source-backed starter uses `.ferrite-source/run-ferrite.mjs` instead.
 - Missing Corepack: install Corepack for your Node distribution, then rerun `corepack enable`.
 - Missing Chromium: run `pnpm exec playwright-core install chromium` in the Ferrite checkout and set `FERRITE_BROWSER_EXECUTABLE` as shown in the README.
@@ -86,8 +86,8 @@ Source package manifests stay `private: true` and retain workspace dependencies.
 
 ## Unproven release surfaces
 
-- npm, Cargo, CLI, native-prebuild, and container publication
-- registry-backed installation on a clean external machine
+- portable npm registry publication and clean-consumer readback until a matching release receipt exists
+- Cargo, CLI, native-prebuild, and container publication
 - native artifact loading on every advertised platform
 - exact-pushed-SHA execution on the dedicated local Buildkite agent
 - Linux, Windows, and Intel macOS execution outside the local arm64 lane

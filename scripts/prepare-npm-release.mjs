@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
@@ -25,6 +26,7 @@ export async function prepareNpmRelease({
   tag = "next",
   sourceIdentity,
   requireBuildkite = true,
+  verifyBuildkite = verifyBuildkiteReport,
 } = {}) {
   if (!reportPath) {
     throw new Error("npm release planning requires --report.");
@@ -56,6 +58,9 @@ export async function prepareNpmRelease({
   }
   if (requireBuildkite && report.build?.provider !== "buildkite") {
     throw new Error("npm release planning requires an exact Buildkite package report.");
+  }
+  if (requireBuildkite) {
+    await verifyBuildkite({ report, reportPath: resolvedReport });
   }
   const packageSetSha256 = createHash("sha256")
     .update(JSON.stringify(packageSetIdentity(report.packages)))
@@ -103,6 +108,115 @@ export async function prepareNpmRelease({
       },
     ],
   };
+}
+
+export async function verifyBuildkiteReport({
+  report,
+  reportPath,
+  runCommand = runBkJson,
+} = {}) {
+  const buildIdentity = report?.build;
+  if (
+    buildIdentity?.provider !== "buildkite" ||
+    buildIdentity.organization !== "roman-mondello" ||
+    buildIdentity.pipeline !== "ferrite" ||
+    !/^\d+$/.test(buildIdentity.buildNumber ?? "")
+  ) {
+    throw new Error("npm release report does not identify the approved Ferrite Buildkite pipeline.");
+  }
+  const buildEndpoint =
+    `/pipelines/${buildIdentity.pipeline}/builds/${buildIdentity.buildNumber}`;
+  const build = await runCommand([
+    "api",
+    buildEndpoint,
+  ]);
+  if (
+    build?.id !== buildIdentity.buildId ||
+    String(build?.number) !== buildIdentity.buildNumber ||
+    build?.web_url !== buildIdentity.url ||
+    build?.commit !== report.source?.commit ||
+    build?.state !== "passed"
+  ) {
+    throw new Error("npm release report Buildkite build identity is not a passed exact-source build.");
+  }
+  const job = build.jobs?.find(({ id }) => id === buildIdentity.jobId);
+  if (
+    !job ||
+    job.step_key !== "ferrite-packages" ||
+    job.command !== "./.buildkite/scripts/ci.sh packages" ||
+    job.state !== "passed" ||
+    job.exit_status !== 0
+  ) {
+    throw new Error("npm release report is not bound to the passed Ferrite packages job.");
+  }
+
+  const artifacts = await runCommand([
+    "api",
+    `${buildEndpoint}/jobs/${buildIdentity.jobId}/artifacts`,
+  ]);
+  const reportRoot = dirname(reportPath);
+  const verifiedPackageArtifacts = await Promise.all(
+    report.packages
+      .filter(({ publishArtifact }) => publishArtifact)
+      .map(async ({ name, publishArtifact }) => ({
+        path: `dist/npm-packages/${publishArtifact.path}`,
+        localPath: (await validateArtifact(name, publishArtifact, reportRoot)).path,
+      })),
+  );
+  const expected = [
+    {
+      path: "dist/npm-packages/npm-package-report.json",
+      localPath: reportPath,
+    },
+    ...verifiedPackageArtifacts,
+  ];
+  for (const item of expected) {
+    const matches = artifacts.filter((artifact) =>
+      artifact.path === item.path && artifact.job_id === buildIdentity.jobId
+    );
+    if (matches.length !== 1 || matches[0].state !== "finished") {
+      throw new Error(`Buildkite package proof requires one finished artifact at ${item.path}.`);
+    }
+    const bytes = await readFile(item.localPath);
+    const sha1 = createHash("sha1").update(bytes).digest("hex");
+    if (
+      matches[0].file_size !== bytes.byteLength ||
+      matches[0].sha1sum !== sha1
+    ) {
+      throw new Error(`Buildkite artifact identity does not match ${item.path}.`);
+    }
+  }
+}
+
+function runBkJson(args) {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn("bk", args, {
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Buildkite evidence lookup failed with exit ${code}: ${stderr.trim()}`));
+        return;
+      }
+      try {
+        resolvePromise(JSON.parse(stdout));
+      } catch (error) {
+        reject(new Error(`Buildkite evidence lookup returned invalid JSON: ${error.message}`));
+      }
+    });
+  });
 }
 
 function validateManifest(name, entry, version) {

@@ -330,6 +330,8 @@ export function readBuildIdentity(environment = env) {
   if (environment.BUILDKITE === "true") {
     const build = {
       provider: "buildkite",
+      organization: environment.BUILDKITE_ORGANIZATION_SLUG,
+      pipeline: environment.BUILDKITE_PIPELINE_SLUG,
       buildId: environment.BUILDKITE_BUILD_ID,
       buildNumber: environment.BUILDKITE_BUILD_NUMBER,
       jobId: environment.BUILDKITE_JOB_ID,
@@ -356,7 +358,7 @@ function validateBuildIdentity(build) {
     throw new Error("npm package report requires an explicit local or Buildkite build identity.");
   }
   if (build.provider === "buildkite") {
-    for (const field of ["buildId", "buildNumber", "jobId", "url"]) {
+    for (const field of ["organization", "pipeline", "buildId", "buildNumber", "jobId", "url"]) {
       if (typeof build[field] !== "string" || build[field].trim() === "") {
         throw new Error(`npm package report Buildkite identity requires ${field}.`);
       }

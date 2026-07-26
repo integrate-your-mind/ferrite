@@ -144,7 +144,6 @@ verify() {
 
 packages() {
   run_gate release-npm pnpm release:verify:npm
-  run_gate release-plan-npm pnpm release:plan:npm
   run_gate release-cargo pnpm release:verify:cargo
   run_gate cargo-audit cargo audit --deny warnings
   run_gate website-install npm --prefix website ci

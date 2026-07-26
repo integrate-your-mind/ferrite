@@ -18,17 +18,27 @@ const version = "0.1.0-alpha.0";
 const source = { commit: "a".repeat(40), tree: "b".repeat(40) };
 const build = {
   provider: "buildkite",
+  organization: "roman-mondello",
+  pipeline: "ferrite",
   buildId: "build-123",
   buildNumber: "123",
   jobId: "job-456",
   url: "https://buildkite.example.test/ferrite/builds/123",
 };
 const names = ["@ferrite/protocol", "@ferrite/protocol-wasm", "@ferrite/runtime"];
+const acceptBuildkite = async () => {};
 
 test("requires an explicit execute flag", async () => {
   await assert.rejects(publishNpmRelease({ reportPath: "unused" }), /explicit --execute/);
-  assert.deepEqual(parsePublishArgs(["--report", "report.json", "--execute"]), {
+  assert.deepEqual(parsePublishArgs([
+    "--report",
+    "report.json",
+    "--receipt",
+    "receipt.json",
+    "--execute",
+  ]), {
     reportPath: "report.json",
+    receiptPath: "receipt.json",
     execute: true,
   });
 });
@@ -40,6 +50,7 @@ test("revalidates and publishes immutable staged bytes in dependency order", asy
       reportPath,
       execute: true,
       sourceIdentity: source,
+      verifyBuildkite: acceptBuildkite,
       runCommand: async (command, args, options) => {
         const bytes = await readFile(args[1]);
         calls.push({
@@ -61,25 +72,38 @@ test("revalidates and publishes immutable staged bytes in dependency order", asy
       calls.map(({ sha256 }) => sha256),
       result.published.map(({ sha256 }) => sha256),
     );
+    const receipt = JSON.parse(await readFile(result.receiptPath, "utf8"));
+    assert.equal(receipt.status, "complete");
+    assert.deepEqual(receipt.published.map(({ name }) => name), names);
   });
 });
 
-test("stops at the first publication failure", async () => {
-  await withReleaseReport(async ({ reportPath }) => {
+test("stops at the first publication failure and preserves partial state", async () => {
+  await withReleaseReport(async ({ reportPath, root }) => {
     let calls = 0;
+    const receiptPath = join(root, "partial-publication.json");
     await assert.rejects(
       publishNpmRelease({
         reportPath,
+        receiptPath,
         execute: true,
         sourceIdentity: source,
+        verifyBuildkite: acceptBuildkite,
         runCommand: async () => {
           calls += 1;
           if (calls === 2) throw new Error("registry rejected package");
         },
       }),
-      /registry rejected package/,
+      /registry rejected package.*published before failure: @ferrite\/protocol/,
     );
     assert.equal(calls, 2);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.status, "partial");
+    assert.deepEqual(receipt.published.map(({ name }) => name), ["@ferrite/protocol"]);
+    assert.deepEqual(receipt.failed, {
+      name: "@ferrite/protocol-wasm",
+      reason: "package publication did not complete",
+    });
   });
 });
 
@@ -91,6 +115,7 @@ test("stops when the package set changes after publication starts", async () => 
         reportPath,
         execute: true,
         sourceIdentity: source,
+        verifyBuildkite: acceptBuildkite,
         runCommand: async () => {
           calls += 1;
           if (calls === 1) {
@@ -116,7 +141,11 @@ test("stops when the package set changes after publication starts", async () => 
 
 test("rejects an artifact replaced after planning before immutable staging", async () => {
   await withReleaseReport(async ({ reportPath, root }) => {
-    const plan = await prepareNpmRelease({ reportPath, sourceIdentity: source });
+    const plan = await prepareNpmRelease({
+      reportPath,
+      sourceIdentity: source,
+      verifyBuildkite: acceptBuildkite,
+    });
     const [pkg] = plan.packages;
     await writeFile(pkg.artifact.path, "replaced after plan\n");
     const stagingRoot = await mkdtemp(join(tmpdir(), "ferrite-publish-stage-test-"));

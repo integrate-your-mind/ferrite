@@ -1,18 +1,18 @@
 # Changelog
 
-Ferrite has no published release at this candidate. The first permitted release
-is the exact portable npm prerelease set documented in
-`docs/npm-release.md`; the CLI and native package matrix remain separate release
-units rather than hidden prerequisites for those three packages.
-
 ## Unreleased
+
+No user-facing changes yet.
+
+## 0.1.0-alpha.0 - 2026-07-26
 
 ### Added
 
 - Rust-owned routing, rendering, protocol validation, artifact construction,
   and bounded production serving.
 - TypeScript JSX, DOM, server, and protocol-facing APIs.
-- Source-build examples and local release-shaped package verification.
+- Source-build examples and the portable `@ferrite/protocol`,
+  `@ferrite/protocol-wasm`, and `@ferrite/runtime` npm prerelease set.
 
 ### Security
 
@@ -22,7 +22,10 @@ units rather than hidden prerequisites for those three packages.
 
 ### Known limits
 
-- No registry publication, supported public CLI distribution, successful
-  hosted CI proof, hosted deployment proof, or production support commitment.
+- No supported public CLI distribution, complete native package matrix,
+  managed hosting, or production support commitment.
+- Registry availability, hosted Buildkite evidence, and provenance must be
+  confirmed by the release receipt for the exact published commit; this
+  changelog entry alone is not publication proof.
 - Ferrite is not a drop-in React or Next.js replacement, and compatibility is
   intentionally incomplete and experimental.

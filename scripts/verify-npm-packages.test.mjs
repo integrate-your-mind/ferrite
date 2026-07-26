@@ -22,6 +22,8 @@ const testReportIdentity = {
   },
   buildIdentity: {
     provider: "buildkite",
+    organization: "roman-mondello",
+    pipeline: "ferrite",
     buildId: "build-123",
     buildNumber: "123",
     jobId: "job-456",

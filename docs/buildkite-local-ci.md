@@ -57,9 +57,8 @@ values in `dist/ci/environment.txt`. Do not bypass this guard to turn an
 1. exact-commit, clean-checkout, host, and toolchain preflight;
 2. frozen dependency installation;
 3. lint, typecheck, build, and the full Rust/Node/browser/demo test suite;
-4. npm/Cargo package verification, a source/build-bound portable npm release
-   plan, dependency audits, site validation, pipeline validation, and a
-   committed-head secret scan;
+4. npm/Cargo package verification, dependency audits, site validation,
+   pipeline validation, and a committed-head secret scan;
 5. measured Rust/runtime/native coverage reports without inventing a threshold
    or overriding `cargo-llvm-cov`'s instrumentation compiler;
 6. the current macOS arm64 native-prebuild package and checksum verifier; and
@@ -69,6 +68,10 @@ The next job is not scheduled when its dependency fails. The nginx stage fails
 closed when Docker or its daemon is unavailable. Each job uploads its reports
 and package candidates from `dist/ci/` and `dist/npm-packages/`. No deploy,
 publish, release, registry credential, or production-data command is present.
+After the package job and artifact upload finish, the separate release planner
+must authenticate to the Buildkite API and bind the downloaded report and
+tarballs to the exact passed package job's artifact metadata. The package job
+cannot validate artifacts that Buildkite has not uploaded yet.
 
 ## Trust boundary
 

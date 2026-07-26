@@ -10,6 +10,7 @@ import {
   PORTABLE_RELEASE_PACKAGES,
   parseArgs,
   prepareNpmRelease,
+  verifyBuildkiteReport,
 } from "./prepare-npm-release.mjs";
 import { createPackageReport } from "./verify-npm-packages.mjs";
 
@@ -20,11 +21,14 @@ const source = {
 };
 const build = {
   provider: "buildkite",
+  organization: "roman-mondello",
+  pipeline: "ferrite",
   buildId: "build-123",
   buildNumber: "123",
   jobId: "job-456",
   url: "https://buildkite.example.test/ferrite/builds/123",
 };
+const acceptBuildkite = async () => {};
 
 test("parses the CLI release-plan contract", () => {
   assert.deepEqual(
@@ -47,7 +51,11 @@ test("parses the CLI release-plan contract", () => {
 test("prepares an exact portable alpha release plan in dependency order", async () => {
   await withReport(async ({ root, reportPath, report }) => {
     await writeReport(reportPath, report);
-    const plan = await prepareNpmRelease({ reportPath, sourceIdentity: source });
+    const plan = await prepareNpmRelease({
+      reportPath,
+      sourceIdentity: source,
+      verifyBuildkite: acceptBuildkite,
+    });
 
     assert.equal(plan.version, version);
     assert.equal(plan.tag, "next");
@@ -71,7 +79,7 @@ test("rejects a package version that differs from the release candidate", async 
     refreshPackageSetDigest(report);
     await writeReport(reportPath, report);
     await assert.rejects(
-      prepareNpmRelease({ reportPath, sourceIdentity: source }),
+      prepareNpmRelease({ reportPath, sourceIdentity: source, verifyBuildkite: acceptBuildkite }),
       /@ferrite\/protocol-wasm: verified package version must be 0\.1\.0-alpha\.0/,
     );
   });
@@ -83,7 +91,7 @@ test("rejects a mismatched artifact digest", async () => {
     refreshPackageSetDigest(report);
     await writeReport(reportPath, report);
     await assert.rejects(
-      prepareNpmRelease({ reportPath, sourceIdentity: source }),
+      prepareNpmRelease({ reportPath, sourceIdentity: source, verifyBuildkite: acceptBuildkite }),
       /@ferrite\/protocol: publish artifact digest does not match/,
     );
   });
@@ -97,7 +105,7 @@ test("rejects an in-root artifact path outside the tarball directory", async () 
     refreshPackageSetDigest(report);
     await writeReport(reportPath, report);
     await assert.rejects(
-      prepareNpmRelease({ reportPath, sourceIdentity: source }),
+      prepareNpmRelease({ reportPath, sourceIdentity: source, verifyBuildkite: acceptBuildkite }),
       /@ferrite\/protocol: publish artifact path is unsafe/,
     );
   });
@@ -116,7 +124,7 @@ test("rejects a publish artifact symlink that escapes the report directory", asy
       refreshPackageSetDigest(report);
       await writeReport(reportPath, report);
       await assert.rejects(
-        prepareNpmRelease({ reportPath, sourceIdentity: source }),
+        prepareNpmRelease({ reportPath, sourceIdentity: source, verifyBuildkite: acceptBuildkite }),
         /@ferrite\/protocol: publish artifact resolves outside/,
       );
     } finally {
@@ -136,7 +144,7 @@ test("rejects a forged self-consistent report containing non-gzip artifacts", as
     refreshPackageSetDigest(report);
     await writeReport(reportPath, report);
     await assert.rejects(
-      prepareNpmRelease({ reportPath, sourceIdentity: source }),
+      prepareNpmRelease({ reportPath, sourceIdentity: source, verifyBuildkite: acceptBuildkite }),
       /not a valid gzip archive/,
     );
   });
@@ -147,7 +155,7 @@ test("rejects a report bound to a stale source commit or tree", async () => {
     report.source.commit = "c".repeat(40);
     await writeReport(reportPath, report);
     await assert.rejects(
-      prepareNpmRelease({ reportPath, sourceIdentity: source }),
+      prepareNpmRelease({ reportPath, sourceIdentity: source, verifyBuildkite: acceptBuildkite }),
       /source commit\/tree does not match/,
     );
   });
@@ -158,9 +166,112 @@ test("rejects a report without exact Buildkite package proof", async () => {
     report.build = { provider: "local" };
     await writeReport(reportPath, report);
     await assert.rejects(
-      prepareNpmRelease({ reportPath, sourceIdentity: source }),
+      prepareNpmRelease({ reportPath, sourceIdentity: source, verifyBuildkite: acceptBuildkite }),
       /requires an exact Buildkite package report/,
     );
+  });
+});
+
+test("accepts only a passed exact-source Buildkite package job and its artifacts", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    await writeReport(reportPath, report);
+    const runCommand = await buildkiteEvidence(reportPath, report);
+
+    await verifyBuildkiteReport({ report, reportPath, runCommand });
+  });
+});
+
+test("rejects fabricated or failed Buildkite build identity", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    await writeReport(reportPath, report);
+    const runCommand = await buildkiteEvidence(reportPath, report, {
+      build: { commit: "c".repeat(40) },
+    });
+
+    await assert.rejects(
+      verifyBuildkiteReport({ report, reportPath, runCommand }),
+      /not a passed exact-source build/,
+    );
+  });
+});
+
+test("rejects a report that names the wrong Buildkite package job", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    await writeReport(reportPath, report);
+    const runCommand = await buildkiteEvidence(reportPath, report, {
+      job: { command: "./.buildkite/scripts/ci.sh verify" },
+    });
+
+    await assert.rejects(
+      verifyBuildkiteReport({ report, reportPath, runCommand }),
+      /not bound to the passed Ferrite packages job/,
+    );
+  });
+});
+
+test("rejects missing, duplicate, unfinished, or changed Buildkite artifacts", async () => {
+  for (const [name, mutate, expected] of [
+    ["missing", (artifacts) => artifacts.slice(1), /requires one finished artifact/],
+    ["duplicate", (artifacts) => [artifacts[0], ...artifacts], /requires one finished artifact/],
+    [
+      "unfinished",
+      (artifacts) => [{ ...artifacts[0], state: "uploading" }, ...artifacts.slice(1)],
+      /requires one finished artifact/,
+    ],
+    [
+      "changed",
+      (artifacts) => [{ ...artifacts[0], sha1sum: "0".repeat(40) }, ...artifacts.slice(1)],
+      /artifact identity does not match/,
+    ],
+  ]) {
+    await withReport(async ({ reportPath, report }) => {
+      await writeReport(reportPath, report);
+      const runCommand = await buildkiteEvidence(reportPath, report, { mutateArtifacts: mutate });
+
+      await assert.rejects(
+        verifyBuildkiteReport({ report, reportPath, runCommand }),
+        expected,
+        name,
+      );
+    });
+  }
+});
+
+test("rejects unsafe report artifact paths before reading Buildkite-bound files", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    report.packages[0].publishArtifact.path = "../../outside.tgz";
+    refreshPackageSetDigest(report);
+    await writeReport(reportPath, report);
+    let artifactLookup = false;
+
+    await assert.rejects(
+      verifyBuildkiteReport({
+        report,
+        reportPath,
+        runCommand: async (args) => {
+          if (args[1].endsWith("/artifacts")) {
+            artifactLookup = true;
+            return [];
+          }
+          return {
+            id: build.buildId,
+            number: Number(build.buildNumber),
+            web_url: build.url,
+            commit: source.commit,
+            state: "passed",
+            jobs: [{
+              id: build.jobId,
+              step_key: "ferrite-packages",
+              command: "./.buildkite/scripts/ci.sh packages",
+              state: "passed",
+              exit_status: 0,
+            }],
+          };
+        },
+      }),
+      /publish artifact path is unsafe/,
+    );
+    assert.equal(artifactLookup, true);
   });
 });
 
@@ -210,6 +321,58 @@ async function withReport(callback) {
 async function writeReport(reportPath, report) {
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   assert.deepEqual(JSON.parse(await readFile(reportPath, "utf8")), report);
+}
+
+async function buildkiteEvidence(
+  reportPath,
+  report,
+  { build: buildOverrides = {}, job: jobOverrides = {}, mutateArtifacts } = {},
+) {
+  const buildResponse = {
+    id: build.buildId,
+    number: Number(build.buildNumber),
+    web_url: build.url,
+    commit: report.source.commit,
+    state: "passed",
+    jobs: [
+      {
+        id: build.jobId,
+        step_key: "ferrite-packages",
+        command: "./.buildkite/scripts/ci.sh packages",
+        state: "passed",
+        exit_status: 0,
+        ...jobOverrides,
+      },
+    ],
+    ...buildOverrides,
+  };
+  const artifactEntries = [
+    {
+      path: "dist/npm-packages/npm-package-report.json",
+      localPath: reportPath,
+    },
+    ...report.packages.map(({ publishArtifact }) => ({
+      path: `dist/npm-packages/${publishArtifact.path}`,
+      localPath: join(dirname(reportPath), publishArtifact.path),
+    })),
+  ];
+  let artifacts = await Promise.all(
+    artifactEntries.map(async ({ path, localPath }) => {
+      const bytes = await readFile(localPath);
+      return {
+        path,
+        job_id: build.jobId,
+        state: "finished",
+        file_size: bytes.byteLength,
+        sha1sum: createHash("sha1").update(bytes).digest("hex"),
+      };
+    }),
+  );
+  if (mutateArtifacts) artifacts = mutateArtifacts(artifacts);
+  return async (args) => {
+    if (args[1].endsWith("/artifacts")) return artifacts;
+    return buildResponse;
+  };
 }
 
 function refreshPackageSetDigest(report) {

@@ -48,8 +48,12 @@ Bind every receipt to the exact candidate commit and tree.
   set digest.
 - `pnpm release:plan:npm` succeeds and emits the portable dependency order
   from those exact retained bytes. The planner reopens each gzip/tar archive and
-  compares its real file list and `package/package.json` with the report. The
-  command validates but never authenticates or publishes.
+  compares its real file list and `package/package.json` with the report. It also
+  uses Buildkite API access with `read_builds` and `read_artifacts` scopes to
+  verify the exact passed build, package job, report artifact, tarball paths,
+  byte sizes, and SHA-1 upload identities before applying the report's SHA-256
+  and archive checks. The command validates but never authenticates to npm or
+  publishes.
 - A clean directory installs those exact tarballs and passes the package smoke
   and starter workflow before any registry mutation.
 - The authenticated npm identity owns or may create every intended scoped
@@ -89,6 +93,7 @@ gap.
    ```sh
    node scripts/publish-npm-release.mjs \
      --report dist/npm-packages/npm-package-report.json \
+     --receipt dist/npm-packages/npm-publication-receipt.json \
      --version 0.1.0-alpha.0 \
      --tag next \
      --execute
@@ -98,7 +103,11 @@ gap.
    and digest before every package, copies the verified bytes into a private
    read-only staging directory, then publishes in dependency order with
    `--access public --tag next`. It stops at the first failure and removes its
-   staging directory. Never repack between proof and publication.
+   staging directory. It atomically writes the exact source, build, package set,
+   successful packages, and any partial failure to the publication receipt
+   immediately before and after each registry mutation. An interrupted receipt
+   retains the package whose registry state must be read back before retry.
+   Never repack between proof and publication.
 7. Read each version and dist-tag back from the registry.
 8. Install the exact registry versions in a clean directory and rerun the
    portable package smoke.
@@ -117,5 +126,7 @@ gap.
 - If a prior good prerelease exists, move `next` back to that version.
 - Prefer deprecation over unpublish. Treat unpublish as a separate destructive
   registry action subject to npm policy and explicit maintainer approval.
-- Record partial-publication state before retrying so dependency order remains
-  auditable.
+- Preserve `npm-publication-receipt.json` after every attempt. A `partial`
+  receipt names the successfully published packages and the first package that
+  did not complete; read those exact versions back before deciding whether to
+  retry.
