@@ -52,8 +52,7 @@ test("local CI preserves build, test, package, coverage, native, and nginx gates
     "pnpm test:nginx:stack",
     "npm --prefix website test",
     "npm --prefix website audit --omit=dev --audit-level=high",
-    "pipeline upload",
-    "--reject-secrets",
+    "./.buildkite/scripts/upload-pipeline.sh --dry-run",
   ]) {
     assert.match(source, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
@@ -65,6 +64,8 @@ test("pipeline upload rejects embedded secrets", async () => {
 
   assert.match(source, /pipeline upload/);
   assert.match(source, /--reject-secrets/);
+  assert.match(source, /Buildkite Agent 3\.127\.x is required/);
+  assert.match(source, /--dry-run --format yaml --agent-access-token local-validation-only/);
   assert.match(source, /\.buildkite\/pipeline\.yml/);
 });
 
@@ -75,10 +76,10 @@ test("dedicated agent configuration disables plugins and local hooks", async () 
   assert.match(source, /project=ferrite/);
   assert.match(source, /no-plugins=true/);
   assert.match(source, /no-local-hooks=true/);
-  assert.match(source, /no-command-eval=true/);
   assert.match(source, /git-clean-flags="-ffxdq"/);
-  assert.match(source, /disconnect-after-job=true/);
   assert.match(source, /disconnect-after-idle-timeout=300/);
+  assert.match(source, /disconnect-after-uptime=8100/);
+  assert.doesNotMatch(source, /no-command-eval=true|disconnect-after-job=true/);
   assert.doesNotMatch(source, /^token\s*=/m);
 });
 
@@ -148,6 +149,19 @@ test("external command hook rejects arbitrary commands", async () => {
 
 test("CI script rejects unknown modes before running project commands", () => {
   const result = spawnSync(ciUrl.pathname, ["unknown"], {
+    encoding: "utf8",
+    env: {
+      HOME: process.env.HOME,
+      PATH: process.env.PATH,
+    },
+  });
+
+  assert.equal(result.status, 64);
+  assert.match(result.stderr, /usage:/);
+});
+
+test("pipeline uploader rejects unexpected arguments before contacting Buildkite", () => {
+  const result = spawnSync(uploadUrl.pathname, ["unexpected"], {
     encoding: "utf8",
     env: {
       HOME: process.env.HOME,

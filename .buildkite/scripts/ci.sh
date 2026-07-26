@@ -52,7 +52,10 @@ preflight() {
   command -v corepack >/dev/null || fail "Corepack is unavailable"
   command -v buildkite-agent >/dev/null || fail "Buildkite Agent is unavailable"
 
-  local node_major pnpm_version rust_version
+  local buildkite_version node_major pnpm_version rust_version
+  buildkite_version="$(buildkite-agent --version)"
+  [[ "${buildkite_version}" == "buildkite-agent version 3.127."* ]] ||
+    fail "Buildkite Agent 3.127.x is required, found ${buildkite_version}"
   node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
   (( node_major >= 22 )) || fail "Node.js 22 or newer is required"
   pnpm_version="$(corepack pnpm --version)"
@@ -69,7 +72,7 @@ preflight() {
     printf 'node=%s\n' "$(node --version)"
     printf 'pnpm=%s\n' "${pnpm_version}"
     printf 'rust=%s\n' "${rust_version}"
-    printf 'buildkite_agent=%s\n' "$(buildkite-agent --version)"
+    printf 'buildkite_agent=%s\n' "${buildkite_version}"
     printf 'host_os=%s\n' "$(uname -s)"
     printf 'host_arch=%s\n' "$(uname -m)"
   } > "${REPORT_DIR}/environment.txt"
@@ -111,11 +114,6 @@ verify() {
 }
 
 packages() {
-  local pipeline_token=()
-  if [[ "${BUILDKITE:-}" != "true" ]]; then
-    pipeline_token=(--agent-access-token local-validation-only)
-  fi
-
   run_gate release-npm corepack pnpm release:verify:npm
   run_gate release-cargo corepack pnpm release:verify:cargo
   run_gate cargo-audit cargo audit --deny warnings
@@ -123,12 +121,7 @@ packages() {
   run_gate website-lint npm --prefix website run lint
   run_gate website-test npm --prefix website test
   run_gate website-production-audit npm --prefix website audit --omit=dev --audit-level=high
-  run_gate buildkite-pipeline buildkite-agent pipeline upload \
-    --dry-run \
-    --format yaml \
-    --reject-secrets \
-    "${pipeline_token[@]}" \
-    .buildkite/pipeline.yml
+  run_gate buildkite-pipeline ./.buildkite/scripts/upload-pipeline.sh --dry-run
   run_gate secret-scan gitleaks git --no-banner --redact --log-opts=-1
 }
 

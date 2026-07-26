@@ -9,6 +9,10 @@ This is local-agent evidence, not hosted-runner or production proof. One Mac
 cannot establish Linux, Windows, Intel macOS, or clean external-machine
 compatibility.
 
+The current pipeline is pinned to Buildkite Agent 3.127.x because it uses the
+v3 `pipeline upload --reject-secrets` fail-closed check. Upgrading to another
+agent series requires reviewing that command and this trust contract first.
+
 ## Pipeline
 
 The Buildkite pipeline has one bounded command:
@@ -62,11 +66,16 @@ The external hooks:
 - reject fork pull requests;
 - require the job SHA to equal an operator-approved SHA;
 - reject common application and registry credentials;
-- allow only the pipeline upload and full proof commands; and
+- allow only the pipeline upload and full proof commands;
 - clear interactive Git/SSH credential helpers before project commands; and
-- force checkout cleanup, disable command evaluation, repository-local hooks,
-  plugins, and submodules, and disconnect after one job or five idle minutes
+- force checkout cleanup, disable repository-local hooks, plugins, and
+  submodules, and disconnect after five idle minutes or 135 minutes of uptime
   through the dedicated agent configuration.
+
+Buildkite's `no-command-eval` mode is intentionally not enabled because it
+rejects the argument-bearing `./.buildkite/scripts/ci.sh all` command. The
+external `pre-command` hook is the command allowlist and must be installed
+before this queue is used.
 
 The existing shared `default` queue and its global hooks are not suitable for
 Ferrite. Use the dedicated configuration and queue:
@@ -74,9 +83,12 @@ Ferrite. Use the dedicated configuration and queue:
 ```sh
 export FERRITE_BUILDKITE_APPROVED_COMMIT="$(git rev-parse HEAD)"
 buildkite-agent start \
-  --config deploy/buildkite/ferrite-agent.cfg.example \
-  --disconnect-after-job
+  --config deploy/buildkite/ferrite-agent.cfg.example
 ```
+
+The first job uploads the repository pipeline and the second runs the proof.
+The same agent remains available for both, then exits on the configured idle
+or uptime bound.
 
 Supply the agent token through the process environment or an external
 credential store. Never add it to this repository, the pipeline YAML, a hook,
@@ -102,12 +114,7 @@ The pipeline and its normal/failure/odd trust paths can be checked without
 connecting an agent:
 
 ```sh
-buildkite-agent pipeline upload \
-  --dry-run \
-  --format yaml \
-  --reject-secrets \
-  --agent-access-token local-validation-only \
-  .buildkite/pipeline.yml
+./.buildkite/scripts/upload-pipeline.sh --dry-run
 node --test scripts/verify-buildkite.test.mjs
 ```
 
