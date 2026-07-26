@@ -18,6 +18,10 @@ the aggregate five-artifact check remain unproven release gates.
 The current pipeline is pinned to Buildkite Agent 3.127.x because it uses the
 v3 `pipeline upload --reject-secrets` fail-closed check. Upgrading to another
 agent series requires reviewing that command and this trust contract first.
+The isolated agent `PATH` must provide Node.js 22 or newer, pnpm 11.7.0,
+Rust 1.95.x, Docker, and Buildkite Agent 3.127.x. The lane invokes the pinned
+pnpm executable directly because current Homebrew Node releases do not bundle
+Corepack.
 
 ## Pipeline
 

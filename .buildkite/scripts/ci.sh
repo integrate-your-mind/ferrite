@@ -51,8 +51,8 @@ preflight() {
   [[ "$(uname -m)" == "arm64" ]] ||
     fail "the committed local-agent lane is intentionally limited to arm64"
   command -v node >/dev/null || fail "Node.js is unavailable"
+  command -v pnpm >/dev/null || fail "pnpm is unavailable"
   command -v rustc >/dev/null || fail "Rust is unavailable"
-  command -v corepack >/dev/null || fail "Corepack is unavailable"
   command -v buildkite-agent >/dev/null || fail "Buildkite Agent is unavailable"
 
   local buildkite_version node_major pnpm_version rust_version
@@ -61,7 +61,7 @@ preflight() {
     fail "Buildkite Agent 3.127.x is required, found ${buildkite_version}"
   node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
   (( node_major >= 22 )) || fail "Node.js 22 or newer is required"
-  pnpm_version="$(corepack pnpm --version)"
+  pnpm_version="$(pnpm --version)"
   [[ "${pnpm_version}" == "11.7.0" ]] ||
     fail "pnpm 11.7.0 is required, found ${pnpm_version}"
   rust_version="$(rustc --version)"
@@ -82,7 +82,7 @@ preflight() {
 }
 
 bootstrap() {
-  run_gate install corepack pnpm install --frozen-lockfile
+  run_gate install pnpm install --frozen-lockfile
 }
 
 browser_executable() {
@@ -99,7 +99,7 @@ browser_executable() {
     return
   fi
 
-  corepack pnpm exec playwright-core install chromium
+  pnpm exec playwright-core install chromium
   local installed
   installed="$(node --input-type=module -e \
     'import { chromium } from "playwright-core"; process.stdout.write(chromium.executablePath())')"
@@ -110,15 +110,15 @@ browser_executable() {
 verify() {
   local browser
   browser="$(browser_executable)"
-  run_gate lint corepack pnpm lint
-  run_gate typecheck corepack pnpm typecheck
-  run_gate build corepack pnpm build
-  run_gate test env FERRITE_BROWSER_EXECUTABLE="${browser}" corepack pnpm test
+  run_gate lint pnpm lint
+  run_gate typecheck pnpm typecheck
+  run_gate build pnpm build
+  run_gate test env FERRITE_BROWSER_EXECUTABLE="${browser}" pnpm test
 }
 
 packages() {
-  run_gate release-npm corepack pnpm release:verify:npm
-  run_gate release-cargo corepack pnpm release:verify:cargo
+  run_gate release-npm pnpm release:verify:npm
+  run_gate release-cargo pnpm release:verify:cargo
   run_gate cargo-audit cargo audit --deny warnings
   run_gate website-install npm --prefix website ci
   run_gate website-lint npm --prefix website run lint
@@ -150,14 +150,14 @@ native_current_host() {
      const name = nativePrebuildPackageName({});
      if (!name) process.exit(1);
      process.stdout.write(name);')"
-  run_gate native-package corepack pnpm --filter @ferrite/node prebuild:package
-  run_gate native-verify corepack pnpm --filter @ferrite/node prebuild:verify --expect "${expected}"
+  run_gate native-package pnpm --filter @ferrite/node prebuild:package
+  run_gate native-verify pnpm --filter @ferrite/node prebuild:verify --expect "${expected}"
 }
 
 nginx() {
   command -v docker >/dev/null || fail "Docker is required for the nginx proof"
   docker info >/dev/null 2>&1 || fail "Docker is installed but its daemon is unavailable"
-  run_gate nginx-stack corepack pnpm test:nginx:stack
+  run_gate nginx-stack pnpm test:nginx:stack
 }
 
 case "${MODE}" in

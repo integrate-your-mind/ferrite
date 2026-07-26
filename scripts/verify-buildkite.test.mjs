@@ -56,6 +56,9 @@ test("local CI retains the host-executable validation gate categories", async ()
   ]) {
     assert.match(source, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
+  assert.match(source, /command -v pnpm/);
+  assert.match(source, /pnpm_version="\$\(pnpm --version\)"/);
+  assert.doesNotMatch(source, /corepack pnpm/);
   assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
 });
 
