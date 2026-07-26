@@ -52,6 +52,7 @@ preflight() {
     fail "the committed local-agent lane is intentionally limited to arm64"
   command -v node >/dev/null || fail "Node.js is unavailable"
   command -v pnpm >/dev/null || fail "pnpm is unavailable"
+  command -v rustup >/dev/null || fail "rustup is unavailable"
   command -v rustc >/dev/null || fail "Rust is unavailable"
   command -v buildkite-agent >/dev/null || fail "Buildkite Agent is unavailable"
 
@@ -67,6 +68,9 @@ preflight() {
   rust_version="$(rustc --version)"
   [[ "${rust_version}" == rustc\ 1.95.* ]] ||
     fail "Rust 1.95 is required, found ${rust_version}"
+  rustup target list --toolchain stable --installed |
+    /usr/bin/grep -qx 'wasm32-unknown-unknown' ||
+    fail "Rust stable target wasm32-unknown-unknown is required"
 
   {
     printf 'commit=%s\n' "${head}"

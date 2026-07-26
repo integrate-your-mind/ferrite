@@ -46,4 +46,4 @@ for name in \
 done
 
 export BUILDKITE_GIT_SUBMODULES=false
-export PATH="${HOME}/bin:/opt/homebrew/bin:/opt/homebrew/sbin:${HOME}/Library/pnpm:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="${CARGO_HOME:-${HOME}/.cargo}/bin:${HOME}/bin:/opt/homebrew/bin:/opt/homebrew/sbin:${HOME}/Library/pnpm:/usr/bin:/bin:/usr/sbin:/sbin"

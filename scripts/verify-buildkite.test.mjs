@@ -58,6 +58,8 @@ test("local CI retains the host-executable validation gate categories", async ()
   }
   assert.match(source, /command -v pnpm/);
   assert.match(source, /pnpm_version="\$\(pnpm --version\)"/);
+  assert.match(source, /rustup target list --toolchain stable --installed/);
+  assert.match(source, /wasm32-unknown-unknown/);
   assert.doesNotMatch(source, /corepack pnpm/);
   assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
 });
@@ -90,6 +92,7 @@ test("dedicated agent configuration disables plugins and local hooks", async () 
 });
 
 test("external environment hook accepts only the approved Ferrite commit", async () => {
+  const source = await readFile(environmentHookUrl, "utf8");
   const approved = "a".repeat(40);
   const base = {
     BUILDKITE_REPO: "git@github.com:integrate-your-mind/ferrite.git",
@@ -99,6 +102,7 @@ test("external environment hook accepts only the approved Ferrite commit", async
   };
 
   assert.equal(runHook(environmentHookUrl, base).status, 0);
+  assert.match(source, /\$\{CARGO_HOME:-\$\{HOME\}\/\.cargo\}\/bin/);
   assert.notEqual(
     runHook(environmentHookUrl, {
       ...base,
