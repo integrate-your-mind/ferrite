@@ -29,7 +29,7 @@ unset, canonical and social metadata use `http://localhost:3000`; request
 ```bash
 npm run lint
 npm test
-npm audit --audit-level=high
+npm audit --omit=dev --audit-level=high
 ```
 
 `npm test` builds the site and checks the rendered HTML, metadata, source
@@ -38,7 +38,12 @@ asset paths and digests.
 
 The site does not use a database. Unused starter D1/Drizzle files and packages
 were removed, and the remaining build dependencies were advanced to patched
-compatible releases before the zero-vulnerability audit.
+compatible releases before the zero-vulnerability production-dependency audit.
+The WASM bridge packages are explicit development dependencies so npm validates
+both native and optional WASM toolchain paths after a clean install.
+The full development-toolchain audit still reports high-severity findings in
+the ESLint dependency chain; npm's suggested major ESLint upgrade is not
+compatible with the current Next.js lint plugins.
 
 ## Evidence
 
