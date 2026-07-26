@@ -20,6 +20,7 @@ import {
   CleanupStack,
   createCleanSourceSnapshot,
   createProofInterruption,
+  formatProofError,
   parseDockerPublishedPort,
   renderProofNginxConfig,
   resolveProofInputPaths,
@@ -206,6 +207,28 @@ test("cleanup remains LIFO and continues after one cleanup failure", async () =>
   assert.deepEqual(order, ["last", "broken", "first"]);
   assert.equal(errors.length, 1);
   assert.match(errors[0].message, /broken: synthetic cleanup failure/);
+});
+
+test("proof error output preserves primary, cleanup, and nested cause details", () => {
+  const primary = new Error("candidate image build failed");
+  const cleanupCause = new Error("Docker daemon stopped responding");
+  const cleanup = new Error("candidate image cleanup failed", { cause: cleanupCause });
+  const failure = new AggregateError(
+    [primary, new AggregateError([cleanup], "nginx proof cleanup failed")],
+    "nginx proof and cleanup failed",
+  );
+
+  const output = formatProofError(failure);
+  assert.match(output, /nginx proof and cleanup failed/);
+  assert.match(output, /candidate image build failed/);
+  assert.match(output, /nginx proof cleanup failed/);
+  assert.match(output, /candidate image cleanup failed/);
+  assert.match(output, /Docker daemon stopped responding/);
+
+  const circular = new Error("circular cleanup failure");
+  circular.cause = circular;
+  assert.match(formatProofError(circular), /cause: \[circular Error\]/);
+  assert.equal(formatProofError("non-error failure"), "non-error failure");
 });
 
 test("expected-failure controls reject success, outer timeout, and wrong failure causes", () => {

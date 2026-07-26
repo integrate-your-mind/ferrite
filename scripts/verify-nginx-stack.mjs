@@ -219,6 +219,34 @@ const assertCommandSucceeded = (result, label) => {
   throw new Error(`${label} ${reason}\n${result.stdout}\n${result.stderr}`.trim());
 };
 
+export const formatProofError = (error) => {
+  const seen = new Set();
+
+  const render = (value, label = "", indent = "") => {
+    const prefix = label ? `${indent}${label}: ` : indent;
+    if (!(value instanceof Error)) return `${prefix}${String(value)}`;
+    if (seen.has(value)) return `${prefix}[circular ${value.name}]`;
+    seen.add(value);
+
+    const stack = value.stack ?? `${value.name}: ${value.message}`;
+    const [summary, ...frames] = stack.split("\n");
+    const frameIndent = `${indent}${label ? "  " : ""}`;
+    const lines = [`${prefix}${summary}`, ...frames.map((frame) => `${frameIndent}${frame}`)];
+
+    if (value.cause !== undefined) {
+      lines.push(render(value.cause, "cause", `${indent}  `));
+    }
+    if (value instanceof AggregateError) {
+      value.errors.forEach((nested, index) => {
+        lines.push(render(nested, `errors[${index}]`, `${indent}  `));
+      });
+    }
+    return lines.join("\n");
+  };
+
+  return render(error);
+};
+
 export const createCleanSourceSnapshot = async ({ sourceRoot, scratch, commit }) => {
   const archive = join(scratch, "source.tar");
   const context = join(scratch, "source");
@@ -934,7 +962,7 @@ const isMain =
   process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url;
 if (isMain) {
   main().catch((error) => {
-    process.stderr.write(`${error.stack ?? error.message}\n`);
+    process.stderr.write(`${formatProofError(error)}\n`);
     process.exitCode = 1;
   });
 }
