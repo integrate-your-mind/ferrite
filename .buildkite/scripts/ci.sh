@@ -122,8 +122,12 @@ coverage_percent() {
       ;;
     js)
       /usr/bin/awk '
-        /^#[[:space:]]*all files[[:space:]]*\|/ {
+        index($0, "|") {
           split($0, fields, "|")
+          label = fields[1]
+          if (label !~ /all files[[:space:]]*$/) next
+          sub(/all files[[:space:]]*$/, "", label)
+          if (label ~ /[[:alnum:]]/) next
           value = fields[2]
           gsub(/[[:space:]%]/, "", value)
         }

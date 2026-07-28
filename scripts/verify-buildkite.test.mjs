@@ -416,14 +416,24 @@ test("coverage floors accept valid reports and reject empty, malformed, and unde
     );
   try {
     await writeFile(join(tempRoot, "rust-ok.log"), "TOTAL 90 8 90.99%\n");
-    await writeFile(join(tempRoot, "js-ok.log"), "# all files | 81.57 | 70.00 | 88.00 |\n");
+    await writeFile(
+      join(tempRoot, "js-ok.log"),
+      "\u2139 all files | 81.57 | 70.00 | 88.00 |\n",
+    );
+    await writeFile(
+      join(tempRoot, "js-legacy.log"),
+      "# all files | 81.57 | 70.00 | 88.00 |\n",
+    );
     assert.equal(invoke(`check_coverage_floor rust '${tempRoot}/rust-ok.log' 90.00`).status, 0);
     assert.equal(invoke(`check_coverage_floor js '${tempRoot}/js-ok.log' 80.00`).status, 0);
+    assert.equal(invoke(`check_coverage_floor js '${tempRoot}/js-legacy.log' 80.00`).status, 0);
 
     await writeFile(join(tempRoot, "rust-low.log"), "TOTAL 90 15 89.99%\n");
     await writeFile(join(tempRoot, "js-malformed.log"), "# all files | n/a | 70.00 |\n");
+    await writeFile(join(tempRoot, "js-misleading.log"), "not all files | 99.99 | 99.99 |\n");
     assert.notEqual(invoke(`check_coverage_floor rust '${tempRoot}/rust-low.log' 90.00`).status, 0);
     assert.notEqual(invoke(`check_coverage_floor js '${tempRoot}/js-malformed.log' 80.00`).status, 0);
+    assert.notEqual(invoke(`check_coverage_floor js '${tempRoot}/js-misleading.log' 80.00`).status, 0);
     assert.notEqual(invoke(`check_coverage_floor js '${tempRoot}/missing.log' 80.00`).status, 0);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
