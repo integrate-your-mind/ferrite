@@ -49,10 +49,10 @@ run_gate() {
 
   printf '\n--- %s\n' "${label}"
   set +e
-  "$@" 2>&1 | "${TEE_BIN}" "${log}"
-  local pipeline_status=("${PIPESTATUS[@]}")
-  child_status="${pipeline_status[0]:-1}"
-  tee_status="${pipeline_status[1]:-1}"
+  "$@" >"${log}" 2>&1
+  child_status="$?"
+  "${TEE_BIN}" "${log}"
+  tee_status="$?"
   set -e
 
   set +e

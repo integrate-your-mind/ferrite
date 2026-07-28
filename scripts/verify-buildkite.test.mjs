@@ -163,7 +163,7 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /command -v cargo-llvm-cov/);
   assert.match(source, /start_cargo_lock_sha/);
   assert.match(source, /end_cargo_lock_sha/);
-  assert.match(source, /PIPESTATUS/);
+  assert.match(source, /child_status="\$\?"/);
   assert.match(source, /tee_status/);
   assert.match(source, /COVERAGE_RUST_LINES_FLOOR="90\.00"/);
   assert.match(source, /COVERAGE_RUNTIME_LINES_FLOOR="80\.00"/);
@@ -404,6 +404,13 @@ test("run_gate fails closed when the child or tee fails", async () => {
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test("run_gate captures command output before replaying it", async () => {
+  const source = await readFile(ciUrl, "utf8");
+  assert.match(source, /"\$@" >"\$\{log\}" 2>&1/);
+  assert.match(source, /"\$\{TEE_BIN\}" "\$\{log\}"/);
+  assert.doesNotMatch(source, /"\$@" 2>&1 \| "\$\{TEE_BIN\}"/);
 });
 
 test("coverage floors accept valid reports and reject empty, malformed, and under-floor reports", async () => {
