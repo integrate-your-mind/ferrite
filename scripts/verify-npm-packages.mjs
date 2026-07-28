@@ -191,6 +191,7 @@ export async function verifyNpmPackages({
   try {
     if (writeReports) {
       await refusePublicationReceipt(packageReportDir);
+      await refuseStaleReportBackup(packageReportDir);
     }
     for (const config of releasePackages) {
       const sourceManifest =
@@ -291,8 +292,10 @@ export async function verifyNpmPackages({
       await assertSourceStable();
       reportPhase("report:source-stability-confirmed");
       await refusePublicationReceipt(packageReportDir);
+      await refuseStaleReportBackup(packageReportDir);
       reportPhase("report:publication-receipt-clear");
-      const backupRoot = join(stageRoot, "previous-report");
+      await mkdir(packageReportDir, { recursive: true });
+      const backupRoot = await mkdtemp(join(packageReportDir, ".previous-report-"));
       const reportPath = join(packageReportDir, "npm-package-report.json");
       const tarballPath = join(packageReportDir, "tarballs");
       const backupReportPath = join(backupRoot, "npm-package-report.json");
@@ -372,6 +375,25 @@ async function refusePublicationReceipt(packageReportDir) {
   if (receiptPath) {
     throw new Error(
       `npm package verification refuses to regenerate artifacts while publication receipt exists at ${receiptPath}; preserve and reconcile it first.`,
+    );
+  }
+}
+
+async function refuseStaleReportBackup(packageReportDir) {
+  let entries;
+  try {
+    entries = await readdir(packageReportDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const staleBackup = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(".previous-report-"))
+    .map((entry) => entry.name)
+    .sort()[0];
+  if (staleBackup) {
+    throw new Error(
+      `npm package verification refuses to replace artifacts while interrupted backup exists at ${join(packageReportDir, staleBackup)}; preserve and reconcile it first.`,
     );
   }
 }

@@ -55,6 +55,33 @@ test("verifier preserves a publication receipt and refuses regeneration", async 
   }
 });
 
+test("verifier preserves an interrupted same-directory backup and refuses regeneration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-backup-guard-"));
+  const reportDir = join(root, "reports");
+  const backup = join(reportDir, ".previous-report-interrupted");
+  const priorReport = join(backup, "npm-package-report.json");
+  const priorText = "prior report bytes\n";
+  try {
+    await mkdir(backup, { recursive: true });
+    await writeFile(priorReport, priorText);
+    await assert.rejects(
+      verifyNpmPackages({
+        ...testReportIdentity,
+        releasePackages: [],
+        workspaceRoot: root,
+        reportDir,
+        runCommand: async () => {
+          throw new Error("build must not run");
+        },
+      }),
+      /interrupted backup exists.*preserve and reconcile it first/,
+    );
+    assert.equal(await readFile(priorReport, "utf8"), priorText);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("source drift before report replacement preserves prior generated artifacts", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-npm-source-drift-"));
   const reportDir = join(root, "reports");

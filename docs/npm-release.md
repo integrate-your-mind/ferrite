@@ -51,6 +51,9 @@ Bind every receipt to the exact candidate commit and tree.
   after persistence; source drift restores the prior generated outputs. A
   recursively discovered `npm-publication-receipt.json` is never removed or
   overwritten; artifact regeneration stops until that receipt is reconciled.
+  Prior outputs are renamed into a same-directory `.previous-report-*` backup
+  so replacement stays on one filesystem. Any backup left by an interrupted
+  verifier blocks regeneration until an operator preserves and reconciles it.
 - `pnpm release:plan:npm` succeeds and emits the portable dependency order
   from those exact retained bytes. The planner reopens each gzip/tar archive and
   compares its real file list and `package/package.json` with the report. It also
