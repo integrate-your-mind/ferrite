@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_IMAGE=rust:1-bookworm
+ARG RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
 ARG NODE_MAJOR=24
 
 FROM ${RUST_IMAGE} AS builder
@@ -12,6 +12,7 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
   && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
   && apt-get install -y --no-install-recommends nodejs \
+  && rustc --version | grep -q '^rustc 1\.95\.0 ' \
   && rustup target add wasm32-unknown-unknown \
   && corepack enable \
   && rm -rf /var/lib/apt/lists/*

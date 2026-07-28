@@ -94,6 +94,12 @@ test("container template runs as a non-root runtime user with a health check", a
   const dockerfile = await text("deploy/container/Dockerfile");
   const dockerignore = await text(".dockerignore");
 
+  assert.match(
+    dockerfile,
+    /ARG RUST_IMAGE=rust:1\.95\.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1/,
+  );
+  assert.match(dockerfile, /rustc --version \| grep -q '\^rustc 1\\\.95\\\.0 '/);
+  assert.doesNotMatch(dockerfile, /ARG RUST_IMAGE=rust:1-bookworm/);
   assert.match(dockerfile, /USER ferrite/);
   assert.match(dockerfile, /ferrite build --project examples\/basic/);
   assert.match(dockerfile, /examples\/basic\/\.ferrite\/build/);
