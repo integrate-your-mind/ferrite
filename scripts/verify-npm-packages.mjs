@@ -182,6 +182,7 @@ export async function verifyNpmPackages({
   const manifests = new Map();
   const results = [];
   const installablePackages = [];
+  const reportPhase = (phase) => console.error(`npm package verification: ${phase}`);
   const sourceReader = readSourceIdentity ?? (sourceIdentity ? null : readGitIdentity);
   const capturedSource = sourceIdentity ?? await sourceReader(packageWorkspaceRoot);
   const stageRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-stage-"));
@@ -273,7 +274,6 @@ export async function verifyNpmPackages({
       installablePackages.push(nativeResult);
     }
 
-    const reportPhase = (phase) => console.error(`npm package verification: ${phase}`);
     await installPackageSet(installablePackages, {
       runCommand,
       onPhase: reportPhase,
@@ -289,7 +289,9 @@ export async function verifyNpmPackages({
       };
       reportPhase("report:source-stability-before");
       await assertSourceStable();
+      reportPhase("report:source-stability-confirmed");
       await refusePublicationReceipt(packageReportDir);
+      reportPhase("report:publication-receipt-clear");
       const backupRoot = join(stageRoot, "previous-report");
       const reportPath = join(packageReportDir, "npm-package-report.json");
       const tarballPath = join(packageReportDir, "tarballs");
@@ -358,7 +360,9 @@ export async function verifyNpmPackages({
     return results;
   } finally {
     if (!preserveStageRoot) {
+      reportPhase("cleanup:stage-root");
       await rm(stageRoot, { force: true, recursive: true });
+      reportPhase("cleanup:stage-root-complete");
     }
   }
 }
