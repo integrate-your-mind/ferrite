@@ -1,0 +1,23 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@ferrite/runtime':
+        specifier: link:../packages/runtime
+        version: link:../packages/runtime
+    devDependencies:
+      '@types/node':
+        specifier: 26.0.1
+        version: 26.0.1
+      eslint:
+        specifier: 9.39.4
+        version: 9.39.4
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3

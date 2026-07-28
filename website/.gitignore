@@ -13,10 +13,9 @@
 # testing
 /coverage
 
-# next.js
-/.next/
-/.vinext/
-/out/
+# Ferrite generated output
+/.ferrite/
+/dist/
 
 # misc
 .DS_Store
@@ -36,7 +35,6 @@ yarn-error.log*
 
 # typescript
 next-env.d.ts
-/dist/
 /.wrangler/
 /outputs/
 /work/

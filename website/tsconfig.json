@@ -1,34 +1,20 @@
 {
   "compilerOptions": {
-    "target": "ES2017",
-    "lib": ["dom", "dom.iterable", "esnext"],
-    "allowJs": true,
-    "skipLibCheck": true,
+    "target": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ESNext"],
     "strict": true,
-    "noEmit": true,
-    "esModuleInterop": true,
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "resolveJsonModule": true,
-    "isolatedModules": true,
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
     "jsx": "react-jsx",
-    "incremental": true,
-    "plugins": [
-      {
-        "name": "next"
-      }
-    ],
+    "jsxImportSource": "@ferrite/runtime",
     "paths": {
-      "@/*": ["./*"]
-    }
+      "@ferrite/runtime": ["../packages/runtime/src/index.ts"],
+      "@ferrite/runtime/jsx-runtime": ["../packages/runtime/src/jsx-runtime.ts"],
+      "@ferrite/runtime/server": ["../packages/runtime/src/server.ts"]
+    },
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"]
   },
-  "include": [
-    "next-env.d.ts",
-    "**/*.ts",
-    "**/*.tsx",
-    ".next/types/**/*.ts",
-    ".next/dev/types/**/*.ts",
-    "**/*.mts"
-  ],
-  "exclude": ["node_modules"]
+  "include": ["app/**/*.ts", "app/**/*.tsx", "tests/**/*.ts", "ferrite-env.d.ts"]
 }

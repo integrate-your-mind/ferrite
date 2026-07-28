@@ -1,77 +1,60 @@
-# Ferrite developer preview site
+# Ferrite developer-preview site
 
-This is the source-backed Ferrite developer-preview showcase. It documents the current
-Rust-first framework experiment and embeds real captures from the
-`examples/docs-workbench` artifact-backed serve.
+This directory is a genuine Ferrite app-directory project. It uses
+`@ferrite/runtime` pages, layouts, a custom `document.tsx`, and explicit
+`"use client"` islands. It does not use Next, React, or vinext.
 
-## Run locally
+## Source-backed loop
 
-Requirements: Node.js 22.13+ and npm.
-
-```bash
-npm install
-npm run dev
-```
-
-Open the local URL printed by vinext. The current ChatGPT Sites project is
-public, but its production deployment is stale: only `/` serves successfully
-while the repository's `/blog` and demo article routes return `404`. Treat it
-as a project-information preview, not a live Ferrite application demo or a
-supported production endpoint. Recheck the Sites access mode and deployed
-source identity before changing that claim.
-
-Set `FERRITE_SITE_ORIGIN` to the site's verified public HTTP or HTTPS origin
-when building or starting a deployment. It is not a secret. The value is
-captured by the vinext build and must contain only the origin, without
-credentials, a path, query, or fragment. Rebuild after changing it. When it is
-unset, canonical and social metadata use `http://localhost:3000`; request
-`Host` and proxy headers are deliberately ignored.
-
-## Validate
+From this directory, with the repository checkout available:
 
 ```bash
-npm run lint
-npm test
-npm audit --omit=dev --audit-level=high
+pnpm install --ignore-workspace --frozen-lockfile
+pnpm run prepare:runtime
+pnpm run check
+pnpm run typecheck
+pnpm run lint
+pnpm run test
+pnpm run build
+pnpm run start
 ```
 
-`npm test` builds the site and checks the rendered HTML, metadata, source
-hygiene, navigation anchors, accessibility structure, and required real-demo
-asset paths and digests.
+The website has its own pinned `pnpm-lock.yaml`; `@ferrite/runtime` is wired as
+a local link to `../packages/runtime`, so this command must be run from this
+directory with the Ferrite source checkout present. The runtime's workspace
+protocol dependencies are resolved by the source checkout's pnpm store.
 
-The site does not use a database. Unused starter D1/Drizzle files and packages
-were removed, and the remaining build dependencies were advanced to patched
-compatible releases before the zero-vulnerability production-dependency audit.
-The WASM bridge packages are explicit development dependencies so npm validates
-both native and optional WASM toolchain paths after a clean install.
-The full development-toolchain audit still reports high-severity findings in
-the ESLint dependency chain; npm's suggested major ESLint upgrade is not
-compatible with the current Next.js lint plugins.
+Ferrite compiles and SSRs the app. The current project is a developer preview;
+there is no managed public-production endpoint or registry-only starter claim.
+Set `FERRITE_SITE_ORIGIN` to the verified HTTP(S) production origin at build
+time to bind canonical, Open Graph, Twitter, robots, and sitemap URLs. The value
+is origin-only; credentials, paths, queries, and fragments are rejected. The
+checked-in robots and sitemap files are templates: `package:sites` regenerates
+them from the validated artifact route manifest and origin.
 
-## Evidence
+## Sites adapter
 
-The screenshots in `public/demos/` were captured from the source-built Ferrite
-Docs Workbench app at exact demo head
-`8716f30c83b9e4fc0835c2f37f9c00bd26e8152d`. See
-`public/demos/capture-manifest.json` for routes, viewports, and hashes, and
-`public/demos/CAPTURE_RECEIPT.md` for the sanitized capture procedure and
-source checks.
+After a Ferrite artifact exists, `pnpm run package:sites` invokes
+`deploy-adapter.mjs`. The adapter copies every declared prerendered HTML,
+`_ferrite/static` bundle, and public asset (while keeping server modules out of
+the public tree) into the Sites shape:
 
-The page reports local proof only. Its numeric test and browser counts are tied
-to the reviewed PR #4 checkpoint, while its screenshots are independently tied
-to the exact demo head above. Neither is presented as current integrated-head
-hosted proof. No coverage threshold was enforced. The page deliberately omits
-one coverage percentage because the historical receipts report different
-scopes. GitHub Actions is no longer the active CI path. A dedicated local
-Buildkite-agent lane is configured, but no exact-head Buildkite execution is
-claimed by this page. Package and Cargo metadata checks are part of the
-repository release-verification commands.
+- `dist/server/index.js` — generated immutable-output adapter entry
+- `dist/client` — browser bundles and public assets
+- `dist/.openai/hosting.json` — unchanged project ID from `.openai/hosting.json`
 
-## Content boundaries
+It verifies the source manifest and every declared file (type, symlink/reparse
+status, size, and SHA-256), stages and verifies a complete output, then swaps
+the Sites directory transactionally with rollback. It serves generated deep
+links, returns a real 404 for unknown paths, and adds conservative
+cache/security headers with no request-body or query logging. The plain adapter
+only serves immutable output; it does not compile Ferrite source.
 
-- Features are labeled Available, Partial, Experimental, or Planned.
-- There is no live Ferrite URL, registry install path, or public-production
-  claim.
-- No secrets, tokens, private URLs, or personal data belong in this site.
-- Keep demo captures tied to their exact source revision; do not replace them
-  with mock screenshots.
+## Evidence and boundaries
+
+Screenshots in `public/demos/` are source-backed captures from
+`examples/docs-workbench` at exact head
+`8716f30c83b9e4fc0835c2f37f9c00bd26e8152d`. They are local evidence, not hosted
+or current-head production proof. Feature status is labeled Available, Partial,
+Experimental, or Planned. No drop-in React/Next, performance, coverage, or
+production-readiness claim is made.

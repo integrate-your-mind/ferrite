@@ -1,0 +1,5 @@
+import type { Child } from "@ferrite/runtime";
+import { siteUrl } from "../../../metadata";
+export const metadata = { title: "State and events · Ferrite comparison", alternates: { canonical: siteUrl("/compare/state-events") } };
+export default function StateEvents() { return <ComparePage title="State and events"><p>Both approaches can express local state and event handlers. Ferrite hooks come from <code>@ferrite/runtime</code>, and client props must remain serializable at the server boundary.</p><pre><code>{"import { useState } from \\\"@ferrite/runtime\\\";\\nconst [count, setCount] = useState(0);"}</code></pre><p>Do not assume React context, third-party hook internals, or event replay semantics transfer unchanged.</p></ComparePage>; }
+function ComparePage({ title, children }: { title: string; children: Child }) { return <div className="wrap article"><p className="kicker">Compare / Series</p><h1>{title}</h1><nav className="subnav"><a href="/compare">Series index</a><a href="/docs/limitations">Limitations</a></nav>{children}</div>; }

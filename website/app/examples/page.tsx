@@ -1,0 +1,4 @@
+import ExamplesIsland from "./ExamplesIsland";
+import { siteUrl } from "../metadata";
+export const metadata = { title: "Interactive examples · Ferrite", description: "Live client-island examples built with @ferrite/runtime.", alternates: { canonical: siteUrl("/examples") } };
+export default function ExamplesPage() { return <div className="wrap article"><p className="kicker">Examples / Client islands</p><h1>Small interactions, real runtime boundaries.</h1><p>Every control below is a Ferrite client island. The data panel performs same-origin requests, including an intentional 404, so its loading and failure states are visible rather than narrated.</p><div className="notice"><b>Runtime note.</b> These are source-level examples. Validate the built artifact on your machine before treating them as release proof.</div><ExamplesIsland/></div>; }
