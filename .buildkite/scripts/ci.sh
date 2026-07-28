@@ -9,6 +9,8 @@ MODE="${1:-}"
 readonly MODE
 MIN_FREE_KIB=20971520
 readonly MIN_FREE_KIB
+RUST_TOOLCHAIN="1.95.0"
+readonly RUST_TOOLCHAIN
 COVERAGE_RUST_LINES_FLOOR="90.00"
 COVERAGE_RUNTIME_LINES_FLOOR="80.00"
 COVERAGE_NATIVE_LINES_FLOOR="78.00"
@@ -158,6 +160,30 @@ check_coverage_floor() {
     "${kind}" "${actual}" "${kind}" "${floor}" >> "${REPORT_DIR}/coverage-results.tsv"
 }
 
+activate_rust_toolchain() {
+  local actual expected tool toolchain_bin
+
+  command -v rustup >/dev/null || fail "rustup is unavailable"
+  expected="$(rustup which --toolchain "${RUST_TOOLCHAIN}" rustc)" ||
+    fail "Rust ${RUST_TOOLCHAIN} is unavailable"
+  toolchain_bin="$(/usr/bin/dirname "${expected}")"
+  [[ -d "${toolchain_bin}" ]] ||
+    fail "Rust ${RUST_TOOLCHAIN} toolchain directory is unavailable"
+
+  export RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}"
+  export PATH="${toolchain_bin}:${PATH}"
+  export FERRITE_RUST_TOOLCHAIN_BIN="${toolchain_bin}"
+
+  for tool in cargo rustc cargo-clippy clippy-driver rustfmt rustdoc; do
+    expected="$(rustup which --toolchain "${RUST_TOOLCHAIN}" "${tool}")" ||
+      fail "${tool} is unavailable in Rust ${RUST_TOOLCHAIN}"
+    actual="$(command -v "${tool}")" ||
+      fail "${tool} is unavailable after activating Rust ${RUST_TOOLCHAIN}"
+    [[ "$(/bin/realpath "${actual}")" == "$(/bin/realpath "${expected}")" ]] ||
+      fail "${tool} did not resolve through Rust ${RUST_TOOLCHAIN}"
+  done
+}
+
 preflight() {
   local available_kib
   available_kib="$(/bin/df -Pk "${ROOT}" | /usr/bin/awk 'NR == 2 { print $4 }')"
@@ -187,13 +213,15 @@ preflight() {
     fail "the committed local-agent lane is intentionally limited to arm64"
   command -v node >/dev/null || fail "Node.js is unavailable"
   command -v pnpm >/dev/null || fail "pnpm is unavailable"
-  command -v rustup >/dev/null || fail "rustup is unavailable"
+  activate_rust_toolchain
   command -v rustc >/dev/null || fail "Rust is unavailable"
+  command -v cargo-clippy >/dev/null || fail "cargo-clippy is unavailable"
+  command -v clippy-driver >/dev/null || fail "clippy-driver is unavailable"
   command -v cargo-audit >/dev/null || fail "cargo-audit is unavailable"
   command -v cargo-llvm-cov >/dev/null || fail "cargo-llvm-cov is unavailable"
   command -v buildkite-agent >/dev/null || fail "Buildkite Agent is unavailable"
 
-  local buildkite_version node_major pnpm_version rust_version
+  local buildkite_version cargo_verbose node_major pnpm_version rust_verbose rust_version
   buildkite_version="$(buildkite-agent --version)"
   [[ "${buildkite_version}" == "buildkite-agent version 3.127."* ]] ||
     fail "Buildkite Agent 3.127.x is required, found ${buildkite_version}"
@@ -205,9 +233,11 @@ preflight() {
   rust_version="$(rustc --version)"
   [[ "${rust_version}" == rustc\ 1.95.* ]] ||
     fail "Rust 1.95 is required, found ${rust_version}"
-  rustup target list --toolchain stable --installed |
+  rustup target list --toolchain "${RUST_TOOLCHAIN}" --installed |
     /usr/bin/grep -qx 'wasm32-unknown-unknown' ||
-    fail "Rust stable target wasm32-unknown-unknown is required"
+    fail "Rust ${RUST_TOOLCHAIN} target wasm32-unknown-unknown is required"
+  cargo_verbose="$(cargo -vV | /usr/bin/tr '\n' ';')"
+  rust_verbose="$(rustc -vV | /usr/bin/tr '\n' ';')"
 
   {
     printf 'commit=%s\n' "${head}"
@@ -217,6 +247,14 @@ preflight() {
     printf 'node=%s\n' "$(node --version)"
     printf 'pnpm=%s\n' "${pnpm_version}"
     printf 'rust=%s\n' "${rust_version}"
+    printf 'rust_toolchain=%s\n' "${RUST_TOOLCHAIN}"
+    printf 'rust_toolchain_bin=%s\n' "${FERRITE_RUST_TOOLCHAIN_BIN}"
+    printf 'cargo_path=%s\n' "$(command -v cargo)"
+    printf 'rustc_path=%s\n' "$(command -v rustc)"
+    printf 'cargo_clippy_path=%s\n' "$(command -v cargo-clippy)"
+    printf 'clippy_driver_path=%s\n' "$(command -v clippy-driver)"
+    printf 'cargo_verbose=%s\n' "${cargo_verbose}"
+    printf 'rust_verbose=%s\n' "${rust_verbose}"
     printf 'buildkite_agent=%s\n' "${buildkite_version}"
     printf 'host_os=%s\n' "$(uname -s)"
     printf 'host_arch=%s\n' "$(uname -m)"
@@ -284,7 +322,7 @@ coverage_rust() {
   # Cargo coverage exercises the real client bundler, which resolves the
   # workspace runtime package through its built protocol exports.
   run_gate coverage-rust-prerequisites pnpm --filter @ferrite/runtime build
-  run_gate coverage-rust rustup run stable cargo llvm-cov --locked \
+  run_gate coverage-rust rustup run "${RUST_TOOLCHAIN}" cargo llvm-cov --locked \
     --workspace \
     --all-targets \
     --summary-only \

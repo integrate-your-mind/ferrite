@@ -70,8 +70,9 @@ build_home="${tmp_root}/ferrite-buildkite-home-${build_id}"
 # toolchains remain under the operator-selected RUSTUP_HOME.
 if [[ -x "${original_cargo_home}/bin/rustup" ]]; then
   /bin/cp "${original_cargo_home}/bin/rustup" "${build_home}/toolchain/bin/rustup"
-  /bin/ln -sf rustup "${build_home}/toolchain/bin/cargo"
-  /bin/ln -sf rustup "${build_home}/toolchain/bin/rustc"
+  for proxy in cargo rustc cargo-clippy clippy-driver rustfmt rustdoc; do
+    /bin/ln -sf rustup "${build_home}/toolchain/bin/${proxy}"
+  done
   if [[ -n "${original_rustup_home}" ]]; then
     export RUSTUP_HOME="${original_rustup_home}"
   fi
@@ -107,6 +108,7 @@ export TMPDIR="${tmp_root}"
 export CARGO_HOME="${build_home}/cargo"
 export PNPM_HOME="${build_home}/pnpm"
 export RUSTUP_HOME="${original_rustup_home}"
+export RUSTUP_TOOLCHAIN="1.95.0"
 export npm_config_userconfig="${build_home}/npm/user.npmrc"
 export NPM_CONFIG_USERCONFIG="${build_home}/npm/user.npmrc"
 export npm_config_globalconfig="${build_home}/npm/global.npmrc"

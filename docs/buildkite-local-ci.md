@@ -19,10 +19,16 @@ The current pipeline is pinned to Buildkite Agent 3.127.x because it uses the
 v3 `pipeline upload --reject-secrets` fail-closed check. Upgrading to another
 agent series requires reviewing that command and this trust contract first.
 The isolated agent `PATH` must provide Node.js 22 or newer, pnpm 11.7.0,
-rustup with Rust 1.95.x and the `wasm32-unknown-unknown` target, cargo-audit,
+rustup with Rust 1.95.0 and the `wasm32-unknown-unknown` target, cargo-audit,
 cargo-llvm-cov, Docker, and Buildkite Agent 3.127.x. The environment hook
-copies the two Cargo subcommand executables into its private toolchain bin when
-present; preflight then fails closed if either required executable is absent.
+copies the rustup proxies needed by Cargo, Rustc, Clippy, rustfmt, and rustdoc
+into its private toolchain bin. Preflight resolves all six tools through the
+same pinned rustup toolchain and fails closed if any tool resolves elsewhere.
+The environment receipt records their paths plus full Cargo and Rustc version
+details, including the LLVM identity that distinguishes incompatible
+same-version distributors. The two standalone Cargo subcommand executables are
+also copied into the private toolchain bin when present; preflight fails closed
+if either required executable is absent.
 The lane invokes the pinned pnpm executable directly
 because current Homebrew Node releases do not bundle Corepack. It places the
 rustup proxies ahead of Homebrew Rust so a clean WASM build cannot be masked by
@@ -129,8 +135,9 @@ The external hooks:
   Docker, AWS, Google Cloud, and Git config/credential paths at separate empty
   or valid-empty files and directories there;
 - canonicalize and validate `TMPDIR` before deriving that per-build directory;
-  the private PATH copies `cargo-audit` and `cargo-llvm-cov` when available,
-  while preflight requires both tools;
+  the private PATH installs rustup proxies for Cargo, Rustc, Clippy, rustfmt,
+  and rustdoc and copies `cargo-audit` and `cargo-llvm-cov` when available,
+  while preflight pins Rust 1.95.0 and requires every tool;
 - remove `$HOME/bin`, `$HOME/.cargo/bin`, and `$HOME/Library/pnpm` from the
   executed `PATH` (rustup proxies are copied into the per-build toolchain bin
   directory when the operator-installed toolchain is present);

@@ -156,7 +156,10 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.doesNotMatch(source, /npm --prefix website/);
   assert.match(source, /command -v pnpm/);
   assert.match(source, /pnpm_version="\$\(pnpm --version\)"/);
-  assert.match(source, /rustup target list --toolchain stable --installed/);
+  assert.match(
+    source,
+    /rustup target list --toolchain "\$\{RUST_TOOLCHAIN\}" --installed/,
+  );
   assert.match(source, /wasm32-unknown-unknown/);
   assert.match(source, /export CARGO_BUILD_JOBS=1/);
   assert.match(source, /export CARGO_INCREMENTAL=0/);
@@ -167,6 +170,25 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /cargo audit --deny warnings/);
   assert.match(source, /command -v cargo-audit/);
   assert.match(source, /command -v cargo-llvm-cov/);
+  assert.match(source, /RUST_TOOLCHAIN="1\.95\.0"/);
+  assert.match(source, /activate_rust_toolchain/);
+  assert.match(source, /rustup which --toolchain "\$\{RUST_TOOLCHAIN\}"/);
+  for (const tool of [
+    "cargo",
+    "rustc",
+    "cargo-clippy",
+    "clippy-driver",
+    "rustfmt",
+    "rustdoc",
+  ]) {
+    assert.match(source, new RegExp(`command -v "\\$\\{tool\\}"`));
+  }
+  assert.match(source, /cargo_path=/);
+  assert.match(source, /rustc_path=/);
+  assert.match(source, /cargo_clippy_path=/);
+  assert.match(source, /clippy_driver_path=/);
+  assert.match(source, /cargo_verbose=/);
+  assert.match(source, /rust_verbose=/);
   assert.match(source, /start_cargo_lock_sha/);
   assert.match(source, /end_cargo_lock_sha/);
   assert.match(source, /child_status="\$\?"/);
@@ -188,7 +210,10 @@ test("local CI retains the host-executable validation gate categories", async ()
     source,
     /run_gate coverage-rust-prerequisites pnpm --filter @ferrite\/runtime build/,
   );
-  assert.match(source, /run_gate coverage-rust rustup run stable cargo llvm-cov/);
+  assert.match(
+    source,
+    /run_gate coverage-rust rustup run "\$\{RUST_TOOLCHAIN\}" cargo llvm-cov/,
+  );
   const coverageRust = source.slice(
     source.indexOf("coverage_rust()"),
     source.indexOf("coverage_js()"),
@@ -227,6 +252,53 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.doesNotMatch(source, /gitleaks git [^\n]*--log-opts=-1/);
   assert.doesNotMatch(source, /corepack pnpm/);
   assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
+});
+
+test("Rust toolchain activation fails closed instead of mixing a missing Clippy tool", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-rust-toolchain-test-"));
+  const shimBin = join(tempRoot, "shim-bin");
+  const toolchainBin = join(tempRoot, "toolchain-bin");
+  await mkdir(shimBin);
+  await mkdir(toolchainBin);
+  await writeFile(
+    join(shimBin, "rustup"),
+    '#!/bin/sh\nprintf "%s/%s\\n" "$FERRITE_TEST_TOOLCHAIN_BIN" "$4"\n',
+    { mode: 0o755 },
+  );
+  await writeFile(join(shimBin, "clippy-driver"), "#!/bin/sh\nexit 0\n", {
+    mode: 0o755,
+  });
+  for (const tool of ["cargo", "rustc", "cargo-clippy", "rustfmt", "rustdoc"]) {
+    await writeFile(join(toolchainBin, tool), "#!/bin/sh\nexit 0\n", {
+      mode: 0o755,
+    });
+  }
+
+  try {
+    const result = spawnSync(
+      "/bin/bash",
+      ["-c", `source '${ciUrl.pathname}'; activate_rust_toolchain`],
+      {
+        encoding: "utf8",
+        env: {
+          HOME: tempRoot,
+          PATH: `${shimBin}:/usr/bin:/bin`,
+          FERRITE_TEST_TOOLCHAIN_BIN: toolchainBin,
+        },
+      },
+    );
+    assert.notEqual(
+      result.status,
+      0,
+      `toolchain activation unexpectedly passed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    );
+    assert.match(
+      result.stderr,
+      /clippy-driver did not resolve through Rust 1\.95\.0/,
+    );
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test("pipeline upload rejects embedded secrets", async () => {
@@ -270,6 +342,7 @@ test("external environment hook accepts only the approved Ferrite commit", async
   assert.equal(runHook(environmentHookUrl, base).status, 0);
   assert.match(source, /ferrite-buildkite-home-/);
   assert.match(source, /original_rustup_home="\$\{RUSTUP_HOME:-\$\{original_home\}\/\.rustup\}"/);
+  assert.match(source, /export RUSTUP_TOOLCHAIN="1\.95\.0"/);
   assert.match(source, /cargo-audit/);
   assert.match(source, /cargo-llvm-cov/);
   assert.match(source, /\/bin\/realpath/);
@@ -283,16 +356,42 @@ test("external environment hook accepts only the approved Ferrite commit", async
   assert.doesNotMatch(source, /\$\{HOME\}\/bin|\$\{HOME\}\/Library\/pnpm/);
   const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-buildkite-hook-test-"));
   try {
+    const operatorCargoHome = join(tempRoot, "operator-cargo");
+    await mkdir(join(operatorCargoHome, "bin"), { recursive: true });
+    await writeFile(
+      join(operatorCargoHome, "bin", "rustup"),
+      "#!/bin/sh\nexit 0\n",
+      { mode: 0o755 },
+    );
     const isolated = runSourcedShell(
       environmentHookUrl,
-      "printf '%s\\n' \"$HOME\" \"$CARGO_HOME\" \"$RUSTUP_HOME\" \"$PNPM_HOME\" \"$NPM_CONFIG_USERCONFIG\" \"$NPM_CONFIG_GLOBALCONFIG\" \"$DOCKER_CONFIG\" \"$PATH\"; cat \"$DOCKER_CONFIG/config.json\"; cat \"$GOOGLE_APPLICATION_CREDENTIALS\"",
-      { ...base, HOME: join(tempRoot, "user"), TMPDIR: tempRoot, PATH: "/tmp/user/bin:/tmp/user/pnpm:/usr/bin" },
+      `printf '%s\\n' "$HOME" "$CARGO_HOME" "$RUSTUP_HOME" "$PNPM_HOME" "$NPM_CONFIG_USERCONFIG" "$NPM_CONFIG_GLOBALCONFIG" "$DOCKER_CONFIG" "$PATH"; cat "$DOCKER_CONFIG/config.json"; cat "$GOOGLE_APPLICATION_CREDENTIALS"; for tool in cargo rustc cargo-clippy clippy-driver rustfmt rustdoc; do printf '%s=%s:%s\\n' "$tool" "$(command -v "$tool")" "$(/usr/bin/readlink "$(command -v "$tool")")"; done`,
+      {
+        ...base,
+        HOME: join(tempRoot, "user"),
+        TMPDIR: tempRoot,
+        PATH: "/tmp/user/bin:/tmp/user/pnpm:/usr/bin",
+        CARGO_HOME: operatorCargoHome,
+        RUSTUP_HOME: join(tempRoot, "operator-rustup"),
+      },
     );
     assert.equal(isolated.status, 0, isolated.stderr);
-    const [home, cargoHome, rustupHome, pnpmHome, npmUser, npmGlobal, dockerConfig, path, dockerJson, googleJson] = isolated.stdout.trim().split("\n");
+    const [
+      home,
+      cargoHome,
+      rustupHome,
+      pnpmHome,
+      npmUser,
+      npmGlobal,
+      dockerConfig,
+      path,
+      dockerJson,
+      googleJson,
+      ...proxyLinks
+    ] = isolated.stdout.trim().split("\n");
     assert.match(home, new RegExp(`${tempRoot}/ferrite-buildkite-home-`));
     assert.equal(cargoHome, `${home}/cargo`);
-    assert.equal(rustupHome, `${join(tempRoot, "user")}/.rustup`);
+    assert.equal(rustupHome, `${join(tempRoot, "operator-rustup")}`);
     assert.equal(pnpmHome, `${home}/pnpm`);
     assert.equal(npmUser, `${home}/npm/user.npmrc`);
     assert.equal(npmGlobal, `${home}/npm/global.npmrc`);
@@ -300,6 +399,17 @@ test("external environment hook accepts only the approved Ferrite commit", async
     assert.equal(dockerJson, "{}");
     assert.equal(googleJson, "{}");
     assert.doesNotMatch(path, /user\/bin|user\/pnpm|\/\.cargo\/bin/);
+    assert.deepEqual(
+      proxyLinks,
+      [
+        "cargo",
+        "rustc",
+        "cargo-clippy",
+        "clippy-driver",
+        "rustfmt",
+        "rustdoc",
+      ].map((tool) => `${tool}=${home}/toolchain/bin/${tool}:rustup`),
+    );
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
