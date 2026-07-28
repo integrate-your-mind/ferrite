@@ -11,7 +11,7 @@
     "build": "pnpm run prepare:runtime && cargo run --manifest-path ../Cargo.toml -p ferrite-cli -- build --project . --page-renderer ../packages/runtime/bin/render-page.mjs --client-bundler ../packages/runtime/bin/build-client.mjs",
     "start": "cargo run --manifest-path ../Cargo.toml -p ferrite-cli -- serve --project . --artifact .ferrite/build --page-renderer ../packages/runtime/bin/render-artifact.mjs",
     "package:sites": "node deploy-adapter.mjs",
-    "typecheck": "tsc --noEmit --incremental false",
+    "typecheck": "pnpm run prepare:runtime && tsc --noEmit --incremental false",
     "lint": "eslint deploy-adapter.mjs tests/*.mjs",
     "test": "node --test tests/*.test.mjs"
   },

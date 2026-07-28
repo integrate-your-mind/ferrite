@@ -190,7 +190,7 @@ function compactClientBundle(bundle) {
 }
 
 function manifestIdentity(manifest) {
-  return {
+  const identity = {
     format: {
       name: manifest.format.name,
       major: manifest.format.major,
@@ -211,6 +211,8 @@ function manifestIdentity(manifest) {
     }),
     files: manifest.files.map((file) => ({ path: file.path, size: file.size, sha256: file.sha256 })),
   };
+  if (manifest.publicFiles?.length > 0) identity.publicFiles = [...manifest.publicFiles];
+  return identity;
 }
 
 export function computeManifestBuildId(manifest) {
@@ -303,7 +305,7 @@ function validateClientBundle(bundle, route, declaredFiles, clientPublicPath) {
 }
 
 function validateManifest(manifest) {
-  exactKeys(manifest, new Set(["format", "buildId", "clientPublicPath", "hasDocument", "routes", "files"]), "manifest");
+  exactKeys(manifest, new Set(["format", "buildId", "clientPublicPath", "hasDocument", "routes", "files", "publicFiles"]), "manifest");
   exactKeys(manifest.format, new Set(["name", "major", "minor"]), "manifest.format");
   if (manifest.format.name !== "ferrite-server") invalid(`unsupported format \`${manifest.format.name}\``);
   if (manifest.format.major !== 1) invalid(`unsupported format major ${manifest.format.major}; expected 1`);
@@ -325,6 +327,17 @@ function validateManifest(manifest) {
     if (!isSha256(file.sha256)) invalid(`${label}.sha256 must be 64 lowercase hex characters`);
     declaredFiles.set(relative, file);
   });
+
+  const publicFiles = manifest.publicFiles ?? [];
+  arrayField(publicFiles, "manifest.publicFiles");
+  const declaredPublicFiles = new Set();
+  publicFiles.forEach((path, index) => {
+    const relative = safeArtifactPath(stringField(path, `manifest.publicFiles[${index}]`));
+    if (!declaredPublicFiles.add(relative)) invalid(`duplicate public file \`${relative}\``);
+    if (!declaredFiles.has(relative)) invalid(`public file \`${relative}\` is not declared in files`);
+    if (relative === MANIFEST_NAME || relative.startsWith(`${MANIFEST_NAME}/`) || relative === BUILD_REPORT_NAME || relative.startsWith(`${BUILD_REPORT_NAME}/`) || relative === "server" || relative.startsWith("server/") || relative === "_ferrite" || relative.startsWith("_ferrite/")) invalid(`public file \`${relative}\` collides with a reserved artifact path`);
+  });
+  manifest.publicFiles = publicFiles;
 
   const routes = arrayField(manifest.routes, "manifest.routes");
   const routePaths = new Set();
@@ -495,7 +508,6 @@ async function verifyStagedOutput(staging, manifest, fsApi, serverFiles, expecte
   const client = join(staging, "client");
   const server = join(staging, "server");
   const openai = join(staging, ".openai");
-  const hosting = join(staging, ".openai", "hosting.json");
   const { declaredFiles } = validateManifest(manifest);
   const clientRoot = await canonicalRoot(client, fsApi);
   const serverRoot = await canonicalRoot(server, fsApi);

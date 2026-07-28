@@ -70,6 +70,7 @@ function validManifest(files) {
       },
     ],
     files: fileRecords(files),
+    publicFiles: ["assets/app.0123456789.js", "blob.bin", "logo.svg", "robots.txt", "sitemap.xml"],
   };
   manifest.buildId = computeManifestBuildId(manifest);
   return manifest;
@@ -194,6 +195,8 @@ for (const [label, mutate] of [
   ["malformed manifest", (manifest) => ({ ...manifest, routes: "not-an-array" })],
   ["unsafe path", (manifest) => ({ ...manifest, files: [{ ...manifest.files[0], path: "../escape" }] })],
   ["duplicate file", (manifest) => ({ ...manifest, files: [...manifest.files, manifest.files[0]] })],
+  ["undeclared public file", (manifest) => ({ ...manifest, publicFiles: [...manifest.publicFiles, "missing.svg"] })],
+  ["reserved public file", (manifest) => ({ ...manifest, publicFiles: ["server/home.mjs"] })],
 ]) {
   test(`fails closed on ${label} without deleting an existing dist`, async () => {
     const fixture = await mkdtemp(join(tmpdir(), "ferrite-invalid-fixture-"));

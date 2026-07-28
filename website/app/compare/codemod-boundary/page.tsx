@@ -1,3 +1,3 @@
 export default function CodemodBoundary() { return <div className="wrap article"><p className="kicker">Compare / Series</p><h1>Where a codemod stops.</h1><p>A mechanical pass can rename imports, add <code>"use client"</code> to a known island, and flag unsupported APIs. It cannot infer auth policy, data ownership, cache invalidation, lifecycle cleanup, or deployment topology.</p><pre><code>{"// candidate transform only\\nimport { useState } from \\\"@ferrite/runtime\\\";"}</code></pre><p>Keep codemods reviewable and fail closed on ambiguous imports. Treat every generated diff as a proposal, not migration proof.</p></div>; }
 export const metadata = { title: "Codemod boundary · Ferrite comparison", alternates: { canonical: siteUrl("/compare/codemod-boundary") } };
-import { siteUrl } from "../../../metadata";
+import { siteUrl } from "../../metadata";
