@@ -93,6 +93,8 @@ pub struct ProductionArtifactManifest {
     pub has_document: bool,
     pub routes: Vec<ProductionArtifactRoute>,
     pub files: Vec<ProductionArtifactFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_files: Vec<String>,
 }
 
 impl ProductionArtifactManifest {
@@ -102,6 +104,16 @@ impl ProductionArtifactManifest {
         routes: Vec<ProductionArtifactRoute>,
         files: Vec<ProductionArtifactFile>,
     ) -> Result<Self, ProductionArtifactError> {
+        Self::new_with_public_files(client_public_path, has_document, routes, files, Vec::new())
+    }
+
+    pub fn new_with_public_files(
+        client_public_path: impl Into<String>,
+        has_document: bool,
+        routes: Vec<ProductionArtifactRoute>,
+        files: Vec<ProductionArtifactFile>,
+        public_files: Vec<String>,
+    ) -> Result<Self, ProductionArtifactError> {
         let mut manifest = Self {
             format: ProductionArtifactFormat::default(),
             build_id: String::new(),
@@ -109,6 +121,7 @@ impl ProductionArtifactManifest {
             has_document,
             routes,
             files,
+            public_files,
         };
         finalize_production_artifact_manifest(&mut manifest)?;
         Ok(manifest)
@@ -136,6 +149,12 @@ struct ProductionArtifactIdentity<'a> {
     has_document: bool,
     routes: &'a [ProductionArtifactRoute],
     files: &'a [ProductionArtifactFile],
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    public_files: &'a [String],
+}
+
+fn slice_is_empty<T>(value: &&[T]) -> bool {
+    value.is_empty()
 }
 
 pub fn artifact_file_record(
@@ -165,6 +184,7 @@ pub fn finalize_production_artifact_manifest(
     manifest
         .files
         .sort_by(|left, right| left.path.cmp(&right.path));
+    manifest.public_files.sort();
     validate_manifest_fields(manifest, false)?;
     manifest.build_id = manifest_build_id(manifest)?;
     Ok(())
@@ -286,6 +306,34 @@ fn validate_manifest_fields(
             return Err(ProductionArtifactError::Invalid(format!(
                 "file `{}` has an invalid SHA-256 digest",
                 file.path
+            )));
+        }
+    }
+
+    let mut public_paths = BTreeSet::new();
+    for path in &manifest.public_files {
+        validate_relative_path(path)?;
+        if !public_paths.insert(path.as_str()) {
+            return Err(ProductionArtifactError::Invalid(format!(
+                "duplicate public file `{path}`"
+            )));
+        }
+        if !file_paths.contains(path.as_str()) {
+            return Err(ProductionArtifactError::Invalid(format!(
+                "public file `{path}` is not declared in files"
+            )));
+        }
+        if path == FERRITE_PRODUCTION_ARTIFACT_MANIFEST
+            || path.starts_with(&format!("{FERRITE_PRODUCTION_ARTIFACT_MANIFEST}/"))
+            || path == "ferrite-build.json"
+            || path.starts_with("ferrite-build.json/")
+            || path == "server"
+            || path.starts_with("server/")
+            || path == "_ferrite"
+            || path.starts_with("_ferrite/")
+        {
+            return Err(ProductionArtifactError::Invalid(format!(
+                "public file `{path}` collides with a reserved artifact path"
             )));
         }
     }
@@ -463,6 +511,7 @@ fn manifest_build_id(
         has_document: manifest.has_document,
         routes: &manifest.routes,
         files: &manifest.files,
+        public_files: &manifest.public_files,
     };
     let encoded = serde_json::to_vec(&identity)?;
     Ok(format!("sha256:{}", sha256_hex(&encoded)))
@@ -620,6 +669,30 @@ mod tests {
 
         let mut manifest = valid_manifest(root.path());
         manifest.routes[0].server_module = "../outside.mjs".to_owned();
+        assert!(finalize_production_artifact_manifest(&mut manifest).is_err());
+    }
+
+    #[test]
+    fn binds_public_files_and_rejects_undeclared_or_tampered_assets() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("logo.svg"), b"logo").unwrap();
+        let public = artifact_file_record(root.path(), "logo.svg").unwrap();
+        let base = valid_manifest(root.path());
+        let mut manifest = ProductionArtifactManifest::new_with_public_files(
+            base.client_public_path,
+            base.has_document,
+            base.routes,
+            [base.files, vec![public]].concat(),
+            vec!["logo.svg".to_owned()],
+        )
+        .unwrap();
+        write_manifest(root.path(), &manifest);
+        assert!(load_production_artifact(root.path()).is_ok());
+        fs::write(root.path().join("logo.svg"), b"tampered").unwrap();
+        assert!(load_production_artifact(root.path()).is_err());
+        manifest.public_files = vec!["undeclared.svg".to_owned()];
+        assert!(finalize_production_artifact_manifest(&mut manifest).is_err());
+        manifest.public_files = vec!["logo.svg".to_owned(), "logo.svg".to_owned()];
         assert!(finalize_production_artifact_manifest(&mut manifest).is_err());
     }
 

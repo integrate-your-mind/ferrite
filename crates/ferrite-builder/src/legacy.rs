@@ -11,6 +11,7 @@ pub use artifact::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use ferrite_client_bundler::{
@@ -379,15 +380,50 @@ fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
         }
         artifact_paths.extend(route.prerendered.values().cloned());
     }
+    let public_root = config.project.join("public");
+    let public_tree = collect_public_tree(&public_root)?;
+    for directory in &public_tree.directories {
+        let relative = directory.to_string_lossy().replace('\\', "/");
+        if is_reserved_public_path(&relative) {
+            return Err(BuildError::Artifact(ProductionArtifactError::Invalid(
+                format!("public directory `{relative}` collides with a reserved artifact path"),
+            )));
+        }
+    }
+    for relative in &public_tree.files {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if artifact_paths.iter().any(|generated| {
+            generated == &relative
+                || generated.starts_with(&format!("{relative}/"))
+                || relative.starts_with(&format!("{generated}/"))
+        }) {
+            return Err(BuildError::Artifact(ProductionArtifactError::Invalid(
+                format!("public file `{relative}` collides with a generated artifact path"),
+            )));
+        }
+        if is_reserved_public_path(&relative) {
+            return Err(BuildError::Artifact(ProductionArtifactError::Invalid(
+                format!("public file `{relative}` collides with a reserved artifact path"),
+            )));
+        }
+        artifact_paths.insert(relative);
+    }
+    copy_public_tree(&public_root, &config.out_dir, &public_tree)?;
     let artifact_files = artifact_paths
         .iter()
         .map(|path| artifact_file_record(&config.out_dir, path))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let production_manifest = ProductionArtifactManifest::new(
+    let public_files = public_tree
+        .files
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let production_manifest = ProductionArtifactManifest::new_with_public_files(
         CLIENT_PUBLIC_PATH,
         document_file.is_some(),
         production_routes,
         artifact_files,
+        public_files,
     )?;
     let production_manifest_file = config.out_dir.join(FERRITE_PRODUCTION_ARTIFACT_MANIFEST);
     fs::write(
@@ -574,6 +610,167 @@ fn artifact_relative_path(root: &Path, path: &Path) -> Result<String> {
         )))
     })?;
     Ok(relative.replace('\\', "/"))
+}
+
+#[derive(Debug, Default)]
+struct PublicTree {
+    files: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+}
+
+fn collect_public_tree(root: &Path) -> Result<PublicTree> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(BuildError::Artifact(ProductionArtifactError::Invalid(
+                    "public must be a real directory".to_owned(),
+                )));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PublicTree::default());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let mut tree = PublicTree::default();
+    collect_public_tree_inner(root, Path::new(""), &mut tree)?;
+    Ok(tree)
+}
+
+fn collect_public_tree_inner(root: &Path, relative: &Path, tree: &mut PublicTree) -> Result<()> {
+    let directory = root.join(relative);
+    let mut entries = fs::read_dir(&directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        validate_public_component(&name)?;
+        let child_relative = relative.join(&name);
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            return Err(BuildError::Artifact(ProductionArtifactError::Invalid(
+                format!("public path `{}` is a symlink", child_relative.display()),
+            )));
+        }
+        if metadata.is_dir() {
+            tree.directories.push(child_relative.clone());
+            collect_public_tree_inner(root, &child_relative, tree)?;
+        } else if metadata.is_file() {
+            tree.files.push(child_relative);
+        } else {
+            return Err(BuildError::Artifact(ProductionArtifactError::Invalid(
+                format!(
+                    "public path `{}` is not a regular file or directory",
+                    child_relative.display()
+                ),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn copy_public_tree(root: &Path, out_dir: &Path, tree: &PublicTree) -> Result<()> {
+    for directory in &tree.directories {
+        fs::create_dir_all(out_dir.join(directory))?;
+    }
+    for relative in &tree.files {
+        let source = root.join(relative);
+        let destination = out_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = read_public_file_no_follow(&source).map_err(|error| {
+            BuildError::Artifact(ProductionArtifactError::Invalid(format!(
+                "public path `{}` changed during build: {error}",
+                relative.display()
+            )))
+        })?;
+        fs::write(destination, bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_public_component(component: &std::ffi::OsStr) -> Result<()> {
+    let component = component.to_str().ok_or_else(|| {
+        BuildError::Artifact(ProductionArtifactError::Invalid(
+            "public path contains a non-UTF-8 filename".to_owned(),
+        ))
+    })?;
+    if component.is_empty() || component.contains('\\') {
+        return Err(BuildError::Artifact(ProductionArtifactError::Invalid(
+            format!("public filename `{component}` is not supported"),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_public_file_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "public path is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut reader = file;
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_public_file_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // FILE_FLAG_OPEN_REPARSE_POINT prevents the final path component from
+        // being followed when it is replaced by a symlink/reparse point.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "public path is not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        let mut reader = file;
+        reader.read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "public path is not a regular file",
+            ));
+        }
+        fs::read(path)
+    }
+}
+
+fn is_reserved_public_path(path: &str) -> bool {
+    path == FERRITE_PRODUCTION_ARTIFACT_MANIFEST
+        || path.starts_with(&format!("{FERRITE_PRODUCTION_ARTIFACT_MANIFEST}/"))
+        || path == "ferrite-build.json"
+        || path.starts_with("ferrite-build.json/")
+        || path == "server"
+        || path.starts_with("server/")
+        || path == "_ferrite"
+        || path.starts_with("_ferrite/")
 }
 
 fn bundle_production_route(
@@ -1151,6 +1348,11 @@ process.stdout.write(JSON.stringify({
             &temp.path().join("app/about/page.tsx"),
             "export default function About() {}",
         );
+        write(
+            &temp.path().join("public/assets/nested.txt"),
+            "public asset",
+        );
+        fs::create_dir_all(temp.path().join("public/assets/empty")).unwrap();
 
         let report = build_project(&build_config(temp.path())).unwrap();
 
@@ -1165,6 +1367,19 @@ process.stdout.write(JSON.stringify({
             temp.path()
                 .join(".ferrite/build/ferrite-build.json")
                 .is_file()
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".ferrite/build/assets/nested.txt")).unwrap(),
+            "public asset"
+        );
+        assert!(temp.path().join(".ferrite/build/assets/empty").is_dir());
+        let production_manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp.path().join(".ferrite/build/ferrite-server.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            production_manifest["publicFiles"],
+            serde_json::json!(["assets/nested.txt"])
         );
         let html = fs::read_to_string(temp.path().join(".ferrite/build/about/index.html")).unwrap();
         assert!(html.contains("<title>About Page</title>"));
@@ -1227,6 +1442,29 @@ process.stdout.write(JSON.stringify({
         }
         assert!(!static_dir.join("route-index.js").exists());
         assert!(report.skipped_dynamic_routes.is_empty());
+    }
+
+    #[test]
+    fn build_rejects_reserved_public_directories_before_install() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join("app/page.tsx"),
+            "export default function Page() {}",
+        );
+        write(
+            &temp.path().join("public/server/secret.txt"),
+            "must not be published",
+        );
+
+        let error = build_project(&build_config(temp.path())).unwrap_err();
+
+        assert!(error.to_string().contains("reserved artifact path"));
+        assert!(
+            !temp
+                .path()
+                .join(".ferrite/build/server/secret.txt")
+                .exists()
+        );
     }
 
     #[test]
@@ -2468,5 +2706,99 @@ process.stdout.write(JSON.stringify({
     #[test]
     fn rejects_a_mixed_error_source_snapshot() {
         assert_rejects_mixed_convention_snapshot("error.tsx");
+    }
+
+    #[test]
+    fn public_tree_is_deterministic_and_preserves_empty_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("public");
+        fs::create_dir_all(public.join("z/empty")).unwrap();
+        write(&public.join("z/nested.txt"), "nested");
+        write(&public.join("a.txt"), "a");
+        let tree = collect_public_tree(&public).unwrap();
+        assert_eq!(
+            tree.files,
+            vec![PathBuf::from("a.txt"), PathBuf::from("z/nested.txt")]
+        );
+        assert_eq!(
+            tree.directories,
+            vec![PathBuf::from("z"), PathBuf::from("z/empty")]
+        );
+        let out = root.path().join("out");
+        copy_public_tree(&public, &out, &tree).unwrap();
+        assert_eq!(
+            fs::read_to_string(out.join("z/nested.txt")).unwrap(),
+            "nested"
+        );
+        assert!(out.join("z/empty").is_dir());
+    }
+
+    #[test]
+    fn missing_public_directory_is_backward_compatible() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            collect_public_tree(&root.path().join("public"))
+                .unwrap()
+                .files
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_tree_rejects_symlink_escape_and_reserved_paths() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("public");
+        fs::create_dir_all(&public).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("secret.txt"), "secret");
+        symlink(outside.path().join("secret.txt"), public.join("secret.txt")).unwrap();
+        assert!(collect_public_tree(&public).is_err());
+        fs::remove_file(public.join("secret.txt")).unwrap();
+        fs::create_dir_all(public.join("_ferrite")).unwrap();
+        let tree = collect_public_tree(&public).unwrap();
+        assert!(is_reserved_public_path("_ferrite"));
+        assert!(
+            tree.directories
+                .iter()
+                .any(|path| path == Path::new("_ferrite"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_tree_rejects_backslash_and_non_utf8_filenames() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("public");
+        fs::create_dir_all(&public).unwrap();
+        write(&public.join("bad\\name.txt"), "bad");
+        assert!(collect_public_tree(&public).is_err());
+        fs::remove_file(public.join("bad\\name.txt")).unwrap();
+
+        let non_utf8 = OsString::from_vec(vec![b'c', 0x80, b'.', b't', b'x', b't']);
+        write(&public.join(non_utf8), "bad");
+        let error = collect_public_tree(&public).unwrap_err();
+        assert!(error.to_string().contains("non-UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_public_tree_does_not_follow_a_source_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("public");
+        fs::create_dir_all(&public).unwrap();
+        write(&public.join("asset.txt"), "safe");
+        let tree = collect_public_tree(&public).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::remove_file(public.join("asset.txt")).unwrap();
+        symlink(outside.path(), public.join("asset.txt")).unwrap();
+
+        assert!(copy_public_tree(&public, &root.path().join("out"), &tree).is_err());
     }
 }

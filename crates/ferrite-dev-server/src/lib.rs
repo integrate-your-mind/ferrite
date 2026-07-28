@@ -726,9 +726,12 @@ impl DevProject {
             _ if path.starts_with(&self.config.client_public_path) => {
                 Ok(self.static_asset_response(path))
             }
-            _ => match route_response_mode(raw_path) {
-                Ok(mode) => Ok(self.route_response(path, mode)),
-                Err(message) => Ok(DevResponse::bad_request(message)),
+            _ => match public_asset_response(path, &self.config.project) {
+                Some(response) => Ok(response),
+                None => match route_response_mode(raw_path) {
+                    Ok(mode) => Ok(self.route_response(path, mode)),
+                    Err(message) => Ok(DevResponse::bad_request(message)),
+                },
             },
         }
     }
@@ -1304,6 +1307,17 @@ impl ProductionProject {
                 Some((relative.to_owned(), Arc::<[u8]>::from(bytes)))
             })
             .collect();
+        let verified_public_assets = loaded
+            .manifest
+            .public_files
+            .iter()
+            .map(|path| {
+                let bytes = verified_files
+                    .remove(path)
+                    .expect("loaded artifact retains every verified public file");
+                (path.clone(), Arc::<[u8]>::from(bytes))
+            })
+            .collect();
         let mut client_bundles = BTreeMap::new();
         let mut server_module_sources = BTreeMap::new();
         let routes = loaded
@@ -1343,6 +1357,7 @@ impl ProductionProject {
                 client_bundles,
                 server_module_sources,
                 verified_static_assets: Some(verified_static_assets),
+                verified_public_assets: Some(verified_public_assets),
             })
             .expect("new production artifact snapshot is empty");
 
@@ -1440,6 +1455,25 @@ impl ProductionProject {
                 snapshot.verified_static_assets.as_ref(),
             )
             .with_cache_control(static_asset_cache_control(path)));
+        }
+
+        let snapshot = self.snapshot.get().expect("snapshot built before response");
+        if let (Some(public_assets), Some(relative)) = (
+            snapshot.verified_public_assets.as_ref(),
+            public_asset_relative_path(path),
+        ) {
+            if public_assets.contains_key(relative) {
+                return Ok(static_asset_response(
+                    path,
+                    "",
+                    self.config
+                        .artifact_root
+                        .as_deref()
+                        .expect("artifact root is configured"),
+                    Some(public_assets),
+                )
+                .with_cache_control(static_asset_cache_control(path)));
+            }
         }
 
         match route_response_mode(raw_path) {
@@ -1549,6 +1583,7 @@ impl ProductionProject {
             client_bundles: BTreeMap::new(),
             server_module_sources: BTreeMap::new(),
             verified_static_assets: None,
+            verified_public_assets: None,
         });
         Ok(())
     }
@@ -2770,6 +2805,7 @@ struct ProductionRouteSnapshot {
     client_bundles: BTreeMap<String, ClientBundle>,
     server_module_sources: BTreeMap<String, Arc<[u8]>>,
     verified_static_assets: Option<BTreeMap<String, Arc<[u8]>>>,
+    verified_public_assets: Option<BTreeMap<String, Arc<[u8]>>>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -4921,6 +4957,40 @@ fn static_asset_response(
     }
 }
 
+fn public_asset_relative_path(path: &str) -> Option<&str> {
+    let relative = path.strip_prefix('/')?;
+    if relative.is_empty()
+        || relative.contains('\\')
+        || relative
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return None;
+    }
+    Some(relative)
+}
+
+fn public_asset_response(path: &str, project_root: &Path) -> Option<DevResponse> {
+    let relative = public_asset_relative_path(path)?;
+    let public_root = project_root.join("public");
+    let root_metadata = fs::symlink_metadata(&public_root).ok()?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return None;
+    }
+    let root = fs::canonicalize(&public_root).ok()?;
+    let candidate = public_root.join(relative);
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let canonical = fs::canonicalize(&candidate).ok()?;
+    if !canonical.starts_with(&root) {
+        return None;
+    }
+    let body = fs::read(&canonical).ok()?;
+    Some(DevResponse::ok(content_type_for(&canonical), body))
+}
+
 fn static_asset_cache_control(path: &str) -> &'static str {
     if is_immutable_static_asset_path(path) {
         "public, max-age=31536000, immutable"
@@ -4975,16 +5045,24 @@ fn is_esbuild_hash(value: &str) -> bool {
 
 fn content_type_for(path: &Path) -> &'static str {
     match path.extension().and_then(|extension| extension.to_str()) {
+        Some("html" | "htm") => "text/html; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("js") => "text/javascript; charset=utf-8",
-        Some("json" | "map") => "application/json; charset=utf-8",
+        Some("json" | "map" | "webmanifest") => "application/json; charset=utf-8",
+        Some("txt" | "text") => "text/plain; charset=utf-8",
         Some("gif") => "image/gif",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("ico") => "image/x-icon",
         Some("woff") => "font/woff",
         Some("woff2") => "font/woff2",
+        Some("wasm") => "application/wasm",
+        Some("pdf") => "application/pdf",
+        Some("mp3") => "audio/mpeg",
+        Some("mp4") => "video/mp4",
         _ => "application/octet-stream",
     }
 }
@@ -8624,6 +8702,7 @@ process.stdout.write(JSON.stringify({{ kind: "text", value: "unexpected" }}));
                     "large.bin".to_owned(),
                     Arc::<[u8]>::from(vec![b'x'; ASSET_BYTES]),
                 )])),
+                verified_public_assets: None,
             })
             .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -9449,6 +9528,43 @@ process.stdout.write(JSON.stringify({
             static_asset_cache_control("/_ferrite/static/admin-bundle.js"),
             "public, max-age=0, must-revalidate"
         );
+    }
+
+    #[test]
+    fn dev_public_assets_fix_previous_missing_public_fallthrough_and_reject_symlink_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        write(&temp.path().join("public/nested/data.json"), "{}\n");
+        let response = public_asset_response("/nested/data.json", temp.path()).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+        assert_eq!(response.body, b"{}\n");
+        assert!(public_asset_response("/nested/../secret", temp.path()).is_none());
+    }
+
+    #[test]
+    fn dev_project_serves_public_assets_before_routes_and_strips_queries() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        write(
+            &app.join("about/page.tsx"),
+            "export default function About() {}",
+        );
+        write(&temp.path().join("public/about"), "public wins");
+        write(&temp.path().join("public/data.json"), "{\"ok\":true}\n");
+
+        let mut project = project_for(&app);
+        let precedence = project.handle_get("/about?cache=miss").unwrap();
+        assert_eq!(precedence.status, 200);
+        assert_eq!(precedence.body, b"public wins");
+        assert_eq!(precedence.content_type, "application/octet-stream");
+        assert_eq!(precedence.cache_control, None);
+
+        let queried = project.handle_get("/data.json?version=1").unwrap();
+        assert_eq!(queried.status, 200);
+        assert_eq!(queried.body, b"{\"ok\":true}\n");
+        assert_eq!(queried.content_type, "application/json; charset=utf-8");
+        assert_eq!(queried.cache_control, None);
     }
 
     #[test]
