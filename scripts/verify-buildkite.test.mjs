@@ -264,6 +264,9 @@ test("Node CI entrypoint rejects functions and sanitizes before Bash", async () 
   assert.match(source, /name\.startsWith\("BASH_FUNC_"\)/);
   assert.match(source, /Object\.fromEntries/);
   assert.match(source, /filter\(\(\[name\]\) => !isDeniedName\(name\)\)/);
+  for (const name of ["BASHOPTS", "BASH_XTRACEFD", "PS4", "SHELLOPTS"]) {
+    assert.match(source, new RegExp(`"${name}"`));
+  }
   assert.match(source, /spawnSync\("\/bin\/bash", \[script, mode\]/);
   assert.match(source, /"ci-internal\.sh"/);
 });
@@ -338,6 +341,48 @@ test("Rust toolchain activation rejects imported shell functions", () => {
   assert.match(result.stderr, /disallowed environment variable: BASH_FUNC_rustup/);
 });
 
+test("Node CI entrypoint removes Bash startup controls before spawning Bash", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-ci-entry-test-"));
+  const entry = join(tempRoot, "ci.mjs");
+  const internal = join(tempRoot, "ci-internal.sh");
+  try {
+    await writeFile(entry, await readFile(ciUrl), { mode: 0o755 });
+    await writeFile(
+      internal,
+      [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        "if /usr/bin/printenv SHELLOPTS >/dev/null; then",
+        "  /bin/echo FERRITE_SHELLOPTS_LEAKED >&2",
+        "  exit 1",
+        "fi",
+        "/bin/echo FERRITE_SANITIZED_BASH",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const result = spawnSync(entry, ["preflight"], {
+      encoding: "utf8",
+      env: {
+        HOME: process.env.HOME,
+        PATH: process.env.PATH,
+        PS4: '$(/bin/echo FERRITE_PS4_EXECUTED >&2) ',
+        SHELLOPTS: "xtrace",
+      },
+    });
+
+    assert.equal(
+      result.status,
+      0,
+      `startup-control sanitization failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    );
+    assert.match(result.stdout, /FERRITE_SANITIZED_BASH/);
+    assert.doesNotMatch(result.stderr, /FERRITE_PS4_EXECUTED|FERRITE_SHELLOPTS_LEAKED/);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("pipeline upload rejects embedded secrets", async () => {
   const source = await readFile(uploadUrl, "utf8");
 
@@ -382,6 +427,8 @@ test("external environment hook accepts only the approved Ferrite commit", async
   };
 
   assert.equal(runHook(environmentHookUrl, base).status, 0);
+  assert.match(source, /^#!\/bin\/bash -p$/m);
+  assert.match(source, /shell startup controls are not allowed/);
   assert.match(source, /ferrite-buildkite-home-/);
   assert.match(source, /original_rustup_home="\$\{RUSTUP_HOME:-\$\{original_home\}\/\.rustup\}"/);
   assert.match(source, /export RUSTUP_TOOLCHAIN="1\.95\.0"/);
@@ -483,6 +530,22 @@ test("external environment hook accepts only the approved Ferrite commit", async
     }).status,
     0,
   );
+  const importedFunction = runHook(environmentHookUrl, {
+    ...base,
+    "BASH_FUNC_printf%%":
+      '() { /bin/echo FERRITE_IMPORTED_PRINTF_EXECUTED >&2; builtin printf "$@"; }',
+  });
+  assert.notEqual(importedFunction.status, 0);
+  assert.match(importedFunction.stderr, /shell startup controls are not allowed/);
+  assert.doesNotMatch(importedFunction.stderr, /FERRITE_IMPORTED_PRINTF_EXECUTED/);
+  const shellStartup = runHook(environmentHookUrl, {
+    ...base,
+    PS4: '$(/bin/echo FERRITE_PS4_EXECUTED >&2) ',
+    SHELLOPTS: "xtrace",
+  });
+  assert.notEqual(shellStartup.status, 0);
+  assert.match(shellStartup.stderr, /shell startup controls are not allowed/);
+  assert.doesNotMatch(shellStartup.stderr, /FERRITE_PS4_EXECUTED/);
 });
 
 test("external command hook rejects arbitrary commands", async () => {
@@ -544,9 +607,26 @@ test("external command hook rejects arbitrary commands", async () => {
     0,
     "an imported builtin function must not suppress the command hook guard",
   );
+  const shellStartup = runHook(preCommandHookUrl, {
+    BUILDKITE_COMMAND: "./.buildkite/scripts/ci.mjs verify",
+    PS4: '$(/bin/echo FERRITE_PS4_EXECUTED >&2) ',
+    SHELLOPTS: "xtrace",
+  });
+  assert.notEqual(shellStartup.status, 0);
+  assert.match(shellStartup.stderr, /disallowed environment variable: PS4|SHELLOPTS/);
+  assert.doesNotMatch(shellStartup.stderr, /FERRITE_PS4_EXECUTED/);
 
   const source = await readFile(preCommandHookUrl, "utf8");
-  for (const name of ["BASH_ENV", "CDPATH", "ENV", "NODE_OPTIONS"]) {
+  assert.match(source, /^#!\/opt\/homebrew\/bin\/node$/m);
+  for (const name of [
+    "BASH_ENV",
+    "BASHOPTS",
+    "CDPATH",
+    "ENV",
+    "NODE_OPTIONS",
+    "PS4",
+    "SHELLOPTS",
+  ]) {
     assert.match(source, new RegExp(name));
   }
   const [ciEntry, uploadEntry] = await Promise.all([
@@ -577,6 +657,8 @@ test("trusted pre-bootstrap rejects tainted job input before shell hooks run", a
   };
 
   try {
+    const source = await readFile(preBootstrapHookUrl, "utf8");
+    assert.match(source, /^#!\/opt\/homebrew\/bin\/node$/m);
     await writeFile(environmentPath, JSON.stringify(base));
     assert.equal(
       runHook(preBootstrapHookUrl, {
@@ -633,6 +715,10 @@ test("trusted pre-bootstrap rejects tainted job input before shell hooks run", a
       { BUILDKITE_PULL_REQUEST_REPO: "https://github.com/someone/other" },
       { NODE_OPTIONS: "--require=/tmp/untrusted.cjs" },
       { NPM_TOKEN: "fixture-value" },
+      {
+        PS4: '$(/bin/echo FERRITE_PS4_EXECUTED >&2) ',
+        SHELLOPTS: "xtrace",
+      },
     ]) {
       await writeFile(
         environmentPath,
@@ -746,6 +832,8 @@ test("pre-exit cleanup removes only the validated per-build home", async () => {
       env: { HOME: process.env.HOME, PATH: process.env.PATH, ...env },
     });
   try {
+    const source = await readFile(preExitHookUrl, "utf8");
+    assert.match(source, /^#!\/bin\/bash -p$/m);
     await writeFile(join(tempRoot, "placeholder"), "ok");
     await writeFile(join(tempRoot, "marker"), "ok");
     const makeHome = spawnSync("/bin/mkdir", ["-p", buildHome], { encoding: "utf8" });
@@ -756,6 +844,14 @@ test("pre-exit cleanup removes only the validated per-build home", async () => {
     assert.notEqual(invoke({ TMPDIR: tempRoot, FERRITE_BUILDKITE_BUILD_HOME: join(tempRoot, "other") }).status, 0);
     assert.notEqual(invoke({ TMPDIR: tempRoot, FERRITE_BUILDKITE_BUILD_HOME: `${tempRoot}/ferrite-buildkite-home-job-1/../etc` }).status, 0);
     assert.notEqual(invoke({ TMPDIR: "/", FERRITE_BUILDKITE_BUILD_HOME: "/ferrite-buildkite-home-job-1" }).status, 0);
+    const shellStartup = invoke({
+      TMPDIR: tempRoot,
+      FERRITE_BUILDKITE_BUILD_HOME: buildHome,
+      PS4: '$(/bin/echo FERRITE_PS4_EXECUTED >&2) ',
+      SHELLOPTS: "xtrace",
+    });
+    assert.notEqual(shellStartup.status, 0);
+    assert.doesNotMatch(shellStartup.stderr, /FERRITE_PS4_EXECUTED/);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }

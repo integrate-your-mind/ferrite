@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/opt/homebrew/bin/node
 
 import { readFileSync } from "node:fs";
 
@@ -19,6 +19,10 @@ const allowedCommands = new Set([
 const deniedNames = new Set([
   "AWS_SECRET_ACCESS_KEY",
   "BASH_ENV",
+  "BASHOPTS",
+  "BASH_COMPAT",
+  "BASH_LOADABLES_PATH",
+  "BASH_XTRACEFD",
   "CDPATH",
   "DYLD_FRAMEWORK_PATH",
   "DYLD_INSERT_LIBRARIES",
@@ -34,12 +38,15 @@ const deniedNames = new Set([
   "NPM_TOKEN",
   "OPENAI_API_KEY",
   "PERL5OPT",
+  "PROMPT_COMMAND",
+  "PS4",
   "PYTHONPATH",
   "RUBYOPT",
   "RUSTC_WRAPPER",
   "RUSTC_WORKSPACE_WRAPPER",
   "RUSTDOCFLAGS",
   "RUSTFLAGS",
+  "SHELLOPTS",
 ]);
 const checkoutOnlyNames = new Set([
   "GIT_ASKPASS",

@@ -7,6 +7,10 @@ import { fileURLToPath } from "node:url";
 
 const deniedNames = new Set([
   "BASH_ENV",
+  "BASHOPTS",
+  "BASH_COMPAT",
+  "BASH_LOADABLES_PATH",
+  "BASH_XTRACEFD",
   "CDPATH",
   "DYLD_FRAMEWORK_PATH",
   "DYLD_INSERT_LIBRARIES",
@@ -19,12 +23,15 @@ const deniedNames = new Set([
   "NODE_OPTIONS",
   "NODE_PATH",
   "PERL5OPT",
+  "PROMPT_COMMAND",
+  "PS4",
   "PYTHONPATH",
   "RUBYOPT",
   "RUSTC_WRAPPER",
   "RUSTC_WORKSPACE_WRAPPER",
   "RUSTDOCFLAGS",
   "RUSTFLAGS",
+  "SHELLOPTS",
   "SSH_ASKPASS",
   "SSH_AUTH_SOCK",
 ]);

@@ -1,4 +1,12 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
+
+if /usr/bin/env | /usr/bin/grep -E \
+  '^(BASH_FUNC_[^=]*%%|BASH_ENV|BASHOPTS|BASH_COMPAT|BASH_LOADABLES_PATH|BASH_XTRACEFD|ENV|PROMPT_COMMAND|PS4|SHELLOPTS)=' \
+  >/dev/null; then
+  /bin/echo "Ferrite Buildkite cleanup: shell startup controls are not allowed" >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 fail() {

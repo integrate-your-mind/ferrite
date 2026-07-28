@@ -137,6 +137,10 @@ The external hooks:
   checkout, reject imported functions and other interpreter/toolchain
   injection variables, and allow only the Ferrite repository, exact commands,
   and operator-approved commit;
+- invoke the Node lifecycle hooks through the fixed Homebrew Node path and run
+  the Bash lifecycle hooks in privileged startup mode, then fail closed on
+  imported functions or Bash startup controls such as `SHELLOPTS`, `BASHOPTS`,
+  and `PS4`;
 - reject fork pull requests;
 - require the job SHA to equal an operator-approved SHA;
 - reject common application and registry credentials;
@@ -170,6 +174,9 @@ must both be installed before this queue is used. Buildkite Agent 3.127 runs
 these extensionless Node hooks as polyglot hooks; unlike shell hooks, their
 environment mutations would not propagate, so the repository Node entrypoint
 also sanitizes the environment before starting the internal Bash runner.
+The fixed `/opt/homebrew/bin/node` interpreter is part of this macOS arm64
+agent contract; changing its location requires updating and re-reviewing both
+external Node hooks before the queue runs again.
 
 The existing shared `default` queue and its global hooks are not suitable for
 Ferrite. Use the dedicated configuration and queue:
