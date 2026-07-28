@@ -273,9 +273,10 @@ export async function verifyNpmPackages({
       installablePackages.push(nativeResult);
     }
 
+    const reportPhase = (phase) => console.error(`npm package verification: ${phase}`);
     await installPackageSet(installablePackages, {
       runCommand,
-      onPhase: (phase) => console.error(`npm package verification: ${phase}`),
+      onPhase: reportPhase,
     });
 
     if (writeReports) {
@@ -286,6 +287,7 @@ export async function verifyNpmPackages({
           throw new Error("npm package report source commit/tree changed during verification.");
         }
       };
+      reportPhase("report:source-stability-before");
       await assertSourceStable();
       await refusePublicationReceipt(packageReportDir);
       const backupRoot = join(stageRoot, "previous-report");
@@ -302,14 +304,18 @@ export async function verifyNpmPackages({
         await rm(reportPath, { force: true });
         await rm(tarballPath, { force: true, recursive: true });
         await mkdir(packageReportDir, { recursive: true });
+        reportPhase("report:persist-tarballs");
         await persistVerifiedTarballs(results, installablePackages, packageReportDir);
+        reportPhase("report:source-stability-after-persist");
         await assertSourceStable();
         const report = createPackageReport({
           packages: results,
           source: capturedSource,
           build: buildIdentity ?? readBuildIdentity(env),
         });
+        reportPhase("report:write");
         await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+        reportPhase("report:source-stability-after-write");
         await assertSourceStable();
       } catch (error) {
         const rollbackErrors = [];
@@ -338,6 +344,7 @@ export async function verifyNpmPackages({
         }
         throw error;
       }
+      reportPhase("report:cleanup-backup");
       await rm(backupRoot, { force: true, recursive: true }).catch((cleanupError) => {
         preserveStageRoot = true;
         throw new Error(
@@ -345,6 +352,7 @@ export async function verifyNpmPackages({
           { cause: cleanupError },
         );
       });
+      reportPhase("report:complete");
     }
 
     return results;
@@ -773,7 +781,9 @@ export async function installPackedPackageSet(packages, { runCommand = run, onPh
       await verifyCleanDeveloperWorkflow(installRoot, { packages, runCommand, onPhase });
     }
   } finally {
+    onPhase("consumer:cleanup-install-root");
     await rm(installRoot, { force: true, recursive: true });
+    onPhase("consumer:install-root-cleaned");
   }
 }
 
