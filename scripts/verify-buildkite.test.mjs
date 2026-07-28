@@ -122,6 +122,7 @@ test("local CI retains the host-executable validation gate categories", async ()
     "npm --prefix website run typecheck",
     "npm --prefix website audit --omit=dev --audit-level=high",
     "./.buildkite/scripts/upload-pipeline.sh --dry-run",
+    "gitleaks git --no-banner --redact",
   ]) {
     assert.match(source, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
@@ -142,7 +143,20 @@ test("local CI retains the host-executable validation gate categories", async ()
     source.indexOf("/bin/df -Pk") < source.indexOf('mkdir -p "${REPORT_DIR}"'),
     "storage admission must run before CI creates report output",
   );
+  assert.match(
+    source,
+    /run_gate coverage-rust-prerequisites pnpm --filter @ferrite\/runtime build/,
+  );
   assert.match(source, /run_gate coverage-rust rustup run stable cargo llvm-cov/);
+  const coverageRust = source.slice(
+    source.indexOf("coverage_rust()"),
+    source.indexOf("coverage_js()"),
+  );
+  assert.ok(
+    coverageRust.indexOf("coverage-rust-prerequisites") <
+      coverageRust.indexOf("run_gate coverage-rust rustup"),
+    "runtime prerequisites must be built before Rust coverage exercises the client bundler",
+  );
   assert.match(
     source,
     /run_gate coverage-runtime-prerequisites pnpm --filter @ferrite\/runtime build/,
@@ -169,6 +183,7 @@ test("local CI retains the host-executable validation gate categories", async ()
     );
   }
   assert.doesNotMatch(source, /coverage-rust env RUSTC=/);
+  assert.doesNotMatch(source, /gitleaks git [^\n]*--log-opts=-1/);
   assert.doesNotMatch(source, /corepack pnpm/);
   assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
 });

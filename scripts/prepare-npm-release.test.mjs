@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
@@ -8,6 +17,7 @@ import { gzipSync } from "node:zlib";
 
 import {
   PORTABLE_RELEASE_PACKAGES,
+  downloadBuildkiteArtifact,
   parseArgs,
   prepareNpmRelease,
   verifyBuildkiteReport,
@@ -175,21 +185,21 @@ test("rejects a report without exact Buildkite package proof", async () => {
 test("accepts only a passed exact-source Buildkite package job and its artifacts", async () => {
   await withReport(async ({ reportPath, report }) => {
     await writeReport(reportPath, report);
-    const runCommand = await buildkiteEvidence(reportPath, report);
+    const evidence = await buildkiteEvidence(reportPath, report);
 
-    await verifyBuildkiteReport({ report, reportPath, runCommand });
+    await verifyBuildkiteReport({ report, reportPath, ...evidence });
   });
 });
 
 test("rejects fabricated or failed Buildkite build identity", async () => {
   await withReport(async ({ reportPath, report }) => {
     await writeReport(reportPath, report);
-    const runCommand = await buildkiteEvidence(reportPath, report, {
+    const evidence = await buildkiteEvidence(reportPath, report, {
       build: { commit: "c".repeat(40) },
     });
 
     await assert.rejects(
-      verifyBuildkiteReport({ report, reportPath, runCommand }),
+      verifyBuildkiteReport({ report, reportPath, ...evidence }),
       /not a passed exact-source build/,
     );
   });
@@ -198,7 +208,7 @@ test("rejects fabricated or failed Buildkite build identity", async () => {
 test("rejects a Buildkite build returned from a different organization", async () => {
   await withReport(async ({ reportPath, report }) => {
     await writeReport(reportPath, report);
-    const runCommand = await buildkiteEvidence(reportPath, report, {
+    const evidence = await buildkiteEvidence(reportPath, report, {
       build: {
         pipeline: {
           slug: "ferrite",
@@ -210,7 +220,7 @@ test("rejects a Buildkite build returned from a different organization", async (
     });
 
     await assert.rejects(
-      verifyBuildkiteReport({ report, reportPath, runCommand }),
+      verifyBuildkiteReport({ report, reportPath, ...evidence }),
       /not a passed exact-source build/,
     );
   });
@@ -219,12 +229,12 @@ test("rejects a Buildkite build returned from a different organization", async (
 test("rejects a report that names the wrong Buildkite package job", async () => {
   await withReport(async ({ reportPath, report }) => {
     await writeReport(reportPath, report);
-    const runCommand = await buildkiteEvidence(reportPath, report, {
+    const evidence = await buildkiteEvidence(reportPath, report, {
       job: { command: "./.buildkite/scripts/ci.sh verify" },
     });
 
     await assert.rejects(
-      verifyBuildkiteReport({ report, reportPath, runCommand }),
+      verifyBuildkiteReport({ report, reportPath, ...evidence }),
       /not bound to the passed Ferrite packages job/,
     );
   });
@@ -247,15 +257,127 @@ test("rejects missing, duplicate, unfinished, or changed Buildkite artifacts", a
   ]) {
     await withReport(async ({ reportPath, report }) => {
       await writeReport(reportPath, report);
-      const runCommand = await buildkiteEvidence(reportPath, report, { mutateArtifacts: mutate });
+      const evidence = await buildkiteEvidence(reportPath, report, { mutateArtifacts: mutate });
 
       await assert.rejects(
-        verifyBuildkiteReport({ report, reportPath, runCommand }),
+        verifyBuildkiteReport({ report, reportPath, ...evidence }),
         expected,
         name,
       );
     });
   }
+});
+
+test("rejects hosted artifact bytes that differ from the authenticated metadata", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    await writeReport(reportPath, report);
+    const evidence = await buildkiteEvidence(reportPath, report, {
+      mutateDownloads: (downloads, artifacts) =>
+        new Map(downloads).set(artifacts[0].id, Buffer.from("different hosted bytes")),
+    });
+
+    await assert.rejects(
+      verifyBuildkiteReport({ report, reportPath, ...evidence }),
+      /downloaded artifact bytes do not match/,
+    );
+  });
+});
+
+test("downloads one exact artifact and removes private staging after success", async () => {
+  const stagingRoot = await mkdtemp(join(tmpdir(), "ferrite-buildkite-download-test-"));
+  const artifact = buildkiteArtifactFixture();
+  let observedArgs;
+
+  const bytes = await downloadBuildkiteArtifact(
+    { artifact, buildIdentity: build },
+    {
+      createStagingRoot: async () => stagingRoot,
+      runDownload: async (args, cwd) => {
+        observedArgs = args;
+        assert.equal(cwd, stagingRoot);
+        await mkdir(join(stagingRoot, dirname(artifact.path)), { recursive: true });
+        await writeFile(join(stagingRoot, artifact.path), "hosted artifact");
+      },
+    },
+  );
+
+  assert.equal(bytes.toString(), "hosted artifact");
+  assert.deepEqual(observedArgs, [
+    "artifacts",
+    "download",
+    artifact.id,
+    "--build",
+    build.buildNumber,
+    "--pipeline",
+    "roman-mondello/ferrite",
+    "--job-uuid",
+    build.jobId,
+    "--yes",
+    "--no-input",
+  ]);
+  await assert.rejects(access(stagingRoot), { code: "ENOENT" });
+});
+
+test("removes private artifact staging after a download failure", async () => {
+  const stagingRoot = await mkdtemp(join(tmpdir(), "ferrite-buildkite-download-failure-"));
+  const artifact = buildkiteArtifactFixture();
+
+  await assert.rejects(
+    downloadBuildkiteArtifact(
+      { artifact, buildIdentity: build },
+      {
+        createStagingRoot: async () => stagingRoot,
+        runDownload: async () => {
+          throw new Error("synthetic artifact download failure");
+        },
+      },
+    ),
+    /synthetic artifact download failure/,
+  );
+  await assert.rejects(access(stagingRoot), { code: "ENOENT" });
+});
+
+test("preserves download and cleanup failures together", async () => {
+  const primary = new Error("synthetic download failure");
+  const cleanup = new Error("synthetic cleanup failure");
+
+  await assert.rejects(
+    downloadBuildkiteArtifact(
+      { artifact: buildkiteArtifactFixture(), buildIdentity: build },
+      {
+        createStagingRoot: async () => "/synthetic/private-staging",
+        runDownload: async () => {
+          throw primary;
+        },
+        removeStagingRoot: async () => {
+          throw cleanup;
+        },
+      },
+    ),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.deepEqual(error.errors, [primary, cleanup]);
+      assert.match(error.message, /cleanup was incomplete/);
+      return true;
+    },
+  );
+});
+
+test("rejects a redirected Buildkite artifact endpoint", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    await writeReport(reportPath, report);
+    const evidence = await buildkiteEvidence(reportPath, report, {
+      mutateArtifacts: (artifacts) => [
+        { ...artifacts[0], download_url: "https://example.invalid/artifact" },
+        ...artifacts.slice(1),
+      ],
+    });
+
+    await assert.rejects(
+      verifyBuildkiteReport({ report, reportPath, ...evidence }),
+      /artifact endpoint identity does not match/,
+    );
+  });
 });
 
 test("rejects unsafe report artifact paths before reading Buildkite-bound files", async () => {
@@ -353,7 +475,12 @@ async function writeReport(reportPath, report) {
 async function buildkiteEvidence(
   reportPath,
   report,
-  { build: buildOverrides = {}, job: jobOverrides = {}, mutateArtifacts } = {},
+  {
+    build: buildOverrides = {},
+    job: jobOverrides = {},
+    mutateArtifacts,
+    mutateDownloads,
+  } = {},
 ) {
   const buildResponse = {
     pipeline: {
@@ -390,21 +517,44 @@ async function buildkiteEvidence(
     })),
   ];
   let artifacts = await Promise.all(
-    artifactEntries.map(async ({ path, localPath }) => {
+    artifactEntries.map(async ({ path, localPath }, index) => {
       const bytes = await readFile(localPath);
+      const id = `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+      const apiBase =
+        "https://api.buildkite.com/v2/organizations/roman-mondello" +
+        `/pipelines/ferrite/builds/${build.buildNumber}/jobs/${build.jobId}/artifacts/${id}`;
       return {
+        id,
         path,
         job_id: build.jobId,
         state: "finished",
         file_size: bytes.byteLength,
         sha1sum: createHash("sha1").update(bytes).digest("hex"),
+        url: apiBase,
+        download_url: `${apiBase}/download`,
       };
     }),
   );
+  let downloads = new Map(
+    await Promise.all(
+      artifacts.map(async (artifact, index) => [
+        artifact.id,
+        await readFile(artifactEntries[index].localPath),
+      ]),
+    ),
+  );
+  if (mutateDownloads) downloads = mutateDownloads(downloads, artifacts);
   if (mutateArtifacts) artifacts = mutateArtifacts(artifacts);
-  return async (args) => {
-    if (args[1].endsWith("/artifacts")) return artifacts;
-    return buildResponse;
+  return {
+    runCommand: async (args) => {
+      if (args[1].endsWith("/artifacts")) return artifacts;
+      return buildResponse;
+    },
+    downloadArtifact: async ({ artifact }) => {
+      const bytes = downloads.get(artifact.id);
+      if (!bytes) throw new Error(`missing test download for ${artifact.id}`);
+      return bytes;
+    },
   };
 }
 
@@ -414,6 +564,19 @@ function refreshPackageSetDigest(report) {
     source: report.source,
     build: report.build,
   }).packageSetSha256;
+}
+
+function buildkiteArtifactFixture() {
+  const id = "00000000-0000-4000-8000-000000000001";
+  const apiBase =
+    "https://api.buildkite.com/v2/organizations/roman-mondello" +
+    `/pipelines/ferrite/builds/${build.buildNumber}/jobs/${build.jobId}/artifacts/${id}`;
+  return {
+    id,
+    path: "dist/npm-packages/npm-package-report.json",
+    url: apiBase,
+    download_url: `${apiBase}/download`,
+  };
 }
 
 function npmTarball(entries) {

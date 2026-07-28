@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile, realpath } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { argv, exit } from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -114,6 +115,7 @@ export async function verifyBuildkiteReport({
   report,
   reportPath,
   runCommand = runBkJson,
+  downloadArtifact = downloadBuildkiteArtifact,
 } = {}) {
   const buildIdentity = report?.build;
   if (
@@ -179,6 +181,9 @@ export async function verifyBuildkiteReport({
     },
     ...verifiedPackageArtifacts,
   ];
+  const artifactApiBase =
+    `${pipelineApiUrl}/builds/${buildIdentity.buildNumber}` +
+    `/jobs/${buildIdentity.jobId}/artifacts`;
   for (const item of expected) {
     const matches = artifacts.filter((artifact) =>
       artifact.path === item.path && artifact.job_id === buildIdentity.jobId
@@ -186,15 +191,120 @@ export async function verifyBuildkiteReport({
     if (matches.length !== 1 || matches[0].state !== "finished") {
       throw new Error(`Buildkite package proof requires one finished artifact at ${item.path}.`);
     }
+    const artifact = matches[0];
+    if (
+      typeof artifact.id !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(artifact.id) ||
+      artifact.url !== `${artifactApiBase}/${artifact.id}` ||
+      artifact.download_url !== `${artifactApiBase}/${artifact.id}/download`
+    ) {
+      throw new Error(`Buildkite artifact endpoint identity does not match ${item.path}.`);
+    }
     const bytes = await readFile(item.localPath);
     const sha1 = createHash("sha1").update(bytes).digest("hex");
     if (
-      matches[0].file_size !== bytes.byteLength ||
-      matches[0].sha1sum !== sha1
+      artifact.file_size !== bytes.byteLength ||
+      artifact.sha1sum !== sha1
     ) {
       throw new Error(`Buildkite artifact identity does not match ${item.path}.`);
     }
+    const downloaded = Buffer.from(await downloadArtifact({ artifact, buildIdentity }));
+    const downloadedSha256 = createHash("sha256").update(downloaded).digest("hex");
+    const localSha256 = createHash("sha256").update(bytes).digest("hex");
+    if (
+      downloaded.byteLength !== bytes.byteLength ||
+      downloadedSha256 !== localSha256 ||
+      !downloaded.equals(bytes)
+    ) {
+      throw new Error(`Buildkite downloaded artifact bytes do not match ${item.path}.`);
+    }
   }
+}
+
+export async function downloadBuildkiteArtifact(
+  { artifact, buildIdentity },
+  {
+    createStagingRoot = () => mkdtemp(join(tmpdir(), "ferrite-buildkite-artifact-")),
+    removeStagingRoot = (path) => rm(path, { recursive: true, force: true }),
+    runDownload = runBkDownload,
+  } = {},
+) {
+  const stagingRoot = await createStagingRoot();
+  let downloadedBytes;
+  let downloadError;
+  try {
+    await runDownload(
+      [
+        "artifacts",
+        "download",
+        artifact.id,
+        "--build",
+        buildIdentity.buildNumber,
+        "--pipeline",
+        `${buildIdentity.organization}/${buildIdentity.pipeline}`,
+        "--job-uuid",
+        buildIdentity.jobId,
+        "--yes",
+        "--no-input",
+      ],
+      stagingRoot,
+    );
+    const [resolvedRoot, artifactInfo, resolvedArtifact] = await Promise.all([
+      realpath(stagingRoot),
+      lstat(resolve(stagingRoot, artifact.path)),
+      realpath(resolve(stagingRoot, artifact.path)),
+    ]);
+    const downloadedRelative = relative(resolvedRoot, resolvedArtifact);
+    if (
+      !artifactInfo.isFile() ||
+      artifactInfo.isSymbolicLink() ||
+      downloadedRelative === "" ||
+      downloadedRelative === ".." ||
+      downloadedRelative.startsWith(`..${separator()}`) ||
+      isAbsolute(downloadedRelative)
+    ) {
+      throw new Error(`Buildkite downloaded artifact path is unsafe: ${artifact.path}.`);
+    }
+    downloadedBytes = await readFile(resolvedArtifact);
+  } catch (error) {
+    downloadError = error;
+  }
+  try {
+    await removeStagingRoot(stagingRoot);
+  } catch (cleanupError) {
+    if (downloadError) {
+      throw new AggregateError(
+        [downloadError, cleanupError],
+        "Buildkite artifact download failed and private staging cleanup was incomplete.",
+      );
+    }
+    throw cleanupError;
+  }
+  if (downloadError) throw downloadError;
+  return downloadedBytes;
+}
+
+function runBkDownload(args, cwd) {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn("bk", args, {
+      cwd,
+      shell: false,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Buildkite artifact download failed with exit ${code}: ${stderr.trim()}`));
+        return;
+      }
+      resolvePromise();
+    });
+  });
 }
 
 function runBkJson(args) {

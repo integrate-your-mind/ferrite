@@ -152,10 +152,13 @@ packages() {
   run_gate website-test npm --prefix website test
   run_gate website-production-audit npm --prefix website audit --omit=dev --audit-level=high
   run_gate buildkite-pipeline ./.buildkite/scripts/upload-pipeline.sh --dry-run
-  run_gate secret-scan gitleaks git --no-banner --redact --log-opts=-1
+  run_gate secret-scan gitleaks git --no-banner --redact
 }
 
 coverage_rust() {
+  # Cargo coverage exercises the real client bundler, which resolves the
+  # workspace runtime package through its built protocol exports.
+  run_gate coverage-rust-prerequisites pnpm --filter @ferrite/runtime build
   run_gate coverage-rust rustup run stable cargo llvm-cov \
     --workspace \
     --all-targets \
