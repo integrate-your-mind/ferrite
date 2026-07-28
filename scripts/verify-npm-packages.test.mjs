@@ -155,6 +155,7 @@ test("clean developer workflow rejects a missing artifact before building and th
   const protocolTarball = join(root, "protocol.tgz");
   const runtimeTarball = join(root, "runtime.tgz");
   const calls = [];
+  const phases = [];
   try {
     await writeFile(cliSource, "candidate cli");
     await writeFile(protocolTarball, "protocol candidate");
@@ -165,6 +166,7 @@ test("clean developer workflow rejects a missing artifact before building and th
         { name: "@ferrite/protocol", tarballPath: protocolTarball },
         { name: "@ferrite/runtime", tarballPath: runtimeTarball },
       ],
+      onPhase: (phase) => phases.push(phase),
       runCommand: async (command, args, options) => {
         calls.push({ command, args, cwd: options.cwd });
         if (command === cliSource && args[0] === "init") {
@@ -196,6 +198,17 @@ test("clean developer workflow rejects a missing artifact before building and th
       "serve",
       "build",
       "serve",
+    ]);
+    assert.deepEqual(phases, [
+      "starter:init",
+      "starter:install",
+      "starter:check",
+      "starter:publish",
+      "starter:published",
+      "consumer:missing-artifact",
+      "consumer:build",
+      "consumer:serve",
+      "consumer:served",
     ]);
     assert.equal(calls[0].cwd, root);
     assert.match(calls[0].args[1], /\.starter\.ferrite-starter-/);

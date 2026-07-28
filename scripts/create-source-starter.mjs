@@ -91,7 +91,7 @@ async function rewriteManifest(target, packages) {
   await writeFile(packagePath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
-export async function createSourceStarter({ target, packages, cliSource, runCommand = run }) {
+export async function createSourceStarter({ target, packages, cliSource, runCommand = run, onPhase = () => {} }) {
   if (!target || !cliSource) throw new Error("target and cliSource are required");
   const cliPath = resolve(cliSource);
   const packageMap = validatePackages(packages);
@@ -107,6 +107,7 @@ export async function createSourceStarter({ target, packages, cliSource, runComm
   await chmod(stagingPath, 0o700);
   const stagingInfo = await lstat(stagingPath);
   try {
+    onPhase("starter:init");
     await runCommand(cliPath, ["init", stagingPath], { cwd: dirname(cliPath) });
     const sourceDir = join(stagingPath, ".ferrite-source");
     const packageDir = join(sourceDir, "packages");
@@ -131,13 +132,19 @@ export async function createSourceStarter({ target, packages, cliSource, runComm
     if (!gitignore.split(/\r?\n/).includes(".ferrite-source/")) {
       await writeFile(gitignorePath, `${gitignore}${gitignore.endsWith("\n") || !gitignore ? "" : "\n"}.ferrite-source/\n`);
     }
+    onPhase("starter:install");
     await runCommand("npm", ["install", "--ignore-scripts", "--no-audit", "--fund=false"], { cwd: stagingPath });
+    onPhase("starter:check");
     await runCommand("npm", ["run", "check"], { cwd: stagingPath });
+    onPhase("starter:publish");
     await publishStagedStarter({ stagingPath, targetPath, cliPath, runCommand });
+    onPhase("starter:published");
     return { target: targetPath, sourceDir: join(targetPath, ".ferrite-source") };
   } catch (error) {
     try {
+      onPhase("starter:cleanup");
       await cleanupOwnedStaging(stagingPath, stagingInfo);
+      onPhase("starter:cleaned");
     } catch (cleanupError) {
       throw new AggregateError([error, cleanupError], "source starter failed and cleanup was incomplete");
     }

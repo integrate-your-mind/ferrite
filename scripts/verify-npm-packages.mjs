@@ -273,7 +273,10 @@ export async function verifyNpmPackages({
       installablePackages.push(nativeResult);
     }
 
-    await installPackageSet(installablePackages, { runCommand });
+    await installPackageSet(installablePackages, {
+      runCommand,
+      onPhase: (phase) => console.error(`npm package verification: ${phase}`),
+    });
 
     if (writeReports) {
       const assertSourceStable = async () => {
@@ -742,7 +745,7 @@ async function readJson(path) {
   return JSON.parse(await readFile(path, "utf8"));
 }
 
-export async function installPackedPackageSet(packages, { runCommand = run } = {}) {
+export async function installPackedPackageSet(packages, { runCommand = run, onPhase = () => {} } = {}) {
   assertInstallablePackages(packages);
   const installRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-install-"));
   try {
@@ -767,7 +770,7 @@ export async function installPackedPackageSet(packages, { runCommand = run } = {
       capture: true,
     });
     if (packages.some((pkg) => pkg.name === "@ferrite/runtime")) {
-      await verifyCleanDeveloperWorkflow(installRoot, { packages, runCommand });
+      await verifyCleanDeveloperWorkflow(installRoot, { packages, runCommand, onPhase });
     }
   } finally {
     await rm(installRoot, { force: true, recursive: true });
@@ -776,13 +779,19 @@ export async function installPackedPackageSet(packages, { runCommand = run } = {
 
 export async function verifyCleanDeveloperWorkflow(
   installRoot,
-  { packages = [], runCommand = run, cliSource = join(workspaceRoot, "target", "debug", process.platform === "win32" ? "ferrite.exe" : "ferrite") } = {},
+  {
+    packages = [],
+    runCommand = run,
+    cliSource = join(workspaceRoot, "target", "debug", process.platform === "win32" ? "ferrite.exe" : "ferrite"),
+    onPhase = () => {},
+  } = {},
 ) {
   const project = join(installRoot, "starter");
-  await createSourceStarter({ target: project, packages, cliSource, runCommand });
+  await createSourceStarter({ target: project, packages, cliSource, runCommand, onPhase });
   const cliPath = join(project, ".ferrite-source", "bin", process.platform === "win32" ? "ferrite.exe" : "ferrite");
   const runtimeBin = join(project, "node_modules", "@ferrite", "runtime", "bin");
 
+  onPhase("consumer:missing-artifact");
   await assertCommandFails(
     runCommand,
     cliPath,
@@ -791,11 +800,13 @@ export async function verifyCleanDeveloperWorkflow(
     /artifact directory[\s\S]*\bos error (?:2|3)\b/i,
     "clean install serve must reject a missing build artifact",
   );
+  onPhase("consumer:build");
   await runCommand(
     cliPath,
     ["build", "--project", project, "--page-renderer", join(runtimeBin, "render-page.mjs"), "--client-bundler", join(runtimeBin, "build-client.mjs")],
     { cwd: project, capture: true },
   );
+  onPhase("consumer:serve");
   const output = await runCommand(
     cliPath,
     ["serve", "--project", project, "--artifact", ".ferrite/build", "--page-renderer", join(runtimeBin, "render-artifact.mjs"), "--once"],
@@ -804,6 +815,7 @@ export async function verifyCleanDeveloperWorkflow(
   if (!output.includes("Rust-first application runtime.")) {
     throw new Error("clean install artifact serve did not render the fixture page");
   }
+  onPhase("consumer:served");
 }
 
 async function assertCommandFails(runCommand, command, args, options, expectedError, message) {
