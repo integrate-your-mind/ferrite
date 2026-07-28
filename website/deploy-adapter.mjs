@@ -487,16 +487,37 @@ function generatedMetadata(manifest, origin) {
   ]);
 }
 
-function outputManifestWithMetadata(manifest, generated) {
-  const files = manifest.files.map((file) => {
-    const bytes = generated.get(file.path);
-    if (!bytes) return { ...file };
-    return { path: file.path, size: bytes.byteLength, sha256: sha256Hex(bytes) };
-  });
-  const output = { ...manifest, files };
+function outputManifestWithPublicFiles(manifest, publicBytes) {
+  const files = new Map(manifest.files.map((file) => [file.path, { ...file }]));
+  for (const [path, bytes] of publicBytes) {
+    files.set(path, { path, size: bytes.byteLength, sha256: sha256Hex(bytes) });
+  }
+  const output = {
+    ...manifest,
+    files: [...files.values()].sort((left, right) => left.path.localeCompare(right.path)),
+    publicFiles: [...new Set([...(manifest.publicFiles ?? []), ...publicBytes.keys()])].sort(),
+  };
   output.buildId = computeManifestBuildId(output);
   validateManifest(output);
   return output;
+}
+
+async function loadPublicFiles(publicDirectory, fsApi) {
+  try {
+    const info = await fsApi.lstat(publicDirectory);
+    if (info.isSymbolicLink() || !info.isDirectory()) invalid(`public directory \`${publicDirectory}\` must be a non-symlink directory`);
+  } catch (error) {
+    if (isMissing(error)) return new Map();
+    throw error;
+  }
+  const publicRoot = await canonicalRoot(publicDirectory, fsApi);
+  const files = new Map();
+  for (const relative of await collectArtifactPaths(publicDirectory, publicRoot.canonical, fsApi)) {
+    if (GENERATED_METADATA_FILES.has(relative)) continue;
+    const file = await regularFile(publicDirectory, publicRoot.canonical, relative, fsApi);
+    files.set(relative, Buffer.from(await fsApi.readFile(file.path)));
+  }
+  return files;
 }
 
 async function writeBytes(destination, bytes, fsApi) {
@@ -593,8 +614,12 @@ export async function packageArtifact(
   const artifactResult = await loadAndVerifyArtifact(artifactDirectory, fsApi);
   const origin = siteOrigin(options.siteOrigin);
   const generated = generatedMetadata(artifactResult.manifest, origin);
-  for (const relative of GENERATED_METADATA_FILES) if (!artifactResult.declaredFiles.has(relative)) invalid(`generated metadata file \`${relative}\` is not declared in files`);
-  const manifest = outputManifestWithMetadata(artifactResult.manifest, generated);
+  const publicBytes = await loadPublicFiles(options.publicDirectory ?? join(root, "public"), fsApi);
+  for (const relative of publicBytes.keys()) {
+    if (artifactResult.declaredFiles.has(relative)) invalid(`public file \`${relative}\` collides with a declared artifact file`);
+  }
+  for (const [relative, bytes] of generated) publicBytes.set(relative, bytes);
+  const manifest = outputManifestWithPublicFiles(artifactResult.manifest, publicBytes);
   const dist = resolve(distDirectory);
   const parent = dirname(dist);
   await fsApi.mkdir(parent, { recursive: true });
@@ -602,7 +627,7 @@ export async function packageArtifact(
   let activated = false;
   const serverFiles = new Set(artifactResult.manifest.routes.map((route) => route.serverModule));
   const clientBytes = new Map(artifactResult.bytesByPath);
-  for (const [relative, bytes] of generated) clientBytes.set(relative, bytes);
+  for (const [relative, bytes] of publicBytes) clientBytes.set(relative, bytes);
   try {
     const client = join(staging, "client");
     const server = join(staging, "server");
@@ -730,6 +755,10 @@ export function createSiteServer(distDirectory = join(root, "dist")) {
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const result = await packageArtifact();
-  const port = Number(process.env.PORT ?? 8788);
-  createSiteServer(result.dist).listen(port, "127.0.0.1", () => console.log(`Ferrite Sites adapter listening on 127.0.0.1:${port}`));
+  if (process.env.FERRITE_SITES_SERVE === "1") {
+    const port = Number(process.env.PORT ?? 8788);
+    createSiteServer(result.dist).listen(port, "127.0.0.1", () => console.log(`Ferrite Sites adapter listening on 127.0.0.1:${port}`));
+  } else {
+    console.log(`Ferrite Sites artifact packaged at ${result.dist}`);
+  }
 }

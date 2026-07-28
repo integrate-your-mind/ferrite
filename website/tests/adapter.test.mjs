@@ -70,7 +70,7 @@ function validManifest(files) {
       },
     ],
     files: fileRecords(files),
-    publicFiles: ["assets/app.0123456789.js", "blob.bin", "logo.svg", "robots.txt", "sitemap.xml"],
+    publicFiles: ["assets/app.0123456789.js", "blob.bin", "logo.svg", "robots.txt", "sitemap.xml"].filter((path) => Object.hasOwn(files, path)),
   };
   manifest.buildId = computeManifestBuildId(manifest);
   return manifest;
@@ -144,6 +144,32 @@ test("packages verified prerendered routes/assets and serves deep links without 
     } finally {
       await close(server);
     }
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("packages validated site public files when the Ferrite artifact does not enumerate them", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "ferrite-public-files-fixture-"));
+  try {
+    const artifactFiles = Object.fromEntries(Object.entries(fixtureFiles).filter(([path]) => !["logo.svg", "blob.bin", "robots.txt", "sitemap.xml"].includes(path)));
+    await writeFixture(join(fixture, "artifact"), { files: artifactFiles });
+    const publicDirectory = join(fixture, "public");
+    await mkdir(publicDirectory);
+    await writeFile(join(publicDirectory, "logo.svg"), fixtureFiles["logo.svg"]);
+    await writeFile(join(publicDirectory, "blob.bin"), fixtureFiles["blob.bin"]);
+    await writeFile(join(publicDirectory, "robots.txt"), "source template\n");
+    await writeFile(join(publicDirectory, "sitemap.xml"), "source template\n");
+
+    const result = await packageArtifact(join(fixture, "artifact"), join(fixture, "dist"), {
+      publicDirectory,
+      siteOrigin: "https://public.example.test",
+    });
+    assert.ok(result.manifest.publicFiles.includes("logo.svg"));
+    assert.ok(result.manifest.publicFiles.includes("robots.txt"));
+    assert.equal(await readFile(join(result.client, "logo.svg"), "utf8"), fixtureFiles["logo.svg"]);
+    assert.match(await readFile(join(result.client, "robots.txt"), "utf8"), /https:\/\/public\.example\.test\/sitemap\.xml/);
+    assert.doesNotMatch(await readFile(join(result.client, "robots.txt"), "utf8"), /source template/);
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }

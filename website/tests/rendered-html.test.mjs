@@ -23,7 +23,7 @@ test("route inventory and comparison series remain source-backed", async () => {
 test("deployment adapter preserves hosting identity and hardens responses", async () => {
   const adapter = await source("deploy-adapter.mjs"); const hosting = JSON.parse(await source(".openai/hosting.json"));
   assert.equal(hosting.project_id, "appgprj_6a5b984c7d4481919ec1cf6bbcbd55c8");
-  for (const required of ["sourceBuildId", "staging", "rollback", "size mismatch", "SHA-256 mismatch", "symlink/reparse", "404", "Cache-Control", "X-Content-Type-Options", "Content-Security-Policy", "GENERATED_SERVER_ENTRY"]) assert.match(adapter, new RegExp(required.replace(/[/.]/g, "\\$&")));
+  for (const required of ["sourceBuildId", "staging", "rollback", "size mismatch", "SHA-256 mismatch", "symlink/reparse", "404", "Cache-Control", "X-Content-Type-Options", "Content-Security-Policy", "GENERATED_SERVER_ENTRY", "FERRITE_SITES_SERVE"]) assert.match(adapter, new RegExp(required.replace(/[/.]/g, "\\$&")));
   assert.match(adapter, /join\(dist, "server", "index\.js"\)/);
   assert.match(adapter, /prerendered/); assert.match(adapter, /manifest\.files/); assert.match(adapter, /FERRITE_SITE_ORIGIN/); assert.match(adapter, /renderSitemap/); assert.match(adapter, /renderRobots/); assert.doesNotMatch(adapter, /home-page fallback|routes\.has\("\/"\)/i);
 });
