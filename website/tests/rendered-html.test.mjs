@@ -17,13 +17,14 @@ test("uses Ferrite app-directory contracts and shared document", async () => {
 
 test("route inventory and comparison series remain source-backed", async () => {
   for (const route of ["app/page.tsx", "app/docs/page.tsx", "app/docs/getting-started/page.tsx", "app/docs/architecture/page.tsx", "app/docs/limitations/page.tsx", "app/docs/deployment/page.tsx", "app/examples/page.tsx", "app/blog/page.tsx", "app/blog/tic-tac-toe/page.tsx", "app/blog/tic-tac-toe-3d/page.tsx", "app/compare/page.tsx", "app/compare/state-events/page.tsx", "app/compare/rendering-lifecycle/page.tsx", "app/compare/routing-data-build/page.tsx", "app/compare/migration-matrix/page.tsx", "app/compare/incompatibilities/page.tsx", "app/compare/codemod-boundary/page.tsx", "app/compare/when-to-stay/page.tsx"]) await access(file(route));
-  const home = await source("app/page.tsx"); assert.match(home, /8716f30/); assert.match(home, /local evidence/i); assert.doesNotMatch(home, /drop-in React/i);
+  const home = await source("app/page.tsx"); assert.match(home, /8716f30/); assert.match(home, /local evidence/i); assert.match(home, /No drop-in React claim/i);
 });
 
 test("deployment adapter preserves hosting identity and hardens responses", async () => {
   const adapter = await source("deploy-adapter.mjs"); const hosting = JSON.parse(await source(".openai/hosting.json"));
   assert.equal(hosting.project_id, "appgprj_6a5b984c7d4481919ec1cf6bbcbd55c8");
-  for (const required of ["dist/server/index.js", "dist/client", "dist/.openai/hosting.json", "sourceBuildId", "staging", "rollback", "size mismatch", "SHA-256 mismatch", "symlink/reparse", "404", "Cache-Control", "X-Content-Type-Options", "Content-Security-Policy"]) assert.match(adapter, new RegExp(required.replace(/[/.]/g, "\\$&")));
+  for (const required of ["sourceBuildId", "staging", "rollback", "size mismatch", "SHA-256 mismatch", "symlink/reparse", "404", "Cache-Control", "X-Content-Type-Options", "Content-Security-Policy", "GENERATED_SERVER_ENTRY"]) assert.match(adapter, new RegExp(required.replace(/[/.]/g, "\\$&")));
+  assert.match(adapter, /join\(dist, "server", "index\.js"\)/);
   assert.match(adapter, /prerendered/); assert.match(adapter, /manifest\.files/); assert.match(adapter, /FERRITE_SITE_ORIGIN/); assert.match(adapter, /renderSitemap/); assert.match(adapter, /renderRobots/); assert.doesNotMatch(adapter, /home-page fallback|routes\.has\("\/"\)/i);
 });
 
