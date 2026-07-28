@@ -342,7 +342,7 @@ packages() {
   run_gate website-test pnpm --dir website test
   run_gate website-package pnpm --dir website package:sites
   run_gate website-production-audit pnpm --dir website audit --prod --audit-level high
-  run_gate buildkite-pipeline ./.buildkite/scripts/upload-pipeline.sh --dry-run
+  run_gate buildkite-pipeline ./.buildkite/scripts/upload-pipeline.mjs --dry-run
   run_gate secret-scan gitleaks git --no-banner --redact
 }
 

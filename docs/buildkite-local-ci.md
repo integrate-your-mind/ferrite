@@ -42,12 +42,12 @@ artifacts from another toolchain.
 The Buildkite pipeline has six bounded, dependency-ordered commands:
 
 ```sh
-./.buildkite/scripts/ci.sh verify
-./.buildkite/scripts/ci.sh packages
-./.buildkite/scripts/ci.sh coverage-rust
-./.buildkite/scripts/ci.sh coverage-js
-./.buildkite/scripts/ci.sh native
-./.buildkite/scripts/ci.sh nginx
+./.buildkite/scripts/ci.mjs verify
+./.buildkite/scripts/ci.mjs packages
+./.buildkite/scripts/ci.mjs coverage-rust
+./.buildkite/scripts/ci.mjs coverage-js
+./.buildkite/scripts/ci.mjs native
+./.buildkite/scripts/ci.mjs nginx
 ```
 
 Each job starts from the agent's clean exact-commit checkout. Splitting the
@@ -121,6 +121,8 @@ hooks are not a trust boundary. Install reviewed copies outside the checkout:
 
 ```sh
 install -d -m 0755 /opt/homebrew/etc/buildkite-agent/ferrite-hooks
+install -m 0755 deploy/buildkite/hooks/pre-bootstrap \
+  /opt/homebrew/etc/buildkite-agent/ferrite-hooks/pre-bootstrap
 install -m 0755 deploy/buildkite/hooks/environment \
   /opt/homebrew/etc/buildkite-agent/ferrite-hooks/environment
 install -m 0755 deploy/buildkite/hooks/pre-command \
@@ -131,7 +133,10 @@ install -m 0755 deploy/buildkite/hooks/pre-exit \
 
 The external hooks:
 
-- allow only the Ferrite repository;
+- inspect the proposed job JSON from a non-Bash `pre-bootstrap` hook before
+  checkout, reject imported functions and other interpreter/toolchain
+  injection variables, and allow only the Ferrite repository, exact commands,
+  and operator-approved commit;
 - reject fork pull requests;
 - require the job SHA to equal an operator-approved SHA;
 - reject common application and registry credentials;
@@ -146,8 +151,10 @@ The external hooks:
   executed `PATH` (rustup proxies are copied into the per-build toolchain bin
   directory when the operator-installed toolchain is present);
 - allow only the pipeline upload and six proof-mode commands;
-- reject imported shell functions and clear interactive Git/SSH credential
-  helpers before project commands; and
+- recheck the exact command and dangerous environment variables from a
+  non-Bash `pre-command` hook; the Node CI entrypoint rejects imported
+  functions again, removes the other denied variables, and starts the internal
+  Bash runner with that sanitized environment; and
 - remove the exact exported per-build HOME from `TMPDIR` in the global
   `pre-exit` hook after validating its basename and path; cleanup is idempotent
   and fails closed for malformed or symlink paths; and
@@ -157,9 +164,12 @@ The external hooks:
   configuration.
 
 Buildkite's `no-command-eval` mode is intentionally not enabled because it
-rejects the argument-bearing proof-mode commands. The external `pre-command`
-hook is the exact command allowlist and must be installed before this queue is
-used.
+rejects the argument-bearing proof-mode commands. The external
+`pre-bootstrap` and `pre-command` hooks are the exact command allowlist and
+must both be installed before this queue is used. Buildkite Agent 3.127 runs
+these extensionless Node hooks as polyglot hooks; unlike shell hooks, their
+environment mutations would not propagate, so the repository Node entrypoint
+also sanitizes the environment before starting the internal Bash runner.
 
 The existing shared `default` queue and its global hooks are not suitable for
 Ferrite. Use the dedicated configuration and queue:
@@ -186,8 +196,12 @@ or a build artifact.
 
 The example allowlist keeps only the local toolchain, temporary-directory,
 locale, and approved-commit inputs. Buildkite's own job variables are
-permitted by the agent. Project commands clear the checkout credential plus
-`BASH_ENV`, `ENV`, `CDPATH`, `GIT_ASKPASS`, and `GIT_SSH_COMMAND`.
+permitted by the agent. The pre-bootstrap hook rejects imported Bash
+functions, interpreter startup variables, dynamic-loader variables, and Rust
+wrapper/flag overrides before any shell hook runs. A checkout-only Git/SSH
+helper is accepted only when it exactly matches the operator environment; both
+repository entrypoints remove those helpers before invoking project or
+Buildkite commands.
 
 The empty per-build locations and command allowlist are policy isolation, not a
 mechanical same-UID sandbox: code running as the agent account can still read
@@ -196,10 +210,10 @@ other jobs' data. A dedicated least-privilege OS account (and separate host or
 VM for hostile-code isolation) is required for that stronger boundary. This
 configuration does not claim to provide it.
 
-Install the reviewed `pre-exit` hook alongside the environment and pre-command
-hooks. It deletes only `FERRITE_BUILDKITE_BUILD_HOME` when that path is exactly
-under `TMPDIR` with a `ferrite-buildkite-home-*` basename; it never cleans a
-general temporary directory.
+Install the reviewed `pre-exit` hook alongside the pre-bootstrap, environment,
+and pre-command hooks. It deletes only `FERRITE_BUILDKITE_BUILD_HOME` when that
+path is exactly under `TMPDIR` with a `ferrite-buildkite-home-*` basename; it
+never cleans a general temporary directory.
 
 ## Buildkite pipeline settings
 
@@ -207,7 +221,7 @@ Creating or changing the Buildkite account pipeline is an external
 administrative action. Configure it separately with:
 
 - repository `git@github.com:integrate-your-mind/ferrite.git`;
-- bootstrap command `./.buildkite/scripts/upload-pipeline.sh`;
+- bootstrap command `./.buildkite/scripts/upload-pipeline.mjs`;
 - fork pull-request builds disabled;
 - no pipeline environment secrets; and
 - queue `ferrite-local` with `project=ferrite`, `os=darwin`, and `arch=arm64`.
@@ -222,19 +236,19 @@ The pipeline and its normal/failure/odd trust paths can be checked without
 connecting an agent:
 
 ```sh
-./.buildkite/scripts/upload-pipeline.sh --dry-run
+./.buildkite/scripts/upload-pipeline.mjs --dry-run
 node --test scripts/verify-buildkite.test.mjs
 ```
 
 Run individual stages for diagnosis:
 
 ```sh
-./.buildkite/scripts/ci.sh verify
-./.buildkite/scripts/ci.sh packages
-./.buildkite/scripts/ci.sh coverage-rust
-./.buildkite/scripts/ci.sh coverage-js
-./.buildkite/scripts/ci.sh native
-./.buildkite/scripts/ci.sh nginx
+./.buildkite/scripts/ci.mjs verify
+./.buildkite/scripts/ci.mjs packages
+./.buildkite/scripts/ci.mjs coverage-rust
+./.buildkite/scripts/ci.mjs coverage-js
+./.buildkite/scripts/ci.mjs native
+./.buildkite/scripts/ci.mjs nginx
 ```
 
 An individual local command is useful evidence, but only a Buildkite job tied

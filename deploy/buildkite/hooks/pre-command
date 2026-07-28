@@ -1,33 +1,45 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env node
 
-if [[ -n "$(builtin declare -Fx)" ]]; then
-  printf 'Ferrite Buildkite trust check: imported shell functions are not allowed\n' >&2
-  exit 1
-fi
+const allowedCommands = new Set([
+  "./.buildkite/scripts/upload-pipeline.mjs",
+  "./.buildkite/scripts/ci.mjs verify",
+  "./.buildkite/scripts/ci.mjs packages",
+  "./.buildkite/scripts/ci.mjs coverage-rust",
+  "./.buildkite/scripts/ci.mjs coverage-js",
+  "./.buildkite/scripts/ci.mjs native",
+  "./.buildkite/scripts/ci.mjs nginx",
+]);
+const deniedNames = new Set([
+  "BASH_ENV",
+  "CDPATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "ENV",
+  "GIT_CONFIG_COUNT",
+  "LD_PRELOAD",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "PERL5OPT",
+  "PYTHONPATH",
+  "RUBYOPT",
+  "RUSTC_WRAPPER",
+  "RUSTC_WORKSPACE_WRAPPER",
+  "RUSTDOCFLAGS",
+  "RUSTFLAGS",
+]);
 
-case "${BUILDKITE_COMMAND:-}" in
-  "./.buildkite/scripts/upload-pipeline.sh" | \
-  "./.buildkite/scripts/ci.sh verify" | \
-  "./.buildkite/scripts/ci.sh packages" | \
-  "./.buildkite/scripts/ci.sh coverage-rust" | \
-  "./.buildkite/scripts/ci.sh coverage-js" | \
-  "./.buildkite/scripts/ci.sh native" | \
-  "./.buildkite/scripts/ci.sh nginx")
-    ;;
-  *)
-    printf 'Ferrite Buildkite trust check: command is not allowlisted\n' >&2
-    exit 1
-    ;;
-esac
+function fail(message) {
+  process.stderr.write(`Ferrite Buildkite trust check: ${message}\n`);
+  process.exit(1);
+}
 
-# Checkout may need the agent account's read-only Git credential. The project
-# command does not; remove common interactive credential helpers before it runs.
-unset \
-  BASH_ENV \
-  CDPATH \
-  ENV \
-  GIT_ASKPASS \
-  GIT_SSH_COMMAND \
-  SSH_ASKPASS \
-  SSH_AUTH_SOCK
+const denied = Object.keys(process.env)
+  .filter((name) => name.startsWith("BASH_FUNC_") || deniedNames.has(name))
+  .sort();
+if (denied.length > 0) {
+  fail(`disallowed environment variable: ${denied[0]}`);
+}
+if (!allowedCommands.has(process.env.BUILDKITE_COMMAND)) {
+  fail("command is not allowlisted");
+}

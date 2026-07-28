@@ -15,10 +15,12 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 const pipelineUrl = new URL("../.buildkite/pipeline.yml", import.meta.url);
-const ciUrl = new URL("../.buildkite/scripts/ci.sh", import.meta.url);
-const uploadUrl = new URL("../.buildkite/scripts/upload-pipeline.sh", import.meta.url);
+const ciUrl = new URL("../.buildkite/scripts/ci.mjs", import.meta.url);
+const ciInternalUrl = new URL("../.buildkite/scripts/ci-internal.sh", import.meta.url);
+const uploadUrl = new URL("../.buildkite/scripts/upload-pipeline.mjs", import.meta.url);
 const configUrl = new URL("../deploy/buildkite/ferrite-agent.cfg.example", import.meta.url);
 const environmentHookUrl = new URL("../deploy/buildkite/hooks/environment", import.meta.url);
+const preBootstrapHookUrl = new URL("../deploy/buildkite/hooks/pre-bootstrap", import.meta.url);
 const preCommandHookUrl = new URL("../deploy/buildkite/hooks/pre-command", import.meta.url);
 const preExitHookUrl = new URL("../deploy/buildkite/hooks/pre-exit", import.meta.url);
 const workflowsUrl = new URL("../.github/workflows", import.meta.url);
@@ -75,7 +77,7 @@ test("Buildkite pipeline runs dependency-ordered clean-checkout gates on the ded
     const step = pipelineStep(source, key);
     assert.match(
       step,
-      new RegExp(`command: "\\./\\.buildkite/scripts/ci\\.sh ${mode}"`),
+      new RegExp(`command: "\\./\\.buildkite/scripts/ci\\.mjs ${mode}"`),
     );
     if (dependency) {
       assert.match(step, new RegExp(`depends_on: "${dependency}"`));
@@ -98,7 +100,7 @@ test("Buildkite pipeline runs dependency-ordered clean-checkout gates on the ded
     expectedKeys.length,
     "every pipeline step must be represented by a validated key",
   );
-  assert.doesNotMatch(source, /command: "\.\/\.buildkite\/scripts\/ci\.sh all"/);
+  assert.doesNotMatch(source, /command: "\.\/\.buildkite\/scripts\/ci\.mjs all"/);
   assert.match(source, /dist\/ci\/\*\*\/\*/);
   assert.doesNotMatch(source, /plugins:|deploy|publish|release/);
 });
@@ -127,7 +129,7 @@ test("bounded agent uptime covers the complete serial job timeout envelope", asy
 });
 
 test("local CI retains the host-executable validation gate categories", async () => {
-  const source = await readFile(ciUrl, "utf8");
+  const source = await readFile(ciInternalUrl, "utf8");
 
   for (const expected of [
     "pnpm lint",
@@ -148,7 +150,7 @@ test("local CI retains the host-executable validation gate categories", async ()
     "pnpm --dir website test",
     "pnpm --dir website package:sites",
     "pnpm --dir website audit --prod --audit-level high",
-    "./.buildkite/scripts/upload-pipeline.sh --dry-run",
+    "./.buildkite/scripts/upload-pipeline.mjs --dry-run",
     "gitleaks git --no-banner --redact",
   ]) {
     assert.match(source, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -255,6 +257,17 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
 });
 
+test("Node CI entrypoint rejects functions and sanitizes before Bash", async () => {
+  const source = await readFile(ciUrl, "utf8");
+
+  assert.match(source, /^#!\/usr\/bin\/env node/);
+  assert.match(source, /name\.startsWith\("BASH_FUNC_"\)/);
+  assert.match(source, /Object\.fromEntries/);
+  assert.match(source, /filter\(\(\[name\]\) => !isDeniedName\(name\)\)/);
+  assert.match(source, /spawnSync\("\/bin\/bash", \[script, mode\]/);
+  assert.match(source, /"ci-internal\.sh"/);
+});
+
 test("Rust toolchain activation fails closed instead of mixing a missing Clippy tool", async () => {
   const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-rust-toolchain-test-"));
   const shimBin = join(tempRoot, "shim-bin");
@@ -278,7 +291,7 @@ test("Rust toolchain activation fails closed instead of mixing a missing Clippy 
   try {
     const result = spawnSync(
       "/bin/bash",
-      ["-c", `source '${ciUrl.pathname}'; activate_rust_toolchain`],
+      ["-c", `source '${ciInternalUrl.pathname}'; activate_rust_toolchain`],
       {
         encoding: "utf8",
         env: {
@@ -322,17 +335,22 @@ test("Rust toolchain activation rejects imported shell functions", () => {
     0,
     `imported rustup function unexpectedly passed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
   );
-  assert.match(result.stderr, /imported shell functions are not allowed/);
+  assert.match(result.stderr, /disallowed environment variable: BASH_FUNC_rustup/);
 });
 
 test("pipeline upload rejects embedded secrets", async () => {
   const source = await readFile(uploadUrl, "utf8");
 
-  assert.match(source, /pipeline upload/);
+  assert.match(source, /"pipeline",\s+"upload",/);
   assert.match(source, /--reject-secrets/);
   assert.match(source, /Buildkite Agent 3\.127\.x is required/);
-  assert.match(source, /--dry-run --format yaml --agent-access-token local-validation-only/);
-  assert.match(source, /\.buildkite\/pipeline\.yml/);
+  assert.match(
+    source,
+    /"--dry-run",\s+"--format",\s+"yaml",\s+"--agent-access-token",\s+"local-validation-only",/,
+  );
+  assert.match(source, /join\(root, "\.buildkite", "pipeline\.yml"\)/);
+  assert.match(source, /Object\.fromEntries/);
+  assert.match(source, /filter\(\(\[name\]\) => !isDeniedName\(name\)\)/);
 });
 
 test("dedicated agent configuration disables plugins and local hooks", async () => {
@@ -470,7 +488,7 @@ test("external environment hook accepts only the approved Ferrite commit", async
 test("external command hook rejects arbitrary commands", async () => {
   assert.equal(
     runHook(preCommandHookUrl, {
-      BUILDKITE_COMMAND: "./.buildkite/scripts/upload-pipeline.sh",
+      BUILDKITE_COMMAND: "./.buildkite/scripts/upload-pipeline.mjs",
     }).status,
     0,
   );
@@ -484,20 +502,20 @@ test("external command hook rejects arbitrary commands", async () => {
   ]) {
     assert.equal(
       runHook(preCommandHookUrl, {
-        BUILDKITE_COMMAND: `./.buildkite/scripts/ci.sh ${mode}`,
+        BUILDKITE_COMMAND: `./.buildkite/scripts/ci.mjs ${mode}`,
       }).status,
       0,
     );
   }
   assert.notEqual(
     runHook(preCommandHookUrl, {
-      BUILDKITE_COMMAND: "./.buildkite/scripts/ci.sh coverage",
+      BUILDKITE_COMMAND: "./.buildkite/scripts/ci.mjs coverage",
     }).status,
     0,
   );
   assert.notEqual(
     runHook(preCommandHookUrl, {
-      BUILDKITE_COMMAND: "./.buildkite/scripts/ci.sh all",
+      BUILDKITE_COMMAND: "./.buildkite/scripts/ci.mjs all",
     }).status,
     0,
   );
@@ -508,26 +526,131 @@ test("external command hook rejects arbitrary commands", async () => {
     0,
   );
   const importedFunction = runHook(preCommandHookUrl, {
-    BUILDKITE_COMMAND: "./.buildkite/scripts/ci.sh verify",
+    BUILDKITE_COMMAND: "./.buildkite/scripts/ci.mjs verify",
     "BASH_FUNC_rustup%%": '() { printf "%s\\n" "/tmp/rustup"; }',
   });
   assert.notEqual(importedFunction.status, 0);
   assert.match(
     importedFunction.stderr,
-    /imported shell functions are not allowed/,
+    /disallowed environment variable: BASH_FUNC_rustup/,
+  );
+  const shadowedGuard = runHook(preCommandHookUrl, {
+    BUILDKITE_COMMAND: "./.buildkite/scripts/ci.mjs verify",
+    "BASH_FUNC_builtin%%": "() { :; }",
+    "BASH_FUNC_rustup%%": "() { :; }",
+  });
+  assert.notEqual(
+    shadowedGuard.status,
+    0,
+    "an imported builtin function must not suppress the command hook guard",
   );
 
   const source = await readFile(preCommandHookUrl, "utf8");
+  for (const name of ["BASH_ENV", "CDPATH", "ENV", "NODE_OPTIONS"]) {
+    assert.match(source, new RegExp(name));
+  }
+  const [ciEntry, uploadEntry] = await Promise.all([
+    readFile(ciUrl, "utf8"),
+    readFile(uploadUrl, "utf8"),
+  ]);
   for (const name of [
-    "BASH_ENV",
-    "CDPATH",
-    "ENV",
     "GIT_ASKPASS",
     "GIT_SSH_COMMAND",
     "SSH_ASKPASS",
     "SSH_AUTH_SOCK",
   ]) {
-    assert.match(source, new RegExp(name));
+    assert.match(ciEntry, new RegExp(name));
+    assert.match(uploadEntry, new RegExp(name));
+  }
+});
+
+test("trusted pre-bootstrap rejects tainted job input before shell hooks run", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-pre-bootstrap-test-"));
+  const environmentPath = join(tempRoot, "job-environment.json");
+  const approved = "a".repeat(40);
+  const base = {
+    BUILDKITE_COMMAND: "./.buildkite/scripts/ci.mjs verify",
+    BUILDKITE_COMMIT: approved,
+    BUILDKITE_PULL_REQUEST_REPO:
+      "https://github.com/integrate-your-mind/ferrite",
+    BUILDKITE_REPO: "git@github.com:integrate-your-mind/ferrite.git",
+  };
+
+  try {
+    await writeFile(environmentPath, JSON.stringify(base));
+    assert.equal(
+      runHook(preBootstrapHookUrl, {
+        BUILDKITE_ENV_JSON_FILE: environmentPath,
+        FERRITE_BUILDKITE_APPROVED_COMMIT: approved,
+      }).status,
+      0,
+    );
+
+    await writeFile(
+      environmentPath,
+      JSON.stringify({
+        ...base,
+        SSH_AUTH_SOCK: "/tmp/operator-ssh-agent",
+      }),
+    );
+    assert.equal(
+      runHook(preBootstrapHookUrl, {
+        BUILDKITE_ENV_JSON_FILE: environmentPath,
+        FERRITE_BUILDKITE_APPROVED_COMMIT: approved,
+        SSH_AUTH_SOCK: "/tmp/operator-ssh-agent",
+      }).status,
+      0,
+    );
+    assert.notEqual(
+      runHook(preBootstrapHookUrl, {
+        BUILDKITE_ENV_JSON_FILE: environmentPath,
+        FERRITE_BUILDKITE_APPROVED_COMMIT: approved,
+        SSH_AUTH_SOCK: "/tmp/different-ssh-agent",
+      }).status,
+      0,
+    );
+
+    await writeFile(
+      environmentPath,
+      JSON.stringify({
+        ...base,
+        "BASH_FUNC_builtin%%": "() { :; }",
+      }),
+    );
+    const importedFunction = runHook(preBootstrapHookUrl, {
+      BUILDKITE_ENV_JSON_FILE: environmentPath,
+      FERRITE_BUILDKITE_APPROVED_COMMIT: approved,
+    });
+    assert.notEqual(importedFunction.status, 0);
+    assert.match(
+      importedFunction.stderr,
+      /disallowed job environment variable/,
+    );
+
+    for (const changed of [
+      { BUILDKITE_COMMAND: "./.buildkite/scripts/ci.mjs all" },
+      { BUILDKITE_COMMIT: "b".repeat(40) },
+      { BUILDKITE_PULL_REQUEST_REPO: "https://github.com/someone/other" },
+      { NODE_OPTIONS: "--require=/tmp/untrusted.cjs" },
+      { NPM_TOKEN: "fixture-value" },
+    ]) {
+      await writeFile(
+        environmentPath,
+        JSON.stringify({
+          ...base,
+          ...changed,
+        }),
+      );
+      assert.notEqual(
+        runHook(preBootstrapHookUrl, {
+          BUILDKITE_ENV_JSON_FILE: environmentPath,
+          FERRITE_BUILDKITE_APPROVED_COMMIT: approved,
+        }).status,
+        0,
+      );
+    }
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
   }
 });
 
@@ -552,7 +675,7 @@ test("run_gate fails closed when the child or tee fails", async () => {
   const invoke = (body, env = {}) =>
     spawnSync(
       "/bin/bash",
-      ["-c", `cd '${workspace}'; source '${ciUrl.pathname}'; mkdir -p "$REPORT_DIR"; : > "$REPORT_DIR/results.tsv"; ${body}`],
+      ["-c", `cd '${workspace}'; source '${ciInternalUrl.pathname}'; mkdir -p "$REPORT_DIR"; : > "$REPORT_DIR/results.tsv"; ${body}`],
       { encoding: "utf8", env: { HOME: process.env.HOME, PATH: process.env.PATH, FERRITE_CI_REPORT_DIR: reportRoot, ...env } },
     );
   try {
@@ -574,7 +697,7 @@ test("run_gate fails closed when the child or tee fails", async () => {
 });
 
 test("run_gate captures command output before replaying it", async () => {
-  const source = await readFile(ciUrl, "utf8");
+  const source = await readFile(ciInternalUrl, "utf8");
   assert.match(source, /"\$@" >"\$\{log\}" 2>&1/);
   assert.match(source, /"\$\{TEE_BIN\}" -a \/dev\/null < "\$\{log\}"/);
   assert.doesNotMatch(source, /"\$@" 2>&1 \| "\$\{TEE_BIN\}"/);
@@ -585,7 +708,7 @@ test("coverage floors accept valid reports and reject empty, malformed, and unde
   const invoke = (body) =>
     spawnSync(
       "/bin/bash",
-      ["-c", `source '${ciUrl.pathname}'; mkdir -p "$REPORT_DIR"; ${body}`],
+      ["-c", `source '${ciInternalUrl.pathname}'; mkdir -p "$REPORT_DIR"; ${body}`],
       { encoding: "utf8", env: { HOME: process.env.HOME, PATH: process.env.PATH, FERRITE_CI_REPORT_DIR: tempRoot } },
     );
   try {
@@ -674,7 +797,15 @@ test("GitHub Actions workflows are removed from the active CI path", async () =>
 });
 
 test("Buildkite scripts and hook templates are executable", async () => {
-  for (const url of [ciUrl, uploadUrl, environmentHookUrl, preCommandHookUrl, preExitHookUrl]) {
+  for (const url of [
+    ciUrl,
+    ciInternalUrl,
+    uploadUrl,
+    environmentHookUrl,
+    preBootstrapHookUrl,
+    preCommandHookUrl,
+    preExitHookUrl,
+  ]) {
     await access(url);
     const metadata = await stat(url);
     assert.notEqual(metadata.mode & 0o111, 0);

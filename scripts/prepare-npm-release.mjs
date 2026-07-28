@@ -154,7 +154,7 @@ export async function verifyBuildkiteReport({
   if (
     !job ||
     job.step_key !== "ferrite-packages" ||
-    job.command !== "./.buildkite/scripts/ci.sh packages" ||
+    job.command !== "./.buildkite/scripts/ci.mjs packages" ||
     job.state !== "passed" ||
     job.exit_status !== 0
   ) {

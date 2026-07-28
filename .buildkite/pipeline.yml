@@ -1,7 +1,7 @@
 steps:
   - label: "Ferrite verify"
     key: "ferrite-verify"
-    command: "./.buildkite/scripts/ci.sh verify"
+    command: "./.buildkite/scripts/ci.mjs verify"
     agents:
       queue: "ferrite-local"
       project: "ferrite"
@@ -14,7 +14,7 @@ steps:
 
   - label: "Ferrite packages"
     key: "ferrite-packages"
-    command: "./.buildkite/scripts/ci.sh packages"
+    command: "./.buildkite/scripts/ci.mjs packages"
     depends_on: "ferrite-verify"
     agents:
       queue: "ferrite-local"
@@ -28,7 +28,7 @@ steps:
 
   - label: "Ferrite Rust coverage"
     key: "ferrite-coverage-rust"
-    command: "./.buildkite/scripts/ci.sh coverage-rust"
+    command: "./.buildkite/scripts/ci.mjs coverage-rust"
     depends_on: "ferrite-packages"
     agents:
       queue: "ferrite-local"
@@ -42,7 +42,7 @@ steps:
 
   - label: "Ferrite JavaScript coverage"
     key: "ferrite-coverage-js"
-    command: "./.buildkite/scripts/ci.sh coverage-js"
+    command: "./.buildkite/scripts/ci.mjs coverage-js"
     depends_on: "ferrite-coverage-rust"
     agents:
       queue: "ferrite-local"
@@ -56,7 +56,7 @@ steps:
 
   - label: "Ferrite native"
     key: "ferrite-native"
-    command: "./.buildkite/scripts/ci.sh native"
+    command: "./.buildkite/scripts/ci.mjs native"
     depends_on: "ferrite-coverage-js"
     agents:
       queue: "ferrite-local"
@@ -70,7 +70,7 @@ steps:
 
   - label: "Ferrite nginx"
     key: "ferrite-nginx"
-    command: "./.buildkite/scripts/ci.sh nginx"
+    command: "./.buildkite/scripts/ci.mjs nginx"
     depends_on: "ferrite-native"
     agents:
       queue: "ferrite-local"

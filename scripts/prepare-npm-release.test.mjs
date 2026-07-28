@@ -230,7 +230,7 @@ test("rejects a report that names the wrong Buildkite package job", async () => 
   await withReport(async ({ reportPath, report }) => {
     await writeReport(reportPath, report);
     const evidence = await buildkiteEvidence(reportPath, report, {
-      job: { command: "./.buildkite/scripts/ci.sh verify" },
+      job: { command: "./.buildkite/scripts/ci.mjs verify" },
     });
 
     await assert.rejects(
@@ -411,7 +411,7 @@ test("rejects unsafe report artifact paths before reading Buildkite-bound files"
             jobs: [{
               id: build.jobId,
               step_key: "ferrite-packages",
-              command: "./.buildkite/scripts/ci.sh packages",
+              command: "./.buildkite/scripts/ci.mjs packages",
               state: "passed",
               exit_status: 0,
             }],
@@ -498,7 +498,7 @@ async function buildkiteEvidence(
       {
         id: build.jobId,
         step_key: "ferrite-packages",
-        command: "./.buildkite/scripts/ci.sh packages",
+        command: "./.buildkite/scripts/ci.mjs packages",
         state: "passed",
         exit_status: 0,
         ...jobOverrides,
