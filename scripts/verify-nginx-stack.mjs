@@ -92,6 +92,16 @@ export const renderProofNginxConfig = (template, upstreamAlias = "ferrite-upstre
   )}`;
 };
 
+export const renderMissingCertificateControlConfig = (template) => {
+  const rendered = renderProofNginxConfig(template);
+  const networkUpstream = "proxy_pass http://ferrite-upstream:3000;";
+  const replacements = rendered.split(networkUpstream).length - 1;
+  if (replacements !== 1) {
+    throw new Error("nginx missing-certificate control requires one proof upstream");
+  }
+  return rendered.replace(networkUpstream, "proxy_pass http://127.0.0.1:3000;");
+};
+
 export const parseDockerPublishedPort = (output) => {
   const lines = output.trim().split(/\r?\n/).filter(Boolean);
   if (lines.length !== 1) {
@@ -112,7 +122,12 @@ export const assertExpectedFailure = (result, label, pattern) => {
   assert.notEqual(result.code, 0, `${label} unexpectedly succeeded`);
   assert.equal(result.timedOut, false, `${label} exceeded its outer process deadline`);
   const output = `${result.stdout}\n${result.stderr}`;
-  assert.match(output, pattern, `${label} failed for an unexpected reason`);
+  const diagnostic = output.length > 4_096 ? output.slice(-4_096) : output;
+  assert.match(
+    output,
+    pattern,
+    `${label} failed for an unexpected reason:\n${diagnostic}`,
+  );
 };
 
 export const assertProofSourceState = (sourceClean, dirtyOverride) => {
@@ -596,6 +611,7 @@ const main = async () => {
     const certificateDirectory = join(scratch, "certificate");
     const missingCertificateDirectory = join(scratch, "missing-certificate");
     const nginxConfigPath = join(scratch, "default.conf");
+    const missingCertificateConfigPath = join(scratch, "missing-certificate.conf");
     const accessLogPath = join(scratch, "ferrite.log");
     await mkdir(certificateDirectory);
     await mkdir(missingCertificateDirectory);
@@ -628,6 +644,10 @@ const main = async () => {
 
     const template = await readFile(proofInputs.nginxTemplate, "utf8");
     await writeFile(nginxConfigPath, renderProofNginxConfig(template));
+    await writeFile(
+      missingCertificateConfigPath,
+      renderMissingCertificateControlConfig(template),
+    );
     assertCommandSucceeded(
       await runCommand("openssl", [
         "req",
@@ -780,7 +800,8 @@ const main = async () => {
       missingCertCheck,
       "--network",
       networkName,
-      ...commonNginxMounts,
+      "--volume",
+      `${missingCertificateConfigPath}:/etc/nginx/conf.d/default.conf:ro`,
       "--volume",
       `${missingCertificateDirectory}:/etc/letsencrypt/live/app.example.com:ro`,
       NGINX_IMAGE,

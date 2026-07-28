@@ -22,6 +22,7 @@ import {
   createProofInterruption,
   formatProofError,
   parseDockerPublishedPort,
+  renderMissingCertificateControlConfig,
   renderProofNginxConfig,
   resolveProofInputPaths,
 } from "./verify-nginx-stack.mjs";
@@ -64,6 +65,14 @@ test("nginx proof config replaces one validated upstream without shell interpola
     () => renderProofNginxConfig(template, "upstream;return-200"),
     /unsupported characters/,
   );
+});
+
+test("missing-certificate control does not depend on proof-network DNS", () => {
+  const template = "server { proxy_pass http://127.0.0.1:3000; }";
+  const rendered = renderMissingCertificateControlConfig(template);
+  assert.match(rendered, /proxy_pass http:\/\/127\.0\.0\.1:3000/);
+  assert.doesNotMatch(rendered, /ferrite-upstream/);
+  assert.match(rendered, /log_format ferrite_proof escape=json/);
 });
 
 test("nginx proof accepts only one loopback Docker port mapping", () => {
@@ -271,7 +280,7 @@ test("expected-failure controls reject success, outer timeout, and wrong failure
         "TLS control",
         /certificate rejected/,
       ),
-    /unexpected reason/,
+    /unexpected reason:\n\nconnection refused/,
   );
 });
 
