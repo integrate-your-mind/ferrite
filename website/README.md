@@ -24,8 +24,9 @@ a local link to `../packages/runtime`, so this command must be run from this
 directory with the Ferrite source checkout present. The runtime's workspace
 protocol dependencies are resolved by the source checkout's pnpm store.
 
-Ferrite compiles and SSRs the app. The current project is a developer preview;
-there is no managed public-production endpoint or registry-only starter claim.
+Ferrite supports request-time server rendering, browser mounting and hydration,
+and build-time prerendering. The current project is a developer preview; there
+is no registry-only starter claim.
 Set `FERRITE_SITE_ORIGIN` to the verified HTTP(S) production origin at build
 time to bind canonical, Open Graph, Twitter, robots, and sitemap URLs. The value
 is origin-only; credentials, paths, queries, and fragments are rejected. The
@@ -39,7 +40,7 @@ After a Ferrite artifact exists, `pnpm run package:sites` invokes
 `_ferrite/static` bundle, and public asset (while keeping server modules out of
 the public tree) into the Sites shape:
 
-- `dist/server/index.js` — generated immutable-output adapter entry
+- `dist/server/index.js` — generated Node-compatible immutable-output adapter entry
 - `dist/client` — browser bundles and public assets
 - `dist/.openai/hosting.json` — unchanged project ID from `.openai/hosting.json`
 
@@ -49,6 +50,10 @@ the Sites directory transactionally with rollback. It serves generated deep
 links, returns a real 404 for unknown paths, and adds conservative
 cache/security headers with no request-body or query logging. The plain adapter
 only serves immutable output; it does not compile Ferrite source.
+
+The Cloudflare-hosted project site uses the verified prerendered HTML and browser
+assets. It does not run Ferrite's native HTTP listener or request-time SSR inside
+a Worker. A future request-time edge mode needs a dedicated fetch-based adapter.
 
 The generated `sourceBuildId` is the verified Ferrite artifact-content identity,
 not a Git commit or tree identity. Exact-source claims must also cite an external

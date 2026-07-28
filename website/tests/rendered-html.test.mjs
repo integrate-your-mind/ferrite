@@ -17,7 +17,13 @@ test("uses Ferrite app-directory contracts and shared document", async () => {
 
 test("route inventory and comparison series remain source-backed", async () => {
   for (const route of ["app/page.tsx", "app/docs/page.tsx", "app/docs/getting-started/page.tsx", "app/docs/architecture/page.tsx", "app/docs/limitations/page.tsx", "app/docs/deployment/page.tsx", "app/examples/page.tsx", "app/blog/page.tsx", "app/blog/tic-tac-toe/page.tsx", "app/blog/tic-tac-toe-3d/page.tsx", "app/compare/page.tsx", "app/compare/state-events/page.tsx", "app/compare/rendering-lifecycle/page.tsx", "app/compare/routing-data-build/page.tsx", "app/compare/migration-matrix/page.tsx", "app/compare/incompatibilities/page.tsx", "app/compare/codemod-boundary/page.tsx", "app/compare/when-to-stay/page.tsx"]) await access(file(route));
-  const home = await source("app/page.tsx"); assert.match(home, /8716f30/); assert.match(home, /local evidence/i); assert.match(home, /No drop-in React claim/i);
+  const [home, architecture, deployment, readme] = await Promise.all([source("app/page.tsx"), source("app/docs/architecture/page.tsx"), source("app/docs/deployment/page.tsx"), source("README.md")]);
+  assert.match(home, /8716f30/); assert.match(home, /local evidence/i); assert.match(home, /No drop-in React claim/i);
+  for (const renderingMode of [/server-side rendering/i, /client-side rendering/i, /static site generation/i]) assert.match(home, renderingMode);
+  for (const renderingMode of [/request-time server rendering/i, /browser mounting and hydration/i, /prerendered static delivery/i]) assert.match(architecture, renderingMode);
+  assert.match(deployment, /does not execute Ferrite's native listener or request-time renderer inside a Worker/i);
+  assert.match(readme, /dedicated fetch-based adapter/i);
+  for (const content of [home, architecture, deployment, readme]) assert.doesNotMatch(content, /plain Worker adapter/i);
 });
 
 test("deployment adapter preserves hosting identity and hardens responses", async () => {
