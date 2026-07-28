@@ -54,6 +54,8 @@ Bind every receipt to the exact candidate commit and tree.
   Prior outputs are renamed into a same-directory `.previous-report-*` backup
   so replacement stays on one filesystem. Any backup left by an interrupted
   verifier blocks regeneration until an operator preserves and reconciles it.
+  If either backup rename fails, the verifier restores only outputs it already
+  moved and never removes an original that was not backed up.
   An atomic same-directory `.verification-lock` serializes the final source
   checks, replacement, rollback, and cleanup. A concurrent verifier fails
   closed, and a lock left by an interrupted verifier is preserved and blocks

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
@@ -188,6 +188,56 @@ test("concurrent report verifiers fail closed instead of interleaving output", a
     releaseInstalls?.();
     releaseWinner?.();
     await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("backup rename failures preserve all prior release evidence", async (t) => {
+  for (const { failureAt, label } of [
+    { failureAt: 1, label: "first backup rename" },
+    { failureAt: 2, label: "second backup rename" },
+  ]) {
+    await t.test(label, async () => {
+      const root = await mkdtemp(join(tmpdir(), "ferrite-npm-backup-failure-"));
+      const reportDir = join(root, "reports");
+      const reportPath = join(reportDir, "npm-package-report.json");
+      const tarballPath = join(reportDir, "tarballs", "prior.tgz");
+      const priorReport = "prior report bytes\n";
+      const priorTarball = Buffer.from("prior tarball bytes\n");
+      let renameCalls = 0;
+      try {
+        await mkdir(dirname(tarballPath), { recursive: true });
+        await writeFile(reportPath, priorReport);
+        await writeFile(tarballPath, priorTarball);
+        await assert.rejects(
+          verifyNpmPackages({
+            ...testReportIdentity,
+            releasePackages: [],
+            workspaceRoot: root,
+            reportDir,
+            runCommand: async () => {},
+            installPackageSet: async () => {},
+            renamePath: async (source, destination) => {
+              renameCalls += 1;
+              if (renameCalls === failureAt) {
+                const error = new Error(`injected ${label} failure`);
+                error.code = "EIO";
+                throw error;
+              }
+              await rename(source, destination);
+            },
+          }),
+          new RegExp(`injected ${label} failure`),
+        );
+        assert.equal(await readFile(reportPath, "utf8"), priorReport);
+        assert.deepEqual(await readFile(tarballPath), priorTarball);
+        assert.doesNotMatch(
+          (await readdir(reportDir)).join("\n"),
+          /^\.verification-lock$|^\.previous-report-/m,
+        );
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    });
   }
 });
 

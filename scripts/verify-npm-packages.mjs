@@ -173,6 +173,7 @@ export async function verifyNpmPackages({
   packNativePackage = npmPackPackage,
   prepareNativePackage = packCurrentNativePrebuild,
   installPackageSet = installPackedPackageSet,
+  renamePath = rename,
   sourceIdentity,
   buildIdentity,
   readSourceIdentity,
@@ -304,11 +305,22 @@ export async function verifyNpmPackages({
         const tarballPath = join(packageReportDir, "tarballs");
         const backupReportPath = join(backupRoot, "npm-package-report.json");
         const backupTarballPath = join(backupRoot, "tarballs");
-        let backedReport = false;
-        let backedTarballs = false;
+        let backedReport;
+        let backedTarballs;
         try {
-          backedReport = await moveIfPresent(reportPath, backupReportPath);
-          backedTarballs = await moveIfPresent(tarballPath, backupTarballPath);
+          ({ backedReport, backedTarballs } = await acquireReportBackups({
+            backupReportPath,
+            backupRoot,
+            backupTarballPath,
+            renamePath,
+            reportPath,
+            tarballPath,
+          }));
+        } catch (error) {
+          if (error instanceof AggregateError) preserveStageRoot = true;
+          throw error;
+        }
+        try {
           await rm(reportPath, { force: true });
           await rm(tarballPath, { force: true, recursive: true });
           await mkdir(packageReportDir, { recursive: true });
@@ -334,12 +346,12 @@ export async function verifyNpmPackages({
             rollbackErrors.push(rollbackError);
           });
           if (backedReport) {
-            await rename(backupReportPath, reportPath).catch((rollbackError) => {
+            await renamePath(backupReportPath, reportPath).catch((rollbackError) => {
               rollbackErrors.push(rollbackError);
             });
           }
           if (backedTarballs) {
-            await rename(backupTarballPath, tarballPath).catch((rollbackError) => {
+            await renamePath(backupTarballPath, tarballPath).catch((rollbackError) => {
               rollbackErrors.push(rollbackError);
             });
           }
@@ -453,9 +465,48 @@ function verificationLockError(lockPath, cause) {
   );
 }
 
-async function moveIfPresent(source, destination) {
+async function acquireReportBackups({
+  backupReportPath,
+  backupRoot,
+  backupTarballPath,
+  renamePath,
+  reportPath,
+  tarballPath,
+}) {
+  let backedReport = false;
+  let backedTarballs = false;
   try {
-    await rename(source, destination);
+    backedReport = await moveIfPresent(reportPath, backupReportPath, renamePath);
+    backedTarballs = await moveIfPresent(tarballPath, backupTarballPath, renamePath);
+    return { backedReport, backedTarballs };
+  } catch (error) {
+    const recoveryErrors = [];
+    if (backedReport) {
+      await renamePath(backupReportPath, reportPath).catch((recoveryError) => {
+        recoveryErrors.push(recoveryError);
+      });
+    }
+    if (backedTarballs) {
+      await renamePath(backupTarballPath, tarballPath).catch((recoveryError) => {
+        recoveryErrors.push(recoveryError);
+      });
+    }
+    await rmdir(backupRoot).catch((recoveryError) => {
+      recoveryErrors.push(recoveryError);
+    });
+    if (recoveryErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...recoveryErrors],
+        `npm package backup acquisition failed and prior output restoration was incomplete; inspect preserved backup ${backupRoot}.`,
+      );
+    }
+    throw error;
+  }
+}
+
+async function moveIfPresent(source, destination, renamePath = rename) {
+  try {
+    await renamePath(source, destination);
     return true;
   } catch (error) {
     if (error?.code === "ENOENT") return false;
