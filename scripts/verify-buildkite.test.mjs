@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   access,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -384,23 +385,41 @@ test("external command hook rejects arbitrary commands", async () => {
 
 test("run_gate fails closed when the child or tee fails", async () => {
   const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-run-gate-test-"));
+  const workspace = join(tempRoot, "workspace");
+  const reportRoot = join(tempRoot, "reports");
   const teePath = join(tempRoot, "tee-fails");
+  await mkdir(workspace);
+  await writeFile(join(workspace, "Cargo.lock"), "# test lockfile\n");
+  for (const args of [
+    ["init", "--quiet"],
+    ["config", "user.email", "ferrite-test@example.invalid"],
+    ["config", "user.name", "Ferrite Test"],
+    ["add", "Cargo.lock"],
+    ["commit", "--quiet", "-m", "test fixture"],
+  ]) {
+    const result = spawnSync("git", args, { cwd: workspace, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  }
   await writeFile(teePath, "#!/bin/sh\nexit 19\n", { mode: 0o755 });
   const invoke = (body, env = {}) =>
     spawnSync(
       "/bin/bash",
-      ["-c", `source '${ciUrl.pathname}'; mkdir -p "$REPORT_DIR"; : > "$REPORT_DIR/results.tsv"; ${body}`],
-      { encoding: "utf8", env: { HOME: process.env.HOME, PATH: process.env.PATH, FERRITE_CI_REPORT_DIR: tempRoot, ...env } },
+      ["-c", `cd '${workspace}'; source '${ciUrl.pathname}'; mkdir -p "$REPORT_DIR"; : > "$REPORT_DIR/results.tsv"; ${body}`],
+      { encoding: "utf8", env: { HOME: process.env.HOME, PATH: process.env.PATH, FERRITE_CI_REPORT_DIR: reportRoot, ...env } },
     );
   try {
+    const success = invoke("run_gate preserves-log /bin/echo captured-output");
+    assert.equal(success.status, 0, success.stderr);
+    assert.match(success.stdout, /captured-output/);
+    assert.equal(await readFile(join(reportRoot, "preserves-log.log"), "utf8"), "captured-output\n");
     const child = invoke("run_gate child-fails /bin/sh -c 'exit 7'");
     assert.equal(child.status, 7, child.stderr);
-    assert.match(await readFile(join(tempRoot, "results.tsv"), "utf8"), /child-fails\t7/);
-    assert.match(await readFile(join(tempRoot, "child-fails.source"), "utf8"), /end_commit=/);
+    assert.match(await readFile(join(reportRoot, "results.tsv"), "utf8"), /child-fails\t7/);
+    assert.match(await readFile(join(reportRoot, "child-fails.source"), "utf8"), /end_commit=/);
     const tee = invoke("run_gate tee-fails /bin/echo ok", { TEE_BIN: teePath });
     assert.equal(tee.status, 19, tee.stderr);
-    assert.match(await readFile(join(tempRoot, "results.tsv"), "utf8"), /tee-fails\t19/);
-    assert.match(await readFile(join(tempRoot, "tee-fails.source"), "utf8"), /integrity_status=/);
+    assert.match(await readFile(join(reportRoot, "results.tsv"), "utf8"), /tee-fails\t19/);
+    assert.match(await readFile(join(reportRoot, "tee-fails.source"), "utf8"), /integrity_status=/);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
@@ -409,7 +428,7 @@ test("run_gate fails closed when the child or tee fails", async () => {
 test("run_gate captures command output before replaying it", async () => {
   const source = await readFile(ciUrl, "utf8");
   assert.match(source, /"\$@" >"\$\{log\}" 2>&1/);
-  assert.match(source, /"\$\{TEE_BIN\}" "\$\{log\}"/);
+  assert.match(source, /"\$\{TEE_BIN\}" -a \/dev\/null < "\$\{log\}"/);
   assert.doesNotMatch(source, /"\$@" 2>&1 \| "\$\{TEE_BIN\}"/);
 });
 

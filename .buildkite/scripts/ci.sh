@@ -51,7 +51,7 @@ run_gate() {
   set +e
   "$@" >"${log}" 2>&1
   child_status="$?"
-  "${TEE_BIN}" "${log}"
+  "${TEE_BIN}" -a /dev/null < "${log}"
   tee_status="$?"
   set -e
 
