@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { argv, cwd, env, exit } from "node:process";
@@ -175,15 +175,22 @@ export async function verifyNpmPackages({
   installPackageSet = installPackedPackageSet,
   sourceIdentity,
   buildIdentity,
+  readSourceIdentity,
 } = {}) {
   const packageVerifier = packPackage ?? npmPackPackage;
   const packageVersions = new Map();
   const manifests = new Map();
   const results = [];
   const installablePackages = [];
+  const sourceReader = readSourceIdentity ?? (sourceIdentity ? null : readGitIdentity);
+  const capturedSource = sourceIdentity ?? await sourceReader(packageWorkspaceRoot);
   const stageRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-stage-"));
+  let preserveStageRoot = false;
 
   try {
+    if (writeReports) {
+      await refusePublicationReceipt(packageReportDir);
+    }
     for (const config of releasePackages) {
       const sourceManifest =
         packageManifests?.get(config.name) ??
@@ -269,21 +276,118 @@ export async function verifyNpmPackages({
     await installPackageSet(installablePackages, { runCommand });
 
     if (writeReports) {
-      await rm(packageReportDir, { force: true, recursive: true });
-      await mkdir(packageReportDir, { recursive: true });
-      await persistVerifiedTarballs(results, installablePackages, packageReportDir);
-      const report = createPackageReport({
-        packages: results,
-        source: sourceIdentity ?? (await readGitIdentity(packageWorkspaceRoot)),
-        build: buildIdentity ?? readBuildIdentity(env),
+      const assertSourceStable = async () => {
+        if (!sourceReader) return;
+        const currentSource = await sourceReader(packageWorkspaceRoot);
+        if (!isDeepStrictEqual(currentSource, capturedSource)) {
+          throw new Error("npm package report source commit/tree changed during verification.");
+        }
+      };
+      await assertSourceStable();
+      await refusePublicationReceipt(packageReportDir);
+      const backupRoot = join(stageRoot, "previous-report");
+      const reportPath = join(packageReportDir, "npm-package-report.json");
+      const tarballPath = join(packageReportDir, "tarballs");
+      const backupReportPath = join(backupRoot, "npm-package-report.json");
+      const backupTarballPath = join(backupRoot, "tarballs");
+      let backedReport = false;
+      let backedTarballs = false;
+      try {
+        await mkdir(backupRoot, { recursive: true });
+        backedReport = await moveIfPresent(reportPath, backupReportPath);
+        backedTarballs = await moveIfPresent(tarballPath, backupTarballPath);
+        await rm(reportPath, { force: true });
+        await rm(tarballPath, { force: true, recursive: true });
+        await mkdir(packageReportDir, { recursive: true });
+        await persistVerifiedTarballs(results, installablePackages, packageReportDir);
+        await assertSourceStable();
+        const report = createPackageReport({
+          packages: results,
+          source: capturedSource,
+          build: buildIdentity ?? readBuildIdentity(env),
+        });
+        await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+        await assertSourceStable();
+      } catch (error) {
+        const rollbackErrors = [];
+        await rm(reportPath, { force: true }).catch((rollbackError) => {
+          rollbackErrors.push(rollbackError);
+        });
+        await rm(tarballPath, { force: true, recursive: true }).catch((rollbackError) => {
+          rollbackErrors.push(rollbackError);
+        });
+        if (backedReport) {
+          await rename(backupReportPath, reportPath).catch((rollbackError) => {
+            rollbackErrors.push(rollbackError);
+          });
+        }
+        if (backedTarballs) {
+          await rename(backupTarballPath, tarballPath).catch((rollbackError) => {
+            rollbackErrors.push(rollbackError);
+          });
+        }
+        if (rollbackErrors.length > 0) {
+          preserveStageRoot = true;
+          throw new AggregateError(
+            [error, ...rollbackErrors],
+            `npm package verification failed and prior output restoration was incomplete; inspect preserved backup ${backupRoot} and report directory ${packageReportDir}.`,
+          );
+        }
+        throw error;
+      }
+      await rm(backupRoot, { force: true, recursive: true }).catch((cleanupError) => {
+        preserveStageRoot = true;
+        throw new Error(
+          `npm package verification succeeded, but prior-output cleanup failed; inspect ${backupRoot} without replacing the verified report at ${packageReportDir}.`,
+          { cause: cleanupError },
+        );
       });
-      await writeFile(join(packageReportDir, "npm-package-report.json"), `${JSON.stringify(report, null, 2)}\n`);
     }
 
     return results;
   } finally {
-    await rm(stageRoot, { force: true, recursive: true });
+    if (!preserveStageRoot) {
+      await rm(stageRoot, { force: true, recursive: true });
+    }
   }
+}
+
+async function refusePublicationReceipt(packageReportDir) {
+  const receiptPath = await findPublicationReceipt(packageReportDir);
+  if (receiptPath) {
+    throw new Error(
+      `npm package verification refuses to regenerate artifacts while publication receipt exists at ${receiptPath}; preserve and reconcile it first.`,
+    );
+  }
+}
+
+async function moveIfPresent(source, destination) {
+  try {
+    await rename(source, destination);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function findPublicationReceipt(root) {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isFile() && entry.name === "npm-publication-receipt.json") return path;
+    if (entry.isDirectory()) {
+      const nested = await findPublicationReceipt(path);
+      if (nested) return nested;
+    }
+  }
+  return null;
 }
 
 export function createPackageReport({ packages, source, build }) {

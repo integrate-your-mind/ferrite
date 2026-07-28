@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { constants as fsConstants, lstat, open, readdir, realpath } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import process, { argv } from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -29,9 +29,15 @@ export async function verifyPrebuildPackageDirs(directories, { expectedPackages 
 }
 
 export async function discoverPrebuildPackageDirs(root) {
-  const entries = await readdir(root, { withFileTypes: true });
+  const rootInfo = await assertDirectory(root, "prebuild root");
+  const entries = await readdir(rootInfo.canonical, { withFileTypes: true });
   const directories = [];
   for (const entry of entries) {
+    const entryPath = join(rootInfo.canonical, entry.name);
+    const entryStat = await lstat(entryPath);
+    if (entryStat.isSymbolicLink()) {
+      throw new Error(`${entryPath}: prebuild directory must not be a symlink or reparse point.`);
+    }
     if (entry.isDirectory()) {
       directories.push(join(root, entry.name));
     }
@@ -41,10 +47,19 @@ export async function discoverPrebuildPackageDirs(root) {
 
 async function verifyPrebuildPackageDir(directory) {
   const root = resolve(directory);
-  const manifest = await readJsonObject(join(root, "package.json"), "package manifest");
-  const checksum = await readJsonObject(join(root, checksumFile), "checksum manifest");
+  const rootInfo = await assertDirectory(root, "native prebuild package");
+  const manifest = await readJsonObject(
+    join(root, "package.json"),
+    "package manifest",
+    rootInfo.canonical,
+  );
+  const checksum = await readJsonObject(
+    join(root, checksumFile),
+    "checksum manifest",
+    rootInfo.canonical,
+  );
   const bindingPath = join(root, bindingFile);
-  const binding = await readNonEmptyFile(bindingPath, "native binding");
+  const binding = await readNonEmptyFile(bindingPath, "native binding", rootInfo.canonical);
   const target = supportedTargets.get(manifest.name);
   if (!target) {
     throw new Error(`${root}: unsupported native prebuild package ${String(manifest.name)}.`);
@@ -131,18 +146,22 @@ let cachedNodePackageManifest;
 async function nodePackageManifest() {
   if (!cachedNodePackageManifest) {
     const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const nodeRoot = resolve(packageRoot);
+    const nodeRootInfo = await assertDirectory(nodeRoot, "@ferrite/node package root");
     cachedNodePackageManifest = await readJsonObject(
       join(packageRoot, "package.json"),
       "@ferrite/node package manifest",
+      nodeRootInfo.canonical,
     );
   }
   return cachedNodePackageManifest;
 }
 
-async function readJsonObject(path, label) {
+async function readJsonObject(path, label, rootCanonical) {
   let value;
   try {
-    value = JSON.parse(await readFile(path, "utf8"));
+    const safePath = await assertRegularFile(path, label, rootCanonical);
+    value = JSON.parse((await readVerifiedFile(safePath, label)).toString("utf8"));
   } catch (error) {
     throw new Error(`${path}: invalid ${label}: ${error instanceof Error ? error.message : String(error)}.`);
   }
@@ -152,13 +171,72 @@ async function readJsonObject(path, label) {
   return value;
 }
 
-async function readNonEmptyFile(path, label) {
-  const file = await readFile(path);
-  const fileStat = await stat(path);
-  if (!fileStat.isFile() || file.length === 0) {
-    throw new Error(`${path}: ${label} must be a non-empty file.`);
-  }
+async function readNonEmptyFile(path, label, rootCanonical) {
+  const safePath = await assertRegularFile(path, label, rootCanonical);
+  const file = await readVerifiedFile(safePath, label);
+  if (file.length === 0) throw new Error(`${path}: ${label} must be a non-empty file.`);
   return file;
+}
+
+async function assertDirectory(path, label) {
+  const info = await inspectPath(path, label);
+  if (!info.stat.isDirectory()) throw new Error(`${path}: ${label} must be a directory.`);
+  return info;
+}
+
+async function assertRegularFile(path, label, rootCanonical) {
+  const info = await inspectPath(path, label, rootCanonical);
+  if (!info.stat.isFile()) throw new Error(`${path}: ${label} must be a regular file.`);
+  return info;
+}
+
+async function readVerifiedFile(info, label) {
+  if (!fsConstants.O_NOFOLLOW && process.platform === "win32") {
+    throw new Error(`${info.lexical}: cannot safely open ${label}; no no-follow primitive is available on Windows.`);
+  }
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+  const handle = await open(info.canonical, flags);
+  try {
+    const openedStat = await handle.stat();
+    if (!openedStat.isFile()) throw new Error(`${info.lexical}: ${label} must be a regular file.`);
+    if (
+      typeof info.stat.dev === "number" &&
+      typeof info.stat.ino === "number" &&
+      info.stat.dev !== 0 &&
+      info.stat.ino !== 0 &&
+      (openedStat.dev !== info.stat.dev || openedStat.ino !== info.stat.ino)
+    ) {
+      throw new Error(`${info.lexical}: ${label} changed during safe opening.`);
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function inspectPath(path, label, rootCanonical) {
+  const lexical = resolve(path);
+  let fileStat;
+  try {
+    fileStat = await lstat(lexical);
+  } catch (error) {
+    throw new Error(`${lexical}: invalid ${label}: ${error instanceof Error ? error.message : String(error)}.`, {
+      cause: error,
+    });
+  }
+  if (fileStat.isSymbolicLink()) {
+    throw new Error(`${lexical}: ${label} must not be a symlink or reparse point.`);
+  }
+  const canonical = await realpath(lexical);
+  if (rootCanonical && !isWithin(rootCanonical, canonical)) {
+    throw new Error(`${lexical}: ${label} resolves outside its canonical root.`);
+  }
+  return { lexical, canonical, stat: fileStat };
+}
+
+function isWithin(root, candidate) {
+  const remainder = relative(root, candidate);
+  return remainder === "" || (!remainder.startsWith("..") && !isAbsolute(remainder));
 }
 
 function assertArrayEquals(root, actual, expected, message) {
@@ -196,10 +274,7 @@ async function main() {
   const { directories, expectedPackages } = parseArgs(argv.slice(2));
   const resolvedDirectories = [];
   for (const directory of directories) {
-    const directoryStat = await stat(directory);
-    if (!directoryStat.isDirectory()) {
-      throw new Error(`${directory}: expected a directory.`);
-    }
+    await assertDirectory(directory, "prebuild package root");
     const childDirs = await discoverPrebuildPackageDirs(directory);
     resolvedDirectories.push(...(childDirs.length > 0 ? childDirs : [directory]));
   }

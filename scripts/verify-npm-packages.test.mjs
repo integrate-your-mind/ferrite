@@ -31,6 +31,124 @@ const testReportIdentity = {
   },
 };
 
+test("verifier preserves a publication receipt and refuses regeneration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-receipt-guard-"));
+  const reportDir = join(root, "reports");
+  const receipt = join(reportDir, "nested", "npm-publication-receipt.json");
+  const receiptText = '{"status":"ambiguous","published":[]}\n';
+  try {
+    await mkdir(join(reportDir, "nested"), { recursive: true });
+    await writeFile(receipt, receiptText);
+    await assert.rejects(
+      verifyNpmPackages({
+        ...testReportIdentity,
+        releasePackages: [],
+        workspaceRoot: root,
+        reportDir,
+        runCommand: async () => { throw new Error("build must not run"); },
+      }),
+      /refuses to regenerate artifacts while publication receipt exists/,
+    );
+    assert.equal(await readFile(receipt, "utf8"), receiptText);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("source drift before report replacement preserves prior generated artifacts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-source-drift-"));
+  const reportDir = join(root, "reports");
+  const reportPath = join(reportDir, "npm-package-report.json");
+  const tarballPath = join(reportDir, "tarballs", "prior.tgz");
+  const source = { commit: "a".repeat(40), tree: "b".repeat(40) };
+  let sourceReads = 0;
+  try {
+    await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "package.json"), `${JSON.stringify(completeSourceManifest("@ferrite/protocol"))}\n`);
+    await mkdir(join(reportDir, "tarballs"), { recursive: true });
+    const priorReport = "prior report bytes\n";
+    const priorTarball = Buffer.from("prior tarball bytes\n");
+    await writeFile(reportPath, priorReport);
+    await writeFile(tarballPath, priorTarball);
+    await assert.rejects(
+      verifyNpmPackages({
+        buildIdentity: testReportIdentity.buildIdentity,
+        releasePackages: [{
+          name: "@ferrite/protocol",
+          directory: "packages/protocol",
+          build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+          requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+          forbiddenFiles: ["src/index.ts", "test"],
+        }],
+        nativePackageNames: [],
+        workspaceRoot: root,
+        reportDir,
+        readSourceIdentity: async () => sourceReads++ === 0 ? source : { ...source, tree: "c".repeat(40) },
+        runCommand: async () => {},
+        packPackage: async () => ({ files: ["package/dist/index.js", "package/dist/index.d.ts"] }),
+        installPackageSet: async () => {},
+      }),
+      /source commit\/tree changed during verification/,
+    );
+    assert.equal(await readFile(reportPath, "utf8"), priorReport);
+    assert.deepEqual(await readFile(tarballPath), priorTarball);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("source drift after report persistence restores prior generated artifacts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-persisted-source-drift-"));
+  const reportDir = join(root, "reports");
+  const reportPath = join(reportDir, "npm-package-report.json");
+  const tarballPath = join(reportDir, "tarballs", "prior.tgz");
+  const source = { commit: "a".repeat(40), tree: "b".repeat(40) };
+  let sourceReads = 0;
+  try {
+    await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
+    await writeFile(join(root, "packages", "protocol", "dist", "index.d.ts"), "export {};\n");
+    await writeFile(
+      join(root, "packages", "protocol", "package.json"),
+      `${JSON.stringify(completeSourceManifest("@ferrite/protocol"))}\n`,
+    );
+    await mkdir(join(reportDir, "tarballs"), { recursive: true });
+    const priorReport = "prior report bytes\n";
+    const priorTarball = Buffer.from("prior tarball bytes\n");
+    await writeFile(reportPath, priorReport);
+    await writeFile(tarballPath, priorTarball);
+    await assert.rejects(
+      verifyNpmPackages({
+        buildIdentity: testReportIdentity.buildIdentity,
+        releasePackages: [{
+          name: "@ferrite/protocol",
+          directory: "packages/protocol",
+          build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+          requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+          forbiddenFiles: ["src/index.ts", "test"],
+        }],
+        nativePackageNames: [],
+        workspaceRoot: root,
+        reportDir,
+        readSourceIdentity: async () =>
+          sourceReads++ < 3 ? source : { ...source, tree: "c".repeat(40) },
+        runCommand: async () => {},
+        packPackage: async () => ({
+          files: ["package/dist/index.js", "package/dist/index.d.ts"],
+        }),
+        installPackageSet: async () => {},
+      }),
+      /source commit\/tree changed during verification/,
+    );
+    assert.equal(await readFile(reportPath, "utf8"), priorReport);
+    assert.deepEqual(await readFile(tarballPath), priorTarball);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("clean developer workflow rejects a missing artifact before building and then serves it", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-clean-workflow-"));
   const cliSource = join(root, "source-ferrite");

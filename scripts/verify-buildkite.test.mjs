@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { access, readFile, readdir, stat } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
@@ -9,10 +19,22 @@ const uploadUrl = new URL("../.buildkite/scripts/upload-pipeline.sh", import.met
 const configUrl = new URL("../deploy/buildkite/ferrite-agent.cfg.example", import.meta.url);
 const environmentHookUrl = new URL("../deploy/buildkite/hooks/environment", import.meta.url);
 const preCommandHookUrl = new URL("../deploy/buildkite/hooks/pre-command", import.meta.url);
+const preExitHookUrl = new URL("../deploy/buildkite/hooks/pre-exit", import.meta.url);
 const workflowsUrl = new URL("../.github/workflows", import.meta.url);
 
 function runHook(url, env) {
   return spawnSync(url.pathname, [], {
+    encoding: "utf8",
+    env: {
+      HOME: process.env.HOME,
+      PATH: process.env.PATH,
+      ...env,
+    },
+  });
+}
+
+function runSourcedShell(url, script, env = {}) {
+  return spawnSync("/bin/bash", ["-c", `source ${url.pathname}; ${script}`], {
     encoding: "utf8",
     env: {
       HOME: process.env.HOME,
@@ -134,6 +156,19 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /export CARGO_INCREMENTAL=0/);
   assert.match(source, /export CARGO_PROFILE_DEV_DEBUG=0/);
   assert.match(source, /export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off/);
+  assert.doesNotMatch(source, /CARGOFLAGS=--locked/);
+  assert.match(source, /cargo llvm-cov --locked/);
+  assert.match(source, /cargo audit --deny warnings/);
+  assert.match(source, /command -v cargo-audit/);
+  assert.match(source, /command -v cargo-llvm-cov/);
+  assert.match(source, /start_cargo_lock_sha/);
+  assert.match(source, /end_cargo_lock_sha/);
+  assert.match(source, /PIPESTATUS/);
+  assert.match(source, /tee_status/);
+  assert.match(source, /COVERAGE_RUST_LINES_FLOOR="90\.00"/);
+  assert.match(source, /COVERAGE_RUNTIME_LINES_FLOOR="80\.00"/);
+  assert.match(source, /COVERAGE_NATIVE_LINES_FLOOR="78\.00"/);
+  assert.match(source, /check_coverage_floor/);
   assert.match(source, /MIN_FREE_KIB=20971520/);
   assert.match(source, /\/bin\/df -Pk "\$\{ROOT\}"/);
   assert.match(source, /storage admission requires at least/);
@@ -211,6 +246,7 @@ test("dedicated agent configuration disables plugins and local hooks", async () 
   assert.match(source, /enable-environment-variable-allowlist=true/);
   assert.match(source, /allowed-environment-variables=/);
   assert.doesNotMatch(source, /BASH_ENV|GIT_SSH_COMMAND|NODE_OPTIONS|RUSTFLAGS/);
+  assert.doesNotMatch(source, /SSH_AUTH_SOCK|CARGO_HOME|PNPM_HOME/);
   assert.doesNotMatch(source, /no-command-eval=true|disconnect-after-job=true/);
   assert.doesNotMatch(source, /^token\s*=/m);
 });
@@ -226,7 +262,41 @@ test("external environment hook accepts only the approved Ferrite commit", async
   };
 
   assert.equal(runHook(environmentHookUrl, base).status, 0);
-  assert.match(source, /\$\{CARGO_HOME:-\$\{HOME\}\/\.cargo\}\/bin/);
+  assert.match(source, /ferrite-buildkite-home-/);
+  assert.match(source, /original_rustup_home="\$\{RUSTUP_HOME:-\$\{original_home\}\/\.rustup\}"/);
+  assert.match(source, /cargo-audit/);
+  assert.match(source, /cargo-llvm-cov/);
+  assert.match(source, /\/bin\/realpath/);
+  assert.match(source, /export CARGO_HOME="\$\{build_home\}\/cargo"/);
+  assert.match(source, /export PNPM_HOME="\$\{build_home\}\/pnpm"/);
+  assert.match(source, /npm\/user\.npmrc/);
+  assert.match(source, /npm\/global\.npmrc/);
+  assert.match(source, /export DOCKER_CONFIG="\$\{build_home\}\/docker"/);
+  assert.match(source, /export AWS_SHARED_CREDENTIALS_FILE="\$\{build_home\}\/aws\/credentials"/);
+  assert.match(source, /export GOOGLE_APPLICATION_CREDENTIALS="\$\{build_home\}\/gcloud\/application_default_credentials\.json"/);
+  assert.doesNotMatch(source, /\$\{HOME\}\/bin|\$\{HOME\}\/Library\/pnpm/);
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-buildkite-hook-test-"));
+  try {
+    const isolated = runSourcedShell(
+      environmentHookUrl,
+      "printf '%s\\n' \"$HOME\" \"$CARGO_HOME\" \"$RUSTUP_HOME\" \"$PNPM_HOME\" \"$NPM_CONFIG_USERCONFIG\" \"$NPM_CONFIG_GLOBALCONFIG\" \"$DOCKER_CONFIG\" \"$PATH\"; cat \"$DOCKER_CONFIG/config.json\"; cat \"$GOOGLE_APPLICATION_CREDENTIALS\"",
+      { ...base, HOME: join(tempRoot, "user"), TMPDIR: tempRoot, PATH: "/tmp/user/bin:/tmp/user/pnpm:/usr/bin" },
+    );
+    assert.equal(isolated.status, 0, isolated.stderr);
+    const [home, cargoHome, rustupHome, pnpmHome, npmUser, npmGlobal, dockerConfig, path, dockerJson, googleJson] = isolated.stdout.trim().split("\n");
+    assert.match(home, new RegExp(`${tempRoot}/ferrite-buildkite-home-`));
+    assert.equal(cargoHome, `${home}/cargo`);
+    assert.equal(rustupHome, `${join(tempRoot, "user")}/.rustup`);
+    assert.equal(pnpmHome, `${home}/pnpm`);
+    assert.equal(npmUser, `${home}/npm/user.npmrc`);
+    assert.equal(npmGlobal, `${home}/npm/global.npmrc`);
+    assert.equal(dockerConfig, `${home}/docker`);
+    assert.equal(dockerJson, "{}");
+    assert.equal(googleJson, "{}");
+    assert.doesNotMatch(path, /user\/bin|user\/pnpm|\/\.cargo\/bin/);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
   assert.notEqual(
     runHook(environmentHookUrl, {
       ...base,
@@ -312,6 +382,78 @@ test("external command hook rejects arbitrary commands", async () => {
   }
 });
 
+test("run_gate fails closed when the child or tee fails", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-run-gate-test-"));
+  const teePath = join(tempRoot, "tee-fails");
+  await writeFile(teePath, "#!/bin/sh\nexit 19\n", { mode: 0o755 });
+  const invoke = (body, env = {}) =>
+    spawnSync(
+      "/bin/bash",
+      ["-c", `source '${ciUrl.pathname}'; mkdir -p "$REPORT_DIR"; : > "$REPORT_DIR/results.tsv"; ${body}`],
+      { encoding: "utf8", env: { HOME: process.env.HOME, PATH: process.env.PATH, FERRITE_CI_REPORT_DIR: tempRoot, ...env } },
+    );
+  try {
+    const child = invoke("run_gate child-fails /bin/sh -c 'exit 7'");
+    assert.equal(child.status, 7, child.stderr);
+    assert.match(await readFile(join(tempRoot, "results.tsv"), "utf8"), /child-fails\t7/);
+    assert.match(await readFile(join(tempRoot, "child-fails.source"), "utf8"), /end_commit=/);
+    const tee = invoke("run_gate tee-fails /bin/echo ok", { TEE_BIN: teePath });
+    assert.equal(tee.status, 19, tee.stderr);
+    assert.match(await readFile(join(tempRoot, "results.tsv"), "utf8"), /tee-fails\t19/);
+    assert.match(await readFile(join(tempRoot, "tee-fails.source"), "utf8"), /integrity_status=/);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("coverage floors accept valid reports and reject empty, malformed, and under-floor reports", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-coverage-test-"));
+  const invoke = (body) =>
+    spawnSync(
+      "/bin/bash",
+      ["-c", `source '${ciUrl.pathname}'; mkdir -p "$REPORT_DIR"; ${body}`],
+      { encoding: "utf8", env: { HOME: process.env.HOME, PATH: process.env.PATH, FERRITE_CI_REPORT_DIR: tempRoot } },
+    );
+  try {
+    await writeFile(join(tempRoot, "rust-ok.log"), "TOTAL 90 8 90.99%\n");
+    await writeFile(join(tempRoot, "js-ok.log"), "# all files | 81.57 | 70.00 | 88.00 |\n");
+    assert.equal(invoke(`check_coverage_floor rust '${tempRoot}/rust-ok.log' 90.00`).status, 0);
+    assert.equal(invoke(`check_coverage_floor js '${tempRoot}/js-ok.log' 80.00`).status, 0);
+
+    await writeFile(join(tempRoot, "rust-low.log"), "TOTAL 90 15 89.99%\n");
+    await writeFile(join(tempRoot, "js-malformed.log"), "# all files | n/a | 70.00 |\n");
+    assert.notEqual(invoke(`check_coverage_floor rust '${tempRoot}/rust-low.log' 90.00`).status, 0);
+    assert.notEqual(invoke(`check_coverage_floor js '${tempRoot}/js-malformed.log' 80.00`).status, 0);
+    assert.notEqual(invoke(`check_coverage_floor js '${tempRoot}/missing.log' 80.00`).status, 0);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("pre-exit cleanup removes only the validated per-build home", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-pre-exit-test-"));
+  const buildHome = join(tempRoot, "ferrite-buildkite-home-job-1");
+  const invoke = (env) =>
+    spawnSync(preExitHookUrl.pathname, [], {
+      encoding: "utf8",
+      env: { HOME: process.env.HOME, PATH: process.env.PATH, ...env },
+    });
+  try {
+    await writeFile(join(tempRoot, "placeholder"), "ok");
+    await writeFile(join(tempRoot, "marker"), "ok");
+    const makeHome = spawnSync("/bin/mkdir", ["-p", buildHome], { encoding: "utf8" });
+    assert.equal(makeHome.status, 0, makeHome.stderr);
+    assert.equal(invoke({ TMPDIR: tempRoot, FERRITE_BUILDKITE_BUILD_HOME: buildHome }).status, 0);
+    assert.equal((await stat(buildHome).catch(() => null)), null);
+    assert.equal(invoke({ TMPDIR: tempRoot, FERRITE_BUILDKITE_BUILD_HOME: buildHome }).status, 0);
+    assert.notEqual(invoke({ TMPDIR: tempRoot, FERRITE_BUILDKITE_BUILD_HOME: join(tempRoot, "other") }).status, 0);
+    assert.notEqual(invoke({ TMPDIR: tempRoot, FERRITE_BUILDKITE_BUILD_HOME: `${tempRoot}/ferrite-buildkite-home-job-1/../etc` }).status, 0);
+    assert.notEqual(invoke({ TMPDIR: "/", FERRITE_BUILDKITE_BUILD_HOME: "/ferrite-buildkite-home-job-1" }).status, 0);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("CI script rejects unknown modes before running project commands", () => {
   const result = spawnSync(ciUrl.pathname, ["unknown"], {
     encoding: "utf8",
@@ -348,7 +490,7 @@ test("GitHub Actions workflows are removed from the active CI path", async () =>
 });
 
 test("Buildkite scripts and hook templates are executable", async () => {
-  for (const url of [ciUrl, uploadUrl, environmentHookUrl, preCommandHookUrl]) {
+  for (const url of [ciUrl, uploadUrl, environmentHookUrl, preCommandHookUrl, preExitHookUrl]) {
     await access(url);
     const metadata = await stat(url);
     assert.notEqual(metadata.mode & 0o111, 0);

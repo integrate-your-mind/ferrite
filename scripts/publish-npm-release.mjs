@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { argv, exit } from "node:process";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import { prepareNpmRelease } from "./prepare-npm-release.mjs";
 
@@ -20,6 +21,8 @@ export async function publishNpmRelease({
   writeReceipt = writePublicationReceipt,
   createReceipt = createPublicationReceipt,
   cleanupStaging = removeStagingDirectory,
+  npmPreflight = preflightNpmRelease,
+  runNpmCommand,
 } = {}) {
   if (!execute) {
     throw new Error("npm publication requires the explicit --execute flag.");
@@ -33,6 +36,12 @@ export async function publishNpmRelease({
     requireBuildkite: true,
     verifyBuildkite,
   });
+  const firstRegistry = await npmPreflight({
+    packages: firstPlan.packages,
+    version,
+    registry: NPM_REGISTRY,
+    runCommand: runNpmCommand ?? run,
+  });
   const resolvedReceipt = resolve(
     receiptPath ?? join(dirname(resolve(reportPath)), "npm-publication-receipt.json"),
   );
@@ -45,6 +54,8 @@ export async function publishNpmRelease({
     packageSetSha256: firstPlan.packageSetSha256,
     version,
     tag,
+    registry: firstRegistry.registry,
+    registryEvidence: firstRegistry,
     planned: firstPlan.packages.map(({ name, artifact }) => ({
       name,
       sha256: artifact.sha256,
@@ -75,6 +86,12 @@ export async function publishNpmRelease({
       if (currentPlan.packageSetSha256 !== firstPlan.packageSetSha256) {
         throw new Error("npm package set changed after publication started.");
       }
+      if (
+        !isDeepStrictEqual(currentPlan.source, firstPlan.source) ||
+        !isDeepStrictEqual(currentPlan.build, firstPlan.build)
+      ) {
+        throw new Error("npm release source/build identity changed after publication started.");
+      }
       const current = currentPlan.packages.find(({ name }) => name === expected.name);
       if (!current) {
         throw new Error(`${expected.name}: package disappeared from the revalidated release plan.`);
@@ -101,10 +118,27 @@ export async function publishNpmRelease({
             sha256: current.artifact.sha256,
           },
         });
+        phase = "registry_preflight";
+        const currentRegistry = await npmPreflight({
+          packages: [current],
+          version,
+          registry: NPM_REGISTRY,
+          runCommand: runNpmCommand ?? run,
+        });
+        if (
+          currentRegistry.registry !== firstRegistry.registry ||
+          currentRegistry.identity !== firstRegistry.identity ||
+          currentRegistry.twoFactorAuth !== firstRegistry.twoFactorAuth ||
+          !isDeepStrictEqual(currentRegistry.org, firstRegistry.org) ||
+          currentRegistry.access[current.name] !== firstRegistry.access[current.name] ||
+          currentRegistry.versions[current.name] !== null
+        ) {
+          throw new Error("npm registry identity/access/version evidence changed after publication started.");
+        }
         phase = "registry_publish";
         await runCommand(
           "npm",
-          ["publish", stagedArtifact, "--access", "public", "--tag", tag],
+          ["publish", stagedArtifact, "--access", "public", "--tag", tag, "--registry", NPM_REGISTRY],
           { cwd: stagingRoot },
         );
         registryConfirmed = true;
@@ -273,6 +307,148 @@ export async function stageVerifiedArtifact(pkg, stagingRoot) {
   return destination;
 }
 
+export const NPM_REGISTRY = "https://registry.npmjs.org/";
+const PUBLISHABLE_ORG_ROLES = new Set(["owner", "admin", "developer"]);
+
+export async function preflightNpmRelease({
+  packages,
+  version,
+  registry = NPM_REGISTRY,
+  runCommand = run,
+  cwd,
+} = {}) {
+  if (registry !== NPM_REGISTRY) {
+    throw new Error(`npm publication registry must be exactly ${NPM_REGISTRY}.`);
+  }
+  if (!Array.isArray(packages) || packages.length === 0) {
+    throw new Error("npm publication preflight requires a non-empty package set.");
+  }
+  const runNpmJson = (args) => runCommand(
+    "npm",
+    [...args, "--registry", registry],
+    { cwd, capture: true, shell: false },
+  );
+  const whoami = parseJsonOutput(
+    await runNpmJson(["whoami", "--json"]),
+    "npm whoami",
+  );
+  const identity = parseNpmIdentity(whoami);
+  const profile = parseJsonOutput(
+    await runNpmJson(["profile", "get", "--json"]),
+    "npm profile get",
+  );
+  const twoFactorAuth = parseTwoFactorAuth(profile);
+  if (twoFactorAuth !== "auth-and-writes") {
+    throw new Error(`npm account two-factor auth must be auth-and-writes, found ${twoFactorAuth ?? "missing"}.`);
+  }
+  const org = parseJsonOutput(
+    await runNpmJson(["org", "ls", "ferrite", identity, "--json"]),
+    "npm org ls",
+  );
+  const orgRole = parseOrgRole(org, identity);
+  if (!PUBLISHABLE_ORG_ROLES.has(orgRole)) {
+    throw new Error(`npm identity ${identity} does not have a publishable ferrite org role.`);
+  }
+  const accessRaw = parseJsonOutput(
+    await runNpmJson(["access", "list", "packages", identity, "--json"]),
+    "npm access list packages",
+  );
+  const access = parsePackageAccess(accessRaw);
+  const packageEvidence = [];
+  for (const pkg of packages) {
+    const name = pkg?.name;
+    if (typeof name !== "string" || name.length === 0) {
+      throw new Error("npm publication package entries require names.");
+    }
+    const accessLevel = access[name];
+    if (accessLevel !== undefined && accessLevel !== "read-write") {
+      throw new Error(`${name}: npm access must be read-write, found ${accessLevel}.`);
+    }
+    const exactVersion = `${name}@${version}`;
+    let exists = false;
+    try {
+      const viewed = parseJsonOutput(
+        await runNpmJson(["view", exactVersion, "version", "--json"]),
+        `npm view ${exactVersion}`,
+      );
+      if (typeof viewed !== "string" || viewed !== version) {
+        throw new Error(`${exactVersion}: npm registry returned malformed version metadata.`);
+      }
+      exists = true;
+    } catch (error) {
+      if (!isAuthenticatedExactVersion404(error)) throw error;
+    }
+    if (exists) {
+      throw new Error(`${exactVersion}: exact npm version already exists; refusing overwrite.`);
+    } else if (accessLevel !== undefined && accessLevel !== "read-write") {
+      throw new Error(`${name}: npm package access is not publishable.`);
+    }
+    packageEvidence.push({ name, version, exists, access: accessLevel ?? "create" });
+  }
+  packageEvidence.sort((left, right) => left.name.localeCompare(right.name));
+  return {
+    registry,
+    identity,
+    twoFactorAuth,
+    org: { organization: "ferrite", identity, role: orgRole },
+    access: Object.fromEntries(packageEvidence.map(({ name, access: level }) => [name, level])),
+    versions: Object.fromEntries(packageEvidence.map(({ name, exists }) => [name, exists ? version : null])),
+    packages: packageEvidence,
+  };
+}
+
+function parseJsonOutput(output, label) {
+  if (output && typeof output === "object" && ("stdout" in output || "output" in output)) {
+    output = output.stdout ?? output.output;
+  }
+  if (output && typeof output === "object") return output;
+  try {
+    return JSON.parse(Buffer.isBuffer(output) ? output.toString("utf8") : String(output));
+  } catch (error) {
+    throw new Error(`${label} returned malformed JSON.`, { cause: error });
+  }
+}
+
+function parseNpmIdentity(value) {
+  const identity = typeof value === "string" ? value : value?.username ?? value?.name;
+  if (typeof identity !== "string" || identity.trim() === "") {
+    throw new Error("npm whoami did not return an authenticated identity.");
+  }
+  return identity.trim();
+}
+
+function parseTwoFactorAuth(profile) {
+  const value = profile?.["two-factor auth"];
+  return typeof value === "string" ? value : value?.mode;
+}
+
+function parseOrgRole(org, identity) {
+  const candidate = typeof org === "string" ? org : org?.[identity] ?? org?.role;
+  const role = typeof candidate === "string" ? candidate : candidate?.role;
+  if (typeof role !== "string") throw new Error("npm org ls returned malformed role JSON.");
+  return role.toLowerCase();
+}
+
+function parsePackageAccess(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("npm access list packages returned malformed JSON.");
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([name, level]) => {
+      if (level && typeof level === "object") level = level.access ?? level.permission;
+      if (typeof level !== "string") throw new Error(`npm access returned malformed access for ${name}.`);
+      return [name, level];
+    }),
+  );
+}
+
+function isAuthenticatedExactVersion404(error) {
+  const text = [error?.code, error?.status, error?.stderr, error?.stdout, error?.message]
+    .filter((value) => value !== undefined)
+    .join(" ");
+  return /(?:^|\b)(?:E404|404)(?:\b|$)/i.test(text) && !/E401|401|unauthor/i.test(text);
+}
+
 export function parsePublishArgs(args) {
   const options = { execute: false };
   for (let index = 0; index < args.length; index += 1) {
@@ -304,15 +480,31 @@ export function parsePublishArgs(args) {
   return options;
 }
 
-function run(command, args, { cwd } = {}) {
+function run(command, args, { cwd, capture = false } = {}) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, { cwd, shell: false, stdio: "inherit" });
+    const child = spawn(command, args, {
+      cwd,
+      shell: false,
+      stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
+    });
+    let stdout = "";
+    let stderr = "";
+    if (capture) {
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+    }
     child.on("error", reject);
     child.on("close", (code) => {
       if (code === 0) {
-        resolvePromise();
+        resolvePromise(capture ? stdout : undefined);
       } else {
-        reject(new Error(`${command} ${args.join(" ")} failed with exit code ${code}`));
+        const error = new Error(`${command} ${args.join(" ")} failed with exit code ${code}`);
+        error.code = code;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
       }
     });
   });

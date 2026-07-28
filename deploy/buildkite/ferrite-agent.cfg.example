@@ -12,4 +12,4 @@ disconnect-after-idle-timeout=300
 disconnect-after-uptime=14400
 strict-single-hooks=true
 enable-environment-variable-allowlist=true
-allowed-environment-variables="^HOME$,^PATH$,^SHELL$,^USER$,^LOGNAME$,^TMPDIR$,^LANG$,^LC_.*$,^SSH_AUTH_SOCK$,^RUSTUP_HOME$,^CARGO_HOME$,^PNPM_HOME$,^FERRITE_BUILDKITE_APPROVED_COMMIT$"
+allowed-environment-variables="^HOME$,^PATH$,^SHELL$,^USER$,^LOGNAME$,^TMPDIR$,^LANG$,^LC_.*$,^RUSTUP_HOME$,^FERRITE_BUILDKITE_APPROVED_COMMIT$"

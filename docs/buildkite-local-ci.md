@@ -19,8 +19,11 @@ The current pipeline is pinned to Buildkite Agent 3.127.x because it uses the
 v3 `pipeline upload --reject-secrets` fail-closed check. Upgrading to another
 agent series requires reviewing that command and this trust contract first.
 The isolated agent `PATH` must provide Node.js 22 or newer, pnpm 11.7.0,
-rustup with Rust 1.95.x and the `wasm32-unknown-unknown` target, Docker, and
-Buildkite Agent 3.127.x. The lane invokes the pinned pnpm executable directly
+rustup with Rust 1.95.x and the `wasm32-unknown-unknown` target, cargo-audit,
+cargo-llvm-cov, Docker, and Buildkite Agent 3.127.x. The environment hook
+copies the two Cargo subcommand executables into its private toolchain bin when
+present; preflight then fails closed if either required executable is absent.
+The lane invokes the pinned pnpm executable directly
 because current Homebrew Node releases do not bundle Corepack. It places the
 rustup proxies ahead of Homebrew Rust so a clean WASM build cannot be masked by
 artifacts from another toolchain.
@@ -48,11 +51,29 @@ builds only its ignored runtime and native prerequisites, copies their
 distributable artifacts, then removes the prerequisite Rust target before
 starting the Node coverage runs.
 
+Only direct `cargo llvm-cov` uses its supported `--locked` flag. `cargo audit`
+does not provide that flag; it reads the checked-out lockfile under the same
+post-gate digest/cleanliness contract. Cargo commands nested inside existing
+pnpm scripts do not receive a portable lock flag; their fail-closed contract is
+the clean checkout plus the start/end `Cargo.lock` SHA-256 and worktree checks.
+`cargo fmt` and `cargo clean` do not support `--locked`. Coverage is a measured gate: the workspace Rust lines floor
+is 90.00%, runtime JavaScript is 80.00%, and native JavaScript is 78.00%.
+Rust parsing requires a `TOTAL` lines percentage; Node parsing requires a
+well-formed `# all files | ...` summary. Empty, malformed, or under-floor
+reports fail closed. These floors sit below the current exact results (90.99%,
+81.57%, and 79.50%) to detect regressions without pretending to be a quality
+target.
+
 Every command step checks storage before creating reports, installing
 dependencies, or building source. It fails closed unless the checkout volume
 has at least 20 GiB available, then records the observed and required KiB
 values in `dist/ci/environment.txt`. Do not bypass this guard to turn an
 `ENOSPC` failure into a nominal CI result.
+
+Each gate records its starting commit, tree, `Cargo.lock` SHA-256, and
+worktree status, then verifies that all four are unchanged before reporting a
+successful gate. This catches accidental checkout or lockfile mutation even
+when the child process itself exits zero; ignored build output remains allowed.
 
 1. exact-commit, clean-checkout, host, and toolchain preflight;
 2. frozen dependency installation;
@@ -94,6 +115,8 @@ install -m 0755 deploy/buildkite/hooks/environment \
   /opt/homebrew/etc/buildkite-agent/ferrite-hooks/environment
 install -m 0755 deploy/buildkite/hooks/pre-command \
   /opt/homebrew/etc/buildkite-agent/ferrite-hooks/pre-command
+install -m 0755 deploy/buildkite/hooks/pre-exit \
+  /opt/homebrew/etc/buildkite-agent/ferrite-hooks/pre-exit
 ```
 
 The external hooks:
@@ -102,8 +125,20 @@ The external hooks:
 - reject fork pull requests;
 - require the job SHA to equal an operator-approved SHA;
 - reject common application and registry credentials;
+- replace `HOME` with a mode-0700 per-build directory and point npm, Cargo,
+  Docker, AWS, Google Cloud, and Git config/credential paths at separate empty
+  or valid-empty files and directories there;
+- canonicalize and validate `TMPDIR` before deriving that per-build directory;
+  the private PATH copies `cargo-audit` and `cargo-llvm-cov` when available,
+  while preflight requires both tools;
+- remove `$HOME/bin`, `$HOME/.cargo/bin`, and `$HOME/Library/pnpm` from the
+  executed `PATH` (rustup proxies are copied into the per-build toolchain bin
+  directory when the operator-installed toolchain is present);
 - allow only the pipeline upload and six proof-mode commands;
 - clear interactive Git/SSH credential helpers before project commands; and
+- remove the exact exported per-build HOME from `TMPDIR` in the global
+  `pre-exit` hook after validating its basename and path; cleanup is idempotent
+  and fails closed for malformed or symlink paths; and
 - force checkout cleanup, allowlist inherited environment variables, disable
   repository-local hooks, plugins, and submodules, and disconnect after five
   idle minutes or 240 minutes of uptime through the dedicated agent
@@ -138,10 +173,21 @@ credential store. Never add it to this repository, the pipeline YAML, a hook,
 or a build artifact.
 
 The example allowlist keeps only the local toolchain, temporary-directory,
-locale, read-only checkout credential, and approved-commit inputs. Buildkite's
-own job variables are permitted by the agent. Project commands clear the
-checkout credential plus `BASH_ENV`, `ENV`, `CDPATH`, `GIT_ASKPASS`, and
-`GIT_SSH_COMMAND`.
+locale, and approved-commit inputs. Buildkite's own job variables are
+permitted by the agent. Project commands clear the checkout credential plus
+`BASH_ENV`, `ENV`, `CDPATH`, `GIT_ASKPASS`, and `GIT_SSH_COMMAND`.
+
+The empty per-build locations and command allowlist are policy isolation, not a
+mechanical same-UID sandbox: code running as the agent account can still read
+or modify anything that account can access, including installed tools and
+other jobs' data. A dedicated least-privilege OS account (and separate host or
+VM for hostile-code isolation) is required for that stronger boundary. This
+configuration does not claim to provide it.
+
+Install the reviewed `pre-exit` hook alongside the environment and pre-command
+hooks. It deletes only `FERRITE_BUILDKITE_BUILD_HOME` when that path is exactly
+under `TMPDIR` with a `ferrite-buildkite-home-*` basename; it never cleans a
+general temporary directory.
 
 ## Buildkite pipeline settings
 

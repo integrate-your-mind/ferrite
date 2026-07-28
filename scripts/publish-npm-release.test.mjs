@@ -10,6 +10,7 @@ import { prepareNpmRelease } from "./prepare-npm-release.mjs";
 import {
   createPublicationReceipt,
   parsePublishArgs,
+  preflightNpmRelease,
   publishNpmRelease,
   removeStagingDirectory,
   stageVerifiedArtifact,
@@ -30,6 +31,15 @@ const build = {
 };
 const names = ["@ferrite/protocol", "@ferrite/protocol-wasm", "@ferrite/runtime"];
 const acceptBuildkite = async () => {};
+const acceptNpmPreflight = async ({ registry, packages, version }) => ({
+  registry,
+  identity: "release-bot",
+  twoFactorAuth: "auth-and-writes",
+  org: { organization: "ferrite", identity: "release-bot", role: "developer" },
+  access: Object.fromEntries(packages.map(({ name }) => [name, "create"])),
+  versions: Object.fromEntries(packages.map(({ name }) => [name, null])),
+  packages: packages.map(({ name }) => ({ name, version, exists: false, access: "create" })),
+});
 
 test("requires an explicit execute flag", async () => {
   await assert.rejects(publishNpmRelease({ reportPath: "unused" }), /explicit --execute/);
@@ -44,6 +54,53 @@ test("requires an explicit execute flag", async () => {
     receiptPath: "receipt.json",
     execute: true,
   });
+});
+
+test("npm preflight is fail-closed for authentication, policy, access, and registry JSON", async () => {
+  const packages = [{ name: "@ferrite/protocol" }];
+  const command = ({ whoami = { username: "release-bot" }, profile = { "two-factor auth": "auth-and-writes" }, org = { "release-bot": "developer" }, access = {}, view = null, error } = {}) => async (_command, args) => {
+    assert.equal(args.at(-1), "https://registry.npmjs.org/");
+    if (args[0] === "whoami") {
+      if (error === "E401") throw Object.assign(new Error("E401"), { stderr: "E401" });
+      return whoami;
+    }
+    if (args[0] === "profile") return profile;
+    if (args[0] === "org") return org;
+    if (args[0] === "access") {
+      assert.deepEqual(args.slice(0, 4), ["access", "list", "packages", "release-bot"]);
+      return access;
+    }
+    if (args[0] === "view") {
+      if (error === "malformed") return "not json";
+      if (error === "exists") return view ?? "0.1.0-alpha.0";
+      throw Object.assign(new Error("E404"), { stderr: "npm ERR! code E404" });
+    }
+    throw new Error(`unexpected npm command ${args.join(" ")}`);
+  };
+  await assert.rejects(
+    preflightNpmRelease({ packages, version, runCommand: command({ error: "E401" }) }),
+    /E401|authenticated/,
+  );
+  await assert.rejects(
+    preflightNpmRelease({ packages, version, runCommand: command({ profile: { "two-factor auth": "auth-only" } }) }),
+    /auth-and-writes/,
+  );
+  await assert.rejects(
+    preflightNpmRelease({ packages, version, runCommand: command({ org: { "release-bot": "read-only" } }) }),
+    /publishable ferrite org role/,
+  );
+  await assert.rejects(
+    preflightNpmRelease({ packages, version, runCommand: command({ access: { "@ferrite/protocol": "read-only" } }) }),
+    /read-write/,
+  );
+  await assert.rejects(
+    preflightNpmRelease({ packages, version, runCommand: command({ access: { "@ferrite/protocol": "read-write" }, error: "exists" }) }),
+    /exact npm version already exists; refusing overwrite/,
+  );
+  await assert.rejects(
+    preflightNpmRelease({ packages, version, runCommand: command({ error: "malformed" }) }),
+    /malformed JSON/,
+  );
 });
 
 test("refuses to overwrite an existing publication receipt", async () => {
@@ -66,6 +123,7 @@ test("refuses to overwrite an existing publication receipt", async () => {
         execute: true,
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
+        npmPreflight: acceptNpmPreflight,
         runCommand: async () => {
           registryCalls += 1;
         },
@@ -87,6 +145,7 @@ test("revalidates and publishes immutable staged bytes in dependency order", asy
       execute: true,
       sourceIdentity: source,
       verifyBuildkite: acceptBuildkite,
+      npmPreflight: acceptNpmPreflight,
       runCommand: async (command, args, options) => {
         const bytes = await readFile(args[1]);
         const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
@@ -105,7 +164,7 @@ test("revalidates and publishes immutable staged bytes in dependency order", asy
     assert.deepEqual(calls.map(({ command }) => command), ["npm", "npm", "npm"]);
     assert.ok(calls.every(({ args }) =>
       args[0] === "publish" &&
-      assert.deepEqual(args[1], ["--access", "public", "--tag", "next"]) === undefined
+      assert.deepEqual(args[1], ["--access", "public", "--tag", "next", "--registry", "https://registry.npmjs.org/"]) === undefined
     ));
     assert.deepEqual(
       calls.map(({ sha256 }) => sha256),
@@ -129,6 +188,7 @@ test("records a response-loss failure as ambiguous instead of failed", async () 
         execute: true,
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
+        npmPreflight: acceptNpmPreflight,
         runCommand: async () => {
           calls += 1;
           if (calls === 2) throw new Error("registry rejected package");
@@ -159,6 +219,7 @@ test("keeps confirmed publication disjoint from a cleanup failure", async () => 
         execute: true,
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
+        npmPreflight: acceptNpmPreflight,
         runCommand: async () => {},
         cleanupStaging: async (stagingRoot) => {
           await removeStagingDirectory(stagingRoot);
@@ -191,6 +252,7 @@ test("recovers a post-success receipt write failure without relabeling success",
         execute: true,
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
+        npmPreflight: acceptNpmPreflight,
         runCommand: async () => {},
         writeReceipt: async (...args) => {
           writes += 1;
@@ -218,6 +280,7 @@ test("stops when the package set changes after publication starts", async () => 
         execute: true,
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
+        npmPreflight: acceptNpmPreflight,
         runCommand: async () => {
           calls += 1;
           if (calls === 1) {
@@ -238,6 +301,56 @@ test("stops when the package set changes after publication starts", async () => 
       /package set changed after publication started/,
     );
     assert.equal(calls, 1);
+  });
+});
+
+test("stops when the source or build identity changes between replans", async () => {
+  for (const field of ["source", "build"]) {
+    await withReleaseReport(async ({ reportPath, report }) => {
+      let calls = 0;
+      await assert.rejects(
+        publishNpmRelease({
+          reportPath,
+          execute: true,
+          sourceIdentity: source,
+          verifyBuildkite: acceptBuildkite,
+          npmPreflight: acceptNpmPreflight,
+          runCommand: async () => {
+            calls += 1;
+            if (calls === 1) {
+              const changed = createPackageReport({
+                packages: report.packages,
+                source: field === "source" ? { ...source, tree: "c".repeat(40) } : source,
+                build: field === "build" ? { ...build, buildId: "build-drift" } : build,
+              });
+              await writeFile(reportPath, `${JSON.stringify(changed, null, 2)}\n`);
+            }
+          },
+        }),
+        /source commit\/tree does not match|source\/build identity changed/,
+      );
+      assert.equal(calls, 1);
+    });
+  }
+});
+
+test("stops when authenticated npm identity drifts before publish", async () => {
+  await withReleaseReport(async ({ reportPath }) => {
+    let preflights = 0;
+    await assert.rejects(
+      publishNpmRelease({
+        reportPath,
+        execute: true,
+        sourceIdentity: source,
+        verifyBuildkite: acceptBuildkite,
+        npmPreflight: async (options) => ({
+          ...await acceptNpmPreflight(options),
+          identity: preflights++ === 0 ? "release-bot" : "different-bot",
+        }),
+        runCommand: async () => {},
+      }),
+      /registry identity\/access\/version evidence changed/,
+    );
   });
 });
 

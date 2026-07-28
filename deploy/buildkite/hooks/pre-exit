@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  printf 'Ferrite Buildkite cleanup: %s\n' "$*" >&2
+  exit 1
+}
+
+build_home="${FERRITE_BUILDKITE_BUILD_HOME:-}"
+tmp_input="${TMPDIR:-}"
+[[ -n "${build_home}" && -n "${tmp_input}" ]] ||
+  fail "per-build HOME and TMPDIR are required"
+[[ -d "${tmp_input}" ]] || fail "TMPDIR must be an existing directory"
+tmp_root="$(/bin/realpath "${tmp_input}")" || fail "could not canonicalize TMPDIR"
+[[ "${tmp_root}" != / ]] || fail "TMPDIR must not be the filesystem root"
+[[ "${build_home}" == "${tmp_root}"/ferrite-buildkite-home-* ]] ||
+  fail "refusing to clean a path outside TMPDIR's Ferrite build-home prefix"
+basename="${build_home##*/}"
+[[ "${basename}" =~ ^ferrite-buildkite-home-[A-Za-z0-9_.-]+$ ]] ||
+  fail "malformed Ferrite build-home basename"
+[[ "${build_home}" != / && ! -L "${build_home}" ]] ||
+  fail "refusing to clean root or a symlink"
+
+# Idempotent: Buildkite may invoke pre-exit more than once for a job.
+[[ -e "${build_home}" ]] || exit 0
+canonical_home="$(/bin/realpath "${build_home}")" ||
+  fail "could not canonicalize the per-build HOME"
+canonical_parent="$(/bin/realpath "${canonical_home%/*}")" ||
+  fail "could not canonicalize the per-build HOME parent"
+[[ "${canonical_parent}" == "${tmp_root}" ]] ||
+  fail "per-build HOME parent is outside canonical TMPDIR"
+/bin/rm -rf -- "${build_home}"

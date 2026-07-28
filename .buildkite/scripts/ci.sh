@@ -3,12 +3,16 @@ set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
 readonly ROOT
-REPORT_DIR="${ROOT}/dist/ci"
+REPORT_DIR="${FERRITE_CI_REPORT_DIR:-${ROOT}/dist/ci}"
 readonly REPORT_DIR
 MODE="${1:-}"
 readonly MODE
 MIN_FREE_KIB=20971520
 readonly MIN_FREE_KIB
+COVERAGE_RUST_LINES_FLOOR="90.00"
+COVERAGE_RUNTIME_LINES_FLOOR="80.00"
+COVERAGE_NATIVE_LINES_FLOOR="78.00"
+TEE_BIN="${TEE_BIN:-/usr/bin/tee}"
 
 # Keep clean local-agent jobs reproducible and bound Rust's generated output.
 export CARGO_BUILD_JOBS=1
@@ -27,15 +31,127 @@ run_gate() {
   local label="$1"
   shift
   local log="${REPORT_DIR}/${label}.log"
-  local status
+  local child_status tee_status status integrity_status
+  local start_commit start_tree start_lock start_status
+  local end_commit end_tree end_lock end_status
+  local end_commit_status end_tree_status end_lock_status end_worktree_status
+
+  start_commit="$(git rev-parse HEAD)"
+  start_tree="$(git rev-parse 'HEAD^{tree}')"
+  start_lock="$(cargo_lock_sha)"
+  start_status="$(git status --porcelain=v1 --untracked-files=all)"
+  {
+    printf 'start_commit=%s\n' "${start_commit}"
+    printf 'start_tree=%s\n' "${start_tree}"
+    printf 'start_cargo_lock_sha=%s\n' "${start_lock}"
+    printf 'start_status=%s\n' "${start_status}"
+  } > "${REPORT_DIR}/${label}.source"
 
   printf '\n--- %s\n' "${label}"
   set +e
-  "$@" 2>&1 | /usr/bin/tee "${log}"
-  status="${PIPESTATUS[0]}"
+  "$@" 2>&1 | "${TEE_BIN}" "${log}"
+  local pipeline_status=("${PIPESTATUS[@]}")
+  child_status="${pipeline_status[0]:-1}"
+  tee_status="${pipeline_status[1]:-1}"
   set -e
+
+  set +e
+  end_commit="$(git rev-parse HEAD 2>/dev/null)"
+  end_commit_status="$?"
+  end_tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
+  end_tree_status="$?"
+  end_lock="$(cargo_lock_sha 2>/dev/null)"
+  end_lock_status="$?"
+  end_status="$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)"
+  end_worktree_status="$?"
+  set -e
+
+  integrity_status=0
+  (( end_commit_status == 0 )) || integrity_status=1
+  (( end_tree_status == 0 )) || integrity_status=1
+  (( end_lock_status == 0 )) || integrity_status=1
+  (( end_worktree_status == 0 )) || integrity_status=1
+  [[ -n "${end_commit}" && "${start_commit}" == "${end_commit}" ]] || integrity_status=1
+  [[ -n "${end_tree}" && "${start_tree}" == "${end_tree}" ]] || integrity_status=1
+  [[ -n "${end_lock}" && "${start_lock}" == "${end_lock}" ]] || integrity_status=1
+  [[ -z "${end_status}" ]] || integrity_status=1
+
+  if (( child_status != 0 )); then
+    status="${child_status}"
+  elif (( tee_status != 0 )); then
+    status="${tee_status}"
+  else
+    status="${integrity_status}"
+  fi
+  {
+    printf 'end_commit=%s\n' "${end_commit}"
+    printf 'end_tree=%s\n' "${end_tree}"
+    printf 'end_cargo_lock_sha=%s\n' "${end_lock}"
+    printf 'end_status=%s\n' "${end_status}"
+    printf 'child_status=%s\n' "${child_status}"
+    printf 'tee_status=%s\n' "${tee_status}"
+    printf 'integrity_status=%s\n' "${integrity_status}"
+  } >> "${REPORT_DIR}/${label}.source"
   printf '%s\t%s\n' "${label}" "${status}" >> "${REPORT_DIR}/results.tsv"
   return "${status}"
+}
+
+cargo_lock_sha() {
+  [[ -f "${ROOT}/Cargo.lock" ]] || fail "Cargo.lock is required"
+  /usr/bin/shasum -a 256 "${ROOT}/Cargo.lock" | /usr/bin/awk '{ print $1 }'
+}
+
+coverage_percent() {
+  local kind="$1"
+  local log="$2"
+  case "${kind}" in
+    rust)
+      /usr/bin/awk '
+        /^TOTAL[[:space:]]/ {
+          value = ""
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^[0-9]+([.][0-9]+)?%$/) value = $i
+          }
+        }
+        END {
+          if (value == "") exit 1
+          sub(/%$/, "", value)
+          print value
+        }
+      ' "${log}"
+      ;;
+    js)
+      /usr/bin/awk '
+        /^#[[:space:]]*all files[[:space:]]*\|/ {
+          split($0, fields, "|")
+          value = fields[2]
+          gsub(/[[:space:]%]/, "", value)
+        }
+        END {
+          if (value !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+          print value
+        }
+      ' "${log}"
+      ;;
+    *)
+      fail "unknown coverage report kind: ${kind}"
+      ;;
+  esac
+}
+
+check_coverage_floor() {
+  local kind="$1"
+  local log="$2"
+  local floor="$3"
+  local actual
+  [[ -s "${log}" ]] || fail "${kind} coverage report is empty"
+  actual="$(coverage_percent "${kind}" "${log}")" ||
+    fail "${kind} coverage report is missing a valid lines percentage"
+  /usr/bin/awk -v actual="${actual}" -v floor="${floor}" \
+    'BEGIN { if (actual + 0 < floor + 0) exit 1 }' ||
+    fail "${kind} coverage ${actual}% is below the ${floor}% lines floor"
+  printf '%s_lines_coverage=%s\n%s_lines_floor=%s\n' \
+    "${kind}" "${actual}" "${kind}" "${floor}" >> "${REPORT_DIR}/coverage-results.tsv"
 }
 
 preflight() {
@@ -69,6 +185,8 @@ preflight() {
   command -v pnpm >/dev/null || fail "pnpm is unavailable"
   command -v rustup >/dev/null || fail "rustup is unavailable"
   command -v rustc >/dev/null || fail "Rust is unavailable"
+  command -v cargo-audit >/dev/null || fail "cargo-audit is unavailable"
+  command -v cargo-llvm-cov >/dev/null || fail "cargo-llvm-cov is unavailable"
   command -v buildkite-agent >/dev/null || fail "Buildkite Agent is unavailable"
 
   local buildkite_version node_major pnpm_version rust_version
@@ -90,6 +208,7 @@ preflight() {
   {
     printf 'commit=%s\n' "${head}"
     printf 'tree=%s\n' "$(git rev-parse 'HEAD^{tree}')"
+    printf 'cargo_lock_sha=%s\n' "$(cargo_lock_sha)"
     printf 'timestamp_utc=%s\n' "$(/bin/date -u +'%Y-%m-%dT%H:%M:%SZ')"
     printf 'node=%s\n' "$(node --version)"
     printf 'pnpm=%s\n' "${pnpm_version}"
@@ -159,12 +278,13 @@ coverage_rust() {
   # Cargo coverage exercises the real client bundler, which resolves the
   # workspace runtime package through its built protocol exports.
   run_gate coverage-rust-prerequisites pnpm --filter @ferrite/runtime build
-  run_gate coverage-rust rustup run stable cargo llvm-cov \
+  run_gate coverage-rust rustup run stable cargo llvm-cov --locked \
     --workspace \
     --all-targets \
     --summary-only \
     -- \
     --test-threads=1
+  check_coverage_floor rust "${REPORT_DIR}/coverage-rust.log" "${COVERAGE_RUST_LINES_FLOOR}"
 }
 
 coverage_js() {
@@ -174,8 +294,10 @@ coverage_js() {
   run_gate coverage-prerequisites-clean cargo clean
   run_gate coverage-runtime bash -c \
     'cd packages/runtime && exec node --test --experimental-test-coverage test/*.test.mjs'
+  check_coverage_floor js "${REPORT_DIR}/coverage-runtime.log" "${COVERAGE_RUNTIME_LINES_FLOOR}"
   run_gate coverage-native bash -c \
     'cd packages/node && exec node --test --experimental-test-coverage test/*.test.mjs'
+  check_coverage_floor js "${REPORT_DIR}/coverage-native.log" "${COVERAGE_NATIVE_LINES_FLOOR}"
 }
 
 coverage() {
@@ -200,6 +322,7 @@ nginx() {
   run_gate nginx-stack pnpm test:nginx:stack
 }
 
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 case "${MODE}" in
   preflight)
     preflight
@@ -253,3 +376,4 @@ case "${MODE}" in
     exit 64
     ;;
 esac
+fi

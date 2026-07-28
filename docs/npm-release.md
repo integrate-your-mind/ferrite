@@ -46,6 +46,11 @@ Bind every receipt to the exact candidate commit and tree.
   byte size, and SHA-256 value in `npm-package-report.json`. The report envelope
   must bind the exact Git commit/tree, Buildkite build/job, and complete package
   set digest.
+  Verification captures the exact Git commit/tree before any package build or
+  install and checks it again before replacing prior report/tarball outputs and
+  after persistence; source drift restores the prior generated outputs. A
+  recursively discovered `npm-publication-receipt.json` is never removed or
+  overwritten; artifact regeneration stops until that receipt is reconciled.
 - `pnpm release:plan:npm` succeeds and emits the portable dependency order
   from those exact retained bytes. The planner reopens each gzip/tar archive and
   compares its real file list and `package/package.json` with the report. It also
@@ -56,9 +61,15 @@ Bind every receipt to the exact candidate commit and tree.
   publishes.
 - A clean directory installs those exact tarballs and passes the package smoke
   and starter workflow before any registry mutation.
-- The authenticated npm identity owns or may create every intended scoped
-  package. `npm whoami` succeeds, the account's required 2FA flow is available,
-  and the exact version is absent from the registry.
+- The authenticated npm identity passes a fail-closed preflight against exactly
+  `https://registry.npmjs.org/`: `npm whoami --json`, `npm profile get --json`
+  must report the `two-factor auth` mode `auth-and-writes`, and
+  `npm org ls ferrite <identity> --json` must report the `owner`, `admin`, or
+  `developer` role. Existing packages must be `read-write` in
+  `npm access list packages <identity> --json`; every exact intended version
+  must be absent, with only an authenticated exact-version `E404` accepted.
+  These checks are captured in the receipt and repeated immediately before
+  each publish. Registry arguments are pinned explicitly on every npm command.
 - The version, package list, dependency order, dist-tag, release notes, and
   rollback owner are recorded before publication.
 - No token, OTP, recovery code, or `.npmrc` content is written to the
@@ -104,6 +115,7 @@ gap.
    read-only staging directory, then publishes in dependency order with
    `--access public --tag next`. It stops at the first failure and removes its
    staging directory. It atomically writes the exact source, build, package set,
+   and authenticated registry identity/access/version evidence,
    successful packages, and any partial failure to the publication receipt
    immediately before and after each registry mutation. Confirmed successes,
    deterministic pre-publish failures, ambiguous registry outcomes, and local
