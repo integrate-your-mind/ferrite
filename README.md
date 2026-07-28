@@ -168,12 +168,13 @@ Initialization refuses non-empty directories, but the generated manifest referen
 The source-backed website and its real demo assets live in `website/`:
 
 ```sh
-cd website
-npm ci
-npm run dev
+pnpm --dir website install --ignore-workspace --frozen-lockfile
+pnpm --dir website check
+pnpm --dir website build
+pnpm --dir website start
 ```
 
-Run `npm run lint` and `npm test` in that directory before changing public claims or demo assets. The repository does not claim a hosted deployment unless a current deployment receipt exists.
+Run `pnpm --dir website lint` and `pnpm --dir website test` before changing public claims or demo assets. The repository does not claim a hosted deployment unless a current deployment receipt exists.
 
 ## Production boundary
 

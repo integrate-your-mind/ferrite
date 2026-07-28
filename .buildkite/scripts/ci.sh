@@ -269,11 +269,13 @@ packages() {
   run_gate release-npm pnpm release:verify:npm
   run_gate release-cargo pnpm release:verify:cargo
   run_gate cargo-audit cargo audit --deny warnings
-  run_gate website-install npm --prefix website ci
-  run_gate website-lint npm --prefix website run lint
-  run_gate website-typecheck npm --prefix website run typecheck
-  run_gate website-test npm --prefix website test
-  run_gate website-production-audit npm --prefix website audit --omit=dev --audit-level=high
+  run_gate website-install pnpm --dir website install --ignore-workspace --frozen-lockfile
+  run_gate website-lint pnpm --dir website lint
+  run_gate website-typecheck pnpm --dir website typecheck
+  run_gate website-build pnpm --dir website build
+  run_gate website-test pnpm --dir website test
+  run_gate website-package pnpm --dir website package:sites
+  run_gate website-production-audit pnpm --dir website audit --prod --audit-level high
   run_gate buildkite-pipeline ./.buildkite/scripts/upload-pipeline.sh --dry-run
   run_gate secret-scan gitleaks git --no-banner --redact
 }

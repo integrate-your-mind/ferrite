@@ -100,13 +100,15 @@ function safeRoutePath(pathname, label = "route path") {
   stringField(pathname, label);
   if (
     !pathname.startsWith("/") ||
+    pathname.includes("//") ||
+    (pathname !== "/" && pathname.endsWith("/")) ||
     pathname.includes("\\") ||
     pathname.includes("\0") ||
     pathname.includes("?") ||
     pathname.includes("#") ||
     pathname.split("/").some((part) => part === "." || part === "..")
   ) {
-    invalid(`${label} \`${pathname}\` is not an absolute URL path`);
+    invalid(`${label} \`${pathname}\` is not a canonical absolute URL path`);
   }
   return pathname;
 }
@@ -696,7 +698,7 @@ async function resolveRequestFile(clientDirectory, pathname, manifest) {
   const routeMap = routeFiles(manifest);
   const clientCanonical = await realpath(clientDirectory);
   const normalized = pathname.length > 1 ? pathname.replace(/\/+$/, "") : "/";
-  const prerendered = routeMap.get(normalized) ?? routeMap.get(`${normalized}/`);
+  const prerendered = routeMap.get(normalized);
   const candidates = [];
   if (prerendered && declared.has(prerendered)) candidates.push(prerendered);
   const relative = normalized === "/" ? "index.html" : normalized.slice(1);
@@ -716,6 +718,17 @@ async function resolveRequestFile(clientDirectory, pathname, manifest) {
 }
 
 async function handleNodeRequest(request, response, clientDirectory) {
+  const method = request.method ?? "GET";
+  if (method !== "GET" && method !== "HEAD") {
+    request.resume();
+    response.writeHead(405, {
+      ...SECURITY_HEADERS,
+      Allow: "GET, HEAD",
+      "Cache-Control": "no-store",
+      "Content-Type": "text/plain; charset=utf-8",
+    }).end("Method not allowed");
+    return;
+  }
   let pathname;
   try {
     pathname = decodeURIComponent(new URL(request.url ?? "/", "http://ferrite.invalid").pathname);

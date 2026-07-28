@@ -141,14 +141,19 @@ test("local CI retains the host-executable validation gate categories", async ()
     "prebuild:package",
     "prebuild:verify",
     "pnpm test:nginx:stack",
-    "npm --prefix website test",
-    "npm --prefix website run typecheck",
-    "npm --prefix website audit --omit=dev --audit-level=high",
+    "pnpm --dir website install --ignore-workspace --frozen-lockfile",
+    "pnpm --dir website lint",
+    "pnpm --dir website typecheck",
+    "pnpm --dir website build",
+    "pnpm --dir website test",
+    "pnpm --dir website package:sites",
+    "pnpm --dir website audit --prod --audit-level high",
     "./.buildkite/scripts/upload-pipeline.sh --dry-run",
     "gitleaks git --no-banner --redact",
   ]) {
     assert.match(source, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
+  assert.doesNotMatch(source, /npm --prefix website/);
   assert.match(source, /command -v pnpm/);
   assert.match(source, /pnpm_version="\$\(pnpm --version\)"/);
   assert.match(source, /rustup target list --toolchain stable --installed/);

@@ -50,6 +50,10 @@ links, returns a real 404 for unknown paths, and adds conservative
 cache/security headers with no request-body or query logging. The plain adapter
 only serves immutable output; it does not compile Ferrite source.
 
+The generated `sourceBuildId` is the verified Ferrite artifact-content identity,
+not a Git commit or tree identity. Exact-source claims must also cite an external
+build receipt bound to the tested commit.
+
 ## Evidence and boundaries
 
 Screenshots in `public/demos/` are source-backed captures from

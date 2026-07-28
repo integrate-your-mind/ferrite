@@ -91,9 +91,9 @@ async function writeFixture(root, { files = fixtureFiles, manifest = validManife
   await writeFile(join(root, "ferrite-build.json"), "{}\n");
 }
 
-async function request(server, path) {
+async function request(server, path, options) {
   const address = server.address();
-  const response = await fetch(`http://127.0.0.1:${address.port}${path}`);
+  const response = await fetch(`http://127.0.0.1:${address.port}${path}`, options);
   return { response, body: await response.text() };
 }
 
@@ -124,6 +124,22 @@ test("packages verified prerendered routes/assets and serves deep links without 
       assert.equal(docs.response.status, 200);
       assert.equal(docs.body, "<h1>Docs</h1>");
       assert.equal(docs.response.headers.get("content-type"), "text/html; charset=utf-8");
+      const docsHead = await request(server, "/docs", { method: "HEAD" });
+      assert.equal(docsHead.response.status, 200);
+      assert.equal(docsHead.body, "");
+      assert.equal(docsHead.response.headers.get("content-type"), "text/html; charset=utf-8");
+      const rejectedPost = await request(server, "/docs", { method: "POST", body: "x".repeat(64 * 1024) });
+      assert.equal(rejectedPost.response.status, 405);
+      assert.equal(rejectedPost.response.headers.get("allow"), "GET, HEAD");
+      assert.equal(rejectedPost.response.headers.get("cache-control"), "no-store");
+      assert.equal(rejectedPost.body, "Method not allowed");
+      const rejectedOptions = await request(server, "/docs", { method: "OPTIONS" });
+      assert.equal(rejectedOptions.response.status, 405);
+      assert.equal(rejectedOptions.response.headers.get("allow"), "GET, HEAD");
+      assert.equal(rejectedOptions.body, "Method not allowed");
+      const docsAfterRejectedBody = await request(server, "/docs");
+      assert.equal(docsAfterRejectedBody.response.status, 200);
+      assert.equal(docsAfterRejectedBody.body, "<h1>Docs</h1>");
       const asset = await request(server, "/assets/app.0123456789.js");
       assert.equal(asset.response.status, 200);
       assert.equal(asset.response.headers.get("content-type"), "text/javascript; charset=utf-8");
@@ -175,7 +191,7 @@ test("packages validated site public files when the Ferrite artifact does not en
   }
 });
 
-test("origin drift regenerates metadata while retaining the verified source build identity", async () => {
+test("origin drift regenerates metadata while retaining the verified source artifact identity", async () => {
   const fixture = await mkdtemp(join(tmpdir(), "ferrite-origin-fixture-"));
   try {
     await writeFixture(join(fixture, "artifact"));
@@ -217,12 +233,19 @@ test("server returns an error instead of falling back when the served manifest i
   }
 });
 
-for (const [label, mutate] of [
+for (const [label, mutate, expected = /invalid Ferrite production artifact/] of [
   ["malformed manifest", (manifest) => ({ ...manifest, routes: "not-an-array" })],
   ["unsafe path", (manifest) => ({ ...manifest, files: [{ ...manifest.files[0], path: "../escape" }] })],
   ["duplicate file", (manifest) => ({ ...manifest, files: [...manifest.files, manifest.files[0]] })],
   ["undeclared public file", (manifest) => ({ ...manifest, publicFiles: [...manifest.publicFiles, "missing.svg"] })],
   ["reserved public file", (manifest) => ({ ...manifest, publicFiles: ["server/home.mjs"] })],
+  ["noncanonical prerendered route alias", (manifest) => {
+    const routes = structuredClone(manifest.routes);
+    routes[1].prerendered["/docs/"] = "docs/index.html";
+    const result = { ...manifest, routes };
+    result.buildId = computeManifestBuildId(result);
+    return result;
+  }, /canonical absolute URL path/],
 ]) {
   test(`fails closed on ${label} without deleting an existing dist`, async () => {
     const fixture = await mkdtemp(join(tmpdir(), "ferrite-invalid-fixture-"));
@@ -234,7 +257,7 @@ for (const [label, mutate] of [
       await writeFixture(artifact);
       const malformed = mutate(validManifest(fixtureFiles));
       await writeFile(join(artifact, "ferrite-server.json"), JSON.stringify(malformed));
-      await assert.rejects(packageArtifact(artifact, dist), /invalid Ferrite production artifact/);
+      await assert.rejects(packageArtifact(artifact, dist), expected);
       assert.equal(await readFile(join(dist, "sentinel"), "utf8"), "keep me");
     } finally {
       await rm(fixture, { recursive: true, force: true });
