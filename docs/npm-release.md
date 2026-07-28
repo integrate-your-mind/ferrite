@@ -54,6 +54,10 @@ Bind every receipt to the exact candidate commit and tree.
   Prior outputs are renamed into a same-directory `.previous-report-*` backup
   so replacement stays on one filesystem. Any backup left by an interrupted
   verifier blocks regeneration until an operator preserves and reconciles it.
+  An atomic same-directory `.verification-lock` serializes the final source
+  checks, replacement, rollback, and cleanup. A concurrent verifier fails
+  closed, and a lock left by an interrupted verifier is preserved and blocks
+  future regeneration until it is reconciled.
 - `pnpm release:plan:npm` succeeds and emits the portable dependency order
   from those exact retained bytes. The planner reopens each gzip/tar archive and
   compares its real file list and `package/package.json` with the report. It also

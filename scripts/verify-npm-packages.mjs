@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, readdir, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { argv, cwd, env, exit } from "node:process";
@@ -192,6 +192,7 @@ export async function verifyNpmPackages({
     if (writeReports) {
       await refusePublicationReceipt(packageReportDir);
       await refuseStaleReportBackup(packageReportDir);
+      await refuseStaleVerificationLock(packageReportDir);
     }
     for (const config of releasePackages) {
       const sourceManifest =
@@ -288,76 +289,99 @@ export async function verifyNpmPackages({
           throw new Error("npm package report source commit/tree changed during verification.");
         }
       };
-      reportPhase("report:source-stability-before");
-      await assertSourceStable();
-      reportPhase("report:source-stability-confirmed");
-      await refusePublicationReceipt(packageReportDir);
-      await refuseStaleReportBackup(packageReportDir);
-      reportPhase("report:publication-receipt-clear");
       await mkdir(packageReportDir, { recursive: true });
-      const backupRoot = await mkdtemp(join(packageReportDir, ".previous-report-"));
-      const reportPath = join(packageReportDir, "npm-package-report.json");
-      const tarballPath = join(packageReportDir, "tarballs");
-      const backupReportPath = join(backupRoot, "npm-package-report.json");
-      const backupTarballPath = join(backupRoot, "tarballs");
-      let backedReport = false;
-      let backedTarballs = false;
+      const verificationLock = await acquireVerificationLock(packageReportDir);
+      let reportError;
       try {
-        await mkdir(backupRoot, { recursive: true });
-        backedReport = await moveIfPresent(reportPath, backupReportPath);
-        backedTarballs = await moveIfPresent(tarballPath, backupTarballPath);
-        await rm(reportPath, { force: true });
-        await rm(tarballPath, { force: true, recursive: true });
-        await mkdir(packageReportDir, { recursive: true });
-        reportPhase("report:persist-tarballs");
-        await persistVerifiedTarballs(results, installablePackages, packageReportDir);
-        reportPhase("report:source-stability-after-persist");
+        reportPhase("report:source-stability-before");
         await assertSourceStable();
-        const report = createPackageReport({
-          packages: results,
-          source: capturedSource,
-          build: buildIdentity ?? readBuildIdentity(env),
-        });
-        reportPhase("report:write");
-        await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-        reportPhase("report:source-stability-after-write");
-        await assertSourceStable();
-      } catch (error) {
-        const rollbackErrors = [];
-        await rm(reportPath, { force: true }).catch((rollbackError) => {
-          rollbackErrors.push(rollbackError);
-        });
-        await rm(tarballPath, { force: true, recursive: true }).catch((rollbackError) => {
-          rollbackErrors.push(rollbackError);
-        });
-        if (backedReport) {
-          await rename(backupReportPath, reportPath).catch((rollbackError) => {
+        reportPhase("report:source-stability-confirmed");
+        await refusePublicationReceipt(packageReportDir);
+        await refuseStaleReportBackup(packageReportDir);
+        reportPhase("report:publication-receipt-clear");
+        const backupRoot = await mkdtemp(join(packageReportDir, ".previous-report-"));
+        const reportPath = join(packageReportDir, "npm-package-report.json");
+        const tarballPath = join(packageReportDir, "tarballs");
+        const backupReportPath = join(backupRoot, "npm-package-report.json");
+        const backupTarballPath = join(backupRoot, "tarballs");
+        let backedReport = false;
+        let backedTarballs = false;
+        try {
+          backedReport = await moveIfPresent(reportPath, backupReportPath);
+          backedTarballs = await moveIfPresent(tarballPath, backupTarballPath);
+          await rm(reportPath, { force: true });
+          await rm(tarballPath, { force: true, recursive: true });
+          await mkdir(packageReportDir, { recursive: true });
+          reportPhase("report:persist-tarballs");
+          await persistVerifiedTarballs(results, installablePackages, packageReportDir);
+          reportPhase("report:source-stability-after-persist");
+          await assertSourceStable();
+          const report = createPackageReport({
+            packages: results,
+            source: capturedSource,
+            build: buildIdentity ?? readBuildIdentity(env),
+          });
+          reportPhase("report:write");
+          await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+          reportPhase("report:source-stability-after-write");
+          await assertSourceStable();
+        } catch (error) {
+          const rollbackErrors = [];
+          await rm(reportPath, { force: true }).catch((rollbackError) => {
             rollbackErrors.push(rollbackError);
           });
-        }
-        if (backedTarballs) {
-          await rename(backupTarballPath, tarballPath).catch((rollbackError) => {
+          await rm(tarballPath, { force: true, recursive: true }).catch((rollbackError) => {
             rollbackErrors.push(rollbackError);
           });
+          if (backedReport) {
+            await rename(backupReportPath, reportPath).catch((rollbackError) => {
+              rollbackErrors.push(rollbackError);
+            });
+          }
+          if (backedTarballs) {
+            await rename(backupTarballPath, tarballPath).catch((rollbackError) => {
+              rollbackErrors.push(rollbackError);
+            });
+          }
+          if (rollbackErrors.length > 0) {
+            preserveStageRoot = true;
+            throw new AggregateError(
+              [error, ...rollbackErrors],
+              `npm package verification failed and prior output restoration was incomplete; inspect preserved backup ${backupRoot} and report directory ${packageReportDir}.`,
+            );
+          }
+          throw error;
         }
-        if (rollbackErrors.length > 0) {
+        reportPhase("report:cleanup-backup");
+        await rm(backupRoot, { force: true, recursive: true }).catch((cleanupError) => {
           preserveStageRoot = true;
-          throw new AggregateError(
-            [error, ...rollbackErrors],
-            `npm package verification failed and prior output restoration was incomplete; inspect preserved backup ${backupRoot} and report directory ${packageReportDir}.`,
+          throw new Error(
+            `npm package verification succeeded, but prior-output cleanup failed; inspect ${backupRoot} without replacing the verified report at ${packageReportDir}.`,
+            { cause: cleanupError },
           );
-        }
-        throw error;
+        });
+        reportPhase("report:complete");
+      } catch (error) {
+        reportError = error;
       }
-      reportPhase("report:cleanup-backup");
-      await rm(backupRoot, { force: true, recursive: true }).catch((cleanupError) => {
+      let lockReleaseError;
+      await rmdir(verificationLock).catch((error) => {
         preserveStageRoot = true;
-        throw new Error(
-          `npm package verification succeeded, but prior-output cleanup failed; inspect ${backupRoot} without replacing the verified report at ${packageReportDir}.`,
-          { cause: cleanupError },
-        );
+        lockReleaseError = error;
       });
-      reportPhase("report:complete");
+      if (reportError && lockReleaseError) {
+        throw new AggregateError(
+          [reportError, lockReleaseError],
+          `npm package verification failed and could not release ${verificationLock}; preserve and reconcile the locked report directory.`,
+        );
+      }
+      if (lockReleaseError) {
+        throw new Error(
+          `npm package verification completed but could not release ${verificationLock}; preserve and reconcile the locked report directory.`,
+          { cause: lockReleaseError },
+        );
+      }
+      if (reportError) throw reportError;
     }
 
     return results;
@@ -396,6 +420,37 @@ async function refuseStaleReportBackup(packageReportDir) {
       `npm package verification refuses to replace artifacts while interrupted backup exists at ${join(packageReportDir, staleBackup)}; preserve and reconcile it first.`,
     );
   }
+}
+
+async function refuseStaleVerificationLock(packageReportDir) {
+  let entries;
+  try {
+    entries = await readdir(packageReportDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  if (entries.includes(".verification-lock")) {
+    throw verificationLockError(join(packageReportDir, ".verification-lock"));
+  }
+}
+
+async function acquireVerificationLock(packageReportDir) {
+  const lockPath = join(packageReportDir, ".verification-lock");
+  try {
+    await mkdir(lockPath);
+    return lockPath;
+  } catch (error) {
+    if (error?.code === "EEXIST") throw verificationLockError(lockPath, error);
+    throw error;
+  }
+}
+
+function verificationLockError(lockPath, cause) {
+  return new Error(
+    `npm package verification lock exists at ${lockPath}; preserve and reconcile it before replacing artifacts.`,
+    cause ? { cause } : undefined,
+  );
 }
 
 async function moveIfPresent(source, destination) {

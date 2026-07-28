@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
@@ -82,6 +82,103 @@ test("verifier preserves an interrupted same-directory backup and refuses regene
   }
 });
 
+test("verifier preserves an interrupted verification lock and refuses regeneration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-lock-guard-"));
+  const reportDir = join(root, "reports");
+  const lock = join(reportDir, ".verification-lock");
+  const marker = join(lock, "operator-note");
+  const markerText = "preserve this interrupted transaction\n";
+  try {
+    await mkdir(lock, { recursive: true });
+    await writeFile(marker, markerText);
+    await assert.rejects(
+      verifyNpmPackages({
+        ...testReportIdentity,
+        releasePackages: [],
+        workspaceRoot: root,
+        reportDir,
+        runCommand: async () => {
+          throw new Error("build must not run");
+        },
+      }),
+      /verification lock exists.*preserve and reconcile/,
+    );
+    assert.equal(await readFile(marker, "utf8"), markerText);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("concurrent report verifiers fail closed instead of interleaving output", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-concurrency-guard-"));
+  const reportDir = join(root, "reports");
+  const source = { commit: "a".repeat(40), tree: "b".repeat(40) };
+  let installed = 0;
+  let releaseInstalls;
+  let allInstalledResolve;
+  const installGate = new Promise((resolve) => {
+    releaseInstalls = resolve;
+  });
+  const allInstalled = new Promise((resolve) => {
+    allInstalledResolve = resolve;
+  });
+  const installPackageSet = async () => {
+    installed += 1;
+    if (installed === 2) allInstalledResolve();
+    await installGate;
+  };
+  let lockHeldResolve;
+  let releaseWinner;
+  const lockHeld = new Promise((resolve) => {
+    lockHeldResolve = resolve;
+  });
+  const winnerGate = new Promise((resolve) => {
+    releaseWinner = resolve;
+  });
+  const readSourceIdentity = () => {
+    let reads = 0;
+    return async () => {
+      reads += 1;
+      if (reads === 2) {
+        lockHeldResolve();
+        await winnerGate;
+      }
+      return source;
+    };
+  };
+  const invoke = () =>
+    verifyNpmPackages({
+      buildIdentity: testReportIdentity.buildIdentity,
+      releasePackages: [],
+      workspaceRoot: root,
+      reportDir,
+      readSourceIdentity: readSourceIdentity(),
+      runCommand: async () => {},
+      installPackageSet,
+    });
+
+  try {
+    const first = invoke();
+    const second = invoke();
+    await allInstalled;
+    releaseInstalls();
+    await lockHeld;
+    releaseWinner();
+    const results = await Promise.allSettled([first, second]);
+    assert.equal(results.filter(({ status }) => status === "fulfilled").length, 1);
+    const rejected = results.find(({ status }) => status === "rejected");
+    assert.match(rejected?.reason?.message ?? "", /verification lock exists/);
+    assert.doesNotMatch(
+      (await readdir(reportDir)).join("\n"),
+      /^\.verification-lock$|^\.previous-report-/m,
+    );
+  } finally {
+    releaseInstalls?.();
+    releaseWinner?.();
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("source drift before report replacement preserves prior generated artifacts", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-npm-source-drift-"));
   const reportDir = join(root, "reports");
@@ -121,6 +218,7 @@ test("source drift before report replacement preserves prior generated artifacts
     );
     assert.equal(await readFile(reportPath, "utf8"), priorReport);
     assert.deepEqual(await readFile(tarballPath), priorTarball);
+    assert.equal((await readdir(reportDir)).includes(".verification-lock"), false);
   } finally {
     await rm(root, { force: true, recursive: true });
   }
@@ -171,6 +269,7 @@ test("source drift after report persistence restores prior generated artifacts",
     );
     assert.equal(await readFile(reportPath, "utf8"), priorReport);
     assert.deepEqual(await readFile(tarballPath), priorTarball);
+    assert.equal((await readdir(reportDir)).includes(".verification-lock"), false);
   } finally {
     await rm(root, { force: true, recursive: true });
   }
