@@ -49,8 +49,8 @@ preflight() {
   mkdir -p "${REPORT_DIR}"
   : > "${REPORT_DIR}/results.tsv"
 
-  git diff --quiet || fail "tracked worktree changes are not allowed"
-  git diff --cached --quiet || fail "staged changes are not allowed"
+  [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] ||
+    fail "a clean worktree, including untracked files, is required"
 
   local head
   head="$(git rev-parse HEAD)"
@@ -148,6 +148,7 @@ packages() {
   run_gate cargo-audit cargo audit --deny warnings
   run_gate website-install npm --prefix website ci
   run_gate website-lint npm --prefix website run lint
+  run_gate website-typecheck npm --prefix website run typecheck
   run_gate website-test npm --prefix website test
   run_gate website-production-audit npm --prefix website audit --omit=dev --audit-level=high
   run_gate buildkite-pipeline ./.buildkite/scripts/upload-pipeline.sh --dry-run

@@ -32,6 +32,14 @@ function pipelineStep(source, key) {
 
 test("Buildkite pipeline runs dependency-ordered clean-checkout gates on the dedicated local queue", async () => {
   const source = await readFile(pipelineUrl, "utf8");
+  const expectedKeys = [
+    "ferrite-verify",
+    "ferrite-packages",
+    "ferrite-coverage-rust",
+    "ferrite-coverage-js",
+    "ferrite-native",
+    "ferrite-nginx",
+  ];
 
   for (const [key, mode, dependency, timeout] of [
     ["ferrite-verify", "verify", null, 30],
@@ -57,6 +65,16 @@ test("Buildkite pipeline runs dependency-ordered clean-checkout gates on the ded
     assert.match(step, /os: "darwin"/);
     assert.match(step, /arch: "arm64"/);
   }
+  assert.deepEqual(
+    [...source.matchAll(/^\s{4}key: "([^"]+)"$/gm)].map(([, key]) => key),
+    expectedKeys,
+    "the pipeline must not gain unreviewed steps outside the six validated gates",
+  );
+  assert.equal(
+    [...source.matchAll(/^\s{2}- label:/gm)].length,
+    expectedKeys.length,
+    "every pipeline step must be represented by a validated key",
+  );
   assert.doesNotMatch(source, /command: "\.\/\.buildkite\/scripts\/ci\.sh all"/);
   assert.match(source, /dist\/ci\/\*\*\/\*/);
   assert.doesNotMatch(source, /plugins:|deploy|publish|release/);
@@ -101,6 +119,7 @@ test("local CI retains the host-executable validation gate categories", async ()
     "prebuild:verify",
     "pnpm test:nginx:stack",
     "npm --prefix website test",
+    "npm --prefix website run typecheck",
     "npm --prefix website audit --omit=dev --audit-level=high",
     "./.buildkite/scripts/upload-pipeline.sh --dry-run",
   ]) {
@@ -117,6 +136,8 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /MIN_FREE_KIB=20971520/);
   assert.match(source, /\/bin\/df -Pk "\$\{ROOT\}"/);
   assert.match(source, /storage admission requires at least/);
+  assert.match(source, /git status --porcelain=v1 --untracked-files=all/);
+  assert.doesNotMatch(source, /git diff --quiet/);
   assert.ok(
     source.indexOf("/bin/df -Pk") < source.indexOf('mkdir -p "${REPORT_DIR}"'),
     "storage admission must run before CI creates report output",

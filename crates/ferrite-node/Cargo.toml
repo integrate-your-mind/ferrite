@@ -12,4 +12,4 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ferrite-ssr = { path = "../ferrite-ssr", version = "0.1.0" }
+ferrite-ssr = { path = "../ferrite-ssr", version = "=0.1.0" }
