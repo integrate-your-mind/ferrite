@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "$(builtin declare -Fx)" ]]; then
+  printf 'Ferrite local CI: imported shell functions are not allowed\n' >&2
+  exit 1
+fi
+
 ROOT="$(git rev-parse --show-toplevel)"
 readonly ROOT
 REPORT_DIR="${FERRITE_CI_REPORT_DIR:-${ROOT}/dist/ci}"
@@ -161,25 +166,45 @@ check_coverage_floor() {
 }
 
 activate_rust_toolchain() {
-  local actual expected tool toolchain_bin
+  local actual actual_real expected expected_real rustup_path tool toolchain_bin
 
-  command -v rustup >/dev/null || fail "rustup is unavailable"
-  expected="$(rustup which --toolchain "${RUST_TOOLCHAIN}" rustc)" ||
+  rustup_path="$(builtin type -P rustup)" || fail "rustup is unavailable"
+  [[ "${rustup_path}" == /* && -f "${rustup_path}" && -x "${rustup_path}" ]] ||
+    fail "rustup must resolve to an absolute regular executable"
+  rustup_path="$(/bin/realpath "${rustup_path}")" ||
+    fail "rustup could not be canonicalized"
+  [[ "${rustup_path}" == /* && -f "${rustup_path}" && -x "${rustup_path}" ]] ||
+    fail "canonical rustup path is not an executable file"
+
+  expected="$("${rustup_path}" which --toolchain "${RUST_TOOLCHAIN}" rustc)" ||
     fail "Rust ${RUST_TOOLCHAIN} is unavailable"
-  toolchain_bin="$(/usr/bin/dirname "${expected}")"
+  [[ "${expected}" == /* && -f "${expected}" && -x "${expected}" ]] ||
+    fail "Rust ${RUST_TOOLCHAIN} rustc path is not an executable file"
+  expected_real="$(/bin/realpath "${expected}")" ||
+    fail "Rust ${RUST_TOOLCHAIN} rustc path could not be canonicalized"
+  toolchain_bin="$(/usr/bin/dirname "${expected_real}")"
   [[ -d "${toolchain_bin}" ]] ||
     fail "Rust ${RUST_TOOLCHAIN} toolchain directory is unavailable"
 
   export RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}"
   export PATH="${toolchain_bin}:${PATH}"
+  export FERRITE_RUSTUP_PATH="${rustup_path}"
   export FERRITE_RUST_TOOLCHAIN_BIN="${toolchain_bin}"
 
   for tool in cargo rustc cargo-clippy clippy-driver rustfmt rustdoc; do
-    expected="$(rustup which --toolchain "${RUST_TOOLCHAIN}" "${tool}")" ||
+    expected="$("${rustup_path}" which --toolchain "${RUST_TOOLCHAIN}" "${tool}")" ||
       fail "${tool} is unavailable in Rust ${RUST_TOOLCHAIN}"
-    actual="$(command -v "${tool}")" ||
+    [[ "${expected}" == /* && -f "${expected}" && -x "${expected}" ]] ||
+      fail "${tool} rustup path is not an executable file"
+    expected_real="$(/bin/realpath "${expected}")" ||
+      fail "${tool} rustup path could not be canonicalized"
+    actual="$(builtin type -P "${tool}")" ||
       fail "${tool} is unavailable after activating Rust ${RUST_TOOLCHAIN}"
-    [[ "$(/bin/realpath "${actual}")" == "$(/bin/realpath "${expected}")" ]] ||
+    [[ "${actual}" == /* && -f "${actual}" && -x "${actual}" ]] ||
+      fail "${tool} must resolve to an absolute regular executable"
+    actual_real="$(/bin/realpath "${actual}")" ||
+      fail "${tool} resolved path could not be canonicalized"
+    [[ "${actual_real}" == "${expected_real}" ]] ||
       fail "${tool} did not resolve through Rust ${RUST_TOOLCHAIN}"
   done
 }
@@ -248,11 +273,14 @@ preflight() {
     printf 'pnpm=%s\n' "${pnpm_version}"
     printf 'rust=%s\n' "${rust_version}"
     printf 'rust_toolchain=%s\n' "${RUST_TOOLCHAIN}"
+    printf 'rustup_path=%s\n' "${FERRITE_RUSTUP_PATH}"
     printf 'rust_toolchain_bin=%s\n' "${FERRITE_RUST_TOOLCHAIN_BIN}"
     printf 'cargo_path=%s\n' "$(command -v cargo)"
     printf 'rustc_path=%s\n' "$(command -v rustc)"
     printf 'cargo_clippy_path=%s\n' "$(command -v cargo-clippy)"
     printf 'clippy_driver_path=%s\n' "$(command -v clippy-driver)"
+    printf 'rustfmt_path=%s\n' "$(command -v rustfmt)"
+    printf 'rustdoc_path=%s\n' "$(command -v rustdoc)"
     printf 'cargo_verbose=%s\n' "${cargo_verbose}"
     printf 'rust_verbose=%s\n' "${rust_verbose}"
     printf 'buildkite_agent=%s\n' "${buildkite_version}"

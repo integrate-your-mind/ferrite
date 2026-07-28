@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "$(builtin declare -Fx)" ]]; then
+  printf 'Ferrite Buildkite trust check: imported shell functions are not allowed\n' >&2
+  exit 1
+fi
+
 case "${BUILDKITE_COMMAND:-}" in
   "./.buildkite/scripts/upload-pipeline.sh" | \
   "./.buildkite/scripts/ci.sh verify" | \

@@ -172,21 +172,22 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /command -v cargo-llvm-cov/);
   assert.match(source, /RUST_TOOLCHAIN="1\.95\.0"/);
   assert.match(source, /activate_rust_toolchain/);
-  assert.match(source, /rustup which --toolchain "\$\{RUST_TOOLCHAIN\}"/);
-  for (const tool of [
-    "cargo",
-    "rustc",
-    "cargo-clippy",
-    "clippy-driver",
-    "rustfmt",
-    "rustdoc",
-  ]) {
-    assert.match(source, new RegExp(`command -v "\\$\\{tool\\}"`));
-  }
+  assert.match(source, /builtin type -P rustup/);
+  assert.match(
+    source,
+    /"\$\{rustup_path\}" which --toolchain "\$\{RUST_TOOLCHAIN\}"/,
+  );
+  assert.match(
+    source,
+    /for tool in cargo rustc cargo-clippy clippy-driver rustfmt rustdoc; do/,
+  );
   assert.match(source, /cargo_path=/);
   assert.match(source, /rustc_path=/);
+  assert.match(source, /rustup_path=/);
   assert.match(source, /cargo_clippy_path=/);
   assert.match(source, /clippy_driver_path=/);
+  assert.match(source, /rustfmt_path=/);
+  assert.match(source, /rustdoc_path=/);
   assert.match(source, /cargo_verbose=/);
   assert.match(source, /rust_verbose=/);
   assert.match(source, /start_cargo_lock_sha/);
@@ -294,11 +295,34 @@ test("Rust toolchain activation fails closed instead of mixing a missing Clippy 
     );
     assert.match(
       result.stderr,
-      /clippy-driver did not resolve through Rust 1\.95\.0/,
+      /clippy-driver rustup path is not an executable file/,
     );
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test("Rust toolchain activation rejects imported shell functions", () => {
+  const result = spawnSync(
+    ciUrl.pathname,
+    ["preflight"],
+    {
+      encoding: "utf8",
+      env: {
+        HOME: process.env.HOME,
+        PATH: process.env.PATH,
+        "BASH_FUNC_rustup%%":
+          '() { printf "%s\\n" "/opt/homebrew/bin/${@: -1}"; }',
+      },
+    },
+  );
+
+  assert.notEqual(
+    result.status,
+    0,
+    `imported rustup function unexpectedly passed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.match(result.stderr, /imported shell functions are not allowed/);
 });
 
 test("pipeline upload rejects embedded secrets", async () => {
@@ -482,6 +506,15 @@ test("external command hook rejects arbitrary commands", async () => {
       BUILDKITE_COMMAND: "env",
     }).status,
     0,
+  );
+  const importedFunction = runHook(preCommandHookUrl, {
+    BUILDKITE_COMMAND: "./.buildkite/scripts/ci.sh verify",
+    "BASH_FUNC_rustup%%": '() { printf "%s\\n" "/tmp/rustup"; }',
+  });
+  assert.notEqual(importedFunction.status, 0);
+  assert.match(
+    importedFunction.stderr,
+    /imported shell functions are not allowed/,
   );
 
   const source = await readFile(preCommandHookUrl, "utf8");

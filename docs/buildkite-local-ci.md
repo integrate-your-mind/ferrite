@@ -24,11 +24,14 @@ cargo-llvm-cov, Docker, and Buildkite Agent 3.127.x. The environment hook
 copies the rustup proxies needed by Cargo, Rustc, Clippy, rustfmt, and rustdoc
 into its private toolchain bin. Preflight resolves all six tools through the
 same pinned rustup toolchain and fails closed if any tool resolves elsewhere.
-The environment receipt records their paths plus full Cargo and Rustc version
-details, including the LLVM identity that distinguishes incompatible
-same-version distributors. The two standalone Cargo subcommand executables are
-also copied into the private toolchain bin when present; preflight fails closed
-if either required executable is absent.
+Preflight accepts only absolute regular executable paths, requires every
+canonicalization to succeed, and rejects inherited shell functions before any
+repository command can run. The environment receipt records rustup and all six
+tool paths plus full Cargo and Rustc version details, including the LLVM
+identity that distinguishes incompatible same-version distributors. The two
+standalone Cargo subcommand executables are also copied into the private
+toolchain bin when present; preflight fails closed if either required
+executable is absent.
 The lane invokes the pinned pnpm executable directly
 because current Homebrew Node releases do not bundle Corepack. It places the
 rustup proxies ahead of Homebrew Rust so a clean WASM build cannot be masked by
@@ -70,11 +73,12 @@ reports fail closed. These floors sit below the current exact results (90.99%,
 81.57%, and 79.50%) to detect regressions without pretending to be a quality
 target.
 
-Every command step checks storage before creating reports, installing
-dependencies, or building source. It fails closed unless the checkout volume
-has at least 20 GiB available, then records the observed and required KiB
-values in `dist/ci/environment.txt`. Do not bypass this guard to turn an
-`ENOSPC` failure into a nominal CI result.
+Each of the six proof-mode jobs checks storage before creating reports,
+installing dependencies, or building source. It fails closed unless the
+checkout volume has at least 20 GiB available, then records the observed and
+required KiB values in `dist/ci/environment.txt`. The pipeline-upload bootstrap
+does not build source or create proof reports. Do not bypass the proof-mode
+guard to turn an `ENOSPC` failure into a nominal CI result.
 
 Each gate records its starting commit, tree, `Cargo.lock` SHA-256, and
 worktree status, then verifies that all four are unchanged before reporting a
@@ -142,7 +146,8 @@ The external hooks:
   executed `PATH` (rustup proxies are copied into the per-build toolchain bin
   directory when the operator-installed toolchain is present);
 - allow only the pipeline upload and six proof-mode commands;
-- clear interactive Git/SSH credential helpers before project commands; and
+- reject imported shell functions and clear interactive Git/SSH credential
+  helpers before project commands; and
 - remove the exact exported per-build HOME from `TMPDIR` in the global
   `pre-exit` hook after validating its basename and path; cleanup is idempotent
   and fails closed for malformed or symlink paths; and
