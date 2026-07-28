@@ -163,6 +163,18 @@ test("concurrent report verifiers fail closed instead of interleaving output", a
     await allInstalled;
     releaseInstalls();
     await lockHeld;
+    const firstSettlement = await Promise.race([
+      first.then(
+        () => ({ status: "fulfilled" }),
+        (reason) => ({ reason, status: "rejected" }),
+      ),
+      second.then(
+        () => ({ status: "fulfilled" }),
+        (reason) => ({ reason, status: "rejected" }),
+      ),
+    ]);
+    assert.equal(firstSettlement.status, "rejected");
+    assert.match(firstSettlement.reason?.message ?? "", /verification lock exists/);
     releaseWinner();
     const results = await Promise.allSettled([first, second]);
     assert.equal(results.filter(({ status }) => status === "fulfilled").length, 1);
