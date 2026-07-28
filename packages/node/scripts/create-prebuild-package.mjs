@@ -195,7 +195,7 @@ export async function createPrebuildPackage({
 
 async function publishStaging({ stagingCanonical, destinationCanonical, renameImpl, removeImpl, lstatImpl }) {
   const destinationStat = await lstatImpl(destinationCanonical).then((value) => value).catch((error) => {
-    if (error?.code === "ENOENT") return false;
+    if (error?.code === "ENOENT") return undefined;
     throw error;
   });
   const destinationExists = Boolean(destinationStat);

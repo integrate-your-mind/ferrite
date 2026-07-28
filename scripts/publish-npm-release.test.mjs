@@ -72,7 +72,7 @@ test("npm preflight is fail-closed for authentication, policy, access, and regis
     }
     if (args[0] === "view") {
       if (error === "malformed") return "not json";
-      if (error === "exists") return view ?? "0.1.0-alpha.0";
+      if (error === "exists") return JSON.stringify(view ?? "0.1.0-alpha.0");
       throw Object.assign(new Error("E404"), { stderr: "npm ERR! code E404" });
     }
     throw new Error(`unexpected npm command ${args.join(" ")}`);
