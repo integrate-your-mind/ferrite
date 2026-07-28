@@ -1,33 +1,3 @@
-import Link from "next/link";
-
-export const metadata = {
-  title: "Ferrite Blog",
-  description: "Proof-oriented Ferrite updates and examples.",
-  alternates: {
-    canonical: "/blog",
-  },
-};
-
-export default function BlogIndexPage() {
-  return (
-    <main style={{ maxWidth: 900, margin: "0 auto", padding: "120px 22px 80px" }}>
-      <div className="kicker">Blog</div>
-      <h1 style={{ marginTop: "0.4rem", marginBottom: "1.1rem", maxWidth: 760 }}>Ferrite building notes</h1>
-      <p style={{ color: "#4b5563", maxWidth: 780 }}>
-        Short-form walkthroughs for people evaluating Ferrite as a React-style app runtime.
-      </p>
-      <ul style={{ marginTop: "1.4rem", paddingLeft: "1.1rem" }}>
-        <li>
-          <Link href="/blog/tic-tac-toe" style={{ textDecoration: "underline" }}>
-            Build a complete Tic Tac Toe app in Ferrite (interactive) →
-          </Link>
-        </li>
-        <li>
-          <Link href="/blog/tic-tac-toe-3d" style={{ textDecoration: "underline" }}>
-            Build a 3-D Tic Tac Toe app in Ferrite with Three.js →
-          </Link>
-        </li>
-      </ul>
-    </main>
-  );
-}
+export const metadata = { title: "Ferrite Blog", description: "Proof-oriented Ferrite updates and examples.", alternates: { canonical: siteUrl("/blog") } };
+export default function BlogIndexPage() { return <div className="wrap article"><p className="kicker">Blog</p><h1>Building notes from the runtime boundary.</h1><p>Short, source-backed walkthroughs for evaluating Ferrite as a React-style app runtime.</p><div className="grid-3"><article><p className="kicker">Interactive</p><h3><a href="/blog/tic-tac-toe">Build Tic-Tac-Toe in Ferrite</a></h3><p>State, immutable updates, reusable components, and a real client island.</p></article><article><p className="kicker">Library boundary</p><h3><a href="/blog/tic-tac-toe-3d">3-D Tic-Tac-Toe with Three.js</a></h3><p>What to isolate when a browser-only library enters a Ferrite route.</p></article></div></div>; }
+import { siteUrl } from "../metadata";

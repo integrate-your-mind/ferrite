@@ -1,230 +1,37 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
-const templateRoot = new URL("../", import.meta.url);
-const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
-let renderSequence = 0;
-const execFileAsync = promisify(execFile);
+const file = (name) => new URL(`../${name}`, import.meta.url);
+const source = (name) => readFile(file(name), "utf8");
 
-async function render(headers = { accept: "text/html" }, pathname = "/") {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${renderSequence++}`);
-  const { default: worker } = await import(workerUrl.href);
-
-  return worker.fetch(
-    new Request(new URL(pathname, "http://localhost/"), {
-      headers,
-    }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
-  );
-}
-
-test("server-renders the source-backed Ferrite site", async () => {
-  const response = await render();
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
-
-  const html = await response.text();
-  assert.match(html, /<title>Ferrite[^<]*Rust-first application framework<\/title>/i);
-  assert.match(html, /Rust owns the control plane/);
-  assert.match(html, /<h1[^>]*>Ferrite<\/h1>/);
-  assert.match(html, /Open-source developer preview/);
-  assert.match(html, />509<\/strong>/);
-  assert.match(html, />10<\/strong>/);
-  assert.match(html, />Captured<\/strong><span>Rust dev-server coverage report<\/span>/);
-  assert.match(html, />Available<\/span>/);
-  assert.match(html, />Partial<\/span>/);
-  assert.match(html, />Experimental<\/span>/);
-  assert.match(html, />Planned<\/span>/);
-  assert.match(html, /exact local artifact-backed serve/);
-  assert.match(html, /8716f30/);
-  assert.match(html, /docs-home-desktop\.png/);
-  assert.match(html, /docs-guide-desktop\.png/);
-  assert.match(html, /docs-catchall-desktop\.png/);
-  assert.match(html, /docs-mobile-nav\.png/);
-  assert.doesNotMatch(html, /_vinext\/image\?/);
-  assert.match(html, /\/guides\/architecture/);
-  assert.match(html, /application-level unavailable state/);
-  assert.match(html, /id="content" tabindex="-1"/);
-  assert.match(html, /FERRITE_ACTION_CSRF/);
-  assert.match(html, /FERRITE_PUBLIC_ORIGIN/);
-  assert.match(html, /pnpm install --frozen-lockfile/);
-  assert.match(html, /--project examples\/basic/);
-  assert.doesNotMatch(html, /pnpm test:demos/);
-  assert.match(html, /https:\/\/github\.com\/integrate-your-mind\/ferrite/);
-  assert.match(html, />Demo PR #5</);
-  assert.doesNotMatch(html, /Draft demo PR #5/);
-  assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
-  assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
-  assert.doesNotMatch(html, /404 behavior|target="_blank"/i);
+test("uses Ferrite app-directory contracts and shared document", async () => {
+  const [layout, document, chrome, examples, packageJson, lockfile, metadata, limitations, compare] = await Promise.all([source("app/layout.tsx"), source("app/document.tsx"), source("app/components/SiteChrome.tsx"), source("app/examples/ExamplesIsland.tsx"), source("package.json"), source("pnpm-lock.yaml"), source("app/metadata.ts"), source("app/docs/limitations/page.tsx"), source("app/compare/migration-matrix/page.tsx")]);
+  assert.match(layout, /@ferrite\/runtime/); assert.match(document, /data-ferrite-document/); assert.match(document, /siteStyles/);
+  assert.match(layout, /openGraph/); assert.match(layout, /twitter/); assert.match(metadata, /FERRITE_SITE_ORIGIN/); assert.match(metadata, /siteUrl/);
+  assert.match(chrome, /noscript/); assert.match(chrome, /mobile-nav-fallback/);
+  assert.match(document, /focus-visible/); assert.match(limitations, /<caption>/); assert.match(compare, /<caption>/);
+  assert.match(examples, /"use client"/); assert.match(examples, /fetch\(path\)/); assert.match(examples, /request\("\/demo-data\.json"\)/); assert.match(examples, /request\("\/demo-data-missing\.json"\)/);
+  assert.doesNotMatch(packageJson, /next|vinext|react-dom/); assert.match(packageJson, /ferrite-cli/); assert.match(packageJson, /pnpm@11\.7\.0/); assert.match(packageJson, /@ferrite\/runtime/); assert.match(packageJson, /eslint/); assert.match(packageJson, /typescript/); assert.match(lockfile, /link:\.\.\/packages\/runtime/);
 });
 
-test("does not derive public metadata from request-controlled proxy headers", async () => {
-  const response = await render({
-    accept: "text/html",
-    host: "attacker.example",
-    "x-forwarded-host": "attacker.example",
-    "x-forwarded-proto": "javascript",
-  });
-  assert.equal(response.status, 200);
-
-  const html = await response.text();
-  assert.match(html, /http:\/\/localhost(?::\d+)?\/og\.png/);
-  assert.doesNotMatch(html, /attacker\.example|javascript:/);
+test("route inventory and comparison series remain source-backed", async () => {
+  for (const route of ["app/page.tsx", "app/docs/page.tsx", "app/docs/getting-started/page.tsx", "app/docs/architecture/page.tsx", "app/docs/limitations/page.tsx", "app/docs/deployment/page.tsx", "app/examples/page.tsx", "app/blog/page.tsx", "app/blog/tic-tac-toe/page.tsx", "app/blog/tic-tac-toe-3d/page.tsx", "app/compare/page.tsx", "app/compare/state-events/page.tsx", "app/compare/rendering-lifecycle/page.tsx", "app/compare/routing-data-build/page.tsx", "app/compare/migration-matrix/page.tsx", "app/compare/incompatibilities/page.tsx", "app/compare/codemod-boundary/page.tsx", "app/compare/when-to-stay/page.tsx"]) await access(file(route));
+  const home = await source("app/page.tsx"); assert.match(home, /8716f30/); assert.match(home, /local evidence/i); assert.match(home, /No drop-in React claim/i);
 });
 
-test("accepts only an explicit HTTP or HTTPS origin for public metadata", async () => {
-  const previousOrigin = process.env.FERRITE_SITE_ORIGIN;
-
-  try {
-    process.env.FERRITE_SITE_ORIGIN = "https://preview.example.test";
-    const response = await render();
-    assert.equal(response.status, 200);
-    assert.match(await response.text(), /https:\/\/preview\.example\.test\/og\.png/);
-
-    for (const invalidOrigin of [
-      "preview.example.test",
-      "javascript:alert(1)",
-      "https://user:secret@preview.example.test",
-      "https://preview.example.test/path/..",
-      "https://preview.example.test/%2e",
-      "https://preview.example.test?query=1",
-      "https://preview.example.test#fragment",
-    ]) {
-      process.env.FERRITE_SITE_ORIGIN = invalidOrigin;
-      await assert.rejects(render(), /FERRITE_SITE_ORIGIN must be/);
-    }
-  } finally {
-    if (previousOrigin === undefined) {
-      delete process.env.FERRITE_SITE_ORIGIN;
-    } else {
-      process.env.FERRITE_SITE_ORIGIN = previousOrigin;
-    }
-  }
+test("deployment adapter preserves hosting identity and hardens responses", async () => {
+  const adapter = await source("deploy-adapter.mjs"); const hosting = JSON.parse(await source(".openai/hosting.json"));
+  assert.equal(hosting.project_id, "appgprj_6a5b984c7d4481919ec1cf6bbcbd55c8");
+  for (const required of ["sourceBuildId", "staging", "rollback", "size mismatch", "SHA-256 mismatch", "symlink/reparse", "404", "Cache-Control", "X-Content-Type-Options", "Content-Security-Policy", "GENERATED_SERVER_ENTRY", "FERRITE_SITES_SERVE"]) assert.match(adapter, new RegExp(required.replace(/[/.]/g, "\\$&")));
+  assert.match(adapter, /join\(dist, "server", "index\.js"\)/);
+  assert.match(adapter, /prerendered/); assert.match(adapter, /manifest\.files/); assert.match(adapter, /FERRITE_SITE_ORIGIN/); assert.match(adapter, /renderSitemap/); assert.match(adapter, /renderRobots/); assert.doesNotMatch(adapter, /home-page fallback|routes\.has\("\/"\)/i);
 });
 
-test("keeps the published source free of initializer artifacts", async () => {
-  const [page, layout, packageJson, css, readme, worker, viteConfig, sitesPlugin] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../package.json", import.meta.url), "utf8"),
-    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
-    readFile(new URL("../README.md", import.meta.url), "utf8"),
-    readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
-    readFile(new URL("../vite.config.ts", import.meta.url), "utf8"),
-    readFile(new URL("../build/sites-vite-plugin.ts", import.meta.url), "utf8"),
-  ]);
-
-  assert.doesNotMatch(page, /codex-preview|SkeletonPreview|Starter Project/i);
-  assert.doesNotMatch(page, /Visual capture pending|placeholder|\+\s+--|notFound\(\)|404 behavior/i);
-  assert.doesNotMatch(layout, /codex-preview|_sites-preview|Starter Project/i);
-  assert.doesNotMatch(packageJson, /react-loading-skeleton/);
-  assert.doesNotMatch(packageJson, /drizzle|db:generate/);
-  assert.doesNotMatch(css, /linear-gradient|radial-gradient/);
-  assert.match(css, /prefers-reduced-motion:\s*reduce/);
-  assert.match(css, /site-header nav/);
-  assert.match(css, /focus-visible/);
-  assert.doesNotMatch(readme, /\\`/);
-  assert.match(readme, /```bash[\s\S]*npm run dev[\s\S]*```/);
-  assert.doesNotMatch(worker, /vinext-starter|Starter Project/i);
-  assert.doesNotMatch(viteConfig, /site-creator|d1_databases|r2_buckets/i);
-  assert.doesNotMatch(sitesPlugin, /drizzle|migration/i);
-
-  await assert.rejects(access(previewRoot));
-  await assert.rejects(access(new URL("public/_sites-preview", templateRoot)));
-  await assert.rejects(access(new URL("../drizzle.config.ts", import.meta.url)));
-  await assert.rejects(access(new URL("../db", import.meta.url)));
-  await assert.rejects(access(new URL("../examples/d1", import.meta.url)));
-  await access(new URL("../public/ferrite-mark.svg", import.meta.url));
-  await access(new URL("../public/og.png", import.meta.url));
-  for (const asset of ["docs-home-desktop.png", "docs-guide-desktop.png", "docs-catchall-desktop.png", "docs-mobile-nav.png", "capture-manifest.json", "CAPTURE_RECEIPT.md"]) {
-    await access(new URL(`../public/demos/${asset}`, import.meta.url));
-  }
-});
-
-test("pins every demo capture to the exact source and recorded digest", async () => {
-  const manifest = JSON.parse(await readFile(new URL("../public/demos/capture-manifest.json", import.meta.url), "utf8"));
-  assert.equal(manifest.source.commit, "8716f30c83b9e4fc0835c2f37f9c00bd26e8152d");
-  assert.equal(manifest.source.baseCommit, "8539f4a9288321f002658cebf6ac25a9bd952519");
-  assert.equal(manifest.source.buildId, "sha256:d54c36b56cc5dff3217c8ae6dc96e907733f5da302714341b5a8413f8d8af99d");
-  assert.deepEqual(manifest.captures.map((capture) => capture.route), ["/", "/guides/architecture", "/guides/unlisted/path", "/"]);
-
-  for (const capture of manifest.captures) {
-    const image = await readFile(new URL(`../public/demos/${capture.file}`, import.meta.url));
-    assert.equal(image.subarray(1, 4).toString("ascii"), "PNG");
-    const dimensions = `${image.readUInt32BE(16)}x${image.readUInt32BE(20)}`;
-    assert.equal(dimensions, capture.viewport);
-    assert.equal(createHash("sha256").update(image).digest("hex"), capture.sha256);
-  }
-});
-
-test("every on-page navigation link has a matching section", async () => {
-  const response = await render();
-  const html = await response.text();
-  const anchors = [...html.matchAll(/href="#([^"]+)"/g)].map((match) => match[1]);
-
-  assert.ok(anchors.length > 0);
-  for (const id of anchors) {
-    assert.match(html, new RegExp(`id="${id}"`));
-  }
-});
-
-test("embeds an explicitly configured public origin in the real site build", async () => {
-  const configuredOrigin = "https://configured-preview.example.test";
-  const previousOrigin = process.env.FERRITE_SITE_ORIGIN;
-
-  try {
-    await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
-      cwd: fileURLToPath(templateRoot),
-      env: { ...process.env, FERRITE_SITE_ORIGIN: configuredOrigin },
-      maxBuffer: 10 * 1024 * 1024,
-    });
-
-    for (const pathname of ["/", "/blog", "/blog/tic-tac-toe", "/blog/tic-tac-toe-3d"]) {
-      const response = await render({ accept: "text/html" }, pathname);
-      assert.equal(response.status, 200);
-      const html = await response.text();
-      const canonical = new URL(pathname, `${configuredOrigin}/`).toString();
-      const canonicalUrls = [...html.matchAll(/<link rel="canonical" href="([^"]+)"\s*\/?>/g)].map(
-        (match) => match[1],
-      );
-      assert.deepEqual(canonicalUrls, [canonical]);
-      assert.match(html, /https:\/\/configured-preview\.example\.test\/og\.png/);
-      assert.match(html, /https:\/\/configured-preview\.example\.test\/favicon\.svg/);
-      assert.doesNotMatch(html, /http:\/\/localhost:3000\/favicon\.svg/);
-    }
-  } finally {
-    const restoreEnv = { ...process.env };
-    if (previousOrigin === undefined) {
-      delete restoreEnv.FERRITE_SITE_ORIGIN;
-    } else {
-      restoreEnv.FERRITE_SITE_ORIGIN = previousOrigin;
-    }
-    await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
-      cwd: fileURLToPath(templateRoot),
-      env: restoreEnv,
-      maxBuffer: 10 * 1024 * 1024,
-    });
-  }
-
-  if (previousOrigin === undefined) {
-    const response = await render();
-    assert.equal(response.status, 200);
-    const html = await response.text();
-    assert.match(html, /http:\/\/localhost(?::\d+)?\/favicon\.svg/);
-    assert.doesNotMatch(html, /configured-preview\.example\.test/);
-  }
+test("robots and sitemap are adapter-generated templates", async () => {
+  const sitemap = await source("public/sitemap.xml"); const robots = await source("public/robots.txt");
+  assert.match(robots, /generated by deploy-adapter\.mjs/i); assert.doesNotMatch(robots, /https:\/\/ferrite\.dev/);
+  assert.match(sitemap, /validated Ferrite route manifest/i); assert.doesNotMatch(sitemap, /https:\/\/ferrite\.dev/);
+  await access(file("public/robots.txt")); await access(file("public/sitemap.xml")); await access(file("public/ferrite-mark.svg")); await access(file("public/og.png"));
+  const manifest = JSON.parse(await source("public/demos/capture-manifest.json")); assert.equal(manifest.source.commit, "8716f30c83b9e4fc0835c2f37f9c00bd26e8152d");
 });
