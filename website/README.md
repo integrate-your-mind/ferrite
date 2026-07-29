@@ -31,6 +31,13 @@ deployable output to the repository-root `dist/` directory. It intentionally
 does not invoke a package manager from inside the deployment build, because the
 Sites builder may install with pnpm and execute the build through npm.
 
+The trusted x86_64 Linux Sites source build may set
+`FERRITE_SITES_BOOTSTRAP_RUST=1` when its image does not include Cargo. That
+path downloads only the pinned official `rustup-init` 1.28.2 binary, verifies
+its checked-in SHA-256, installs the repository's Rust 1.95.0 toolchain with the
+minimal profile into an ephemeral directory, and removes the toolchain and
+compilation cache after packaging. Other platforms fail closed.
+
 The website has its own pinned `pnpm-lock.yaml`; `@ferrite/runtime` is wired as
 a local link to `../packages/runtime`, so this command must be run from this
 directory with the Ferrite source checkout present. The runtime's workspace
