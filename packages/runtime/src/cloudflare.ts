@@ -826,7 +826,7 @@ async function withinRequestBudget<T>(
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       operation,
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => reject(new ResponseDeadlineError()), remaining);
@@ -839,6 +839,9 @@ async function withinRequestBudget<T>(
         }
       }),
     ]);
+    throwIfAborted(signal);
+    ensureBeforeDeadline(deadline);
+    return result;
   } finally {
     if (timeout !== undefined) {
       clearTimeout(timeout);
@@ -850,7 +853,7 @@ async function withinRequestBudget<T>(
 }
 
 function ensureBeforeDeadline(deadline: number): void {
-  if (monotonicNow() > deadline) {
+  if (monotonicNow() >= deadline) {
     throw new ResponseDeadlineError();
   }
 }

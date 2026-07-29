@@ -69,18 +69,22 @@ isolated deterministic fixture, generates four edge route artifacts, and runs
 post-bundle route artifact, requires each artifact and metadata/module identity
 in Wrangler's metafile and emitted modules, and starts
 `wrangler dev --local --no-bundle` from a regular, realpath-contained entry
-whose bytes match that exact inventory. It then observes two distinct
-request-time renders in the same isolate, re-inventories the Worker, assets, and
-route bindings after runtime execution, and checks:
+whose bytes match that exact inventory. Two isolated Wrangler dry-runs must
+emit byte-identical bundles from the monitored fixture inputs. The verifier
+then observes two distinct request-time renders in the same isolate,
+re-inventories the Worker, assets, and route bindings after runtime execution,
+and checks:
 
 - exact deep-route refresh plus `HEAD`
 - static-asset passthrough and missing assets
 - route-exception, response-deadline, and rendered-server-action fallback
 - unsupported methods, representations, and payload streaming
 - encoded traversal and separator rejection
-- clean and unchanged Git HEAD/tree/branch plus a tracked-input digest at proof
-  start and after cleanup; a live monitor also rejects transient tracked-source
-  writes during the proof
+- clean and unchanged Git HEAD/tree/branch plus exact working-file mode/blob
+  equality with HEAD and the index at proof start and after cleanup; unsupported
+  assume-unchanged and skip-worktree flags fail closed
+- live monitors that reject transient tracked-source, fixture-input, bundle,
+  metafile, and runtime-config writes even when their final bytes are restored
 - route receipts, manifest/config/lockfile identities, bounded emitted
   bundle/WASM identities, and command process-group cleanup
 
@@ -189,7 +193,14 @@ Official constraints and configuration references:
 - `shouldRender` is the rollback gate. Returning `false` bypasses request rendering and serves the declared prerender.
 - Unknown paths and declared static assets remain owned by `env.ASSETS`.
 
-`responseDeadlineMs` bounds manifest verification plus request rendering. A fallback binding gets a fresh deadline of the same duration so recovery remains possible after a render timeout. These are response deadlines, not CPU budgets or forced-cancellation guarantees: synchronous code or a non-cooperative promise can continue after the response path has selected fallback.
+`responseDeadlineMs` bounds manifest verification plus request rendering. Every
+completed async operation and response-body chunk is also checked against the
+monotonic deadline, so continuously resolved tiny or empty chunks cannot rely
+on starving the timeout callback. A fallback binding gets a fresh deadline of
+the same duration so recovery remains possible after a render timeout. These
+are response deadlines, not CPU budgets or forced-cancellation guarantees:
+synchronous component code or a non-cooperative promise can continue after the
+response path has selected fallback.
 
 ## Not Yet Proven
 

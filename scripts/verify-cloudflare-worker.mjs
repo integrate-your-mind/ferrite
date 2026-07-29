@@ -41,13 +41,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 
 async function verifyCloudflareWorker() {
-  const trackedPaths = await trackedSourcePaths();
+  const committedSource = await committedSourceContract();
+  const trackedPaths = committedSource.records.map(({ path }) => path);
   const sourceMonitor = startTrackedSourceMonitor(trackedPaths);
   let sourceStart;
   try {
     sourceStart = {
       ...await sourceState(),
-      ...await trackedSourceSnapshot(trackedPaths),
+      ...await trackedSourceSnapshot(committedSource),
     };
     assertCleanSourceState(sourceStart, "before the proof");
     await sourceMonitor.assertUnchanged();
@@ -64,11 +65,23 @@ async function verifyCloudflareWorker() {
       head: sourceStart.head,
       tree: sourceStart.tree,
       branch: sourceStart.branch,
+      committedSourceSha256: sourceStart.committedSourceSha256,
       trackedInputSha256: sourceStart.trackedInputSha256,
     },
   });
 
   let fixtureRoot;
+  let fixture;
+  let fixtureInputs;
+  let fixtureInputMonitor;
+  let bundle;
+  let bundleMonitor;
+  let bundleMetafile;
+  let bundleMetafileIdentity;
+  let bundleMetafileMonitor;
+  let runtimeConfig;
+  let runtimeConfigIdentity;
+  let runtimeConfigMonitor;
   let dev;
   let result;
   let processCleanup;
@@ -79,8 +92,27 @@ async function verifyCloudflareWorker() {
   try {
     await buildPrerequisites();
     fixtureRoot = await makeFixtureRoot();
-    const fixture = await createFixture(fixtureRoot);
-    const bundleMetafile = join(fixture.bundle, "bundle-meta.json");
+    fixture = await createFixture(fixtureRoot);
+    fixtureInputs = await inventoryProofInputs(
+      fixtureRoot,
+      [fixture.app, fixture.assets, fixture.generated, ...fixture.inputFiles],
+    );
+    fixtureInputMonitor = startTrackedSourceMonitor(
+      fixtureInputs.files.map(({ path }) => path),
+      fixtureRoot,
+    );
+    await verifyRouteArtifactReceipts(fixture, fixtureRoot);
+    assert.deepEqual(
+      await inventoryProofInputs(
+        fixtureRoot,
+        [fixture.app, fixture.assets, fixture.generated, ...fixture.inputFiles],
+      ),
+      fixtureInputs,
+      "Cloudflare fixture inputs changed before Wrangler bundling.",
+    );
+    await fixtureInputMonitor.assertUnchanged();
+
+    bundleMetafile = join(fixtureRoot, "bundle-meta.json");
     const dryRun = await runCapture(
       wrangler,
       [
@@ -95,12 +127,53 @@ async function verifyCloudflareWorker() {
       ],
       { cwd: fixtureRoot, timeoutMs: commandTimeoutMs },
     );
-    const bundle = await inventoryFiles(fixture.bundle);
+    bundleMetafileMonitor = startTrackedSourceMonitor(
+      [relative(fixtureRoot, bundleMetafile).replaceAll("\\", "/")],
+      fixtureRoot,
+    );
+    bundleMetafileIdentity = await fileIdentity(bundleMetafile);
+    await bundleMetafileMonitor.assertUnchanged();
+    assert.deepEqual(
+      await inventoryProofInputs(
+        fixtureRoot,
+        [fixture.app, fixture.assets, fixture.generated, ...fixture.inputFiles],
+      ),
+      fixtureInputs,
+      "Cloudflare fixture inputs changed during Wrangler bundling.",
+    );
+    await fixtureInputMonitor.assertUnchanged();
+    bundle = await inventoryFiles(fixture.bundle);
+    bundleMonitor = startTrackedSourceMonitor(
+      bundle.files.map(({ path }) => path),
+      fixture.bundle,
+    );
+    const checkMetafile = join(fixtureRoot, "bundle-check-meta.json");
+    await runCapture(
+      wrangler,
+      [
+        "deploy",
+        "--dry-run",
+        "--config",
+        fixture.config,
+        "--outdir",
+        fixture.bundleCheck,
+        "--metafile",
+        checkMetafile,
+      ],
+      { cwd: fixtureRoot, timeoutMs: commandTimeoutMs },
+    );
+    assert.deepEqual(
+      await inventoryFiles(fixture.bundleCheck),
+      bundle,
+      "Two Wrangler dry-runs from the same verified inputs emitted different Worker bundles.",
+    );
+    await bundleMonitor.assertUnchanged();
     const routeBundleBindings = await verifyBundledRouteArtifacts(
       fixture,
       bundleMetafile,
       fixtureRoot,
       bundle,
+      fixtureInputs,
     );
     const staticAssets = await inventoryFiles(fixture.assets);
     assert.ok(bundle.files.length > 0, "Wrangler dry-run must emit a Worker bundle.");
@@ -108,12 +181,18 @@ async function verifyCloudflareWorker() {
       bundle.gzipBytes < 3 * 1024 * 1024,
       `The proof Worker exceeds the 3 MiB compressed free-plan limit (${bundle.gzipBytes} bytes).`,
     );
-    const runtimeConfig = await writeExactBundleConfig(
+    runtimeConfig = await writeExactBundleConfig(
       fixture,
       bundleMetafile,
       fixtureRoot,
       bundle,
     );
+    runtimeConfigMonitor = startTrackedSourceMonitor(
+      [relative(fixtureRoot, runtimeConfig).replaceAll("\\", "/")],
+      fixtureRoot,
+    );
+    runtimeConfigIdentity = await fileIdentity(runtimeConfig);
+    await runtimeConfigMonitor.assertUnchanged();
 
     const port = await reserveLoopbackPort();
     const inspectorPort = await reserveLoopbackPort();
@@ -126,7 +205,13 @@ async function verifyCloudflareWorker() {
     const [bundleAfter, staticAssetsAfter, routeBundleBindingsAfter] = await Promise.all([
       inventoryFiles(fixture.bundle),
       inventoryFiles(fixture.assets),
-      verifyBundledRouteArtifacts(fixture, bundleMetafile, fixtureRoot, bundle),
+      verifyBundledRouteArtifacts(
+        fixture,
+        bundleMetafile,
+        fixtureRoot,
+        bundle,
+        fixtureInputs,
+      ),
     ]);
     assert.deepEqual(
       bundleAfter,
@@ -143,13 +228,34 @@ async function verifyCloudflareWorker() {
       routeBundleBindings,
       "The route artifact bindings changed while workerd was executing them.",
     );
+    assert.deepEqual(
+      await inventoryProofInputs(
+        fixtureRoot,
+        [fixture.app, fixture.assets, fixture.generated, ...fixture.inputFiles],
+      ),
+      fixtureInputs,
+      "Cloudflare fixture inputs changed while workerd was executing the bundle.",
+    );
+    await fixtureInputMonitor.assertUnchanged();
+    await bundleMonitor.assertUnchanged();
+    assert.deepEqual(
+      await fileIdentity(bundleMetafile),
+      bundleMetafileIdentity,
+      "The Wrangler metafile changed while its bundle was being verified or executed.",
+    );
+    await bundleMetafileMonitor.assertUnchanged();
+    assert.deepEqual(
+      await fileIdentity(runtimeConfig),
+      runtimeConfigIdentity,
+      "The exact-bundle Wrangler config changed while workerd was executing it.",
+    );
+    await runtimeConfigMonitor.assertUnchanged();
     const wasm = await fileIdentity(
       join(workspaceRoot, "packages/protocol-wasm/dist/ferrite_protocol_wasm.wasm"),
     );
-    const [versions, buildConfig, runtimeConfigIdentity, lockfile] = await Promise.all([
+    const [versions, buildConfig, lockfile] = await Promise.all([
       toolVersions(),
       fileIdentity(fixture.config),
-      fileIdentity(runtimeConfig),
       fileIdentity(join(workspaceRoot, "pnpm-lock.yaml")),
     ]);
 
@@ -167,6 +273,7 @@ async function verifyCloudflareWorker() {
       })),
       assetBuildId: fixture.assetBuildId,
       assetManifestSha256: fixture.assetManifestSha256,
+      fixtureInputs,
       routeReceipts: fixture.routeReceipts,
       versions,
       toolchainInputs: {
@@ -181,6 +288,7 @@ async function verifyCloudflareWorker() {
         bytes: bundle.bytes,
         gzipBytes: bundle.gzipBytes,
         routeBindings: routeBundleBindings,
+        deterministicDryRuns: true,
         stableThroughRuntime: true,
         dryRunSummary: boundedLog(`${dryRun.stdout}\n${dryRun.stderr}`),
       },
@@ -202,6 +310,65 @@ async function verifyCloudflareWorker() {
         cleanupErrors.push(error);
       }
     }
+    if (fixtureInputMonitor && fixtureInputs && fixture && fixtureRoot) {
+      try {
+        assert.deepEqual(
+          await inventoryProofInputs(
+            fixtureRoot,
+            [fixture.app, fixture.assets, fixture.generated, ...fixture.inputFiles],
+          ),
+          fixtureInputs,
+          "Cloudflare fixture inputs changed before proof cleanup.",
+        );
+        await fixtureInputMonitor.assertUnchanged();
+      } catch (error) {
+        cleanupErrors.push(error);
+      } finally {
+        fixtureInputMonitor.close();
+      }
+    }
+    if (bundleMonitor && bundle && fixture) {
+      try {
+        assert.deepEqual(
+          await inventoryFiles(fixture.bundle),
+          bundle,
+          "The exact Worker bundle changed before proof cleanup.",
+        );
+        await bundleMonitor.assertUnchanged();
+      } catch (error) {
+        cleanupErrors.push(error);
+      } finally {
+        bundleMonitor.close();
+      }
+    }
+    for (const [monitor, path, identity, message] of [
+      [
+        bundleMetafileMonitor,
+        bundleMetafile,
+        bundleMetafileIdentity,
+        "The Wrangler metafile changed before proof cleanup.",
+      ],
+      [
+        runtimeConfigMonitor,
+        runtimeConfig,
+        runtimeConfigIdentity,
+        "The exact-bundle Wrangler config changed before proof cleanup.",
+      ],
+    ]) {
+      if (!monitor) {
+        continue;
+      }
+      try {
+        if (path && identity) {
+          assert.deepEqual(await fileIdentity(path), identity, message);
+        }
+        await monitor.assertUnchanged();
+      } catch (error) {
+        cleanupErrors.push(error);
+      } finally {
+        monitor.close();
+      }
+    }
     if (fixtureRoot) {
       try {
         await rm(fixtureRoot, { recursive: true, force: true });
@@ -214,9 +381,10 @@ async function verifyCloudflareWorker() {
       }
     }
     try {
+      const committedSourceEnd = await committedSourceContract();
       sourceEnd = {
         ...await sourceState(),
-        ...await trackedSourceSnapshot(trackedPaths),
+        ...await trackedSourceSnapshot(committedSourceEnd),
       };
       assertSameSourceState(sourceStart, sourceEnd);
       await sourceMonitor.assertUnchanged();
@@ -280,11 +448,13 @@ async function createFixture(root) {
   const assets = join(root, "assets");
   const generated = join(root, "generated");
   const bundle = join(root, "bundle");
+  const bundleCheck = join(root, "bundle-check");
   const persist = join(root, "persist");
   await Promise.all([
     mkdir(app, { recursive: true }),
     mkdir(assets, { recursive: true }),
     mkdir(bundle, { recursive: true }),
+    mkdir(bundleCheck, { recursive: true }),
     mkdir(generated, { recursive: true }),
     mkdir(persist, { recursive: true }),
   ]);
@@ -519,55 +689,30 @@ async function createFixture(root) {
     }, null, 2)}\n`,
   );
   return {
+    app,
     assets,
     assetBuildId,
     assetManifestSha256,
     bundle,
+    bundleCheck,
     config,
+    generated,
+    inputFiles: [
+      join(root, "package.json"),
+      join(root, "cloudflare.js"),
+      join(root, "protocol-wasm.js"),
+      join(root, "ferrite_protocol_wasm.wasm"),
+      join(root, "worker.mjs"),
+      config,
+    ],
     persist,
     routeArtifacts,
     routeReceipts,
   };
 }
 
-async function verifyBundledRouteArtifacts(
-  fixture,
-  metafilePath,
-  fixtureRoot,
-  bundle,
-) {
-  const metafile = JSON.parse(await readFile(metafilePath, "utf8"));
-  const outputInputs = new Map();
-  for (const output of Object.values(metafile.outputs ?? {})) {
-    for (const [inputPath, input] of Object.entries(output?.inputs ?? {})) {
-      const absolute = isAbsolute(inputPath) ? inputPath : resolve(fixtureRoot, inputPath);
-      outputInputs.set(
-        absolute,
-        (outputInputs.get(absolute) ?? 0) + Number(input?.bytesInOutput ?? 0),
-      );
-    }
-  }
-  const emittedModuleBytes = Buffer.concat(
-    await Promise.all(
-      bundle.files
-        .filter(({ path }) => /\.(?:m?js)$/.test(path))
-        .map(({ path }) => readFile(join(fixture.bundle, path))),
-    ),
-  );
-  assert.ok(
-    emittedModuleBytes.byteLength > 0,
-    "Wrangler dry-run must emit at least one JavaScript Worker module.",
-  );
-  assert.equal(
-    allBufferOffsets(
-      emittedModuleBytes,
-      Buffer.from(fixture.assetManifestSha256),
-    ).length,
-    1,
-    "Wrangler output must contain exactly one pinned asset-manifest identity.",
-  );
-
-  const bindings = [];
+async function verifyRouteArtifactReceipts(fixture, fixtureRoot) {
+  const verifiedRoutes = new Map();
   for (const routeArtifact of fixture.routeArtifacts) {
     const receiptRecord = fixture.routeReceipts.find(
       ({ path }) => path === routeArtifact.path,
@@ -602,6 +747,64 @@ async function verifyBundledRouteArtifacts(
     assert.equal(verified.receipt.sourceBuildId, receiptRecord.sourceBuildId);
     assert.equal(verified.receipt.metadataBuildId, receiptRecord.metadataBuildId);
     assert.equal(verified.receipt.moduleBuildId, receiptRecord.moduleBuildId);
+    verifiedRoutes.set(routeArtifact.path, receiptRecord);
+  }
+  return verifiedRoutes;
+}
+
+async function verifyBundledRouteArtifacts(
+  fixture,
+  metafilePath,
+  fixtureRoot,
+  bundle,
+  fixtureInputs,
+) {
+  const verifiedRoutes = await verifyRouteArtifactReceipts(fixture, fixtureRoot);
+  const metafile = JSON.parse(await readFile(metafilePath, "utf8"));
+  const allowedInputs = new Set(
+    await Promise.all(
+      fixtureInputs.files.map(({ path }) => realpath(join(fixtureRoot, path))),
+    ),
+  );
+  const outputInputs = new Map();
+  for (const output of Object.values(metafile.outputs ?? {})) {
+    for (const [inputPath, input] of Object.entries(output?.inputs ?? {})) {
+      const absolute = isAbsolute(inputPath) ? inputPath : resolve(fixtureRoot, inputPath);
+      const canonicalInput = await realpath(absolute);
+      assert.ok(
+        allowedInputs.has(canonicalInput),
+        `Wrangler bundled unmonitored input "${inputPath}".`,
+      );
+      outputInputs.set(
+        absolute,
+        (outputInputs.get(absolute) ?? 0) + Number(input?.bytesInOutput ?? 0),
+      );
+    }
+  }
+  const emittedModuleBytes = Buffer.concat(
+    await Promise.all(
+      bundle.files
+        .filter(({ path }) => /\.(?:m?js)$/.test(path))
+        .map(({ path }) => readFile(join(fixture.bundle, path))),
+    ),
+  );
+  assert.ok(
+    emittedModuleBytes.byteLength > 0,
+    "Wrangler dry-run must emit at least one JavaScript Worker module.",
+  );
+  assert.equal(
+    allBufferOffsets(
+      emittedModuleBytes,
+      Buffer.from(fixture.assetManifestSha256),
+    ).length,
+    1,
+    "Wrangler output must contain exactly one pinned asset-manifest identity.",
+  );
+
+  const bindings = [];
+  for (const routeArtifact of fixture.routeArtifacts) {
+    const receiptRecord = verifiedRoutes.get(routeArtifact.path);
+    assert.ok(receiptRecord, `Missing route receipt for ${routeArtifact.path}.`);
     const bytesInOutput = outputInputs.get(resolve(routeArtifact.artifact)) ?? 0;
     assert.ok(
       bytesInOutput > 0,
@@ -931,63 +1134,205 @@ async function sourceState() {
   };
 }
 
-async function trackedSourcePaths() {
-  const { stdout } = await runCapture(
-    "git",
-    ["ls-files", "-z"],
-    {
-      cwd: workspaceRoot,
-      maxOutputBytes: 8 * 1024 * 1024,
-      timeoutMs: 10_000,
+async function committedSourceContract() {
+  const options = {
+    cwd: workspaceRoot,
+    maxOutputBytes: 8 * 1024 * 1024,
+    timeoutMs: 10_000,
+  };
+  const [formatResult, treeResult, indexResult, flagsResult] = await Promise.all([
+    runCapture("git", ["rev-parse", "--show-object-format"], options),
+    runCapture("git", ["ls-tree", "-rz", "--full-tree", "HEAD"], options),
+    runCapture("git", ["ls-files", "--stage", "-z"], options),
+    runCapture("git", ["ls-files", "-v", "-z"], options),
+  ]);
+  const objectFormat = formatResult.stdout.trim();
+  if (objectFormat !== "sha1" && objectFormat !== "sha256") {
+    throw new Error(`Ferrite proof does not support Git object format "${objectFormat}".`);
+  }
+
+  const tree = parseUniqueRecords(
+    treeResult.stdout,
+    "HEAD tree",
+    (record) => {
+      const tab = record.indexOf("\t");
+      const match = record.slice(0, tab).match(/^(\d+) ([a-z]+) ([a-f0-9]+)$/);
+      if (tab < 1 || !match) {
+        throw new Error(`Ferrite proof could not parse HEAD tree record "${record}".`);
+      }
+      return {
+        path: record.slice(tab + 1),
+        mode: match[1],
+        type: match[2],
+        oid: match[3],
+      };
     },
   );
-  const paths = stdout
-    .split("\0")
-    .filter(Boolean)
-    .sort((left, right) => left.localeCompare(right));
-  assert.ok(paths.length > 0, "Ferrite proof found no tracked source files.");
-  for (const path of paths) {
-    if (isAbsolute(path) || path === ".." || path.startsWith("../")) {
-      throw new Error(`Ferrite proof received an invalid tracked path "${path}".`);
+  const index = parseUniqueRecords(
+    indexResult.stdout,
+    "Git index",
+    (record) => {
+      const tab = record.indexOf("\t");
+      const match = record.slice(0, tab).match(/^(\d+) ([a-f0-9]+) ([0-3])$/);
+      if (tab < 1 || !match) {
+        throw new Error(`Ferrite proof could not parse Git index record "${record}".`);
+      }
+      return {
+        path: record.slice(tab + 1),
+        mode: match[1],
+        oid: match[2],
+        stage: Number(match[3]),
+      };
+    },
+  );
+  const flags = parseUniqueRecords(
+    flagsResult.stdout,
+    "Git index flags",
+    (record) => {
+      const match = record.match(/^(.?) (.*)$/s);
+      if (!match) {
+        throw new Error(`Ferrite proof could not parse Git index flag record "${record}".`);
+      }
+      return { path: match[2], tag: match[1] };
+    },
+  );
+
+  assert.equal(index.size, tree.size, "Ferrite Git index entry count differs from HEAD.");
+  assert.equal(flags.size, tree.size, "Ferrite Git index flag count differs from HEAD.");
+  const records = [];
+  for (const expected of [...tree.values()].sort((left, right) =>
+    left.path.localeCompare(right.path)
+  )) {
+    if (expected.type !== "blob" || !["100644", "100755", "120000"].includes(expected.mode)) {
+      throw new Error(
+        `Ferrite proof does not support tracked ${expected.type} "${expected.path}" with mode ${expected.mode}.`,
+      );
     }
+    const indexed = index.get(expected.path);
+    assert.deepEqual(
+      indexed,
+      {
+        path: expected.path,
+        mode: expected.mode,
+        oid: expected.oid,
+        stage: 0,
+      },
+      `Ferrite Git index entry "${expected.path}" differs from HEAD.`,
+    );
+    assertSupportedIndexFlag(expected.path, flags.get(expected.path)?.tag);
+    records.push({
+      path: expected.path,
+      mode: expected.mode,
+      oid: expected.oid,
+    });
   }
-  return paths;
+  return {
+    objectFormat,
+    records,
+    committedSourceSha256: digestIdentity({
+      format: "ferrite-committed-source-contract",
+      version: 1,
+      objectFormat,
+      records,
+    }),
+  };
 }
 
-export async function trackedSourceSnapshot(paths, root = workspaceRoot) {
+function parseUniqueRecords(stdout, label, parse) {
+  const records = new Map();
+  for (const raw of stdout.split("\0").filter(Boolean)) {
+    const record = parse(raw);
+    if (
+      !record.path ||
+      isAbsolute(record.path) ||
+      record.path === ".." ||
+      record.path.startsWith("../")
+    ) {
+      throw new Error(`Ferrite proof received an invalid ${label} path "${record.path}".`);
+    }
+    if (records.has(record.path)) {
+      throw new Error(`Ferrite proof received duplicate ${label} path "${record.path}".`);
+    }
+    records.set(record.path, record);
+  }
+  assert.ok(records.size > 0, `Ferrite proof found no ${label} records.`);
+  return records;
+}
+
+export function assertSupportedIndexFlag(path, tag) {
+  assert.equal(
+    tag,
+    "H",
+    `Ferrite tracked input "${path}" has assume-unchanged, skip-worktree, or another unsupported index flag.`,
+  );
+}
+
+export async function trackedSourceSnapshot(contract, root = workspaceRoot) {
   const records = [];
-  for (const path of paths) {
-    const absolute = resolve(root, path);
+  for (const expected of contract.records) {
+    const absolute = resolve(root, expected.path);
     const stat = await lstat(absolute);
     if (stat.isSymbolicLink()) {
-      const target = await readlink(absolute);
+      const target = await readlink(absolute, { encoding: "buffer" });
+      assert.equal(
+        expected.mode,
+        "120000",
+        `Ferrite tracked input "${expected.path}" mode differs from HEAD.`,
+      );
+      assert.equal(
+        gitBlobObjectId(target, contract.objectFormat),
+        expected.oid,
+        `Ferrite tracked input "${expected.path}" bytes differ from HEAD.`,
+      );
       records.push({
-        path,
-        mode: "120000",
-        bytes: Buffer.byteLength(target),
+        path: expected.path,
+        mode: expected.mode,
+        bytes: target.byteLength,
         sha256: createHash("sha256").update(target).digest("hex"),
       });
       continue;
     }
     if (!stat.isFile()) {
-      throw new Error(`Ferrite tracked input "${path}" is not a regular file or symlink.`);
+      throw new Error(
+        `Ferrite tracked input "${expected.path}" is not a regular file or symlink.`,
+      );
     }
+    const actualMode = stat.mode & 0o111 ? "100755" : "100644";
+    assert.equal(
+      actualMode,
+      expected.mode,
+      `Ferrite tracked input "${expected.path}" mode differs from HEAD.`,
+    );
     const contents = await readFile(absolute);
+    assert.equal(
+      gitBlobObjectId(contents, contract.objectFormat),
+      expected.oid,
+      `Ferrite tracked input "${expected.path}" bytes differ from HEAD.`,
+    );
     records.push({
-      path,
-      mode: stat.mode & 0o111 ? "100755" : "100644",
+      path: expected.path,
+      mode: actualMode,
       bytes: contents.byteLength,
       sha256: createHash("sha256").update(contents).digest("hex"),
     });
   }
   return {
     trackedFileCount: records.length,
+    committedSourceSha256: contract.committedSourceSha256,
     trackedInputSha256: digestIdentity({
       format: "ferrite-tracked-source-snapshot",
       version: 1,
       records,
     }),
   };
+}
+
+export function gitBlobObjectId(bytes, objectFormat) {
+  const contents = Buffer.from(bytes);
+  return createHash(objectFormat)
+    .update(`blob ${contents.byteLength}\0`)
+    .update(contents)
+    .digest("hex");
 }
 
 export function startTrackedSourceMonitor(paths, root = workspaceRoot) {
@@ -1068,6 +1413,7 @@ export function assertSameSourceState(expected, actual) {
       head: actual.head,
       tree: actual.tree,
       branch: actual.branch,
+      committedSourceSha256: actual.committedSourceSha256,
       trackedFileCount: actual.trackedFileCount,
       trackedInputSha256: actual.trackedInputSha256,
     },
@@ -1075,6 +1421,7 @@ export function assertSameSourceState(expected, actual) {
       head: expected.head,
       tree: expected.tree,
       branch: expected.branch,
+      committedSourceSha256: expected.committedSourceSha256,
       trackedFileCount: expected.trackedFileCount,
       trackedInputSha256: expected.trackedInputSha256,
     },
@@ -1113,6 +1460,54 @@ export async function inventoryFiles(root) {
   }
   await visit(canonicalRoot);
   return { files, bytes, gzipBytes };
+}
+
+async function inventoryProofInputs(root, locations) {
+  const canonicalRoot = await realpath(root);
+  const files = [];
+  for (const location of locations) {
+    const stat = await lstat(location);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Ferrite proof input "${location}" must not be a symlink.`);
+    }
+    if (stat.isDirectory()) {
+      const inventory = await inventoryFiles(location);
+      const prefix = relative(canonicalRoot, await realpath(location)).replaceAll("\\", "/");
+      for (const file of inventory.files) {
+        files.push({
+          ...file,
+          path: `${prefix}/${file.path}`,
+        });
+      }
+      continue;
+    }
+    if (!stat.isFile()) {
+      throw new Error(`Ferrite proof input "${location}" must be a regular file.`);
+    }
+    const canonicalLocation = await realpath(location);
+    const path = relative(canonicalRoot, canonicalLocation).replaceAll("\\", "/");
+    if (path === "" || path.startsWith("..") || isAbsolute(path)) {
+      throw new Error(`Ferrite proof input "${location}" must resolve inside its fixture.`);
+    }
+    files.push({ path, ...await fileIdentity(canonicalLocation) });
+  }
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  const seen = new Set();
+  for (const { path } of files) {
+    if (seen.has(path)) {
+      throw new Error(`Ferrite proof input "${path}" was inventoried more than once.`);
+    }
+    seen.add(path);
+  }
+  return {
+    files,
+    bytes: files.reduce((total, file) => total + file.bytes, 0),
+    sha256: digestIdentity({
+      format: "ferrite-cloudflare-fixture-inputs",
+      version: 1,
+      files,
+    }),
+  };
 }
 
 async function fileIdentity(path) {

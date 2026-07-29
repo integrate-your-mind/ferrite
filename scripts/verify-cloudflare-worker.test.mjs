@@ -17,6 +17,8 @@ import {
   assertCleanSourceState,
   assertInventoriedRegularFile,
   assertSameSourceState,
+  assertSupportedIndexFlag,
+  gitBlobObjectId,
   inventoryFiles,
   runCapture,
   startTrackedSourceMonitor,
@@ -101,6 +103,7 @@ test("Cloudflare proof rejects dirty or changing source state", () => {
   const source = {
     branch: "codex/cloudflare-request-ssr",
     clean: true,
+    committedSourceSha256: `sha256:${"f".repeat(64)}`,
     head: "a".repeat(40),
     residue: null,
     trackedFileCount: 10,
@@ -124,25 +127,86 @@ test("Cloudflare proof rejects dirty or changing source state", () => {
     }),
     /tracked-input identity changed/,
   );
+  assert.doesNotThrow(() => assertSupportedIndexFlag("source.mjs", "H"));
+  assert.throws(
+    () => assertSupportedIndexFlag("source.mjs", "h"),
+    /assume-unchanged, skip-worktree/,
+  );
+  assert.throws(
+    () => assertSupportedIndexFlag("source.mjs", "S"),
+    /assume-unchanged, skip-worktree/,
+  );
 });
 
 test("Cloudflare proof records and monitors tracked input bytes", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-source-monitor-"));
-  const monitor = startTrackedSourceMonitor(["source.mjs"], root);
+  let monitor;
   try {
-    await writeFile(join(root, "source.mjs"), "export const value = 1;\n");
-    const first = await trackedSourceSnapshot(["source.mjs"], root);
+    const original = Buffer.from("export const value = 1;\n");
+    const contract = {
+      committedSourceSha256: `sha256:${"a".repeat(64)}`,
+      objectFormat: "sha1",
+      records: [{
+        path: "source.mjs",
+        mode: "100644",
+        oid: gitBlobObjectId(original, "sha1"),
+      }],
+    };
+    await writeFile(join(root, "source.mjs"), original);
+    const first = await trackedSourceSnapshot(contract, root);
     assert.equal(first.trackedFileCount, 1);
     assert.match(first.trackedInputSha256, /^sha256:[a-f0-9]{64}$/);
+    monitor = startTrackedSourceMonitor(["source.mjs"], root);
     await writeFile(join(root, "source.mjs"), "export const value = 2;\n");
-    const second = await trackedSourceSnapshot(["source.mjs"], root);
-    assert.notEqual(second.trackedInputSha256, first.trackedInputSha256);
+    await assert.rejects(
+      trackedSourceSnapshot(contract, root),
+      /bytes differ from HEAD/,
+    );
+    await writeFile(join(root, "source.mjs"), original);
+    assert.deepEqual(await trackedSourceSnapshot(contract, root), first);
     await assert.rejects(
       monitor.assertUnchanged(),
       /tracked source changed during the Worker proof/,
     );
   } finally {
-    monitor.close();
+    monitor?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Cloudflare fixture and bundle monitors reject restored ABA replacements", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-aba-"));
+  const fixture = join(root, "fixture");
+  const bundle = join(root, "bundle");
+  let fixtureMonitor;
+  let bundleMonitor;
+  try {
+    await Promise.all([mkdir(fixture), mkdir(bundle)]);
+    await writeFile(join(fixture, "route.mjs"), "export const route = 1;\n");
+    await writeFile(join(bundle, "worker.mjs"), "export default { fetch() {} };\n");
+    const fixtureBefore = await inventoryFiles(fixture);
+    const bundleBefore = await inventoryFiles(bundle);
+    fixtureMonitor = startTrackedSourceMonitor(
+      fixtureBefore.files.map(({ path }) => path),
+      fixture,
+    );
+    bundleMonitor = startTrackedSourceMonitor(
+      bundleBefore.files.map(({ path }) => path),
+      bundle,
+    );
+
+    await writeFile(join(fixture, "route.mjs"), "export const route = 2;\n");
+    await writeFile(join(fixture, "route.mjs"), "export const route = 1;\n");
+    await writeFile(join(bundle, "worker.mjs"), "export default { altered: true };\n");
+    await writeFile(join(bundle, "worker.mjs"), "export default { fetch() {} };\n");
+
+    assert.deepEqual(await inventoryFiles(fixture), fixtureBefore);
+    assert.deepEqual(await inventoryFiles(bundle), bundleBefore);
+    await assert.rejects(fixtureMonitor.assertUnchanged(), /tracked source changed/);
+    await assert.rejects(bundleMonitor.assertUnchanged(), /tracked source changed/);
+  } finally {
+    fixtureMonitor?.close();
+    bundleMonitor?.close();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -173,6 +237,42 @@ test("captured command timeout terminates the complete process group", { skip: p
         { cwd: root, timeoutMs: 1_000 },
       ),
       /exceeded 1000ms/,
+    );
+    const grandchildPid = Number(await readFile(pidFile, "utf8"));
+    assert.throws(
+      () => process.kill(grandchildPid, 0),
+      (error) => error?.code === "ESRCH",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("captured command rejects and terminates descendants left after normal exit", { skip: platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-process-tree-"));
+  try {
+    const grandchild = join(root, "grandchild.mjs");
+    const parent = join(root, "parent.mjs");
+    const pidFile = join(root, "grandchild.pid");
+    await writeFile(grandchild, "setInterval(() => {}, 1_000);\n");
+    await writeFile(
+      parent,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        "const child = spawn(process.execPath, [process.argv[2]], { stdio: \"ignore\" });",
+        "writeFileSync(process.argv[3], String(child.pid));",
+        "",
+      ].join("\n"),
+    );
+
+    await assert.rejects(
+      runCapture(
+        process.execPath,
+        [parent, grandchild, pidFile],
+        { cwd: root, timeoutMs: 5_000 },
+      ),
+      /left 1 descendant process/,
     );
     const grandchildPid = Number(await readFile(pidFile, "utf8"));
     assert.throws(

@@ -578,6 +578,27 @@ test("buffers fallback HTML and fails closed on stream errors, stalls, and inval
   assert.equal(await stalled.text(), "Gateway timeout");
   assert.equal(stalledCanceled, true);
 
+  let zeroBytePulls = 0;
+  const zeroByteFlood = await handler({ responseDeadlineMs: 20 }).fetch(
+    new Request("https://example.test/docs"),
+    fallbackEnvironment(() => new Response(new ReadableStream({
+      pull(controller) {
+        zeroBytePulls += 1;
+        if (zeroBytePulls < 1_000_000) {
+          controller.enqueue(new Uint8Array());
+        } else {
+          controller.close();
+        }
+      },
+    }), {
+      headers: { "Content-Type": "text/html" },
+    })),
+  );
+  assert.equal(zeroByteFlood.status, 504);
+  assert.equal(await zeroByteFlood.text(), "Gateway timeout");
+  assert.ok(zeroBytePulls > 0);
+  assert.ok(zeroBytePulls < 1_000_000);
+
   const oversized = await handler({ maxHtmlBytes: 4 }).fetch(
     new Request("https://example.test/docs"),
     fallbackEnvironment(() => new Response("<!doctype html>", {
