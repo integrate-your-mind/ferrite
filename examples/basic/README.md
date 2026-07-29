@@ -59,8 +59,10 @@ line-delimited stream frames are available through the CLI's documented
 
 - Server actions are explicit form POSTs only. The production adapter can bind
   a process-local replay nonce to an app-owned session cookie and route, but
-  this example does not establish an authenticated session. Automatic
-  `"use server"` discovery, client event invocation, first-class auth,
+  the binding is not action-specific authorization and this example does not
+  establish an authenticated session. Accepted nonces stay spent after an
+  action failure or timeout, so retries require a freshly rendered form.
+  Automatic `"use server"` discovery, client event invocation, first-class auth,
   session-bound CSRF token issuance, and distributed replay coordination are
   not implemented.
 - Client navigation, prefetch, hydration, and stream-frame behavior require

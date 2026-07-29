@@ -194,6 +194,12 @@ Production deployments should put Ferrite behind a mature edge such as nginx, En
 - [Architecture](docs/architecture.md)
 - [Production-readiness review](docs/production-readiness-review-2026-07-10.md)
 
+Server actions can opt into process-local replay nonces bound to one app-owned
+session cookie value and exact route. This does not authenticate the cookie,
+authorize an action, or coordinate replay state across processes. See the
+[deployment security notes](docs/deployment.md#security-notes) for retry,
+rotation, cookie, and sticky-process requirements.
+
 ## Proof and limits
 
 The repository records exact-source local proof for linting, type checks, builds, tests, browser flows, source-backed starter creation, package candidates, module-graph invalidation, artifact integrity, request framing, overload, timeouts, cleanup, and rollback behavior.

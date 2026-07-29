@@ -507,6 +507,12 @@ impl ProductionReplayNonces {
         consumed
     }
 
+    fn discard(&mut self, nonce: &str) {
+        if self.entries.remove(nonce).is_some() {
+            self.issuance_order.retain(|issued| issued != nonce);
+        }
+    }
+
     fn prune_expired(&mut self, now: Instant) {
         while let Some(oldest) = self.issuance_order.front() {
             if self
@@ -1703,7 +1709,7 @@ impl ProductionProject {
                 .client_bundles
                 .get(&match_result.route.path)
                 .cloned();
-            match mode {
+            let response = match mode {
                 RouteResponseMode::Html => match artifact_client_bundle.as_ref() {
                     Some(client_bundle) => self.artifact_route_stream_response(
                         path,
@@ -1781,7 +1787,13 @@ impl ProductionProject {
                 }
             }
             .with_cache_control("no-store")
-            .with_route_pattern(match_result.route.path)
+            .with_route_pattern(match_result.route.path);
+            if response.status >= 400 {
+                if let Some(replay_nonce) = replay_nonce.as_deref() {
+                    self.discard_server_action_replay_nonce(replay_nonce);
+                }
+            }
+            response
         } else {
             DevResponse::not_found(render_production_not_found(path, &snapshot.routes))
                 .with_cache_control("no-store")
@@ -1815,6 +1827,15 @@ impl ProductionProject {
                 replay_nonces.issue_for(binding).map(Some)
             }
             None => Ok(None),
+        }
+    }
+
+    fn discard_server_action_replay_nonce(&self, nonce: &str) {
+        if let Some(replay_nonces) = &self.replay_nonces {
+            replay_nonces
+                .lock()
+                .expect("production replay nonce mutex poisoned")
+                .discard(nonce);
         }
     }
 
@@ -8147,6 +8168,58 @@ process.exit(1);
     }
 
     #[test]
+    fn production_render_failure_discards_unreachable_nonce_and_next_get_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let base = action_production_project_for(&app, "process.exit(1);");
+        let config = base
+            .config
+            .with_server_action_csrf_token("token-123")
+            .with_server_action_replay_ttl(Duration::from_secs(30))
+            .with_server_action_session_cookie_name("app_session");
+        let project = ProductionProject::new(config);
+        let headers = BTreeMap::from([("cookie".to_owned(), "app_session=session-123".to_owned())]);
+
+        let failed = project
+            .handle_get_with_headers("/posts/abc", &headers)
+            .unwrap();
+        assert_eq!(failed.status, 500);
+        assert!(
+            project
+                .replay_nonces
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty(),
+            "a render failure must not leave an unreachable nonce until expiry"
+        );
+
+        make_script(&project.config.page_renderer, action_renderer_body());
+        let recovered = project
+            .handle_get_with_headers("/posts/abc", &headers)
+            .unwrap();
+        assert_eq!(recovered.status, 200);
+        assert_eq!(
+            project
+                .replay_nonces
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .len(),
+            1,
+            "a successful retry must receive a fresh bound nonce"
+        );
+    }
+
+    #[test]
     fn production_action_replay_binding_requires_session_and_survives_rotation_rejections() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -8292,10 +8365,7 @@ if (process.argv[2] === "--server-action") {
             .with_server_action_session_cookie_name("app_session");
         let project = ProductionProject::new(config);
         let mut headers = action_headers_with_host("application/x-www-form-urlencoded");
-        headers.insert(
-            "cookie".to_owned(),
-            "app_session=session-123".to_owned(),
-        );
+        headers.insert("cookie".to_owned(), "app_session=session-123".to_owned());
         let context = project.request_context(&headers, None);
         let timed_out_nonce = project
             .issue_server_action_replay_nonce("/posts/abc", &context)
