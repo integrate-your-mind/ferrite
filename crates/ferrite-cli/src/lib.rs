@@ -676,10 +676,11 @@ fn run_cli(cli: Cli) -> Result<()> {
                     eprintln!("{}", format_action_log_event(&event, format));
                 });
             }
+            let mut production_project = ProductionProject::from_artifact(config)?;
             if let Some(event_log) = &event_log {
-                config = config.with_observability_emitter(event_log.emitter());
+                production_project =
+                    production_project.with_observability_emitter(event_log.emitter());
             }
-            let production_project = ProductionProject::from_artifact(config)?;
             let production_limits = ServeLimitsOutput::from(production_project.config());
             let artifact_build_id = production_project
                 .config()
