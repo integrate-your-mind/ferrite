@@ -6387,11 +6387,11 @@ process.exit(1);
     }
 
     #[test]
-    fn multipart_action_form_rejects_binary_text_and_filename_star_parts() {
+    fn multipart_action_form_rejects_non_utf8_text_and_filename_star_parts() {
         let content_type = "multipart/form-data; boundary=FerriteBoundary";
-        let binary_text = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\n\xff\r\n--FerriteBoundary--\r\n";
-        let binary_error = parse_multipart_form(content_type, binary_text).unwrap_err();
-        assert!(binary_error.contains("must be UTF-8"), "{binary_error}");
+        let non_utf8_text = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\n\xff\r\n--FerriteBoundary--\r\n";
+        let non_utf8_error = parse_multipart_form(content_type, non_utf8_text).unwrap_err();
+        assert!(non_utf8_error.contains("must be UTF-8"), "{non_utf8_error}");
 
         for disposition in [
             "form-data; name=\"asset\"; filename*=UTF-8''..%2Fsecret.txt",

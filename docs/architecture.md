@@ -66,8 +66,8 @@ requires exact CRLF header lines plus opening and terminal delimiters, rejects
 epilogue bytes and duplicate interpreted part headers, and limits part and
 header counts inside the existing whole-request budget. Only UTF-8 text values
 enter the version-1 action protocol. `filename`, `filename*`, RFC 2231-style
-filename continuations, and binary values are rejected before action lookup or
-invocation. This is parser hardening, not file-upload support: Ferrite has no
+filename continuations, and non-UTF-8 values are rejected before action lookup
+or invocation. This is parser hardening, not file-upload support: Ferrite has no
 request stream, temporary upload capability, per-file budget, cleanup
 lifecycle, or broad native-platform upload proof.
 
