@@ -260,14 +260,16 @@ test("rejects every missing or weakened required Buildkite gate", async () => {
         const evidence = await buildkiteEvidence(reportPath, report, {
           mutateJobs: (jobs) =>
             jobs.map((job) =>
-              job.step_key === required.stepKey ? mutateJob(job) : job,
+              buildkiteJobMatches(job, required) ? mutateJob(job) : job,
             ),
         });
 
         await assert.rejects(
           verifyBuildkiteReport({ report, reportPath, ...evidence }),
-          new RegExp(`Buildkite ${required.stepKey} job did not pass its exact contract`),
-          `${required.stepKey}:${caseName}`,
+          required.stepKey === null && caseName === "changed-command"
+            ? /requires one current Buildkite pipeline-upload bootstrap job/
+            : new RegExp(`Buildkite ${required.label} job did not pass its exact contract`),
+          `${required.label}:${caseName}`,
         );
       });
     }
@@ -276,16 +278,38 @@ test("rejects every missing or weakened required Buildkite gate", async () => {
       await writeReport(reportPath, report);
       const evidence = await buildkiteEvidence(reportPath, report, {
         mutateJobs: (jobs) =>
-          jobs.filter((job) => job.step_key !== required.stepKey),
+          jobs.filter((job) => !buildkiteJobMatches(job, required)),
       });
 
       await assert.rejects(
         verifyBuildkiteReport({ report, reportPath, ...evidence }),
         /Buildkite job topology does not match Ferrite CI/,
-        `${required.stepKey}:missing`,
+        `${required.label}:missing`,
       );
     });
   }
+});
+
+test("rejects unexpected current Buildkite job types", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    await writeReport(reportPath, report);
+    const evidence = await buildkiteEvidence(reportPath, report, {
+      mutateJobs: (jobs) => [
+        ...jobs,
+        {
+          id: "unexpected-trigger",
+          type: "trigger",
+          step_key: "unreviewed-deployment",
+          retried: false,
+        },
+      ],
+    });
+
+    await assert.rejects(
+      verifyBuildkiteReport({ report, reportPath, ...evidence }),
+      /Buildkite job topology does not match Ferrite CI/,
+    );
+  });
 });
 
 test("ignores superseded Buildkite retries but rejects duplicate current jobs", async () => {
@@ -621,13 +645,19 @@ function buildkiteJobsFixture() {
   return REQUIRED_BUILDKITE_JOBS.map(({ stepKey, command }, index) => ({
     id: stepKey === "ferrite-packages" ? build.jobId : `job-${index + 1}`,
     type: "script",
-    step_key: stepKey,
+    step_key: stepKey ?? "provider-assigned-bootstrap-key",
     command,
     state: "passed",
     exit_status: 0,
     retried: false,
     soft_failed: false,
   }));
+}
+
+function buildkiteJobMatches(job, expected) {
+  return expected.stepKey === null
+    ? job.command === expected.command
+    : job.step_key === expected.stepKey;
 }
 
 function refreshPackageSetDigest(report) {
