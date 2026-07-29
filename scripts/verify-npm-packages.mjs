@@ -145,6 +145,21 @@ export function validatePackFiles({ packageName, files, requiredFiles, forbidden
   }
 }
 
+export function validatePackedLicense({ packageName, expectedLicenseContent, packedLicenseContent }) {
+  if (typeof packedLicenseContent === "undefined") {
+    throw new Error(`${packageName}: packed package must include LICENSE.`);
+  }
+  const expected = Buffer.isBuffer(expectedLicenseContent)
+    ? expectedLicenseContent
+    : Buffer.from(String(expectedLicenseContent));
+  const packed = Buffer.isBuffer(packedLicenseContent)
+    ? packedLicenseContent
+    : Buffer.from(String(packedLicenseContent));
+  if (!expected.equals(packed)) {
+    throw new Error(`${packageName}: packed LICENSE does not match the repository LICENSE.`);
+  }
+}
+
 export function validatePackedManifest({ packageName, releaseManifest, packedManifest }) {
   if (packedManifest.name !== releaseManifest.name) {
     throw new Error(`${packageName}: tarball manifest name ${packedManifest.name ?? "<missing>"} does not match.`);
@@ -190,6 +205,17 @@ export async function verifyNpmPackages({
   let preserveStageRoot = false;
 
   try {
+    let licenseContent;
+    try {
+      licenseContent = await readFile(join(packageWorkspaceRoot, "LICENSE"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      if (publishManifestMode) {
+        throw new Error(
+          "npm publish-manifest verification requires the repository LICENSE.",
+        );
+      }
+    }
     if (writeReports) {
       await refusePublicationReceipt(packageReportDir);
       await refuseStaleReportBackup(packageReportDir);
@@ -225,15 +251,24 @@ export async function verifyNpmPackages({
         stageRoot,
         packageName: config.name,
         releaseManifest,
+        licensePath: licenseContent !== undefined ? join(packageWorkspaceRoot, "LICENSE") : undefined,
       });
       const packResult = normalizePackResult(config.name, await packageVerifier(stagedPackageDir));
       const tarball = await inspectTarballIdentity(config.name, packResult, stageRoot);
       validatePackFiles({
         packageName: config.name,
         files: packResult.files,
-        requiredFiles: config.requiredFiles,
+        requiredFiles: licenseContent !== undefined ? [...config.requiredFiles, "LICENSE"] : config.requiredFiles,
         forbiddenFiles: config.forbiddenFiles,
       });
+      if (licenseContent !== undefined && packResult.tarballPath) {
+        const inspected = await inspectNpmTarball(packResult.tarballPath, { includeContents: true });
+        validatePackedLicense({
+          packageName: config.name,
+          expectedLicenseContent: licenseContent,
+          packedLicenseContent: inspected.contents?.LICENSE,
+        });
+      }
       if (packResult.packedManifest) {
         validatePackedManifest({
           packageName: config.name,
@@ -267,6 +302,7 @@ export async function verifyNpmPackages({
         packPackage: packNativePackage,
         publishManifestMode,
         stageRoot,
+        licenseContent,
       });
       const { tarball: nativeTarball, tarballPath: _tarballPath, ...nativeReport } = nativeResult;
       const tarball = nativeTarball ?? (await inspectTarballIdentity(nativeResult.name, nativeResult, stageRoot));
@@ -655,6 +691,9 @@ export async function packCurrentNativePrebuild({
   packPackage = npmPackPackage,
   publishManifestMode = false,
   stageRoot,
+  licenseContent,
+  createPrebuildPackageImpl = createPrebuildPackage,
+  verifyPrebuildPackageDirsImpl = verifyPrebuildPackageDirs,
 } = {}) {
   if (!stageRoot) {
     throw new Error("Current native prebuild packaging requires a staging directory.");
@@ -665,11 +704,31 @@ export async function packCurrentNativePrebuild({
   }
 
   const directory = join(stageRoot, sanitizePackageName(packageName));
-  await createPrebuildPackage({
+  await createPrebuildPackageImpl({
     packageRoot: join(packageWorkspaceRoot, "packages", "node"),
     destinationRoot: directory,
   });
-  await verifyPrebuildPackageDirs([directory], { expectedPackages: [packageName] });
+  let expectedLicenseContent = licenseContent;
+  if (expectedLicenseContent === undefined) {
+    try {
+      expectedLicenseContent = await readFile(join(packageWorkspaceRoot, "LICENSE"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      if (publishManifestMode) {
+        throw new Error(
+          "npm publish-manifest verification requires the repository LICENSE.",
+        );
+      }
+    }
+  }
+  if (expectedLicenseContent !== undefined) {
+    await writeFile(join(directory, "LICENSE"), expectedLicenseContent, {
+      flag: "wx",
+    });
+  }
+  await verifyPrebuildPackageDirsImpl([directory], {
+    expectedPackages: [packageName],
+  });
 
   const releaseManifest = await readJson(join(directory, "package.json"));
   validateManifestMetadata({
@@ -683,9 +742,23 @@ export async function packCurrentNativePrebuild({
   validatePackFiles({
     packageName,
     files: packResult.files,
-    requiredFiles: ["ferrite-node.node", "ferrite-node.sha256.json"],
+    requiredFiles: [
+      "ferrite-node.node",
+      "ferrite-node.sha256.json",
+      ...(expectedLicenseContent === undefined ? [] : ["LICENSE"]),
+    ],
     forbiddenFiles: [],
   });
+  if (expectedLicenseContent !== undefined && packResult.tarballPath) {
+    const inspected = await inspectNpmTarball(packResult.tarballPath, {
+      includeContents: true,
+    });
+    validatePackedLicense({
+      packageName,
+      expectedLicenseContent,
+      packedLicenseContent: inspected.contents?.LICENSE,
+    });
+  }
   if (packResult.packedManifest) {
     validatePackedManifest({ packageName, releaseManifest, packedManifest: packResult.packedManifest });
   }
@@ -768,12 +841,15 @@ function packageDirectoryFor(packageName) {
   return config.directory;
 }
 
-async function stageReleasePackage({ sourceDir, stageRoot, packageName, releaseManifest }) {
+async function stageReleasePackage({ sourceDir, stageRoot, packageName, releaseManifest, licensePath }) {
   const stagedPackageDir = join(stageRoot, sanitizePackageName(packageName));
   await cp(sourceDir, stagedPackageDir, {
     recursive: true,
     filter: (source) => !source.split(/[\\/]/).includes("node_modules"),
   });
+  if (licensePath) {
+    await copyFile(licensePath, join(stagedPackageDir, "LICENSE"));
+  }
   await writeFile(join(stagedPackageDir, "package.json"), `${JSON.stringify(releaseManifest, null, 2)}\n`);
   return stagedPackageDir;
 }
@@ -850,17 +926,24 @@ function assertSafeTarballFilename(packageName, filename) {
   }
 }
 
-async function npmPackPackage(packageDir) {
+export async function npmPackPackage(
+  packageDir,
+  { runCommand = run } = {},
+) {
   const tarballDir = join(dirname(packageDir), ".tarballs");
   await mkdir(tarballDir, { recursive: true });
-  const output = await run("npm", ["pack", "--json", "--pack-destination", tarballDir], { cwd: packageDir, capture: true });
+  const output = await runCommand(
+    "npm",
+    ["pack", "--json", "--pack-destination", tarballDir],
+    { cwd: packageDir, capture: true },
+  );
   let parsed;
   try {
     parsed = JSON.parse(output);
   } catch (error) {
     throw new Error(`${packageDir}: npm pack --json returned invalid JSON: ${error.message}`);
   }
-  const [entry] = parsed;
+  const entry = normalizeNpmPackJsonEntry(parsed, packageDir);
   if (!entry || !Array.isArray(entry.files)) {
     throw new Error(`${packageDir}: npm pack output did not include a file list.`);
   }
@@ -879,6 +962,25 @@ async function npmPackPackage(packageDir) {
     tarballPath,
     npmReportedSize: entry.size,
   };
+}
+
+export function normalizeNpmPackJsonEntry(value, packageDir) {
+  const entries = Array.isArray(value)
+    ? value
+    : value && typeof value === "object"
+      ? Object.values(value)
+      : [];
+  if (
+    entries.length !== 1 ||
+    !entries[0] ||
+    typeof entries[0] !== "object" ||
+    Array.isArray(entries[0])
+  ) {
+    throw new Error(
+      `${packageDir}: npm pack output must identify exactly one package.`,
+    );
+  }
+  return entries[0];
 }
 
 async function readJson(path) {
@@ -1083,7 +1185,7 @@ if (packageNames.has("@ferrite/node")) {
 `;
 }
 
-export async function inspectNpmTarball(tarballPath) {
+export async function inspectNpmTarball(tarballPath, { includeContents = false } = {}) {
   let archive;
   try {
     archive = await gunzip(await readFile(tarballPath));
@@ -1091,6 +1193,7 @@ export async function inspectNpmTarball(tarballPath) {
     throw new Error(`${tarballPath}: npm artifact is not a valid gzip archive: ${error.message}`);
   }
   const files = [];
+  const contents = includeContents ? {} : undefined;
   const paths = new Set();
   let manifest;
   let offset = 0;
@@ -1128,6 +1231,7 @@ export async function inspectNpmTarball(tarballPath) {
     const regularFile = type === 0 || type === 48;
     if (regularFile) {
       files.push(path.slice("package/".length));
+      if (contents) contents[path.slice("package/".length)] = archive.subarray(dataStart, dataEnd);
       if (path === "package/package.json") {
         try {
           manifest = JSON.parse(archive.subarray(dataStart, dataEnd).toString("utf8"));
@@ -1143,7 +1247,7 @@ export async function inspectNpmTarball(tarballPath) {
   if (!manifest) {
     throw new Error(`${tarballPath}: package/package.json was not found.`);
   }
-  return { manifest, files: files.sort() };
+  return { manifest, files: files.sort(), ...(contents ? { contents } : {}) };
 }
 
 async function readTarballPackageManifest(tarballPath) {
