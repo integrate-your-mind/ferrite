@@ -4,16 +4,22 @@ import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } fro
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 
 import {
   RELEASE_PACKAGE_NAMES,
   createReleaseManifest,
+  normalizeNpmPackJsonEntry,
+  npmPackPackage,
+  packCurrentNativePrebuild,
   validateManifestMetadata,
   validatePackFiles,
+  validatePackedLicense,
   validatePackedManifest,
   verifyCleanDeveloperWorkflow,
   verifyNpmPackages,
 } from "./verify-npm-packages.mjs";
+import { nativePrebuildPackageName } from "../packages/node/binding.js";
 
 const testReportIdentity = {
   sourceIdentity: {
@@ -630,6 +636,304 @@ test("pack file validation accepts required files and rejects forbidden files", 
   );
 });
 
+test("pack file validation requires the staged repository license when configured", () => {
+  assert.throws(
+    () =>
+      validatePackFiles({
+        packageName: "@ferrite/protocol",
+        files: ["package/dist/index.js"],
+        requiredFiles: ["dist/index.js", "LICENSE"],
+        forbiddenFiles: [],
+      }),
+    /@ferrite\/protocol: packed package must include LICENSE/,
+  );
+  validatePackedLicense({
+    packageName: "@ferrite/protocol",
+    expectedLicenseContent: "license bytes\n",
+    packedLicenseContent: Buffer.from("license bytes\n"),
+  });
+  assert.throws(
+    () =>
+      validatePackedLicense({
+        packageName: "@ferrite/protocol",
+        expectedLicenseContent: "license bytes\n",
+        packedLicenseContent: Buffer.from("tampered\n"),
+      }),
+    /packed LICENSE does not match the repository LICENSE/,
+  );
+  assert.throws(
+    () =>
+      validatePackedLicense({
+        packageName: "@ferrite/protocol",
+        expectedLicenseContent: "license bytes\n",
+      }),
+    /packed package must include LICENSE/,
+  );
+});
+
+test("npm pack generation accepts npm 11 keyed and legacy array JSON", async (context) => {
+  for (const shape of ["keyed", "array"]) {
+    await context.test(shape, async () => {
+      const root = await mkdtemp(join(tmpdir(), "ferrite-npm-pack-json-"));
+      const packageDir = join(root, "package");
+      const tarballDir = join(root, ".tarballs");
+      const manifest = completeReleaseManifest("@ferrite/runtime");
+      const filename = "ferrite-runtime-0.1.0.tgz";
+      const bytes = npmTarball({
+        "package/package.json": `${JSON.stringify(manifest)}\n`,
+        "package/LICENSE": "Ferrite test license\n",
+      });
+      const entry = {
+        filename,
+        size: bytes.byteLength,
+        files: [
+          { path: "package.json" },
+          { path: "LICENSE" },
+        ],
+      };
+      try {
+        await mkdir(packageDir, { recursive: true });
+        const result = await npmPackPackage(packageDir, {
+          runCommand: async (command, args, options) => {
+            assert.equal(command, "npm");
+            assert.deepEqual(
+              args,
+              ["pack", "--json", "--pack-destination", tarballDir],
+            );
+            assert.equal(options.cwd, packageDir);
+            assert.equal(options.capture, true);
+            await writeFile(join(tarballDir, filename), bytes);
+            return JSON.stringify(
+              shape === "keyed" ? { "0": entry } : [entry],
+            );
+          },
+        });
+        assert.deepEqual(result.files, ["package.json", "LICENSE"]);
+        assert.deepEqual(result.packedManifest, manifest);
+        assert.equal(result.tarballPath, join(tarballDir, filename));
+        assert.equal(result.npmReportedSize, bytes.byteLength);
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    });
+  }
+});
+
+test("npm pack generation rejects a keyed result without a file list", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-pack-malformed-"));
+  const packageDir = join(root, "package");
+  try {
+    await mkdir(packageDir, { recursive: true });
+    await assert.rejects(
+      npmPackPackage(packageDir, {
+        runCommand: async () =>
+          JSON.stringify({
+            "0": {
+              filename: "ferrite-runtime-0.1.0.tgz",
+              size: 1,
+            },
+          }),
+      }),
+      /did not include a file list/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("npm pack JSON normalization supports legacy arrays and rejects ambiguous shapes", () => {
+  const entry = {
+    filename: "ferrite-runtime-0.1.0.tgz",
+    size: 1,
+    files: [{ path: "package.json" }],
+  };
+  assert.equal(
+    normalizeNpmPackJsonEntry([entry], "fixture"),
+    entry,
+  );
+  assert.throws(
+    () => normalizeNpmPackJsonEntry({}, "fixture"),
+    /must identify exactly one package/,
+  );
+  assert.throws(
+    () =>
+      normalizeNpmPackJsonEntry(
+        { "0": entry, "1": { ...entry, filename: "second.tgz" } },
+        "fixture",
+      ),
+    /must identify exactly one package/,
+  );
+  assert.throws(
+    () => normalizeNpmPackJsonEntry({ "0": [entry] }, "fixture"),
+    /must identify exactly one package/,
+  );
+});
+
+test("npm pack generation rejects unsafe keyed tarball filenames", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-pack-unsafe-"));
+  const packageDir = join(root, "package");
+  try {
+    await mkdir(packageDir, { recursive: true });
+    await assert.rejects(
+      npmPackPackage(packageDir, {
+        runCommand: async () =>
+          JSON.stringify({
+            "0": {
+              filename: "../outside.tgz",
+              size: 1,
+              files: [{ path: "package.json" }],
+            },
+          }),
+      }),
+      /unsafe tarball filename/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("publish-manifest verification fails closed when the repository license is missing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-missing-license-"));
+  try {
+    await assert.rejects(
+      verifyNpmPackages({
+        ...testReportIdentity,
+        publishManifestMode: true,
+        releasePackages: [],
+        workspaceRoot: root,
+        reportDir: join(root, "reports"),
+        runCommand: async () => {
+          throw new Error("build must not run");
+        },
+      }),
+      /publish-manifest verification requires the repository LICENSE/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("native prebuild staging includes the exact repository license", async (context) => {
+  const packageName = nativePrebuildPackageName();
+  if (!packageName) {
+    context.skip("current platform has no Ferrite native prebuild mapping");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "ferrite-native-license-"));
+  const stageRoot = join(root, "stage");
+  const licenseContent = Buffer.from("Ferrite MIT license bytes\n");
+  try {
+    await mkdir(stageRoot, { recursive: true });
+    const result = await packCurrentNativePrebuild({
+      packageWorkspaceRoot: root,
+      stageRoot,
+      licenseContent,
+      createPrebuildPackageImpl: async ({ destinationRoot }) => {
+        await mkdir(destinationRoot, { recursive: true });
+        await writeFile(
+          join(destinationRoot, "package.json"),
+          `${JSON.stringify({
+            ...completeReleaseManifest(packageName),
+            license: "MIT",
+          })}\n`,
+        );
+        await writeFile(join(destinationRoot, "ferrite-node.node"), "binding");
+        await writeFile(
+          join(destinationRoot, "ferrite-node.sha256.json"),
+          "{}\n",
+        );
+      },
+      verifyPrebuildPackageDirsImpl: async (directories, options) => {
+        assert.deepEqual(options.expectedPackages, [packageName]);
+        assert.equal(directories.length, 1);
+      },
+      packPackage: async (directory) => {
+        assert.deepEqual(
+          await readFile(join(directory, "LICENSE")),
+          licenseContent,
+        );
+        return {
+          files: [
+            "package/ferrite-node.node",
+            "package/ferrite-node.sha256.json",
+            "package/LICENSE",
+            "package/package.json",
+          ],
+          packedManifest: {
+            ...completeReleaseManifest(packageName),
+            license: "MIT",
+          },
+        };
+      },
+    });
+    assert.equal(result.name, packageName);
+    assert.ok(result.files.includes("package/LICENSE"));
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("native prebuild tarball contains the exact repository license", async (context) => {
+  const packageName = nativePrebuildPackageName();
+  if (!packageName) {
+    context.skip("current platform has no Ferrite native prebuild mapping");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "ferrite-native-license-tarball-"));
+  const stageRoot = join(root, "stage");
+  const licenseContent = Buffer.from("Ferrite MIT license bytes\n");
+  try {
+    await mkdir(stageRoot, { recursive: true });
+    const result = await packCurrentNativePrebuild({
+      packageWorkspaceRoot: root,
+      stageRoot,
+      licenseContent,
+      createPrebuildPackageImpl: createNativePrebuildFixture(packageName),
+      verifyPrebuildPackageDirsImpl: async () => {},
+      packPackage: packNativeFixtureTarball({
+        packageName,
+        stageRoot,
+        licenseContent,
+      }),
+    });
+    assert.equal(result.name, packageName);
+    assert.match(result.tarball?.sha256 ?? "", /^[a-f0-9]{64}$/);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("native prebuild tarball rejects a tampered license", async (context) => {
+  const packageName = nativePrebuildPackageName();
+  if (!packageName) {
+    context.skip("current platform has no Ferrite native prebuild mapping");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "ferrite-native-license-tamper-"));
+  const stageRoot = join(root, "stage");
+  const licenseContent = Buffer.from("Ferrite MIT license bytes\n");
+  try {
+    await mkdir(stageRoot, { recursive: true });
+    await assert.rejects(
+      packCurrentNativePrebuild({
+        packageWorkspaceRoot: root,
+        stageRoot,
+        licenseContent,
+        createPrebuildPackageImpl: createNativePrebuildFixture(packageName),
+        verifyPrebuildPackageDirsImpl: async () => {},
+        packPackage: packNativeFixtureTarball({
+          packageName,
+          stageRoot,
+          licenseContent: Buffer.from("tampered license bytes\n"),
+        }),
+      }),
+      /packed LICENSE does not match the repository LICENSE/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("packed manifest validation rejects source-only release blockers", () => {
   const releaseManifest = {
     name: "@ferrite/runtime",
@@ -710,7 +1014,7 @@ test("verifier validates packages and writes the inspected report", async () => 
       },
       packPackage: async (packageDir) => {
         packCalls.push(packageDir);
-        return ["package/dist/index.js", "package/dist/index.d.ts"];
+        return ["package/dist/index.js", "package/dist/index.d.ts", "package/LICENSE"];
       },
       installPackageSet: async () => {},
     });
@@ -741,7 +1045,9 @@ test("verifier validates packages and writes the inspected report", async () => 
 
 test("verifier packs a staged release manifest instead of the source manifest", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-npm-stage-"));
+  const licenseText = "Ferrite test MIT license\n";
   try {
+    await writeFile(join(root, "LICENSE"), licenseText);
     await mkdir(join(root, "packages", "protocol", "dist"), { recursive: true });
     await mkdir(join(root, "packages", "runtime", "dist"), { recursive: true });
     await writeFile(join(root, "packages", "protocol", "dist", "index.js"), "export {};\n");
@@ -816,13 +1122,14 @@ test("verifier packs a staged release manifest instead of the source manifest", 
         const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
         assert.equal(Object.hasOwn(manifest, "private"), false);
         assert.notEqual(packageDir, join(root, "packages", manifest.name.replace("@ferrite/", "")));
+        assert.equal(await readFile(join(packageDir, "LICENSE"), "utf8"), licenseText);
         if (manifest.name === "@ferrite/runtime") {
           assert.deepEqual(manifest.dependencies, {
             "@ferrite/protocol": "0.1.0",
           });
         }
         return {
-          files: ["package/dist/index.js", "package/dist/index.d.ts", "package/package.json"],
+          files: ["package/dist/index.js", "package/dist/index.d.ts", "package/LICENSE", "package/package.json"],
           packedManifest: manifest,
         };
       },
@@ -1160,4 +1467,96 @@ function completeReleaseManifest(name) {
   const manifest = completeSourceManifest(name);
   delete manifest.private;
   return manifest;
+}
+
+function createNativePrebuildFixture(packageName) {
+  return async ({ destinationRoot }) => {
+    await mkdir(destinationRoot, { recursive: true });
+    await writeFile(
+      join(destinationRoot, "package.json"),
+      `${JSON.stringify({
+        ...completeReleaseManifest(packageName),
+        license: "MIT",
+      })}\n`,
+    );
+    await writeFile(join(destinationRoot, "ferrite-node.node"), "binding");
+    await writeFile(
+      join(destinationRoot, "ferrite-node.sha256.json"),
+      "{}\n",
+    );
+  };
+}
+
+function packNativeFixtureTarball({
+  packageName,
+  stageRoot,
+  licenseContent,
+}) {
+  return async (directory) => {
+    const manifest = JSON.parse(
+      await readFile(join(directory, "package.json"), "utf8"),
+    );
+    const tarballBytes = npmTarball({
+      "package/package.json": `${JSON.stringify(manifest)}\n`,
+      "package/ferrite-node.node": "binding",
+      "package/ferrite-node.sha256.json": "{}\n",
+      "package/LICENSE": licenseContent,
+    });
+    const tarballPath = join(stageRoot, `${packageName.replace("@ferrite/", "")}.tgz`);
+    await writeFile(tarballPath, tarballBytes);
+    return {
+      files: [
+        "package/ferrite-node.node",
+        "package/ferrite-node.sha256.json",
+        "package/LICENSE",
+        "package/package.json",
+      ],
+      packedManifest: manifest,
+      tarballPath,
+      size: tarballBytes.byteLength,
+    };
+  };
+}
+
+function npmTarball(entries) {
+  const chunks = [];
+  for (const [path, content] of Object.entries(entries)) {
+    const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
+    const header = Buffer.alloc(512);
+    writeTarString(header, 0, 100, path);
+    writeTarString(header, 100, 8, "0000644");
+    writeTarString(header, 108, 8, "0000000");
+    writeTarString(header, 116, 8, "0000000");
+    writeTarString(
+      header,
+      124,
+      12,
+      `${bytes.byteLength.toString(8).padStart(11, "0")}\0`,
+    );
+    writeTarString(header, 136, 12, "00000000000");
+    header.fill(32, 148, 156);
+    header[156] = 48;
+    writeTarString(header, 257, 6, "ustar");
+    writeTarString(header, 263, 2, "00");
+    const checksum = header.reduce((sum, byte) => sum + byte, 0);
+    writeTarString(
+      header,
+      148,
+      8,
+      `${checksum.toString(8).padStart(6, "0")}\0 `,
+    );
+    chunks.push(
+      header,
+      bytes,
+      Buffer.alloc((512 - (bytes.byteLength % 512)) % 512),
+    );
+  }
+  chunks.push(Buffer.alloc(1024));
+  return gzipSync(Buffer.concat(chunks), { mtime: 0 });
+}
+
+function writeTarString(buffer, offset, length, value) {
+  const bytes = Buffer.from(value);
+  assert.ok(bytes.byteLength <= length, `tar field overflow for ${value}`);
+  bytes.copy(buffer, offset, 0, bytes.byteLength);
 }
