@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,11 +9,13 @@ import { gzipSync } from "node:zlib";
 import { prepareNpmRelease } from "./prepare-npm-release.mjs";
 import {
   createPublicationReceipt,
+  normalizeNpmPackReadback,
   parsePublishArgs,
   preflightNpmRelease,
   publishNpmRelease,
   removeStagingDirectory,
   stageVerifiedArtifact,
+  verifyPublishedPackageReadback,
   writePublicationReceipt,
 } from "./publish-npm-release.mjs";
 import { createPackageReport } from "./verify-npm-packages.mjs";
@@ -40,6 +42,12 @@ const acceptNpmPreflight = async ({ registry, packages, version }) => ({
   versions: Object.fromEntries(packages.map(({ name }) => [name, null])),
   packages: packages.map(({ name }) => ({ name, version, exists: false, access: "create" })),
 });
+const acceptPublishedPackage = async ({ package: pkg, version: publishedVersion, tag }) => ({
+  version: publishedVersion,
+  tag,
+  integrity: "sha512-test",
+  tarball: { filename: pkg.artifact.filename, size: pkg.artifact.size, sha256: pkg.artifact.sha256 },
+});
 
 test("requires an explicit execute flag", async () => {
   await assert.rejects(publishNpmRelease({ reportPath: "unused" }), /explicit --execute/);
@@ -54,6 +62,50 @@ test("requires an explicit execute flag", async () => {
     receiptPath: "receipt.json",
     execute: true,
   });
+});
+
+test("npm pack readback accepts npm 11 keyed and legacy array JSON", () => {
+  const entry = {
+    name: "@ferrite/runtime",
+    version,
+    filename: "ferrite-runtime-0.1.0-alpha.0.tgz",
+  };
+  assert.deepEqual(
+    normalizeNpmPackReadback(
+      { "0": entry },
+      "@ferrite/runtime",
+      version,
+    ),
+    entry,
+  );
+  assert.deepEqual(
+    normalizeNpmPackReadback([entry], "@ferrite/runtime", version),
+    entry,
+  );
+});
+
+test("npm pack readback rejects ambiguous or mismatched output", () => {
+  assert.throws(
+    () =>
+      normalizeNpmPackReadback(
+        {
+          first: { filename: "first.tgz" },
+          second: { filename: "second.tgz" },
+        },
+        "@ferrite/runtime",
+        version,
+      ),
+    /must identify exactly one tarball/,
+  );
+  assert.throws(
+    () =>
+      normalizeNpmPackReadback(
+        [{ name: "@ferrite/protocol", version, filename: "wrong.tgz" }],
+        "@ferrite/runtime",
+        version,
+      ),
+    /returned package @ferrite\/protocol/,
+  );
 });
 
 test("npm preflight is fail-closed for authentication, policy, access, and registry JSON", async () => {
@@ -124,6 +176,7 @@ test("refuses to overwrite an existing publication receipt", async () => {
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
         npmPreflight: acceptNpmPreflight,
+        verifyPublishedPackage: acceptPublishedPackage,
         runCommand: async () => {
           registryCalls += 1;
         },
@@ -146,6 +199,7 @@ test("revalidates and publishes immutable staged bytes in dependency order", asy
       sourceIdentity: source,
       verifyBuildkite: acceptBuildkite,
       npmPreflight: acceptNpmPreflight,
+      verifyPublishedPackage: acceptPublishedPackage,
       runCommand: async (command, args, options) => {
         const bytes = await readFile(args[1]);
         const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
@@ -177,6 +231,172 @@ test("revalidates and publishes immutable staged bytes in dependency order", asy
   });
 });
 
+test("does not treat npm publish exit 0 as confirmed without complete registry readback", async () => {
+  await withReleaseReport(async ({ reportPath, root }) => {
+    const receiptPath = join(root, "missing-readback.json");
+    await assert.rejects(
+      publishNpmRelease({
+        reportPath,
+        receiptPath,
+        execute: true,
+        sourceIdentity: source,
+        verifyBuildkite: acceptBuildkite,
+        npmPreflight: acceptNpmPreflight,
+        runCommand: async () => {},
+        runNpmCommand: async (_command, args) => {
+          if (args[0] === "view") {
+            return { version, "dist-tags": { next: version }, dist: {} };
+          }
+          throw new Error(`unexpected npm readback command: ${args.join(" ")}`);
+        },
+      }),
+      /ambiguous registry outcome/,
+    );
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.status, "ambiguous");
+    assert.equal(receipt.published.length, 0);
+    assert.equal(receipt.ambiguous.phase, "registry_readback");
+  });
+});
+
+test("records version, dist-tag, integrity, and downloaded tarball identity after publication", async () => {
+  await withReleaseReport(async ({ reportPath, root }) => {
+    const receiptPath = join(root, "readback-complete.json");
+    let artifact;
+    const result = await publishNpmRelease({
+      reportPath,
+      receiptPath,
+      execute: true,
+      sourceIdentity: source,
+      verifyBuildkite: acceptBuildkite,
+      npmPreflight: acceptNpmPreflight,
+      runCommand: async (_command, args) => {
+        artifact = args[1];
+      },
+      runNpmCommand: async (_command, args) => {
+        if (args[0] === "view") {
+          const bytes = await readFile(artifact);
+          return {
+            version,
+            "dist-tags": { next: version },
+            dist: { integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}` },
+          };
+        }
+        const destination = args[args.indexOf("--pack-destination") + 1];
+        const filename = artifact.split("/").at(-1);
+        const packageName = args[1].slice(0, -`@${version}`.length);
+        await copyFile(artifact, join(destination, filename));
+        const bytes = await readFile(artifact);
+        return {
+          "0": {
+            name: packageName,
+            version,
+            filename,
+            size: bytes.byteLength,
+          },
+        };
+      },
+    });
+    assert.equal(result.published[0].registryReadback.version, version);
+    assert.equal(result.published[0].registryReadback.tag, "next");
+    assert.equal(result.published[0].registryReadback.tarball.sha256, result.published[0].sha256);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.status, "complete");
+    assert.equal(receipt.published[0].registryReadback.tarball.size, result.published[0].registryReadback.tarball.size);
+  });
+});
+
+test("records confirmed registry evidence when readback cleanup fails", async () => {
+  await withReleaseReport(async ({ reportPath, root }) => {
+    const receiptPath = join(root, "readback-cleanup-failure.json");
+    let artifact;
+    await assert.rejects(
+      publishNpmRelease({
+        reportPath,
+        receiptPath,
+        execute: true,
+        sourceIdentity: source,
+        verifyBuildkite: acceptBuildkite,
+        npmPreflight: acceptNpmPreflight,
+        runCommand: async (_command, args) => {
+          artifact = args[1];
+        },
+        runNpmCommand: readbackCommand(() => artifact),
+        cleanupReadback: async (downloadRoot) => {
+          await rm(downloadRoot, { recursive: true, force: true });
+          throw new Error("injected readback cleanup failure");
+        },
+      }),
+      /confirmed published: @ferrite\/protocol.*registry_readback_cleanup failure/,
+    );
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.status, "partial");
+    assert.deepEqual(
+      receipt.published.map(({ name }) => name),
+      ["@ferrite/protocol"],
+    );
+    assert.equal(receipt.ambiguous, undefined);
+    assert.deepEqual(receipt.postPublicationFailure, {
+      name: "@ferrite/protocol",
+      phase: "registry_readback_cleanup",
+      reason: "registry success was confirmed but local completion did not finish",
+    });
+    assert.equal(receipt.published[0].registryReadback.version, version);
+  });
+});
+
+test("preserves validation and cleanup failures from registry readback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-readback-dual-failure-"));
+  const artifact = join(root, "artifact.tgz");
+  const bytes = Buffer.from("expected artifact bytes\n");
+  await writeFile(artifact, bytes);
+  try {
+    await assert.rejects(
+      verifyPublishedPackageReadback({
+        package: {
+          name: "@ferrite/runtime",
+          artifact: {
+            path: artifact,
+            size: bytes.byteLength,
+            sha256: createHash("sha256").update(bytes).digest("hex"),
+          },
+        },
+        version,
+        tag: "next",
+        runCommand: async (_command, args) => {
+          if (args[0] === "view") {
+            return {
+              version,
+              "dist-tags": { next: version },
+              dist: {
+                integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
+              },
+            };
+          }
+          throw new Error("injected registry download failure");
+        },
+        cleanupDownload: async (downloadRoot) => {
+          await rm(downloadRoot, { recursive: true, force: true });
+          throw new Error("injected readback cleanup failure");
+        },
+      }),
+      (error) => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(
+          error.errors.map(({ message }) => message),
+          [
+            "injected registry download failure",
+            "injected readback cleanup failure",
+          ],
+        );
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("records a response-loss failure as ambiguous instead of failed", async () => {
   await withReleaseReport(async ({ reportPath, root }) => {
     let calls = 0;
@@ -189,6 +409,7 @@ test("records a response-loss failure as ambiguous instead of failed", async () 
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
         npmPreflight: acceptNpmPreflight,
+        verifyPublishedPackage: acceptPublishedPackage,
         runCommand: async () => {
           calls += 1;
           if (calls === 2) throw new Error("registry rejected package");
@@ -220,6 +441,7 @@ test("keeps confirmed publication disjoint from a cleanup failure", async () => 
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
         npmPreflight: acceptNpmPreflight,
+        verifyPublishedPackage: acceptPublishedPackage,
         runCommand: async () => {},
         cleanupStaging: async (stagingRoot) => {
           await removeStagingDirectory(stagingRoot);
@@ -253,6 +475,7 @@ test("recovers a post-success receipt write failure without relabeling success",
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
         npmPreflight: acceptNpmPreflight,
+        verifyPublishedPackage: acceptPublishedPackage,
         runCommand: async () => {},
         writeReceipt: async (...args) => {
           writes += 1;
@@ -281,6 +504,7 @@ test("stops when the package set changes after publication starts", async () => 
         sourceIdentity: source,
         verifyBuildkite: acceptBuildkite,
         npmPreflight: acceptNpmPreflight,
+        verifyPublishedPackage: acceptPublishedPackage,
         runCommand: async () => {
           calls += 1;
           if (calls === 1) {
@@ -315,6 +539,7 @@ test("stops when the source or build identity changes between replans", async ()
           sourceIdentity: source,
           verifyBuildkite: acceptBuildkite,
           npmPreflight: acceptNpmPreflight,
+          verifyPublishedPackage: acceptPublishedPackage,
           runCommand: async () => {
             calls += 1;
             if (calls === 1) {
@@ -440,6 +665,34 @@ function npmTarball(entries) {
   }
   chunks.push(Buffer.alloc(1024));
   return gzipSync(Buffer.concat(chunks), { mtime: 0 });
+}
+
+function readbackCommand(readArtifactPath) {
+  return async (_command, args) => {
+    const artifact = readArtifactPath();
+    const bytes = await readFile(artifact);
+    if (args[0] === "view") {
+      return {
+        version,
+        "dist-tags": { next: version },
+        dist: {
+          integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
+        },
+      };
+    }
+    const destination = args[args.indexOf("--pack-destination") + 1];
+    const filename = artifact.split("/").at(-1);
+    const packageName = args[1].slice(0, -`@${version}`.length);
+    await copyFile(artifact, join(destination, filename));
+    return {
+      "0": {
+        name: packageName,
+        version,
+        filename,
+        size: bytes.byteLength,
+      },
+    };
+  };
 }
 
 function writeTarString(buffer, offset, length, value) {
