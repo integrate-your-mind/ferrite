@@ -1,0 +1,43 @@
+{
+  "name": "@ferrite/cli",
+  "version": "0.1.0-alpha.0",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "description": "Integrity-checked npm launcher for the Ferrite Rust CLI.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/integrate-your-mind/ferrite.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/integrate-your-mind/ferrite#readme",
+  "bugs": {
+    "url": "https://github.com/integrate-your-mind/ferrite/issues"
+  },
+  "keywords": [
+    "ferrite",
+    "cli",
+    "rust",
+    "typescript"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "ferrite": "./bin/ferrite.mjs"
+  },
+  "files": [
+    "bin",
+    "lib"
+  ],
+  "scripts": {
+    "build": "pnpm typecheck",
+    "candidate:create": "node scripts/create-cli-candidate.mjs",
+    "candidate:verify": "node scripts/verify-cli-consumer.mjs",
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "node --check bin/ferrite.mjs && node --check lib/cli-package.js && node --check scripts/create-cli-candidate.mjs && node --check scripts/verify-cli-consumer.mjs"
+  }
+}

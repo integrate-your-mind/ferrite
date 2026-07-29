@@ -6,18 +6,19 @@
   },
   "type": "module",
   "scripts": {
-    "build": "cargo build --workspace && pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/protocol-wasm build && pnpm --filter @ferrite/runtime build && pnpm --filter @ferrite/node build",
+    "build": "cargo build --workspace && pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/protocol-wasm build && pnpm --filter @ferrite/runtime build && pnpm --filter @ferrite/node build && pnpm --filter @ferrite/cli build",
     "build:site": "node scripts/build-sites-source.mjs",
     "build:example": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- build --project examples/basic",
     "check": "cargo run -p ferrite-cli -- check --project examples/basic",
     "dev:once": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- dev --project examples/basic --once --request-path /posts/abc",
-    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/protocol-wasm typecheck && pnpm --filter @ferrite/runtime typecheck && pnpm --filter @ferrite/node typecheck",
+    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/protocol-wasm typecheck && pnpm --filter @ferrite/runtime typecheck && pnpm --filter @ferrite/node typecheck && pnpm --filter @ferrite/cli typecheck",
+    "release:verify:cli": "cargo build -p ferrite-cli && node packages/cli/scripts/verify-cli-consumer.mjs",
     "release:verify:npm": "cargo build -p ferrite-cli && node scripts/verify-npm-packages.mjs --publish-manifest --repository-url https://github.com/integrate-your-mind/ferrite",
     "release:plan:npm": "node scripts/prepare-npm-release.mjs --report dist/npm-packages/npm-package-report.json --version 0.1.0-alpha.0 --tag next",
     "release:verify:cargo": "cargo package --workspace --no-verify",
     "starter:create": "cargo build -p ferrite-cli && node scripts/create-source-starter.mjs",
     "render:fixture": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && node examples/basic/render.mjs | cargo run -p ferrite-cli -- render --input -",
-    "test": "node --test scripts/*.test.mjs && cargo test --workspace -- --test-threads=1 && pnpm --filter @ferrite/protocol test && pnpm --filter @ferrite/protocol-wasm test && pnpm --filter @ferrite/runtime test && pnpm --filter @ferrite/node test && pnpm test:browser && pnpm test:example && pnpm test:demos",
+    "test": "node --test scripts/*.test.mjs && cargo test --workspace -- --test-threads=1 && pnpm --filter @ferrite/protocol test && pnpm --filter @ferrite/protocol-wasm test && pnpm --filter @ferrite/runtime test && pnpm --filter @ferrite/node test && pnpm --filter @ferrite/cli test && pnpm test:browser && pnpm test:example && pnpm test:demos",
     "test:browser": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/protocol-wasm build && pnpm --filter @ferrite/runtime build && node --test --test-concurrency=1 test/*.test.mjs",
     "test:example": "pnpm build:example && pnpm render:fixture && pnpm dev:once && cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path /posts/abc",
     "test:nginx": "node scripts/verify-nginx-runtime.mjs",
@@ -26,7 +27,7 @@
     "build:demos": "node scripts/verify-demo-examples.mjs --build-only",
     "test:demos": "node scripts/verify-demo-examples.mjs",
     "test:release": "node --test scripts/*.test.mjs",
-    "typecheck": "pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/protocol-wasm typecheck && pnpm --filter @ferrite/runtime typecheck && cargo run -p ferrite-cli -- check --project examples/basic && pnpm check:demos"
+    "typecheck": "pnpm --filter @ferrite/protocol typecheck && pnpm --filter @ferrite/protocol-wasm typecheck && pnpm --filter @ferrite/runtime typecheck && pnpm --filter @ferrite/cli typecheck && cargo run -p ferrite-cli -- check --project examples/basic && pnpm check:demos"
   },
   "devDependencies": {
     "esbuild": "0.28.1",

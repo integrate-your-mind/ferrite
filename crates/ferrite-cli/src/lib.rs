@@ -464,7 +464,9 @@ fn run_cli(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::Init(args) => {
-            let project = initialize_project(&args.project)?;
+            let npm_package_version = npm_package_version_from_environment()?;
+            let project =
+                initialize_project_with_npm_version(&args.project, npm_package_version.as_deref())?;
             if cli.json {
                 print_json(&InitOutput { project })?;
             } else {
@@ -884,11 +886,19 @@ fn serve_production_until_signal(addr: String, project: ProductionProject) -> Re
 }
 
 fn initialize_project(project: &Path) -> Result<PathBuf> {
+    initialize_project_with_npm_version(project, None)
+}
+
+fn initialize_project_with_npm_version(
+    project: &Path,
+    npm_package_version: Option<&str>,
+) -> Result<PathBuf> {
     let project = if project.is_absolute() {
         project.to_path_buf()
     } else {
         env::current_dir()?.join(project)
     };
+    let package_json = starter_package_json(npm_package_version)?;
     if project.exists() {
         if !project.is_dir() {
             return Err(CliError::Config(format!(
@@ -905,15 +915,39 @@ fn initialize_project(project: &Path) -> Result<PathBuf> {
     }
 
     fs::create_dir_all(project.join("app"))?;
-    fs::write(project.join("package.json"), starter_package_json())?;
+    fs::write(project.join("package.json"), package_json)?;
     fs::write(project.join("tsconfig.json"), starter_tsconfig())?;
     fs::write(project.join("app/page.tsx"), starter_page())?;
     fs::write(project.join(".gitignore"), ".ferrite/\nnode_modules/\n")?;
     Ok(project)
 }
 
-fn starter_package_json() -> String {
-    format!(
+fn npm_package_version_from_environment() -> Result<Option<String>> {
+    let Some(value) = env::var_os("FERRITE_NPM_PACKAGE_VERSION") else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| {
+        CliError::Config("FERRITE_NPM_PACKAGE_VERSION must be valid Unicode".to_owned())
+    })?;
+    if !is_exact_semver(&value) {
+        return Err(CliError::Config(
+            "FERRITE_NPM_PACKAGE_VERSION must be an exact semantic version".to_owned(),
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn starter_package_json(npm_package_version: Option<&str>) -> Result<String> {
+    let runtime_version = npm_package_version.unwrap_or(env!("CARGO_PKG_VERSION"));
+    if !is_exact_semver(runtime_version) {
+        return Err(CliError::Config(
+            "starter npm package version must be an exact semantic version".to_owned(),
+        ));
+    }
+    let dev_dependencies = npm_package_version.map(|version| {
+        format!(",\n  \"devDependencies\": {{\n    \"@ferrite/cli\": \"{version}\"\n  }}")
+    });
+    Ok(format!(
         concat!(
             "{{\n  \"name\": \"ferrite-app\",\n  \"private\": true,\n  \"type\": \"module\",\n",
             "  \"scripts\": {{\n",
@@ -921,10 +955,62 @@ fn starter_package_json() -> String {
             "    \"dev\": \"ferrite dev --page-renderer node_modules/@ferrite/runtime/bin/render-page.mjs --client-bundler node_modules/@ferrite/runtime/bin/build-client.mjs\",\n",
             "    \"build\": \"ferrite build --page-renderer node_modules/@ferrite/runtime/bin/render-page.mjs --client-bundler node_modules/@ferrite/runtime/bin/build-client.mjs\",\n",
             "    \"start\": \"ferrite serve --page-renderer node_modules/@ferrite/runtime/bin/render-artifact.mjs\"\n",
-            "  }},\n  \"dependencies\": {{\n    \"@ferrite/runtime\": \"{}\"\n  }}\n}}\n"
+            "  }},\n  \"dependencies\": {{\n    \"@ferrite/runtime\": \"{}\"\n  }}{}\n}}\n"
         ),
-        env!("CARGO_PKG_VERSION")
-    )
+        runtime_version,
+        dev_dependencies.unwrap_or_default()
+    ))
+}
+
+fn is_exact_semver(value: &str) -> bool {
+    let (without_build, build) = match value.split_once('+') {
+        Some((version, build)) if !build.contains('+') => (version, Some(build)),
+        Some(_) => return false,
+        None => (value, None),
+    };
+    if build.is_some_and(|build| !valid_semver_identifiers(build, false)) {
+        return false;
+    }
+
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (without_build, None),
+    };
+    if prerelease.is_some_and(|prerelease| !valid_semver_identifiers(prerelease, true)) {
+        return false;
+    }
+
+    let mut core_parts = core.split('.');
+    let Some(major) = core_parts.next() else {
+        return false;
+    };
+    let Some(minor) = core_parts.next() else {
+        return false;
+    };
+    let Some(patch) = core_parts.next() else {
+        return false;
+    };
+    core_parts.next().is_none() && [major, minor, patch].into_iter().all(valid_semver_number)
+}
+
+fn valid_semver_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn valid_semver_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !(reject_numeric_leading_zero
+                    && identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    && identifier.len() > 1
+                    && identifier.starts_with('0'))
+        })
 }
 
 fn starter_tsconfig() -> &'static str {
@@ -1434,6 +1520,7 @@ mod tests {
         assert_eq!(initialized, project);
         let package = fs::read_to_string(project.join("package.json")).unwrap();
         assert!(package.contains("\"@ferrite/runtime\": \"0.1.0\""));
+        assert!(!package.contains("\"@ferrite/cli\""));
         assert!(package.contains("node_modules/@ferrite/runtime/bin/render-page.mjs"));
         assert!(project.join("tsconfig.json").is_file());
         assert!(project.join("app/page.tsx").is_file());
@@ -1441,6 +1528,50 @@ mod tests {
             fs::read_to_string(project.join(".gitignore")).unwrap(),
             ".ferrite/\nnode_modules/\n"
         );
+    }
+
+    #[test]
+    fn npm_cli_init_pins_matching_prerelease_packages() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("app");
+
+        initialize_project_with_npm_version(&project, Some("0.1.0-alpha.0")).unwrap();
+
+        let package = fs::read_to_string(project.join("package.json")).unwrap();
+        assert!(package.contains("\"@ferrite/runtime\": \"0.1.0-alpha.0\""));
+        assert!(package.contains("\"@ferrite/cli\": \"0.1.0-alpha.0\""));
+    }
+
+    #[test]
+    fn invalid_npm_cli_version_does_not_create_a_partial_target() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("app");
+
+        let error =
+            initialize_project_with_npm_version(&project, Some("latest || attacker")).unwrap_err();
+
+        assert!(error.to_string().contains("exact semantic version"));
+        assert!(!project.exists());
+    }
+
+    #[test]
+    fn npm_cli_version_validation_accepts_exact_semver_only() {
+        for version in ["0.1.0", "0.1.0-alpha.0", "1.2.3+build.7"] {
+            assert!(is_exact_semver(version), "{version}");
+        }
+        for version in [
+            "",
+            "latest",
+            "1",
+            "1.2",
+            "01.2.3",
+            "1.2.3-01",
+            "1.2.3-",
+            "1.2.3+",
+            "1.2.3 || latest",
+        ] {
+            assert!(!is_exact_semver(version), "{version}");
+        }
     }
 
     #[test]
