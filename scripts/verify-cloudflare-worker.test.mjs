@@ -20,10 +20,53 @@ import {
   assertSupportedIndexFlag,
   gitBlobObjectId,
   inventoryFiles,
+  removeWranglerDryRunReadme,
   runCapture,
   startTrackedSourceMonitor,
   trackedSourceSnapshot,
 } from "./verify-cloudflare-worker.mjs";
+
+test("Cloudflare proof excludes only validated Wrangler dry-run metadata", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-wrangler-metadata-"));
+  try {
+    const output = join(root, "bundle");
+    const readme = join(output, "README.md");
+    const worker = "ferrite-worker";
+    await mkdir(output);
+    await writeFile(
+      readme,
+      `This folder contains the built output assets for the worker "${worker}" generated at 2026-07-29T19:00:00.000Z.`,
+    );
+    assert.deepEqual(await removeWranglerDryRunReadme(output, worker), {
+      path: "README.md",
+      bytes: 115,
+      generatedAt: "2026-07-29T19:00:00.000Z",
+      worker,
+      removed: true,
+    });
+    await assert.rejects(readFile(readme), (error) => error?.code === "ENOENT");
+
+    await writeFile(readme, "unexpected metadata");
+    await assert.rejects(
+      removeWranglerDryRunReadme(output, worker),
+      /did not match the expected metadata format/,
+    );
+
+    await rm(readme);
+    const external = join(root, "external-readme");
+    await writeFile(
+      external,
+      `This folder contains the built output assets for the worker "${worker}" generated at 2026-07-29T19:00:00.000Z.`,
+    );
+    await symlink(external, readme);
+    await assert.rejects(
+      removeWranglerDryRunReadme(output, worker),
+      /must be a regular, non-symlink file/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("Cloudflare proof inventory binds regular files to their exact bytes", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-inventory-"));

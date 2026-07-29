@@ -34,6 +34,7 @@ const wrangler = join(
 const renderPage = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const compatibilityDate = "2026-07-29";
 const commandTimeoutMs = 120_000;
+const workerName = "ferrite-cloudflare-request-ssr-proof";
 const workspaceProofOutputPaths = Object.freeze([
   ".ferrite",
   "packages/protocol-wasm/dist",
@@ -136,6 +137,10 @@ async function verifyCloudflareWorker() {
       ],
       { cwd: fixtureRoot, timeoutMs: commandTimeoutMs },
     );
+    const firstWranglerMetadata = await removeWranglerDryRunReadme(
+      fixture.bundle,
+      workerName,
+    );
     bundleMetafileMonitor = await startTrackedSourceMonitor(
       [relative(fixtureRoot, bundleMetafile).replaceAll("\\", "/")],
       fixtureRoot,
@@ -170,6 +175,23 @@ async function verifyCloudflareWorker() {
         checkMetafile,
       ],
       { cwd: fixtureRoot, timeoutMs: commandTimeoutMs },
+    );
+    const secondWranglerMetadata = await removeWranglerDryRunReadme(
+      fixture.bundleCheck,
+      workerName,
+    );
+    assert.deepEqual(
+      {
+        path: secondWranglerMetadata.path,
+        bytes: secondWranglerMetadata.bytes,
+        worker: secondWranglerMetadata.worker,
+      },
+      {
+        path: firstWranglerMetadata.path,
+        bytes: firstWranglerMetadata.bytes,
+        worker: firstWranglerMetadata.worker,
+      },
+      "Wrangler dry-runs emitted different non-runtime metadata shapes.",
     );
     assert.deepEqual(
       await inventoryFiles(fixture.bundleCheck),
@@ -298,6 +320,11 @@ async function verifyCloudflareWorker() {
         gzipBytes: bundle.gzipBytes,
         routeBindings: routeBundleBindings,
         deterministicDryRuns: true,
+        excludedWranglerMetadata: {
+          reason: "Wrangler --outdir README contains a wall-clock timestamp and is not a Worker runtime input.",
+          first: firstWranglerMetadata,
+          second: secondWranglerMetadata,
+        },
         stableThroughRuntime: true,
         dryRunSummary: boundedLog(`${dryRun.stdout}\n${dryRun.stderr}`),
       },
@@ -685,7 +712,7 @@ async function createFixture(root) {
     config,
     `${JSON.stringify({
       $schema: join(workspaceRoot, "node_modules/wrangler/config-schema.json"),
-      name: "ferrite-cloudflare-request-ssr-proof",
+      name: workerName,
       main: "./worker.mjs",
       compatibility_date: compatibilityDate,
       compatibility_flags: ["nodejs_compat"],
@@ -862,7 +889,7 @@ async function writeExactBundleConfig(fixture, metafilePath, fixtureRoot, bundle
     config,
     `${JSON.stringify({
       $schema: join(workspaceRoot, "node_modules/wrangler/config-schema.json"),
-      name: "ferrite-cloudflare-request-ssr-proof",
+      name: workerName,
       main: `./${relative(fixtureRoot, entry).replaceAll("\\", "/")}`,
       no_bundle: true,
       find_additional_modules: true,
@@ -1499,6 +1526,36 @@ export async function inventoryFiles(root) {
   }
   await visit(canonicalRoot);
   return { files, bytes, gzipBytes };
+}
+
+export async function removeWranglerDryRunReadme(outputDirectory, expectedWorkerName) {
+  const path = join(outputDirectory, "README.md");
+  const stat = await lstat(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error("Wrangler dry-run README must be a regular, non-symlink file.");
+  }
+  const contents = await readFile(path, "utf8");
+  const prefix = `This folder contains the built output assets for the worker "${expectedWorkerName}" generated at `;
+  if (!contents.startsWith(prefix) || !contents.endsWith(".")) {
+    throw new Error("Wrangler dry-run README did not match the expected metadata format.");
+  }
+  const generatedAt = contents.slice(prefix.length, -1);
+  const parsed = new Date(generatedAt);
+  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== generatedAt) {
+    throw new Error("Wrangler dry-run README contained an invalid generation timestamp.");
+  }
+  const bytes = Buffer.byteLength(contents);
+  await rm(path);
+  if (await pathExists(path)) {
+    throw new Error("Wrangler dry-run README remained after metadata cleanup.");
+  }
+  return {
+    path: "README.md",
+    bytes,
+    generatedAt,
+    worker: expectedWorkerName,
+    removed: true,
+  };
 }
 
 async function inventoryProofInputs(root, locations) {
