@@ -8425,7 +8425,7 @@ process.exit(17);
                 "render",
                 "/private-id",
                 "/posts/:id",
-                "private renderer detail",
+                &"private renderer detail",
             )
             .expect("default mode preserves the legacy diagnostic");
         assert!(legacy.contains("private-id"));
@@ -8447,7 +8447,7 @@ process.exit(17);
                     "render",
                     "/private-id",
                     "/posts/:id",
-                    "private renderer detail",
+                    &"private renderer detail",
                 )
                 .is_none()
         );
