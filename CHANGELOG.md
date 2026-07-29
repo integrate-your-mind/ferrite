@@ -22,8 +22,10 @@
 - CLI execution now runs an integrity-verified private binary snapshot instead
   of a mutable package pathname, and candidate/starter publication uses the
   Rust no-replace primitive.
-- `ferrite init` now stages the complete project before publication and rejects
-  existing or symbolic-link targets without writing through them.
+- `ferrite init` now stages the complete project before publication, safely
+  accepts absent or verified empty targets, and rejects non-empty,
+  current-working-directory, or symbolic-link targets without writing through
+  them.
 
 ### Known limits
 

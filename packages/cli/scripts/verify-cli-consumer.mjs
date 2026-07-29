@@ -138,7 +138,7 @@ export async function verifyCliConsumer({
       cwd: consumerRoot,
       expectFailure: true,
     });
-    if (!/refusing to initialize an existing directory/.test(refusal.stderr)) {
+    if (!/refusing to initialize a non-empty directory/.test(refusal.stderr)) {
       throw new Error("Packaged Ferrite CLI did not report its existing-target refusal.");
     }
     if ((await readFile(marker, "utf8")) !== "keep\n") {

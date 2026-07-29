@@ -911,7 +911,7 @@ where
         env::current_dir()?.join(project)
     };
     let package_json = starter_package_json(npm_package_version)?;
-    match fs::symlink_metadata(&project) {
+    let existing_empty_target = match fs::symlink_metadata(&project) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(CliError::Config(format!(
                 "init target must not be a symbolic link: {}",
@@ -925,14 +925,23 @@ where
             )));
         }
         Ok(_) => {
-            return Err(CliError::Config(format!(
-                "refusing to initialize an existing directory: {}",
-                project.display()
-            )));
+            if fs::read_dir(&project)?.next().transpose()?.is_some() {
+                return Err(CliError::Config(format!(
+                    "refusing to initialize a non-empty directory: {}",
+                    project.display()
+                )));
+            }
+            if fs::canonicalize(&project)? == fs::canonicalize(env::current_dir()?)? {
+                return Err(CliError::Config(format!(
+                    "refusing to replace the current working directory: {}",
+                    project.display()
+                )));
+            }
+            true
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
-    }
+    };
 
     let parent = project.parent().ok_or_else(|| {
         CliError::Config(format!(
@@ -961,7 +970,21 @@ where
         &staging.path().join(".gitignore"),
         b".ferrite/\nnode_modules/\n",
     )?;
-    publish_directory_no_replace(staging.path(), &project)?;
+    if existing_empty_target {
+        fs::remove_dir(&project)?;
+    }
+    if let Err(error) = publish_directory_no_replace(staging.path(), &project) {
+        if existing_empty_target && !project.exists() {
+            fs::create_dir(&project).map_err(|restore_error| {
+                CliError::Config(format!(
+                    "starter publication failed ({error}) and the empty target could not be restored ({}): {}",
+                    restore_error,
+                    project.display()
+                ))
+            })?;
+        }
+        return Err(error);
+    }
     Ok(project)
 }
 
@@ -1625,7 +1648,7 @@ mod tests {
         let error = initialize_project_with_npm_version(project.path(), None).unwrap_err();
 
         assert!(matches!(error, CliError::Config(_)));
-        assert!(error.to_string().contains("existing directory"));
+        assert!(error.to_string().contains("non-empty directory"));
         assert_eq!(
             fs::read_to_string(project.path().join("owned.txt")).unwrap(),
             "keep"
@@ -1634,15 +1657,16 @@ mod tests {
     }
 
     #[test]
-    fn init_refuses_an_existing_empty_directory() {
+    fn init_populates_an_existing_empty_directory_from_staging() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("existing");
         fs::create_dir(&target).unwrap();
 
-        let error = initialize_project_with_npm_version(&target, None).unwrap_err();
+        let initialized = initialize_project_with_npm_version(&target, None).unwrap();
 
-        assert!(error.to_string().contains("existing directory"));
-        assert!(target.read_dir().unwrap().next().is_none());
+        assert_eq!(initialized, target);
+        assert!(target.join("package.json").is_file());
+        assert!(target.join("app/page.tsx").is_file());
     }
 
     #[cfg(unix)]
@@ -1720,6 +1744,34 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".ferrite-init-")
         }));
+    }
+
+    #[test]
+    fn init_preserves_an_existing_target_modified_during_staging() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("app");
+        fs::create_dir(&project).unwrap();
+        let racing_target = project.clone();
+        let mut writes = 0;
+
+        let error = initialize_project_with_writer(&project, None, |path, bytes| {
+            fs::write(path, bytes)?;
+            writes += 1;
+            if writes == 4 {
+                fs::write(path.parent().unwrap().join("trigger"), b"complete staging")?;
+                fs::create_dir_all(&racing_target)?;
+                fs::write(racing_target.join("owned.txt"), "keep")?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::Io(_)));
+        assert_eq!(
+            fs::read_to_string(project.join("owned.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!project.join("package.json").exists());
     }
 
     #[test]
