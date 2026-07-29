@@ -7,7 +7,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { platform } from "node:process";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { createServerActionRequest, validateServerActionResponse } from "../dist/index.js";
@@ -79,6 +79,31 @@ async function renderPageActionManifest(projectRoot, pageFile, props = {}) {
     },
   );
   return JSON.parse(stdout);
+}
+
+async function buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+  layouts = [],
+  document = null,
+  conventions = {},
+  routePattern = "/",
+} = {}) {
+  await execFileAsync(
+    "node",
+    [
+      renderPageScript,
+      "--build-cloudflare-artifact",
+      pageFile,
+      outputFile,
+      JSON.stringify(layouts),
+      JSON.stringify(document),
+      JSON.stringify(conventions),
+      routePattern,
+    ],
+    {
+      cwd: projectRoot,
+      maxBuffer: 1024 * 1024,
+    },
+  );
 }
 
 async function buildClient(projectRoot, pageFile) {
@@ -211,6 +236,72 @@ test("build-client reports deterministic module-graph cycles and unresolved impo
     } finally {
       await rm(outsideFile, { force: true });
     }
+  });
+});
+
+test("build-cloudflare-artifact emits an isolate-targeted route module with only the runtime async context external", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        "let renders = 0;",
+        "export default function Page() {",
+        "  renders += 1;",
+        "  return <main data-render={renders}>Ferrite & Workers</main>;",
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    const source = await readFile(outputFile, "utf8");
+    assert.match(source, /node:async_hooks/);
+    assert.doesNotMatch(source, /node:(?:child_process|fs|http|path)/);
+
+    const route = await import(`${pathToFileURL(outputFile).href}?test=${Date.now()}`);
+    assert.equal(route.routePattern, "/");
+    const first = await route.serverRuntime.renderPageModuleToPacket(
+      route.pageModule,
+      {},
+      route.layoutModules,
+      route.conventionModules,
+      { routePath: "/", routePattern: "/" },
+    );
+    const second = await route.serverRuntime.renderPageModuleToPacket(
+      route.pageModule,
+      {},
+      route.layoutModules,
+      route.conventionModules,
+      { routePath: "/", routePattern: "/" },
+    );
+    assert.equal(first.root[2]["data-render"], 1);
+    assert.equal(second.root[2]["data-render"], 2);
+  });
+});
+
+test("build-cloudflare-artifact rejects application Node builtins instead of shipping a false edge claim", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        'import { readFile } from "node:fs/promises";',
+        "export default function Page() {",
+        "  return <main>{typeof readFile}</main>;",
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile),
+      /cannot import Node builtin "node:fs\/promises"/,
+    );
   });
 });
 

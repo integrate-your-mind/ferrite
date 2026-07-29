@@ -15,7 +15,16 @@ if (prebuiltArtifact) {
 }
 if (args[0] === "--build-artifact") {
   try {
-    await buildServerArtifact(args.slice(1));
+    await buildServerArtifact(args.slice(1), "node");
+  } catch (error) {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  }
+  process.exit(0);
+}
+if (args[0] === "--build-cloudflare-artifact") {
+  try {
+    await buildServerArtifact(args.slice(1), "cloudflare");
   } catch (error) {
     console.error(error instanceof Error ? error.stack || error.message : String(error));
     process.exit(1);
@@ -289,12 +298,12 @@ async function executeEntryModule(entryModule, server) {
   }
 }
 
-async function buildServerArtifact(buildArgs) {
+async function buildServerArtifact(buildArgs, targetRuntime) {
   const [sourcePageFile, outputFile, layoutsJson = "[]", documentJson = "null", conventionsJson = "{}", routePattern] =
     buildArgs;
   if (!sourcePageFile || !outputFile || !routePattern) {
     throw new TypeError(
-      "usage: render-page --build-artifact <page-file> <output-file> <layouts-json> <document-json> <conventions-json> <route-pattern>",
+      `usage: render-page --build-${targetRuntime === "cloudflare" ? "cloudflare-" : ""}artifact <page-file> <output-file> <layouts-json> <document-json> <conventions-json> <route-pattern>`,
     );
   }
 
@@ -355,6 +364,7 @@ async function buildServerArtifact(buildArgs) {
       outputFile: resolve(outputFile),
       projectRoot: artifactProjectRoot,
       excludedFiles,
+      targetRuntime,
     });
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -387,17 +397,33 @@ function serverArtifactEntrySource({ pageFile, layoutFiles, documentFile, conven
   ].join("\n");
 }
 
-async function bundleServerArtifact({ entryFile, outputFile, projectRoot, excludedFiles }) {
+async function bundleServerArtifact({
+  entryFile,
+  outputFile,
+  projectRoot,
+  excludedFiles,
+  targetRuntime = "node",
+}) {
+  const cloudflare = targetRuntime === "cloudflare";
   const result = await build({
     entryPoints: [entryFile],
     outfile: outputFile,
     bundle: true,
-    platform: "node",
+    platform: cloudflare ? "neutral" : "node",
     format: "esm",
-    target: "node22",
+    target: cloudflare ? "es2022" : "node22",
+    ...(cloudflare
+      ? {
+          conditions: ["workerd", "worker", "browser", "import", "default"],
+          mainFields: ["module", "main"],
+        }
+      : {}),
     jsx: "automatic",
     jsxImportSource: "@ferrite/runtime",
-    plugins: [clientReferenceProxyPlugin({ projectRoot, excludedFiles })],
+    plugins: [
+      clientReferenceProxyPlugin({ projectRoot, excludedFiles }),
+      ...(cloudflare ? [cloudflareBuiltinGuardPlugin()] : []),
+    ],
     loader: {
       ".css": "empty",
     },
@@ -408,13 +434,45 @@ async function bundleServerArtifact({ entryFile, outputFile, projectRoot, exclud
   });
   const unsupportedExternals = Object.values(result.metafile.outputs)
     .flatMap((output) => output.imports)
-    .filter((item) => item.external && !isBuiltin(item.path))
+    .filter((item) =>
+      item.external &&
+      (cloudflare ? item.path !== "node:async_hooks" : !isBuiltin(item.path))
+    )
     .map((item) => item.path);
   if (unsupportedExternals.length > 0) {
     throw new TypeError(
-      `Ferrite server artifacts cannot depend on external packages: ${[...new Set(unsupportedExternals)].sort().join(", ")}`,
+      `Ferrite ${cloudflare ? "Cloudflare " : ""}server artifacts cannot depend on unsupported external packages: ${[...new Set(unsupportedExternals)].sort().join(", ")}`,
     );
   }
+}
+
+function cloudflareBuiltinGuardPlugin() {
+  return {
+    name: "ferrite-cloudflare-builtin-guard",
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (args) => {
+        if (!isBuiltin(args.path)) {
+          return undefined;
+        }
+        const importer = args.importer.replaceAll("\\", "/");
+        const runtimeAsyncContext =
+          args.path === "node:async_hooks" &&
+          /(?:^|\/)(?:packages\/runtime|node_modules\/@ferrite\/runtime)\/(?:src|dist)\/server\.(?:ts|js)$/.test(
+            importer,
+          );
+        if (runtimeAsyncContext) {
+          return { path: args.path, external: true };
+        }
+        return {
+          errors: [
+            {
+              text: `Ferrite Cloudflare server artifacts cannot import Node builtin "${args.path}" from "${importer || "<entry>"}".`,
+            },
+          ],
+        };
+      });
+    },
+  };
 }
 
 function clientReferenceProxyPlugin({ projectRoot, excludedFiles }) {

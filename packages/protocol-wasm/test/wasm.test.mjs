@@ -101,3 +101,39 @@ test("rejects malformed server payload JSON through Rust WASM", async () => {
     /invalid server payload JSON/,
   );
 });
+
+test("renders canonical escaped HTML through Rust WASM", async () => {
+  const protocol = await loadProtocolWasm();
+  const packet = {
+    ferrite: "render-packet",
+    version: 1,
+    root: [2, "main", { "data-label": "\"<&" }, [[0, "<Ferrite & Workers>"]]],
+  };
+
+  assert.equal(
+    protocol.renderJsonToHtml(JSON.stringify(packet)),
+    "<main data-label=\"&quot;&lt;&amp;\">&lt;Ferrite &amp; Workers&gt;</main>",
+  );
+});
+
+test("rejects malformed and oversized render output through Rust WASM", async () => {
+  const protocol = await loadProtocolWasm();
+
+  assert.throws(() => protocol.renderJsonToHtml("{"), /invalid/i);
+  assert.throws(
+    () =>
+      protocol.renderJsonToHtml(
+        JSON.stringify({
+          ferrite: "render-packet",
+          version: 1,
+          root: [0, "larger than four bytes"],
+        }),
+        4,
+      ),
+    /exceeds the 4-byte output limit/,
+  );
+  assert.throws(
+    () => protocol.renderJsonToHtml("{}", 0),
+    /positive 32-bit integer/,
+  );
+});

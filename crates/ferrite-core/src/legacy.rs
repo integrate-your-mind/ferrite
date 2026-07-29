@@ -9,6 +9,7 @@ pub enum CoreError {
     InvalidAttributeName(String),
     VoidElementHasChildren(String),
     NonFiniteNumberAttribute(String),
+    OutputLimitExceeded(usize),
 }
 
 impl fmt::Display for CoreError {
@@ -25,6 +26,9 @@ impl fmt::Display for CoreError {
             }
             CoreError::NonFiniteNumberAttribute(name) => {
                 write!(f, "attribute `{name}` contains a non-finite number")
+            }
+            CoreError::OutputLimitExceeded(limit) => {
+                write!(f, "rendered HTML exceeds the {limit}-byte output limit")
             }
         }
     }
