@@ -479,8 +479,10 @@ test("fails closed when route code and static assets do not share one build iden
 
 test("bounds manifest hashing before rollback can receive a fresh deadline", async () => {
   const originalDigest = globalThis.crypto.subtle.digest;
+  let digestCalls = 0;
   let fallbackFetches = 0;
   globalThis.crypto.subtle.digest = async function delayedDigest(...args) {
+    digestCalls += 1;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
     return originalDigest.apply(this, args);
   };
@@ -513,6 +515,7 @@ test("bounds manifest hashing before rollback can receive a fresh deadline", asy
     );
     assert.equal(response.status, 504);
     assert.equal(await response.text(), "Gateway timeout");
+    assert.equal(digestCalls, 1);
     assert.equal(fallbackFetches, 0);
   } finally {
     globalThis.crypto.subtle.digest = originalDigest;
