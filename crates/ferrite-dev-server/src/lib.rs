@@ -3623,12 +3623,14 @@ where
             emit_transport_terminal_event(
                 emitter,
                 correlation_id.as_ref(),
-                MethodClass::Other,
-                &response,
-                response_mode,
-                None,
-                started.elapsed(),
-                write_result.as_ref().err(),
+                TransportTerminalEvent {
+                    method: MethodClass::Other,
+                    response: &response,
+                    response_mode,
+                    route_pattern: None,
+                    elapsed: started.elapsed(),
+                    write_error: write_result.as_ref().err(),
+                },
             );
             write_result?;
             let _ = stream.shutdown(Shutdown::Write);
@@ -3678,12 +3680,14 @@ where
     emit_transport_terminal_event(
         emitter,
         correlation_id.as_ref(),
-        MethodClass::from_method(&request.method),
-        &response,
-        response_mode,
-        observability_route_pattern,
-        started.elapsed(),
-        write_result.as_ref().err(),
+        TransportTerminalEvent {
+            method: MethodClass::from_method(&request.method),
+            response: &response,
+            response_mode,
+            route_pattern: observability_route_pattern,
+            elapsed: started.elapsed(),
+            write_error: write_result.as_ref().err(),
+        },
     );
     write_result
 }
@@ -3721,20 +3725,24 @@ fn emit_server_terminal_event(
     );
 }
 
+struct TransportTerminalEvent<'a> {
+    method: MethodClass,
+    response: &'a DevResponse,
+    response_mode: ObservabilityResponseMode,
+    route_pattern: Option<&'a str>,
+    elapsed: Duration,
+    write_error: Option<&'a DevServerError>,
+}
+
 fn emit_transport_terminal_event(
     emitter: Option<&EventEmitter>,
     correlation_id: Option<&CorrelationId>,
-    method: MethodClass,
-    response: &DevResponse,
-    response_mode: ObservabilityResponseMode,
-    observability_route_pattern: Option<&str>,
-    elapsed: Duration,
-    write_error: Option<&DevServerError>,
+    event: TransportTerminalEvent<'_>,
 ) {
     let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id) else {
         return;
     };
-    let (outcome, error_class, failure_phase) = match write_error {
+    let (outcome, error_class, failure_phase) = match event.write_error {
         Some(DevServerError::Io(error)) => {
             let (outcome, error_class) = classify_observability_io_error(error);
             (outcome, Some(error_class), Some(FailurePhase::Write))
@@ -3755,13 +3763,13 @@ fn emit_transport_terminal_event(
             outcome,
             error_class,
             failure_phase,
-            elapsed,
+            event.elapsed,
         )
         .with_http(HttpFields::new(
-            method,
-            Some(response.status),
-            observability_route_pattern,
-            response_mode,
+            event.method,
+            Some(event.response.status),
+            event.route_pattern,
+            event.response_mode,
         )),
     );
 }
@@ -8379,22 +8387,26 @@ process.exit(17);
         emit_transport_terminal_event(
             Some(&emitter),
             Some(&correlation_id),
-            MethodClass::Get,
-            &response,
-            ObservabilityResponseMode::Other,
-            Some("/posts/:id"),
-            Duration::from_millis(5),
-            Some(&disconnected),
+            TransportTerminalEvent {
+                method: MethodClass::Get,
+                response: &response,
+                response_mode: ObservabilityResponseMode::Other,
+                route_pattern: Some("/posts/:id"),
+                elapsed: Duration::from_millis(5),
+                write_error: Some(&disconnected),
+            },
         );
         emit_transport_terminal_event(
             Some(&emitter),
             Some(&correlation_id),
-            MethodClass::Get,
-            &response,
-            ObservabilityResponseMode::Other,
-            Some("/posts/:id"),
-            Duration::from_millis(7),
-            Some(&timed_out),
+            TransportTerminalEvent {
+                method: MethodClass::Get,
+                response: &response,
+                response_mode: ObservabilityResponseMode::Other,
+                route_pattern: Some("/posts/:id"),
+                elapsed: Duration::from_millis(7),
+                write_error: Some(&timed_out),
+            },
         );
         let events = receiver.try_iter().collect::<Vec<_>>();
 
