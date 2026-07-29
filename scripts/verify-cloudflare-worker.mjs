@@ -193,9 +193,9 @@ async function verifyCloudflareWorker() {
       },
       "Wrangler dry-runs emitted different non-runtime metadata shapes.",
     );
-    assert.deepEqual(
-      await inventoryFiles(fixture.bundleCheck),
+    assertSameFileInventory(
       bundle,
+      await inventoryFiles(fixture.bundleCheck),
       "Two Wrangler dry-runs from the same verified inputs emitted different Worker bundles.",
     );
     await bundleMonitor.assertUnchanged();
@@ -1526,6 +1526,31 @@ export async function inventoryFiles(root) {
   }
   await visit(canonicalRoot);
   return { files, bytes, gzipBytes };
+}
+
+function assertSameFileInventory(expected, actual, message) {
+  if (JSON.stringify(actual) === JSON.stringify(expected)) {
+    return;
+  }
+  const expectedFiles = new Map(expected.files.map((file) => [file.path, file]));
+  const actualFiles = new Map(actual.files.map((file) => [file.path, file]));
+  const changed = [...new Set([...expectedFiles.keys(), ...actualFiles.keys()])]
+    .sort()
+    .filter((path) =>
+      JSON.stringify(actualFiles.get(path)) !== JSON.stringify(expectedFiles.get(path))
+    )
+    .map((path) => ({
+      path,
+      expected: expectedFiles.get(path) ?? null,
+      actual: actualFiles.get(path) ?? null,
+    }));
+  throw new Error(
+    `${message} ${JSON.stringify({
+      expected: { bytes: expected.bytes, gzipBytes: expected.gzipBytes },
+      actual: { bytes: actual.bytes, gzipBytes: actual.gzipBytes },
+      changed,
+    })}`,
+  );
 }
 
 export async function removeWranglerDryRunReadme(outputDirectory, expectedWorkerName) {
