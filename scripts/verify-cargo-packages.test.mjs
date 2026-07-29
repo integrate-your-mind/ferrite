@@ -30,10 +30,11 @@ test("workspace path dependencies exact-pin the unpublished Ferrite version", as
   assert.equal(internalDependencies.length, 20);
 });
 
-test("Cargo packaging rejects dirty tracked source", async () => {
+test("Cargo packaging verifies clean archives with the locked dependency graph", async () => {
   const rootPackage = JSON.parse(await readFile(packageUrl, "utf8"));
   const command = rootPackage.scripts["release:verify:cargo"];
 
-  assert.equal(command, "cargo package --workspace --no-verify");
+  assert.equal(command, "cargo package --workspace --locked");
   assert.doesNotMatch(command, /--allow-dirty/);
+  assert.doesNotMatch(command, /--no-verify/);
 });
