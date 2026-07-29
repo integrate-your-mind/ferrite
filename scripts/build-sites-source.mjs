@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import {
   cp,
   lstat,
@@ -36,6 +36,7 @@ const outputDist = join(root, "dist");
 const rustupMaximumBytes = 32 * 1024 * 1024;
 const rustupInstallTimeoutMs = 5 * 60_000;
 const zigMaximumBytes = 60 * 1024 * 1024;
+const zigTarMaximumBytes = 1024 * 1024 * 1024;
 const zigDownloadTimeoutMs = 2 * 60_000;
 const zigExtractTimeoutMs = 2 * 60_000;
 
@@ -241,6 +242,37 @@ export async function writeVerifiedBody(
   return total;
 }
 
+export async function decompressXzArchive(
+  source,
+  destination,
+  maximumBytes = zigTarMaximumBytes,
+) {
+  const { XzReadableStream } = await import("xz-decompress");
+  const decoded = new XzReadableStream(
+    Readable.toWeb(createReadStream(source)),
+  );
+  let total = 0;
+  const limiter = new Transform({
+    transform(chunk, _encoding, callback) {
+      total += chunk.length;
+      if (total > maximumBytes) {
+        callback(new Error("pinned Zig archive exceeds the expanded size limit"));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+  await pipeline(
+    Readable.fromWeb(decoded),
+    limiter,
+    createWriteStream(destination, { flags: "wx", mode: 0o600 }),
+  );
+  if (total === 0) {
+    throw new Error("pinned Zig archive has an invalid expanded size");
+  }
+  return total;
+}
+
 export async function installZigLinker(options) {
   const toolRoot = options.toolRoot;
   const env = options.env;
@@ -250,12 +282,15 @@ export async function installZigLinker(options) {
   const runImpl = options.runImpl ?? run;
   const writeFileImpl = options.writeFileImpl ?? writeFile;
   const downloadImpl = options.downloadImpl ?? writeVerifiedBody;
+  const decompressImpl =
+    options.decompressImpl ?? decompressXzArchive;
   const zigUrl = options.zigUrl ?? ZIG_ARCHIVE_URL;
   const expectedSha256 =
     options.expectedSha256 ?? ZIG_ARCHIVE_SHA256;
   const maximumBytes = options.maximumBytes ?? zigMaximumBytes;
   const tarCommand = options.tarCommand ?? SYSTEM_TAR;
   const archive = join(toolRoot, `zig-${ZIG_VERSION}.tar.xz`);
+  const tarArchive = join(toolRoot, `zig-${ZIG_VERSION}.tar`);
   const zigRoot = join(toolRoot, "zig");
   const zigBinary = join(zigRoot, "zig");
   const linker = join(toolRoot, "zig-cc.mjs");
@@ -279,6 +314,7 @@ export async function installZigLinker(options) {
     throw new Error("pinned Zig download exceeds the size limit");
   }
   await downloadImpl(response, archive, expectedSha256, maximumBytes);
+  await decompressImpl(archive, tarArchive, zigTarMaximumBytes);
   await mkdirImpl(zigRoot, { recursive: true });
   const tarEnv = { ...env };
   for (const key of ["TAR_OPTIONS", "XZ_DEFAULTS", "XZ_OPT"]) {
@@ -287,8 +323,8 @@ export async function installZigLinker(options) {
   await runImpl(
     tarCommand,
     [
-      "-xJf",
-      archive,
+      "-xf",
+      tarArchive,
       "--strip-components=1",
       "--no-same-owner",
       "--no-same-permissions",

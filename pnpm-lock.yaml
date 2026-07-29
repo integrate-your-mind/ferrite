@@ -20,6 +20,9 @@ importers:
       typescript:
         specifier: 6.0.3
         version: 6.0.3
+      xz-decompress:
+        specifier: 0.2.3
+        version: 0.2.3
 
   examples/basic:
     dependencies:
@@ -343,6 +346,9 @@ packages:
       utf-8-validate:
         optional: true
 
+  xz-decompress@0.2.3:
+    resolution: {integrity: sha512-O8v6HG8T0PrKBcpyWA13GkSYWFvncwzuzcLx5A7++l3HsE3atmoetXjIxrZ/JV/nbvSZ7WS4+3XvREZuVn+rEA==}
+
 snapshots:
 
   '@dimforge/rapier3d-compat@0.12.0': {}
@@ -516,3 +522,5 @@ snapshots:
   whatwg-mimetype@3.0.0: {}
 
   ws@8.21.0: {}
+
+  xz-decompress@0.2.3: {}

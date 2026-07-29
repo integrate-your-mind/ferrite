@@ -14,6 +14,7 @@ import {
   bootstrapCargo,
   buildPlan,
   buildSitesSource,
+  decompressXzArchive,
   DEFAULT_SITE_ORIGIN,
   installZigLinker,
   readBoundedBody,
@@ -171,6 +172,44 @@ test("verified download streams to disk with size and checksum bounds", async ()
   }
 });
 
+test("real XZ decoder streams bytes and enforces output destinations", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-xz-test-"));
+  const source = join(directory, "fixture.tar.xz");
+  const expected = Buffer.from("verified tar bytes");
+  const fixture = Buffer.from(
+    "/Td6WFoAAATm1rRGAgAhARYAAAB0L+WjAQARdmVyaWZpZWQgdGFyIGJ5dGVzAAAAlewz/+DnDOIAASoSSwhUvB+2830BAAAAAARZWg==",
+    "base64",
+  );
+  try {
+    await writeFile(source, fixture);
+    const output = join(directory, "fixture.tar");
+    assert.equal(
+      await decompressXzArchive(source, output, expected.length),
+      expected.length,
+    );
+    assert.deepEqual(await readFile(output), expected);
+
+    await assert.rejects(
+      decompressXzArchive(
+        source,
+        join(directory, "oversized.tar"),
+        expected.length - 1,
+      ),
+      /exceeds the expanded size limit/,
+    );
+
+    const existing = join(directory, "existing.tar");
+    await writeFile(existing, "preserve");
+    await assert.rejects(
+      decompressXzArchive(source, existing, expected.length),
+      { code: "EEXIST" },
+    );
+    assert.equal(await readFile(existing, "utf8"), "preserve");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Zig linker install is pinned and produces a bounded cc wrapper", async () => {
   const payload = Buffer.from("zig archive");
   const events = [];
@@ -195,6 +234,9 @@ test("Zig linker install is pinned and produces a bounded cc wrapper", async () 
         expected,
         maximum,
       });
+    },
+    decompressImpl: async (source, destination, maximum) => {
+      events.push({ type: "decompress", source, destination, maximum });
     },
     mkdirImpl: async (path, options) => {
       events.push({ type: "mkdir", path, options });
@@ -221,11 +263,17 @@ test("Zig linker install is pinned and produces a bounded cc wrapper", async () 
   const downloadEvent = events.find(({ type }) => type === "download");
   assert.equal(downloadEvent.expected, sha256(payload));
   assert.match(downloadEvent.destination, /zig-0\.15\.2\.tar\.xz$/);
+  const decompressEvent = events.find(
+    ({ type }) => type === "decompress",
+  );
+  assert.equal(decompressEvent.source, downloadEvent.destination);
+  assert.match(decompressEvent.destination, /zig-0\.15\.2\.tar$/);
+  assert.equal(decompressEvent.maximum, 1024 * 1024 * 1024);
   const runEvent = events.find(({ type }) => type === "run");
   assert.equal(runEvent.command, SYSTEM_TAR);
   assert.deepEqual(runEvent.args, [
-    "-xJf",
-    downloadEvent.destination,
+    "-xf",
+    decompressEvent.destination,
     "--strip-components=1",
     "--no-same-owner",
     "--no-same-permissions",
@@ -262,6 +310,7 @@ test("Zig cc wrapper preserves linker arguments and exit status", async () => {
       fetchImpl: async (url) =>
         responseFor(Buffer.from("zig archive"), { url }),
       downloadImpl: async () => {},
+      decompressImpl: async () => {},
       runImpl: async () => {
         const fakeZig = join(zigRoot, "zig");
         await writeFile(

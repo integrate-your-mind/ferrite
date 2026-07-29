@@ -32,7 +32,8 @@
     "esbuild": "0.28.1",
     "happy-dom": "20.10.6",
     "playwright-core": "1.57.0",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "xz-decompress": "0.2.3"
   },
   "packageManager": "pnpm@11.7.0"
 }

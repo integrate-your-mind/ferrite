@@ -37,8 +37,11 @@ path downloads only the pinned official `rustup-init` 1.28.2 binary, verifies
 its checked-in SHA-256, installs the repository's Rust 1.95.0 toolchain with the
 minimal profile into an ephemeral directory, and uses the official Zig 0.15.2
 `zig cc` driver from a separately pinned, checksum-verified archive instead of
-trusting an ambient system linker. It removes the toolchain, linker, and
-compilation cache after packaging. Other platforms fail closed.
+trusting an ambient system linker. The locked, zero-native-dependency
+`xz-decompress` WASM module expands the archive before the explicit system tar
+extracts it, so the builder does not need an `xz` executable. The build removes
+the toolchain, linker, and compilation cache after packaging. Other platforms
+fail closed.
 
 The website has its own pinned `pnpm-lock.yaml`; `@ferrite/runtime` is wired as
 a local link to `../packages/runtime`, so this command must be run from this
