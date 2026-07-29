@@ -67,7 +67,10 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct InitArgs {
-    #[arg(default_value = ".", help = "Directory to initialize")]
+    #[arg(
+        default_value = "ferrite-app",
+        help = "New, absent directory to initialize"
+    )]
     project: PathBuf,
 }
 
@@ -464,7 +467,9 @@ fn run_cli(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::Init(args) => {
-            let project = initialize_project(&args.project)?;
+            let npm_package_version = npm_package_version_from_environment()?;
+            let project =
+                initialize_project_with_npm_version(&args.project, npm_package_version.as_deref())?;
             if cli.json {
                 print_json(&InitOutput { project })?;
             } else {
@@ -883,37 +888,132 @@ fn serve_production_until_signal(addr: String, project: ProductionProject) -> Re
     result.map_err(CliError::from)
 }
 
-fn initialize_project(project: &Path) -> Result<PathBuf> {
+fn initialize_project_with_npm_version(
+    project: &Path,
+    npm_package_version: Option<&str>,
+) -> Result<PathBuf> {
+    initialize_project_with_writer(project, npm_package_version, |path, bytes| {
+        fs::write(path, bytes)
+    })
+}
+
+fn initialize_project_with_writer<F>(
+    project: &Path,
+    npm_package_version: Option<&str>,
+    mut write_file: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(&Path, &[u8]) -> std::io::Result<()>,
+{
     let project = if project.is_absolute() {
         project.to_path_buf()
     } else {
         env::current_dir()?.join(project)
     };
-    if project.exists() {
-        if !project.is_dir() {
+    let package_json = starter_package_json(npm_package_version)?;
+    let existing_empty_target = match fs::symlink_metadata(&project) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(CliError::Config(format!(
+                "init target must not be a symbolic link: {}",
+                project.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
             return Err(CliError::Config(format!(
                 "init target is not a directory: {}",
                 project.display()
             )));
         }
-        if fs::read_dir(&project)?.next().transpose()?.is_some() {
-            return Err(CliError::Config(format!(
-                "refusing to initialize non-empty directory: {}",
-                project.display()
-            )));
+        Ok(_) => {
+            if fs::read_dir(&project)?.next().transpose()?.is_some() {
+                return Err(CliError::Config(format!(
+                    "refusing to initialize a non-empty directory: {}",
+                    project.display()
+                )));
+            }
+            if fs::canonicalize(&project)? == fs::canonicalize(env::current_dir()?)? {
+                return Err(CliError::Config(format!(
+                    "refusing to replace the current working directory: {}",
+                    project.display()
+                )));
+            }
+            true
         }
-    }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
 
-    fs::create_dir_all(project.join("app"))?;
-    fs::write(project.join("package.json"), starter_package_json())?;
-    fs::write(project.join("tsconfig.json"), starter_tsconfig())?;
-    fs::write(project.join("app/page.tsx"), starter_page())?;
-    fs::write(project.join(".gitignore"), ".ferrite/\nnode_modules/\n")?;
+    let parent = project.parent().ok_or_else(|| {
+        CliError::Config(format!(
+            "init target has no parent directory: {}",
+            project.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".ferrite-init-")
+        .tempdir_in(parent)?;
+    fs::create_dir(staging.path().join("app"))?;
+    write_file(
+        &staging.path().join("package.json"),
+        package_json.as_bytes(),
+    )?;
+    write_file(
+        &staging.path().join("tsconfig.json"),
+        starter_tsconfig().as_bytes(),
+    )?;
+    write_file(
+        &staging.path().join("app/page.tsx"),
+        starter_page().as_bytes(),
+    )?;
+    write_file(
+        &staging.path().join(".gitignore"),
+        b".ferrite/\nnode_modules/\n",
+    )?;
+    if existing_empty_target {
+        fs::remove_dir(&project)?;
+    }
+    if let Err(error) = publish_directory_no_replace(staging.path(), &project) {
+        if existing_empty_target && !project.exists() {
+            fs::create_dir(&project).map_err(|restore_error| {
+                CliError::Config(format!(
+                    "starter publication failed ({error}) and the empty target could not be restored ({}): {}",
+                    restore_error,
+                    project.display()
+                ))
+            })?;
+        }
+        return Err(error);
+    }
     Ok(project)
 }
 
-fn starter_package_json() -> String {
-    format!(
+fn npm_package_version_from_environment() -> Result<Option<String>> {
+    let Some(value) = env::var_os("FERRITE_INTERNAL_NPM_PACKAGE_VERSION") else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| {
+        CliError::Config("FERRITE_INTERNAL_NPM_PACKAGE_VERSION must be valid Unicode".to_owned())
+    })?;
+    if !is_exact_semver(&value) {
+        return Err(CliError::Config(
+            "FERRITE_INTERNAL_NPM_PACKAGE_VERSION must be an exact semantic version".to_owned(),
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn starter_package_json(npm_package_version: Option<&str>) -> Result<String> {
+    let runtime_version = npm_package_version.unwrap_or(env!("CARGO_PKG_VERSION"));
+    if !is_exact_semver(runtime_version) {
+        return Err(CliError::Config(
+            "starter npm package version must be an exact semantic version".to_owned(),
+        ));
+    }
+    let dev_dependencies = npm_package_version.map(|version| {
+        format!(",\n  \"devDependencies\": {{\n    \"@ferrite/cli\": \"{version}\"\n  }}")
+    });
+    Ok(format!(
         concat!(
             "{{\n  \"name\": \"ferrite-app\",\n  \"private\": true,\n  \"type\": \"module\",\n",
             "  \"scripts\": {{\n",
@@ -921,10 +1021,62 @@ fn starter_package_json() -> String {
             "    \"dev\": \"ferrite dev --page-renderer node_modules/@ferrite/runtime/bin/render-page.mjs --client-bundler node_modules/@ferrite/runtime/bin/build-client.mjs\",\n",
             "    \"build\": \"ferrite build --page-renderer node_modules/@ferrite/runtime/bin/render-page.mjs --client-bundler node_modules/@ferrite/runtime/bin/build-client.mjs\",\n",
             "    \"start\": \"ferrite serve --page-renderer node_modules/@ferrite/runtime/bin/render-artifact.mjs\"\n",
-            "  }},\n  \"dependencies\": {{\n    \"@ferrite/runtime\": \"{}\"\n  }}\n}}\n"
+            "  }},\n  \"dependencies\": {{\n    \"@ferrite/runtime\": \"{}\"\n  }}{}\n}}\n"
         ),
-        env!("CARGO_PKG_VERSION")
-    )
+        runtime_version,
+        dev_dependencies.unwrap_or_default()
+    ))
+}
+
+fn is_exact_semver(value: &str) -> bool {
+    let (without_build, build) = match value.split_once('+') {
+        Some((version, build)) if !build.contains('+') => (version, Some(build)),
+        Some(_) => return false,
+        None => (value, None),
+    };
+    if build.is_some_and(|build| !valid_semver_identifiers(build, false)) {
+        return false;
+    }
+
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (without_build, None),
+    };
+    if prerelease.is_some_and(|prerelease| !valid_semver_identifiers(prerelease, true)) {
+        return false;
+    }
+
+    let mut core_parts = core.split('.');
+    let Some(major) = core_parts.next() else {
+        return false;
+    };
+    let Some(minor) = core_parts.next() else {
+        return false;
+    };
+    let Some(patch) = core_parts.next() else {
+        return false;
+    };
+    core_parts.next().is_none() && [major, minor, patch].into_iter().all(valid_semver_number)
+}
+
+fn valid_semver_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn valid_semver_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !(reject_numeric_leading_zero
+                    && identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    && identifier.len() > 1
+                    && identifier.starts_with('0'))
+        })
 }
 
 fn starter_tsconfig() -> &'static str {
@@ -1429,11 +1581,12 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let project = parent.path().join("nested/app");
 
-        let initialized = initialize_project(&project).unwrap();
+        let initialized = initialize_project_with_npm_version(&project, None).unwrap();
 
         assert_eq!(initialized, project);
         let package = fs::read_to_string(project.join("package.json")).unwrap();
         assert!(package.contains("\"@ferrite/runtime\": \"0.1.0\""));
+        assert!(!package.contains("\"@ferrite/cli\""));
         assert!(package.contains("node_modules/@ferrite/runtime/bin/render-page.mjs"));
         assert!(project.join("tsconfig.json").is_file());
         assert!(project.join("app/page.tsx").is_file());
@@ -1444,11 +1597,55 @@ mod tests {
     }
 
     #[test]
+    fn npm_cli_init_pins_matching_prerelease_packages() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("app");
+
+        initialize_project_with_npm_version(&project, Some("0.1.0-alpha.0")).unwrap();
+
+        let package = fs::read_to_string(project.join("package.json")).unwrap();
+        assert!(package.contains("\"@ferrite/runtime\": \"0.1.0-alpha.0\""));
+        assert!(package.contains("\"@ferrite/cli\": \"0.1.0-alpha.0\""));
+    }
+
+    #[test]
+    fn invalid_npm_cli_version_does_not_create_a_partial_target() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("app");
+
+        let error =
+            initialize_project_with_npm_version(&project, Some("latest || attacker")).unwrap_err();
+
+        assert!(error.to_string().contains("exact semantic version"));
+        assert!(!project.exists());
+    }
+
+    #[test]
+    fn npm_cli_version_validation_accepts_exact_semver_only() {
+        for version in ["0.1.0", "0.1.0-alpha.0", "1.2.3+build.7"] {
+            assert!(is_exact_semver(version), "{version}");
+        }
+        for version in [
+            "",
+            "latest",
+            "1",
+            "1.2",
+            "01.2.3",
+            "1.2.3-01",
+            "1.2.3-",
+            "1.2.3+",
+            "1.2.3 || latest",
+        ] {
+            assert!(!is_exact_semver(version), "{version}");
+        }
+    }
+
+    #[test]
     fn init_refuses_to_modify_a_non_empty_directory() {
         let project = tempfile::tempdir().unwrap();
         fs::write(project.path().join("owned.txt"), "keep").unwrap();
 
-        let error = initialize_project(project.path()).unwrap_err();
+        let error = initialize_project_with_npm_version(project.path(), None).unwrap_err();
 
         assert!(matches!(error, CliError::Config(_)));
         assert!(error.to_string().contains("non-empty directory"));
@@ -1460,12 +1657,130 @@ mod tests {
     }
 
     #[test]
+    fn init_populates_an_existing_empty_directory_from_staging() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("existing");
+        fs::create_dir(&target).unwrap();
+
+        let initialized = initialize_project_with_npm_version(&target, None).unwrap();
+
+        assert_eq!(initialized, target);
+        assert!(target.join("package.json").is_file());
+        assert!(target.join("app/page.tsx").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rejects_a_symlink_without_writing_through_it() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let real_target = parent.path().join("real");
+        let link = parent.path().join("link");
+        fs::create_dir(&real_target).unwrap();
+        symlink(&real_target, &link).unwrap();
+
+        let error = initialize_project_with_npm_version(&link, None).unwrap_err();
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(real_target.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn init_removes_staging_after_a_write_failure() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("app");
+        let mut writes = 0;
+
+        let error =
+            initialize_project_with_writer(&project, Some("0.1.0-alpha.0"), |path, bytes| {
+                writes += 1;
+                if writes == 2 {
+                    return Err(std::io::Error::other("injected starter write failure"));
+                }
+                fs::write(path, bytes)
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected starter write failure"));
+        assert!(!project.exists());
+        assert!(parent.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ferrite-init-")
+        }));
+    }
+
+    #[test]
+    fn init_preserves_a_target_that_appears_during_staging() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("app");
+        let racing_target = project.clone();
+        let mut writes = 0;
+
+        let error = initialize_project_with_writer(&project, None, |path, bytes| {
+            fs::write(path, bytes)?;
+            writes += 1;
+            if writes == 4 {
+                fs::create_dir(&racing_target)?;
+                fs::write(racing_target.join("owned.txt"), "keep")?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("target appeared"));
+        assert_eq!(
+            fs::read_to_string(project.join("owned.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!project.join("package.json").exists());
+        assert!(parent.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ferrite-init-")
+        }));
+    }
+
+    #[test]
+    fn init_preserves_an_existing_target_modified_during_staging() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("app");
+        fs::create_dir(&project).unwrap();
+        let racing_target = project.clone();
+        let mut writes = 0;
+
+        let error = initialize_project_with_writer(&project, None, |path, bytes| {
+            fs::write(path, bytes)?;
+            writes += 1;
+            if writes == 4 {
+                fs::write(path.parent().unwrap().join("trigger"), b"complete staging")?;
+                fs::create_dir_all(&racing_target)?;
+                fs::write(racing_target.join("owned.txt"), "keep")?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::Io(_)));
+        assert_eq!(
+            fs::read_to_string(project.join("owned.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!project.join("package.json").exists());
+    }
+
+    #[test]
     fn init_refuses_a_file_target() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("existing");
         fs::write(&target, "keep").unwrap();
 
-        let error = initialize_project(&target).unwrap_err();
+        let error = initialize_project_with_npm_version(&target, None).unwrap_err();
 
         assert!(error.to_string().contains("not a directory"));
         assert_eq!(fs::read_to_string(target).unwrap(), "keep");

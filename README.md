@@ -119,7 +119,11 @@ pnpm test:browser
 
 ## Create a source-backed starter
 
-The portable npm prerelease does not provide the Rust CLI or a registry-only application starter. From a clean Ferrite source checkout, create a working local starter with:
+The portable npm prerelease does not provide the Rust CLI or a registry-only
+application starter. The repository now verifies a local macOS arm64 CLI
+package candidate, but the source-backed path remains the supported entry
+point. From a clean Ferrite source checkout, create a working local starter
+with:
 
 ```sh
 pnpm starter:create -- ../my-ferrite-app
@@ -137,6 +141,20 @@ npm run start -- --once --request-path /
 ```
 
 The generated app is tied to the source checkout and host platform that created `.ferrite-source/`. Recreate it from source on another machine. This workflow is for developer-preview evaluation; it is not a substitute for registry packages or a supported CLI release. See [Source onboarding](docs/source-onboarding.md) for the exact boundary and troubleshooting steps.
+
+To build two release-shaped CLI tarball candidates and exercise the real
+packaged binary from an offline, empty npm consumer on macOS arm64:
+
+```sh
+pnpm release:verify:cli
+```
+
+This verifies the `@ferrite/cli` launcher, the
+`@ferrite/cli-darwin-arm64` binary package, exact starter dependency versions,
+existing-target refusal, and tamper rejection. It does not publish either
+package, prove npm ownership, install the generated application's dependencies
+offline, or support another host. See
+[CLI distribution candidate](docs/cli-distribution.md).
 
 ## Exercise the included applications
 
@@ -161,7 +179,17 @@ A locally built `ferrite` binary can initialize the registry-shaped project skel
 ferrite init my-app
 ```
 
-Initialization refuses non-empty directories, but the generated manifest references unpublished Ferrite packages and a plain `npm install` returns a registry `404`. Do not use the raw skeleton as an onboarding path. Use `pnpm starter:create` above for the proven source-backed workflow until registry publication and public CLI installation are separately authorized and verified.
+Initialization accepts an absent or verified empty target; it rejects files,
+non-empty directories, the current working directory, and symbolic links
+without writing through them. Ferrite stages the complete skeleton in a
+private sibling and publishes it with an operating-system no-replace rename.
+A direct source-built binary still emits the source-mode package versions; the
+verified npm wrapper instead pins matching `@ferrite/runtime` and
+`@ferrite/cli` prerelease versions. Both manifests reference unpublished
+Ferrite packages, so a plain `npm install` still returns a registry `404`. Do
+not use the raw skeleton as an onboarding path. Use `pnpm starter:create` above
+until registry publication and public CLI installation are separately
+authorized and verified.
 
 ## Project website
 

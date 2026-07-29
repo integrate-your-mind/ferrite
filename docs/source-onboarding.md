@@ -1,9 +1,9 @@
 # Source onboarding
 
 Ferrite's supported end-to-end developer-preview entry point is a source
-checkout. The portable npm prerelease is limited to protocol, protocol-WASM,
-and runtime packages; it does not distribute the Rust CLI or a registry-only
-`ferrite init` workflow.
+checkout. The repository can now build and clean-install a local macOS arm64
+CLI package candidate, but the portable npm prerelease still does not
+distribute that CLI or provide a registry-only `ferrite init` workflow.
 
 ## Prerequisites
 
@@ -72,9 +72,21 @@ npm run start -- --once --request-path /
 | `@ferrite/protocol-wasm` | Packed WASM instantiated; valid input accepted and invalid input rejected | Not needed by the minimal starter; portable alpha candidate |
 | `@ferrite/runtime` | Root and all public subpath exports imported; starter check/build/serve exercised | Portable alpha candidate; registry availability must match a verified release receipt |
 | `@ferrite/node` | Installed with the current host's native prebuild and used for real render success/failure | Separate native release unit; other platforms require their own hosted proof |
+| `@ferrite/cli` + current CLI binary | Wrapper-only omission fails closed; both packages are also installed offline in an empty consumer and used for real `--version` and `init`, existing-target refusal, and tamper rejection | Local macOS arm64 candidate only; not in the npm release driver or registry |
 | Current native prebuild | Metadata, file set, checksum, install, resolution, and native load verified | Only the current host artifact is built locally |
 
 Source package manifests stay `private: true` and retain workspace dependencies. The verifier stages separate release manifests, rewrites internal versions, checks metadata and file allowlists, creates tarballs, and installs those tarballs together. The guarded publication driver is a separate explicit step; verification alone never publishes.
+
+Build and exercise the separate CLI package candidate with:
+
+```sh
+pnpm release:verify:cli
+```
+
+That command makes no registry claim. Its npm install runs offline from exact
+local CLI tarballs. It does not install the generated application's runtime
+dependencies offline. See [CLI distribution candidate](cli-distribution.md)
+for the package, integrity, rollback, and platform boundary.
 
 ## Troubleshooting
 
@@ -87,7 +99,8 @@ Source package manifests stay `private: true` and retain workspace dependencies.
 ## Unproven release surfaces
 
 - portable npm registry publication and clean-consumer readback until a matching release receipt exists
-- Cargo, CLI, native-prebuild, and container publication
+- Cargo, CLI, native-prebuild, and container publication; the local CLI
+  candidate is not registry proof
 - native artifact loading on every advertised platform
 - exact-pushed-SHA execution on the dedicated local Buildkite agent
 - Linux, Windows, and Intel macOS execution outside the local arm64 lane

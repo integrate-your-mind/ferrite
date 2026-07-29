@@ -2,7 +2,36 @@
 
 ## Unreleased
 
-No user-facing changes yet.
+### Added
+
+- Added a lifecycle-free `@ferrite/cli` npm wrapper candidate and a
+  `@ferrite/cli-darwin-arm64` binary package candidate with strict platform,
+  version, byte-count, and SHA-256 verification.
+- Added clean-consumer offline tarball proof for real CLI execution, project
+  initialization, omitted-platform rejection, existing-target refusal, and
+  binary-tamper rejection.
+
+### Changed
+
+- Registry-shaped `ferrite init` now pins matching `@ferrite/runtime` and
+  `@ferrite/cli` prerelease versions when invoked through the verified npm
+  wrapper. Source-built initialization remains unchanged.
+- The npm wrapper now owns the asynchronous Rust child lifecycle, forwards
+  termination signals, waits for child cleanup, and removes its signal
+  listeners before returning the child's exit outcome.
+- CLI execution now runs an integrity-verified private binary snapshot instead
+  of a mutable package pathname, and candidate/starter publication uses the
+  Rust no-replace primitive.
+- `ferrite init` now stages the complete project before publication, safely
+  accepts absent or verified empty targets, and rejects non-empty,
+  current-working-directory, or symbolic-link targets without writing through
+  them.
+
+### Known limits
+
+- These packages are local release candidates only. They are not published,
+  are not part of the current npm release driver, and have only been defined
+  for macOS arm64.
 
 ## 0.1.0-alpha.0 - 2026-07-26
 
