@@ -123,7 +123,7 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
     assert.equal(first.headers.get("x-ferrite-render"), "request");
     assert.match(
       await first.text(),
-      /^<!doctype html>\n<html><head><title>Ferrite Edge<\/title><\/head><body><div data-ferrite-page-props="\{\}" data-route="\/" data-route-pattern="\/" id="edge-root"><main data-render="1">Ferrite &amp; Workers<\/main><\/div><\/body><\/html>$/,
+      /^<!doctype html>\n<html><head><meta charset="utf-8"><title>Ferrite Edge<\/title><\/head><body><div data-ferrite-page-props="\{\}" data-route="\/" data-route-pattern="\/" id="edge-root"><main data-render="1">Ferrite &amp; Workers<\/main><\/div><\/body><\/html>$/,
     );
     assert.match(await second.text(), /data-render="2"/);
     assert.deepEqual(fallbackRequests, []);
