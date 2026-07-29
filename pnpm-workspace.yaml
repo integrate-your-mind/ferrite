@@ -4,6 +4,7 @@ packages:
 allowBuilds:
   esbuild: true
   workerd: true
+# Wrangler and Miniflare are exact-pinned together for the local workerd gate.
 minimumReleaseAgeExclude:
   - miniflare@4.20260722.1
   - wrangler@4.115.0

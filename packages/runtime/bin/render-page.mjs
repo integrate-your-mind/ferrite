@@ -1,12 +1,24 @@
 #!/usr/bin/env node
 import { pathToFileURL } from "node:url";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { isBuiltin } from "node:module";
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { build } from "esbuild";
+import { build, version as esbuildVersion } from "esbuild";
 
 const CLIENT_ORIGINAL_SUFFIX = "?ferrite-client-original";
+const SHA256_BUILD_ID = /^sha256:[a-f0-9]{64}$/;
+const ZERO_SHA256_BUILD_ID = `sha256:${"0".repeat(64)}`;
+const CLOUDFLARE_ROUTE_RECEIPT_FORMAT = "ferrite-cloudflare-route-receipt";
 
 const args = process.argv.slice(2);
 const prebuiltArtifact = args[0] === "--prebuilt";
@@ -25,6 +37,16 @@ if (args[0] === "--build-artifact") {
 if (args[0] === "--build-cloudflare-artifact") {
   try {
     await buildServerArtifact(args.slice(1), "cloudflare");
+  } catch (error) {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  }
+  process.exit(0);
+}
+if (args[0] === "--verify-cloudflare-artifact-receipt") {
+  try {
+    const verified = await verifyCloudflareArtifactReceipt(args.slice(1));
+    process.stdout.write(`${JSON.stringify(verified)}\n`);
   } catch (error) {
     console.error(error instanceof Error ? error.stack || error.message : String(error));
     process.exit(1);
@@ -357,29 +379,242 @@ async function buildServerArtifact(buildArgs, targetRuntime) {
   await mkdir(tempRoot, { recursive: true });
   const tempDir = await mkdtemp(join(tempRoot, "server-artifact-"));
   const entryFile = join(tempDir, "entry.mjs");
+  const resolvedOutput = resolve(outputFile);
 
   try {
-    await writeFile(
-      entryFile,
-      serverArtifactEntrySource({
-        pageFile: resolvedPage,
-        layoutFiles: resolvedLayouts,
-        documentFile: resolvedDocument,
-        conventionFiles: resolvedConventions,
-        routePattern,
+    if (targetRuntime === "cloudflare") {
+      await buildCloudflareServerArtifact({
+        artifactProjectRoot,
         cloudflareMetadata,
-      }),
-    );
-    await mkdir(dirname(resolve(outputFile)), { recursive: true });
-    await bundleServerArtifact({
-      entryFile,
-      outputFile: resolve(outputFile),
-      projectRoot: artifactProjectRoot,
-      excludedFiles,
-      targetRuntime,
-    });
+        conventionFiles: resolvedConventions,
+        documentFile: resolvedDocument,
+        entryFile,
+        excludedFiles,
+        layoutFiles: resolvedLayouts,
+        outputFile: resolvedOutput,
+        pageFile: resolvedPage,
+        routePattern,
+        tempDir,
+      });
+    } else {
+      await writeFile(
+        entryFile,
+        serverArtifactEntrySource({
+          pageFile: resolvedPage,
+          layoutFiles: resolvedLayouts,
+          documentFile: resolvedDocument,
+          conventionFiles: resolvedConventions,
+          routePattern,
+          cloudflareMetadata,
+        }),
+      );
+      await mkdir(dirname(resolvedOutput), { recursive: true });
+      await bundleServerArtifact({
+        entryFile,
+        outputFile: resolvedOutput,
+        projectRoot: artifactProjectRoot,
+        excludedFiles,
+        targetRuntime,
+      });
+    }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function buildCloudflareServerArtifact({
+  artifactProjectRoot,
+  cloudflareMetadata,
+  conventionFiles,
+  documentFile,
+  entryFile,
+  excludedFiles,
+  layoutFiles,
+  outputFile,
+  pageFile,
+  routePattern,
+  tempDir,
+}) {
+  const preliminaryOutput = join(tempDir, "preliminary.mjs");
+  const canonicalOutput = join(tempDir, "canonical.mjs");
+  const preliminaryMetadata = cloudflareRouteIdentity(
+    cloudflareMetadata,
+    routePattern,
+    ZERO_SHA256_BUILD_ID,
+    ZERO_SHA256_BUILD_ID,
+  );
+  const preliminary = await buildCloudflareArtifactPass({
+    cloudflareMetadata: preliminaryMetadata,
+    conventionFiles,
+    documentFile,
+    entryFile,
+    excludedFiles,
+    layoutFiles,
+    outputFile: preliminaryOutput,
+    pageFile,
+    projectRoot: artifactProjectRoot,
+    routePattern,
+  });
+  const sourceBuildId = digestBuildIdentity({
+    format: "ferrite-cloudflare-source",
+    version: 1,
+    inputs: preliminary.inputs,
+  });
+  if (
+    cloudflareMetadata.claimedSourceBuildId !== undefined &&
+    cloudflareMetadata.claimedSourceBuildId !== sourceBuildId
+  ) {
+    throw new TypeError(
+      `Ferrite Cloudflare sourceBuildId is stale: expected ${sourceBuildId}, received ${cloudflareMetadata.claimedSourceBuildId}.`,
+    );
+  }
+
+  const canonicalMetadata = cloudflareRouteIdentity(
+    cloudflareMetadata,
+    routePattern,
+    sourceBuildId,
+    ZERO_SHA256_BUILD_ID,
+  );
+  const canonical = await buildCloudflareArtifactPass({
+    cloudflareMetadata: canonicalMetadata,
+    conventionFiles,
+    documentFile,
+    entryFile,
+    excludedFiles,
+    layoutFiles,
+    outputFile: canonicalOutput,
+    pageFile,
+    projectRoot: artifactProjectRoot,
+    routePattern,
+  });
+  assertSameCloudflareInputs(preliminary.inputs, canonical.inputs);
+  const canonicalModule = await fileIdentity(canonicalOutput);
+  const moduleBuildId = `sha256:${canonicalModule.sha256}`;
+
+  const finalMetadata = cloudflareRouteIdentity(
+    cloudflareMetadata,
+    routePattern,
+    sourceBuildId,
+    moduleBuildId,
+  );
+  await mkdir(dirname(outputFile), { recursive: true });
+  const final = await buildCloudflareArtifactPass({
+    cloudflareMetadata: finalMetadata,
+    conventionFiles,
+    documentFile,
+    entryFile,
+    excludedFiles,
+    layoutFiles,
+    outputFile,
+    pageFile,
+    projectRoot: artifactProjectRoot,
+    routePattern,
+  });
+  assertSameCloudflareInputs(preliminary.inputs, final.inputs);
+
+  const [canonicalBytes, finalBytes] = await Promise.all([
+    readFile(canonicalOutput),
+    readFile(outputFile),
+  ]);
+  const sentinel = Buffer.from(ZERO_SHA256_BUILD_ID);
+  const replacement = Buffer.from(moduleBuildId);
+  const sentinelOffsets = allBufferOffsets(canonicalBytes, sentinel);
+  if (sentinelOffsets.length !== 1) {
+    throw new TypeError(
+      `Ferrite Cloudflare canonical module must contain exactly one module identity sentinel; found ${sentinelOffsets.length}.`,
+    );
+  }
+  const expectedFinal = Buffer.from(canonicalBytes);
+  replacement.copy(expectedFinal, sentinelOffsets[0]);
+  if (!expectedFinal.equals(finalBytes)) {
+    throw new TypeError(
+      "Ferrite Cloudflare final module changed outside its canonical module identity field.",
+    );
+  }
+
+  const module = await fileIdentity(outputFile);
+  const receipt = {
+    format: {
+      name: CLOUDFLARE_ROUTE_RECEIPT_FORMAT,
+      major: 1,
+      minor: 0,
+    },
+    sourceBuildId,
+    metadataBuildId: finalMetadata.metadataBuildId,
+    moduleBuildId,
+    assetBuildId: cloudflareMetadata.assetBuildId,
+    path: routePattern,
+    fallbackPath: cloudflareMetadata.fallbackPath,
+    observedActions: cloudflareMetadata.observedActions,
+    compiler: {
+      name: "esbuild",
+      version: esbuildVersion,
+      node: process.version,
+      platform: "neutral",
+      format: "esm",
+      target: "es2022",
+      conditions: ["workerd", "worker", "browser", "import", "default"],
+      mainFields: ["module", "main"],
+    },
+    inputs: final.inputs,
+    canonicalModule,
+    module: {
+      path: basename(outputFile),
+      ...module,
+    },
+  };
+  const receiptPath = `${outputFile}.receipt.json`;
+  const receiptBytes = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`);
+  await writeFile(receiptPath, receiptBytes);
+  await verifyCloudflareArtifactReceipt([outputFile, receiptPath]);
+}
+
+async function buildCloudflareArtifactPass({
+  cloudflareMetadata,
+  conventionFiles,
+  documentFile,
+  entryFile,
+  excludedFiles,
+  layoutFiles,
+  outputFile,
+  pageFile,
+  projectRoot,
+  routePattern,
+}) {
+  await writeFile(
+    entryFile,
+    serverArtifactEntrySource({
+      pageFile,
+      layoutFiles,
+      documentFile,
+      conventionFiles,
+      routePattern,
+      cloudflareMetadata,
+    }),
+  );
+  const inputSnapshot = new Map();
+  await bundleServerArtifact({
+    entryFile,
+    outputFile,
+    projectRoot,
+    excludedFiles,
+    targetRuntime: "cloudflare",
+    inputSnapshot,
+  });
+  await assertCapturedCloudflareInputsUnchanged(inputSnapshot);
+  return {
+    inputs: await serializeCloudflareInputSnapshot(inputSnapshot, projectRoot, entryFile),
+  };
+}
+
+async function assertCapturedCloudflareInputsUnchanged(inputSnapshot) {
+  for (const [file, captured] of inputSnapshot) {
+    const current = await readFile(file);
+    if (!captured.equals(current)) {
+      throw new TypeError(
+        `Ferrite Cloudflare route input changed during bundling: "${file}".`,
+      );
+    }
   }
 }
 
@@ -448,16 +683,17 @@ function parseCloudflareMetadata(source, routePattern) {
     throw new TypeError(`Ferrite Cloudflare artifact metadata contains unknown fields: ${unknown.join(", ")}`);
   }
   if (
-    typeof metadata.sourceBuildId !== "string" ||
-    !/^sha256:[a-f0-9]{64}$/.test(metadata.sourceBuildId)
+    metadata.sourceBuildId !== undefined &&
+    (typeof metadata.sourceBuildId !== "string" ||
+      !SHA256_BUILD_ID.test(metadata.sourceBuildId))
   ) {
     throw new TypeError(
-      "Ferrite Cloudflare artifact metadata sourceBuildId must be a SHA-256 build identity.",
+      "Ferrite Cloudflare artifact metadata sourceBuildId must be a SHA-256 build identity when supplied.",
     );
   }
   if (
     typeof metadata.assetBuildId !== "string" ||
-    !/^sha256:[a-f0-9]{64}$/.test(metadata.assetBuildId)
+    !SHA256_BUILD_ID.test(metadata.assetBuildId)
   ) {
     throw new TypeError(
       "Ferrite Cloudflare artifact metadata assetBuildId must be a SHA-256 build identity.",
@@ -490,14 +726,57 @@ function parseCloudflareMetadata(source, routePattern) {
     throw new TypeError("Ferrite Cloudflare artifacts do not support routes with observed server actions.");
   }
   return {
+    claimedSourceBuildId: metadata.sourceBuildId,
+    assetBuildId: metadata.assetBuildId,
+    fallbackPath: metadata.fallbackPath,
+    observedActions: metadata.observedActions,
+  };
+}
+
+function cloudflareRouteIdentity(
+  metadata,
+  routePattern,
+  sourceBuildId,
+  moduleBuildId,
+) {
+  const identity = {
     format: "ferrite-cloudflare-route",
-    version: 1,
-    sourceBuildId: metadata.sourceBuildId,
+    version: 2,
+    sourceBuildId,
     assetBuildId: metadata.assetBuildId,
     path: routePattern,
     fallbackPath: metadata.fallbackPath,
     observedActions: metadata.observedActions,
   };
+  return {
+    ...identity,
+    metadataBuildId: cloudflareRouteMetadataBuildId(identity),
+    moduleBuildId,
+  };
+}
+
+function cloudflareRouteMetadataBuildId({
+  format,
+  version,
+  sourceBuildId,
+  assetBuildId,
+  path,
+  fallbackPath,
+  observedActions,
+}) {
+  return digestBuildIdentity({
+    format: "ferrite-cloudflare-route-metadata",
+    version: 1,
+    route: {
+      format,
+      version,
+      sourceBuildId,
+      assetBuildId,
+      path,
+      fallbackPath,
+      observedActions,
+    },
+  });
 }
 
 async function bundleServerArtifact({
@@ -506,6 +785,7 @@ async function bundleServerArtifact({
   projectRoot,
   excludedFiles,
   targetRuntime = "node",
+  inputSnapshot,
 }) {
   const cloudflare = targetRuntime === "cloudflare";
   const result = await build({
@@ -524,8 +804,16 @@ async function bundleServerArtifact({
     jsx: "automatic",
     jsxImportSource: "@ferrite/runtime",
     plugins: [
-      clientReferenceProxyPlugin({ projectRoot, excludedFiles }),
-      ...(cloudflare ? [cloudflareBuiltinGuardPlugin()] : []),
+      clientReferenceProxyPlugin({ projectRoot, excludedFiles, inputSnapshot }),
+      ...(cloudflare
+        ? [
+            cloudflareBuiltinGuardPlugin(),
+            cloudflareInputSnapshotPlugin({
+              inputSnapshot,
+              projectRoot,
+            }),
+          ]
+        : []),
     ],
     loader: {
       ".css": "empty",
@@ -547,6 +835,7 @@ async function bundleServerArtifact({
       `Ferrite ${cloudflare ? "Cloudflare " : ""}server artifacts cannot depend on unsupported external packages: ${[...new Set(unsupportedExternals)].sort().join(", ")}`,
     );
   }
+  return result;
 }
 
 function cloudflareBuiltinGuardPlugin() {
@@ -578,7 +867,45 @@ function cloudflareBuiltinGuardPlugin() {
   };
 }
 
-function clientReferenceProxyPlugin({ projectRoot, excludedFiles }) {
+function cloudflareInputSnapshotPlugin({ inputSnapshot, projectRoot }) {
+  return {
+    name: "ferrite-cloudflare-input-snapshot",
+    setup(build) {
+      build.onLoad({ filter: /.*/, namespace: "file" }, async (args) => {
+        const file = await realSourcePath(args.path);
+        const contents = await readFile(file);
+        recordCloudflareInput(inputSnapshot, file, contents);
+        const extension = extname(file);
+        if (extension === ".css") {
+          return {
+            contents: "",
+            loader: "css",
+            resolveDir: dirname(file),
+          };
+        }
+        if (extension === ".json") {
+          return {
+            contents,
+            loader: "json",
+            resolveDir: dirname(file),
+          };
+        }
+        if (!/\.[cm]?[jt]sx?$/.test(extension)) {
+          throw new TypeError(
+            `Ferrite Cloudflare route input "${portablePath(file, projectRoot)}" uses unsupported extension "${extension || "<none>"}".`,
+          );
+        }
+        return {
+          contents,
+          loader: loaderForPath(file),
+          resolveDir: dirname(file),
+        };
+      });
+    },
+  };
+}
+
+function clientReferenceProxyPlugin({ projectRoot, excludedFiles, inputSnapshot }) {
   return {
     name: "ferrite-client-reference-proxy",
     setup(build) {
@@ -600,11 +927,15 @@ function clientReferenceProxyPlugin({ projectRoot, excludedFiles }) {
         return { path: resolved, namespace: "ferrite-client-original" };
       });
 
-      build.onLoad({ filter: /\.[cm]?[jt]sx?$/, namespace: "ferrite-client-original" }, async (args) => ({
-        contents: await readFile(args.path, "utf8"),
-        loader: loaderForPath(args.path),
-        resolveDir: dirname(args.path),
-      }));
+      build.onLoad({ filter: /\.[cm]?[jt]sx?$/, namespace: "ferrite-client-original" }, async (args) => {
+        const contents = await readFile(args.path);
+        recordCloudflareInput(inputSnapshot, await realSourcePath(args.path), contents);
+        return {
+          contents,
+          loader: loaderForPath(args.path),
+          resolveDir: dirname(args.path),
+        };
+      });
 
       build.onLoad({ filter: /\.[cm]?[jt]sx?$/ }, async (args) => {
         const file = await realSourcePath(args.path);
@@ -612,7 +943,9 @@ function clientReferenceProxyPlugin({ projectRoot, excludedFiles }) {
           return undefined;
         }
 
-        const source = await readFile(file, "utf8");
+        const sourceBytes = await readFile(file);
+        recordCloudflareInput(inputSnapshot, file, sourceBytes);
+        const source = sourceBytes.toString("utf8");
         if (!startsWithDirective(source, "use client")) {
           return undefined;
         }
@@ -625,6 +958,103 @@ function clientReferenceProxyPlugin({ projectRoot, excludedFiles }) {
       });
     },
   };
+}
+
+function recordCloudflareInput(inputSnapshot, file, contents) {
+  if (!inputSnapshot) {
+    return;
+  }
+  const bytes = Buffer.isBuffer(contents) ? contents : Buffer.from(contents);
+  const previous = inputSnapshot.get(file);
+  if (previous && !previous.equals(bytes)) {
+    throw new TypeError(
+      `Ferrite Cloudflare route input changed while esbuild was reading "${file}".`,
+    );
+  }
+  inputSnapshot.set(file, Buffer.from(bytes));
+}
+
+async function serializeCloudflareInputSnapshot(inputSnapshot, projectRoot, entryFile) {
+  const [canonicalProjectRoot, canonicalEntry, canonicalRuntimeRoot] = await Promise.all([
+    realSourcePath(projectRoot),
+    realSourcePath(entryFile),
+    realSourcePath(resolve(dirname(fileURLToPath(import.meta.url)), "..")),
+  ]);
+  const records = [];
+  for (const [file, contents] of inputSnapshot) {
+    const canonicalFile = await realSourcePath(file);
+    if (canonicalFile === canonicalEntry) {
+      continue;
+    }
+    let path;
+    if (isPathInside(canonicalProjectRoot, canonicalFile)) {
+      const projectRelative = portableRelativePath(canonicalProjectRoot, canonicalFile);
+      if (hasGeneratedSourceSegment(projectRelative)) {
+        throw new TypeError(
+          `Ferrite Cloudflare route imported excluded generated source "${projectRelative}".`,
+        );
+      }
+      path = `project/${projectRelative}`;
+    } else if (isPathInside(canonicalRuntimeRoot, canonicalFile)) {
+      path = `@ferrite/runtime/${portableRelativePath(canonicalRuntimeRoot, canonicalFile)}`;
+    } else {
+      throw new TypeError(
+        `Ferrite Cloudflare route imported source outside the project and runtime roots: "${canonicalFile}".`,
+      );
+    }
+    records.push({
+      path,
+      bytes: contents.byteLength,
+      sha256: sha256Hex(contents),
+    });
+  }
+  records.sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+  const duplicate = records.find((record, index) =>
+    index > 0 && records[index - 1].path === record.path
+  );
+  if (duplicate) {
+    throw new TypeError(
+      `Ferrite Cloudflare route input manifest contains duplicate path "${duplicate.path}".`,
+    );
+  }
+  if (records.length === 0) {
+    throw new TypeError("Ferrite Cloudflare route input manifest is empty.");
+  }
+  return records;
+}
+
+function assertSameCloudflareInputs(expected, actual) {
+  if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+    throw new TypeError(
+      "Ferrite Cloudflare route inputs changed between identity capture and final bundling.",
+    );
+  }
+}
+
+function isPathInside(root, candidate) {
+  const path = relative(root, candidate);
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+function portableRelativePath(root, candidate) {
+  return relative(root, candidate).split(sep).join("/");
+}
+
+function portablePath(file, projectRoot) {
+  return isPathInside(projectRoot, file)
+    ? portableRelativePath(projectRoot, file)
+    : file.split(sep).join("/");
+}
+
+function hasGeneratedSourceSegment(path) {
+  return path.split("/").some((segment) =>
+    segment === ".git" ||
+    segment === ".ferrite" ||
+    segment === "node_modules" ||
+    segment === "target" ||
+    segment.startsWith(".ferrite-build-") ||
+    segment.startsWith(".ferrite-verified-build-")
+  );
 }
 
 function clientReferenceProxySource(file, projectRoot, source) {
@@ -840,6 +1270,198 @@ function loaderForPath(path) {
     default:
       return "js";
   }
+}
+
+function digestBuildIdentity(value) {
+  return `sha256:${sha256Hex(Buffer.from(JSON.stringify(value)))}`;
+}
+
+function sha256Hex(contents) {
+  return createHash("sha256").update(contents).digest("hex");
+}
+
+async function fileIdentity(path) {
+  const contents = await readFile(path);
+  return {
+    bytes: contents.byteLength,
+    sha256: sha256Hex(contents),
+  };
+}
+
+function allBufferOffsets(buffer, needle) {
+  const offsets = [];
+  let offset = 0;
+  while (offset <= buffer.byteLength - needle.byteLength) {
+    const found = buffer.indexOf(needle, offset);
+    if (found === -1) {
+      break;
+    }
+    offsets.push(found);
+    offset = found + needle.byteLength;
+  }
+  return offsets;
+}
+
+async function verifyCloudflareArtifactReceipt(buildArgs) {
+  const [artifactFile, receiptFile = artifactFile ? `${artifactFile}.receipt.json` : undefined] =
+    buildArgs;
+  if (!artifactFile || !receiptFile) {
+    throw new TypeError(
+      "usage: render-page --verify-cloudflare-artifact-receipt <artifact-file> [receipt-file]",
+    );
+  }
+  const [artifactBytes, receiptBytes] = await Promise.all([
+    readFile(resolve(artifactFile)),
+    readFile(resolve(receiptFile)),
+  ]);
+  const artifact = {
+    bytes: artifactBytes.byteLength,
+    sha256: sha256Hex(artifactBytes),
+  };
+  let receipt;
+  try {
+    receipt = JSON.parse(receiptBytes.toString("utf8"));
+  } catch {
+    throw new TypeError("Ferrite Cloudflare route receipt is not valid JSON.");
+  }
+  if (
+    !receipt ||
+    typeof receipt !== "object" ||
+    Array.isArray(receipt) ||
+    receipt.format?.name !== CLOUDFLARE_ROUTE_RECEIPT_FORMAT ||
+    receipt.format?.major !== 1 ||
+    receipt.format?.minor !== 0 ||
+    !SHA256_BUILD_ID.test(receipt.sourceBuildId ?? "") ||
+    !SHA256_BUILD_ID.test(receipt.metadataBuildId ?? "") ||
+    !SHA256_BUILD_ID.test(receipt.moduleBuildId ?? "") ||
+    !SHA256_BUILD_ID.test(receipt.assetBuildId ?? "") ||
+    !receipt.module ||
+    typeof receipt.module !== "object" ||
+    Array.isArray(receipt.module) ||
+    receipt.module.path !== basename(resolve(artifactFile)) ||
+    !Number.isSafeInteger(receipt.module.bytes) ||
+    receipt.module.bytes < 0 ||
+    !/^[a-f0-9]{64}$/.test(receipt.module.sha256 ?? "") ||
+    !receipt.canonicalModule ||
+    typeof receipt.canonicalModule !== "object" ||
+    Array.isArray(receipt.canonicalModule) ||
+    !Number.isSafeInteger(receipt.canonicalModule.bytes) ||
+    receipt.canonicalModule.bytes < 0 ||
+    !/^[a-f0-9]{64}$/.test(receipt.canonicalModule.sha256 ?? "") ||
+    typeof receipt.path !== "string" ||
+    !receipt.path.startsWith("/") ||
+    typeof receipt.fallbackPath !== "string" ||
+    !receipt.fallbackPath.startsWith("/") ||
+    !Array.isArray(receipt.observedActions) ||
+    receipt.observedActions.length !== 0 ||
+    receipt.compiler?.name !== "esbuild" ||
+    receipt.compiler?.version !== esbuildVersion ||
+    receipt.compiler?.node !== process.version ||
+    receipt.compiler?.platform !== "neutral" ||
+    receipt.compiler?.format !== "esm" ||
+    receipt.compiler?.target !== "es2022" ||
+    JSON.stringify(receipt.compiler?.conditions) !==
+      JSON.stringify(["workerd", "worker", "browser", "import", "default"]) ||
+    JSON.stringify(receipt.compiler?.mainFields) !==
+      JSON.stringify(["module", "main"]) ||
+    !Array.isArray(receipt.inputs)
+  ) {
+    throw new TypeError("Ferrite Cloudflare route receipt has an invalid schema.");
+  }
+  const inputPaths = new Set();
+  for (const input of receipt.inputs) {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      typeof input.path !== "string" ||
+      (!input.path.startsWith("project/") &&
+        !input.path.startsWith("@ferrite/runtime/")) ||
+      !Number.isSafeInteger(input.bytes) ||
+      input.bytes < 0 ||
+      !/^[a-f0-9]{64}$/.test(input.sha256 ?? "") ||
+      inputPaths.has(input.path)
+    ) {
+      throw new TypeError("Ferrite Cloudflare route receipt has an invalid input manifest.");
+    }
+    inputPaths.add(input.path);
+  }
+  const sortedInputs = [...receipt.inputs].sort((left, right) =>
+    Buffer.from(left.path).compare(Buffer.from(right.path))
+  );
+  if (JSON.stringify(sortedInputs) !== JSON.stringify(receipt.inputs)) {
+    throw new TypeError("Ferrite Cloudflare route receipt input manifest is not canonical.");
+  }
+  if (
+    artifact.bytes !== receipt.module.bytes ||
+    artifact.sha256 !== receipt.module.sha256
+  ) {
+    throw new TypeError("Ferrite Cloudflare route module does not match its receipt.");
+  }
+  const expectedSourceBuildId = digestBuildIdentity({
+    format: "ferrite-cloudflare-source",
+    version: 1,
+    inputs: receipt.inputs,
+  });
+  if (receipt.sourceBuildId !== expectedSourceBuildId) {
+    throw new TypeError("Ferrite Cloudflare route receipt source identity is invalid.");
+  }
+  const expectedMetadataBuildId = cloudflareRouteMetadataBuildId({
+    format: "ferrite-cloudflare-route",
+    version: 2,
+    sourceBuildId: receipt.sourceBuildId,
+    assetBuildId: receipt.assetBuildId,
+    path: receipt.path,
+    fallbackPath: receipt.fallbackPath,
+    observedActions: receipt.observedActions,
+  });
+  if (receipt.metadataBuildId !== expectedMetadataBuildId) {
+    throw new TypeError("Ferrite Cloudflare route receipt metadata identity is invalid.");
+  }
+  if (allBufferOffsets(artifactBytes, Buffer.from(receipt.metadataBuildId)).length !== 1) {
+    throw new TypeError(
+      "Ferrite Cloudflare route module does not contain exactly one receipt metadata identity.",
+    );
+  }
+  if (receipt.moduleBuildId !== `sha256:${receipt.canonicalModule?.sha256 ?? ""}`) {
+    throw new TypeError("Ferrite Cloudflare route receipt canonical module identity is invalid.");
+  }
+  const moduleIdentity = Buffer.from(receipt.moduleBuildId);
+  const moduleIdentityOffsets = allBufferOffsets(artifactBytes, moduleIdentity);
+  if (moduleIdentityOffsets.length !== 1) {
+    throw new TypeError(
+      "Ferrite Cloudflare route module does not contain exactly one canonical module identity.",
+    );
+  }
+  const reconstructedCanonical = Buffer.from(artifactBytes);
+  Buffer.from(ZERO_SHA256_BUILD_ID).copy(
+    reconstructedCanonical,
+    moduleIdentityOffsets[0],
+  );
+  if (
+    reconstructedCanonical.byteLength !== receipt.canonicalModule.bytes ||
+    sha256Hex(reconstructedCanonical) !== receipt.canonicalModule.sha256
+  ) {
+    throw new TypeError(
+      "Ferrite Cloudflare route module cannot be reconstructed from its canonical receipt.",
+    );
+  }
+  return {
+    status: "verified",
+    artifact: {
+      bytes: artifact.bytes,
+      sha256: artifact.sha256,
+    },
+    receipt: {
+      bytes: receiptBytes.byteLength,
+      sha256: sha256Hex(receiptBytes),
+      sourceBuildId: receipt.sourceBuildId,
+      metadataBuildId: receipt.metadataBuildId,
+      moduleBuildId: receipt.moduleBuildId,
+      assetBuildId: receipt.assetBuildId,
+      path: receipt.path,
+    },
+  };
 }
 
 async function resolveSourceFile(path) {

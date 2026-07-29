@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { platform } from "node:process";
@@ -88,7 +88,6 @@ async function buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
   conventions = {},
   routePattern = "/",
   cloudflareMetadata = {
-    sourceBuildId: CLOUDFLARE_BUILD_ID,
     assetBuildId: CLOUDFLARE_BUILD_ID,
     fallbackPath: "/index.html",
     observedActions: [],
@@ -112,6 +111,7 @@ async function buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
       maxBuffer: 1024 * 1024,
     },
   );
+  return JSON.parse(await readFile(`${outputFile}.receipt.json`, "utf8"));
 }
 
 async function buildClient(projectRoot, pageFile) {
@@ -264,17 +264,23 @@ test("build-cloudflare-artifact emits an isolate-targeted route module with only
       ].join("\n"),
     );
 
-    await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    const receipt = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
     const source = await readFile(outputFile, "utf8");
     assert.match(source, /node:async_hooks/);
     assert.doesNotMatch(source, /node:(?:child_process|fs|http|path)/);
+    assert.equal(receipt.module.sha256, sha256(source).slice("sha256:".length));
+    assert.match(receipt.sourceBuildId, /^sha256:[a-f0-9]{64}$/);
+    assert.match(receipt.metadataBuildId, /^sha256:[a-f0-9]{64}$/);
+    assert.match(receipt.moduleBuildId, /^sha256:[a-f0-9]{64}$/);
 
     const route = await import(`${pathToFileURL(outputFile).href}?test=${Date.now()}`);
     assert.equal(route.routePattern, "/");
     assert.deepEqual(route.cloudflare, {
       format: "ferrite-cloudflare-route",
-      version: 1,
-      sourceBuildId: CLOUDFLARE_BUILD_ID,
+      version: 2,
+      sourceBuildId: receipt.sourceBuildId,
+      metadataBuildId: receipt.metadataBuildId,
+      moduleBuildId: receipt.moduleBuildId,
       assetBuildId: CLOUDFLARE_BUILD_ID,
       path: "/",
       fallbackPath: "/index.html",
@@ -296,6 +302,169 @@ test("build-cloudflare-artifact emits an isolate-targeted route module with only
     );
     assert.equal(first.root[2]["data-render"], 1);
     assert.equal(second.root[2]["data-render"], 2);
+  });
+});
+
+test("build-cloudflare-artifact derives stable receipts and rejects stale or tampered inputs", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const sharedFile = join(projectRoot, "app/shared.ts");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      'import { label } from "./shared"; export default function Page() { return <main>{label}</main>; }\n',
+    );
+    await writeFile(sharedFile, 'export const label = "one";\n');
+
+    const first = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    const firstModule = await readFile(outputFile);
+    const second = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    assert.deepEqual(second, first);
+    assert.deepEqual(await readFile(outputFile), firstModule);
+
+    await writeFile(sharedFile, 'export const label = "two";\n');
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+        cloudflareMetadata: {
+          sourceBuildId: first.sourceBuildId,
+          assetBuildId: CLOUDFLARE_BUILD_ID,
+          fallbackPath: "/index.html",
+          observedActions: [],
+        },
+      }),
+      /sourceBuildId is stale/,
+    );
+    const changed = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    assert.notEqual(changed.sourceBuildId, first.sourceBuildId);
+    assert.notEqual(changed.moduleBuildId, first.moduleBuildId);
+    assert.notEqual(changed.module.sha256, first.module.sha256);
+
+    const changedModule = await readFile(outputFile);
+    await writeFile(outputFile, Buffer.concat([changedModule, Buffer.from(" ")]));
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        [
+          renderPageScript,
+          "--verify-cloudflare-artifact-receipt",
+          outputFile,
+        ],
+        { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+      ),
+      /does not match its receipt/,
+    );
+
+    await writeFile(outputFile, changedModule);
+    const receiptPath = `${outputFile}.receipt.json`;
+    const tamperedReceipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    tamperedReceipt.fallbackPath = "/private.html";
+    await writeFile(receiptPath, `${JSON.stringify(tamperedReceipt, null, 2)}\n`);
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        [
+          renderPageScript,
+          "--verify-cloudflare-artifact-receipt",
+          outputFile,
+          receiptPath,
+        ],
+        { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+      ),
+      /metadata identity is invalid/,
+    );
+  });
+});
+
+test("build-cloudflare-artifact rejects a transitive input that changes during its identity passes", { skip: platform === "win32" }, async () => {
+  await withTempProject(async (projectRoot) => {
+    const app = join(projectRoot, "app");
+    const pageFile = join(app, "page.tsx");
+    const sharedFile = join(app, "shared.ts");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    const filler = Array.from(
+      { length: 20_000 },
+      (_value, index) => `export const filler${index} = ${index};`,
+    ).join("\n");
+    await mkdir(app, { recursive: true });
+    await writeFile(join(app, "filler.ts"), `${filler}\n`);
+    await writeFile(sharedFile, 'export const label = "zero";\n');
+    await writeFile(
+      pageFile,
+      'import "./filler"; import { label } from "./shared"; export default function Page() { return <main>{label}</main>; }\n',
+    );
+
+    let settled = false;
+    const outcome = buildCloudflareArtifact(projectRoot, pageFile, outputFile)
+      .then(() => ({ error: undefined }))
+      .catch((error) => ({ error }))
+      .finally(() => {
+        settled = true;
+      });
+    await waitForDirectoryWithPrefix(
+      join(projectRoot, ".ferrite", "tmp"),
+      "server-artifact-",
+    );
+    let revision = 0;
+    while (!settled && revision < 1_000) {
+      const replacement = `${sharedFile}.${revision}.tmp`;
+      await writeFile(replacement, `export const label = "revision-${revision}";\n`);
+      await rename(replacement, sharedFile);
+      revision += 1;
+      await delay(1);
+    }
+    const { error } = await outcome;
+    assert.ok(error, "A changing Cloudflare input must not produce an artifact.");
+    assert.match(
+      String(error),
+      /changed (?:during bundling|while esbuild was reading|between identity capture and final bundling)/,
+    );
+  });
+});
+
+test("build-cloudflare-artifact binds fallback metadata into the canonical module identity", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, "export default function Page() { return <main>Edge</main>; }\n");
+
+    const first = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    const changed = await buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+      cloudflareMetadata: {
+        assetBuildId: CLOUDFLARE_BUILD_ID,
+        fallbackPath: "/fallback/index.html",
+        observedActions: [],
+      },
+    });
+    assert.equal(changed.sourceBuildId, first.sourceBuildId);
+    assert.notEqual(changed.metadataBuildId, first.metadataBuildId);
+    assert.notEqual(changed.moduleBuildId, first.moduleBuildId);
+    assert.notEqual(changed.module.sha256, first.module.sha256);
+  });
+});
+
+test("build-cloudflare-artifact rejects transitive source that resolves outside its receipt roots", async () => {
+  await withTempProject(async (projectRoot) => {
+    const outside = join(tmpdir(), `ferrite-cloudflare-outside-${process.pid}-${Date.now()}.ts`);
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const link = join(projectRoot, "app/outside.ts");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    try {
+      await mkdir(dirname(pageFile), { recursive: true });
+      await writeFile(outside, 'export const label = "outside";\n');
+      await symlink(outside, link);
+      await writeFile(
+        pageFile,
+        'import { label } from "./outside"; export default function Page() { return <main>{label}</main>; }\n',
+      );
+      await assert.rejects(
+        buildCloudflareArtifact(projectRoot, pageFile, outputFile),
+        /outside the project and runtime roots/,
+      );
+    } finally {
+      await rm(outside, { force: true });
+    }
   });
 });
 

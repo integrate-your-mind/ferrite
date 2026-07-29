@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -15,7 +16,7 @@ const execFileAsync = promisify(execFile);
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const renderPageScript = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const runtimePackage = join(workspaceRoot, "packages/runtime");
-const BUILD_ID = `sha256:${"a".repeat(64)}`;
+const ASSET_BUILD_ID = `sha256:${"a".repeat(64)}`;
 const wasmPath = join(
   workspaceRoot,
   "packages/protocol-wasm/dist/ferrite_protocol_wasm.wasm",
@@ -70,8 +71,7 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
         "{}",
         "/",
         JSON.stringify({
-          sourceBuildId: BUILD_ID,
-          assetBuildId: BUILD_ID,
+          assetBuildId: ASSET_BUILD_ID,
           fallbackPath: "/index.html",
           observedActions: [],
         }),
@@ -79,25 +79,42 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
       { cwd: project, maxBuffer: 1024 * 1024 },
     );
 
-    const [routeModule, renderer] = await Promise.all([
+    const receiptPath = `${artifact}.receipt.json`;
+    const [routeModule, renderer, receiptBytes] = await Promise.all([
       import(`${pathToFileURL(artifact).href}?test=${Date.now()}`),
       instantiateFerriteProtocolWasm(await readFile(wasmPath)),
+      readFile(receiptPath),
     ]);
+    const receipt = JSON.parse(receiptBytes.toString("utf8"));
+    const manifest = {
+      format: { name: "ferrite-server", major: 1, minor: 0 },
+      buildId: ASSET_BUILD_ID,
+      routes: [{
+        path: "/",
+        prerendered: { "/": "index.html" },
+        observedActions: [],
+        cloudflare: {
+          path: "/",
+          sourceBuildId: receipt.sourceBuildId,
+          metadataBuildId: receipt.metadataBuildId,
+          moduleBuildId: receipt.moduleBuildId,
+          moduleBytes: receipt.module.bytes,
+          moduleSha256: receipt.module.sha256,
+          receiptBytes: receiptBytes.byteLength,
+          receiptSha256: createHash("sha256").update(receiptBytes).digest("hex"),
+        },
+      }],
+    };
+    const manifestBytes = Buffer.from(JSON.stringify(manifest));
+    const assetManifestSha256 =
+      `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
     const fallbackRequests = [];
     const env = {
       ASSETS: {
         async fetch(request) {
           const pathname = new URL(request.url).pathname;
           if (pathname === "/ferrite-server.json") {
-            return new Response(JSON.stringify({
-              format: { name: "ferrite-server", major: 1, minor: 0 },
-              buildId: BUILD_ID,
-              routes: [{
-                path: "/",
-                prerendered: { "/": "index.html" },
-                observedActions: [],
-              }],
-            }), {
+            return new Response(manifestBytes, {
               headers: { "Content-Type": "application/json" },
             });
           }
@@ -114,6 +131,7 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
         document: { rootId: "edge-root" },
       }],
       renderer,
+      assetManifestSha256,
     });
 
     const first = await handler.fetch(new Request("https://worker.example.test/"), env);

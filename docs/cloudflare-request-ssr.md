@@ -31,7 +31,59 @@ It rejects dynamic/catch-all route patterns, server actions, reserved payload-st
 
 The current Ferrite stream API resolves every deferred Suspense chunk before it returns a packet. The Worker adapter therefore does not claim progressive SSR streaming. A deadline or aborted request abandons the response path, but JavaScript cannot forcibly cancel an arbitrary user promise that ignores `AbortSignal`.
 
-Every generated route artifact embeds the source artifact `buildId`, the final packaged asset `buildId`, fallback path, and observed-action inventory. Before request-time rendering, the adapter fetches the deployed `/ferrite-server.json` through `ASSETS` and requires the final asset identity plus the exact action-free route-to-prerender mapping. This prevents request-time HTML from running against a stale client/fallback asset set. The production generator must supply both identities from its already validated source and packaged manifests; hand-authored identities are not release evidence.
+The experimental generator derives each route's source identity from the exact
+transitive project and Ferrite runtime bytes consumed by esbuild. It rejects
+imports outside those receipt roots, rechecks every input after each build
+pass, derives a canonical module identity with one fixed-width sentinel, and
+writes `<route>.receipt.json` with the final module size and SHA-256. A
+caller-supplied `sourceBuildId` is only an assertion and is rejected when stale;
+it never selects the identity.
+
+The artifact also embeds a metadata identity derived from the route path,
+fallback path, asset identity, source identity, schema version, and observed
+action inventory. Receipt verification recomputes that value and requires it
+to occur exactly once in the final module, so rewriting receipt claims after
+the build fails closed.
+
+Before request-time rendering, the adapter fetches the deployed
+`/ferrite-server.json` through `ASSETS`, hashes its exact bytes against the
+identity embedded in the Worker entry, and requires the final asset identity,
+per-route source/metadata/module receipt fields, and exact action-free route-to-prerender
+mapping. The local verifier generates that manifest from validated receipts.
+This prevents a stale or independently replaced asset manifest from silently
+authorizing request rendering. An attacker authorized to replace both Worker
+code and assets remains outside this unsigned local-spike threat model.
+
+## Local Workerd Proof
+
+The repository pins Wrangler `4.115.0` and its workerd runtime through the root
+lockfile. After a frozen install, run the dedicated gate:
+
+```sh
+pnpm test:cloudflare-worker
+```
+
+The verifier rebuilds the runtime and release-profile Rust WASM, creates an
+isolated deterministic fixture, generates four edge route artifacts, and runs
+`wrangler deploy --dry-run`. It then revalidates every receipt against the
+post-bundle route artifact, requires each artifact and metadata/module identity
+in Wrangler's metafile and emitted modules, and starts
+`wrangler dev --local --no-bundle` from that exact inventoried output. It then
+observes two distinct request-time renders in the same isolate and checks:
+
+- exact deep-route refresh plus `HEAD`
+- static-asset passthrough and missing assets
+- route-exception, response-deadline, and rendered-server-action fallback
+- unsupported methods, representations, and payload streaming
+- encoded traversal and separator rejection
+- Git HEAD/tree/cleanliness, route receipts, manifest/config/lockfile identities,
+  bounded emitted bundle/WASM identities, and descendant cleanup
+
+A passing receipt proves that fixture in the pinned local workerd version. It
+does not prove a Cloudflare deployment, production traffic, cross-platform
+parity, or a hosted Buildkite result. The root `pnpm test` command includes this
+gate, so the existing Buildkite `verify` step will execute it when the dedicated
+Ferrite agent is available.
 
 ## Build A Route Artifact
 
@@ -48,10 +100,24 @@ node packages/runtime/bin/render-page.mjs \
   '"app/document.tsx"' \
   '{}' \
   / \
-  '{"sourceBuildId":"sha256:<64 lowercase source-manifest hex characters>","assetBuildId":"sha256:<64 lowercase packaged-manifest hex characters>","fallbackPath":"/index.html","observedActions":[]}'
+  '{"assetBuildId":"sha256:<64 lowercase packaged-manifest hex characters>","fallbackPath":"/index.html","observedActions":[]}'
 ```
 
-The build uses an isolate-oriented ESM target and fails if application code imports a Node built-in. The only external allowed by this first profile is `node:async_hooks` from Ferrite's own server runtime. `PROFILE=release pnpm --filter @ferrite/protocol-wasm build` builds the release-profile WASM used for bundle-size and production proof.
+The command emits `dist/server/home.mjs` plus
+`dist/server/home.mjs.receipt.json`. Verify the pair before Worker bundling:
+
+```sh
+node packages/runtime/bin/render-page.mjs \
+  --verify-cloudflare-artifact-receipt \
+  dist/server/home.mjs
+```
+
+The build uses an isolate-oriented ESM target and fails if application code
+imports a Node built-in or resolves transitive source outside the project and
+Ferrite runtime receipt roots. The only external allowed by this first profile
+is `node:async_hooks` from Ferrite's own server runtime.
+`PROFILE=release pnpm --filter @ferrite/protocol-wasm build` builds the
+release-profile WASM used for bundle-size and production proof.
 
 ## Worker Entry
 
@@ -71,6 +137,7 @@ export default createCloudflareSsrHandler({
     document: { rootId: "ferrite-root" },
   }],
   renderer,
+  assetManifestSha256: "sha256:<exact ferrite-server.json bytes>",
   responseDeadlineMs: 50,
   maxPacketBytes: 2 * 1024 * 1024,
   maxHtmlBytes: 8 * 1024 * 1024,
@@ -108,7 +175,10 @@ Official constraints and configuration references:
 - A malformed request, unsupported method, unsupported `Accept`, or payload-stream request never invokes the route or asset binding.
 - A route exception, action control, invalid/oversized packet, invalid/oversized HTML, or deadline failure may fetch only that route's declared fallback path.
 - An aborted request is rethrown as `AbortError`; it must not start fallback work.
-- Fallback requests strip range and conditional headers and accept only a full `200` document. A missing, throwing, partial, conditional, or non-success fallback produces a generic no-store `500` or `504` without exposing the route error.
+- Fallback requests strip range and conditional headers and accept only a full
+  `200` `text/html` document. A missing, throwing, partial, conditional,
+  wrong-media-type, or non-success fallback produces a generic no-store `500`
+  or `504` without exposing the route error.
 - `shouldRender` is the rollback gate. Returning `false` bypasses request rendering and serves the declared prerender.
 - Unknown paths and declared static assets remain owned by `env.ASSETS`.
 
@@ -124,7 +194,10 @@ Official constraints and configuration references:
 - Forced cancellation of non-cooperative component work
 - Distributed data caches, tracing, or multi-region consistency
 - Worker bundle size, CPU, and memory headroom for a real application corpus
-- Production generation that records the edge route-module digest in the immutable artifact receipt
+- Rust production-builder integration for the edge receipt and Worker entry
+- A signed release manifest for a threat model where one actor can replace both Worker and assets
 - Cross-platform Wrangler parity or a hosted Buildkite Worker-runtime gate
 
-The next promotion gate is a local workerd/Wrangler run of the exact committed fixture followed by exact-head Buildkite proof. Deployment remains a separate authorization boundary.
+The next promotion gate is a passing local workerd/Wrangler receipt bound to the
+exact committed fixture, followed by exact-head Buildkite proof. Deployment
+remains a separate authorization boundary.
