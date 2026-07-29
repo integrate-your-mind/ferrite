@@ -229,6 +229,76 @@ test("createCliCandidate restores prior output when publication fails", async ()
   });
 });
 
+test("createCliCandidate preserves a verified backup when rollback fails", async () => {
+  await usingFixture(async ({ binary, root }) => {
+    const destination = join(root, "candidate");
+    await createCliCandidate({ binaryPath: binary, destinationRoot: destination });
+
+    await assert.rejects(
+      createCliCandidate({
+        binaryPath: binary,
+        destinationRoot: destination,
+        async renameImpl(source, target) {
+          if (source.includes(".staging-") && target === destination) {
+            throw new Error("injected publication failure");
+          }
+          if (source.includes(".backup-") && target === destination) {
+            throw new Error("injected rollback failure");
+          }
+          return rename(source, target);
+        },
+      }),
+      (error) =>
+        error instanceof AggregateError &&
+        error.errors.some((entry) => /publication failure/.test(entry.message)) &&
+        error.errors.some((entry) => /rollback failure/.test(entry.message)),
+    );
+
+    await assert.rejects(lstat(destination), { code: "ENOENT" });
+    const backups = (await readdir(root)).filter((name) =>
+      name.includes(".backup-"),
+    );
+    assert.equal(backups.length, 1);
+    await verifyCliCandidate(join(root, backups[0]));
+    assert.deepEqual(
+      (await readdir(root)).filter((name) => name.includes(".staging-")),
+      [],
+    );
+  });
+});
+
+test("createCliCandidate preserves both verified outputs when backup cleanup fails", async () => {
+  await usingFixture(async ({ binary, root }) => {
+    const destination = join(root, "candidate");
+    await createCliCandidate({ binaryPath: binary, destinationRoot: destination });
+
+    await assert.rejects(
+      createCliCandidate({
+        binaryPath: binary,
+        destinationRoot: destination,
+        async removeImpl(path, options) {
+          if (path.includes(".backup-")) {
+            throw new Error("injected backup cleanup failure");
+          }
+          return rm(path, options);
+        },
+      }),
+      /published.*prior output remains.*backup cleanup failure/,
+    );
+
+    await verifyCliCandidate(destination);
+    const backups = (await readdir(root)).filter((name) =>
+      name.includes(".backup-"),
+    );
+    assert.equal(backups.length, 1);
+    await verifyCliCandidate(join(root, backups[0]));
+    assert.deepEqual(
+      (await readdir(root)).filter((name) => name.includes(".staging-")),
+      [],
+    );
+  });
+});
+
 test("createCliCandidate preserves an unrelated existing destination", async () => {
   await usingFixture(async ({ binary, root }) => {
     const destination = join(root, "owned-directory");

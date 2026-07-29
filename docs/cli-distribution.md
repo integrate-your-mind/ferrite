@@ -42,15 +42,19 @@ The gate:
 2. creates both package candidates in a private sibling;
 3. verifies their exact file sets and integrity metadata;
 4. atomically replaces only the ignored candidate output, restoring prior
-   output if publication fails;
+   output if publication fails and preserving a verified backup if rollback
+   itself cannot complete;
 5. packs both directories with npm;
-6. installs the two tarballs into an empty directory with lifecycle scripts
+6. installs only the wrapper tarball into an empty directory with optional
+   dependencies omitted, then proves the real launcher names and rejects the
+   missing platform package;
+7. installs both tarballs into another empty directory with lifecycle scripts
    disabled, npm offline mode enabled, and an unreachable registry configured;
-7. runs the packaged `ferrite --version`;
-8. initializes a project whose path contains spaces;
-9. verifies exact runtime and CLI dependency versions;
-10. proves non-empty target refusal without changing an owned marker; and
-11. tampers with the installed binary and proves execution fails closed.
+8. runs the packaged `ferrite --version`;
+9. initializes a project whose path contains spaces;
+10. verifies exact runtime and CLI dependency versions;
+11. proves non-empty target refusal without changing an owned marker; and
+12. tampers with the installed binary and proves execution fails closed.
 
 Generated candidate output lives under `dist/cli-candidate/` and is ignored.
 The clean consumer and tarballs used by the gate are temporary and are removed

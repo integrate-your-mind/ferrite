@@ -8,7 +8,8 @@
   `@ferrite/cli-darwin-arm64` binary package candidate with strict platform,
   version, byte-count, and SHA-256 verification.
 - Added clean-consumer offline tarball proof for real CLI execution, project
-  initialization, existing-target refusal, and binary-tamper rejection.
+  initialization, omitted-platform rejection, existing-target refusal, and
+  binary-tamper rejection.
 
 ### Changed
 

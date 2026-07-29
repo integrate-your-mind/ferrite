@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { argv, env, platform } from "node:process";
@@ -24,6 +32,7 @@ export async function verifyCliConsumer({
   const temporaryRoot = await mkdtemp(join(tmpdir(), "ferrite cli consumer "));
   const tarballRoot = join(temporaryRoot, "tarballs");
   const consumerRoot = join(temporaryRoot, "consumer");
+  const omittedPlatformRoot = join(temporaryRoot, "consumer without platform");
 
   try {
     await mkdir(tarballRoot, { recursive: true });
@@ -39,18 +48,53 @@ export async function verifyCliConsumer({
       tarballRoot,
       temporaryRoot,
     );
-    await mkdir(consumerRoot, { recursive: true });
-    await writeFile(
-      join(consumerRoot, "package.json"),
-      `${JSON.stringify({ name: "ferrite-cli-consumer", private: true }, null, 2)}\n`,
-    );
-
     const offlineEnvironment = {
       ...env,
       npm_config_cache: join(temporaryRoot, "npm-cache"),
       npm_config_offline: "true",
       npm_config_registry: "http://127.0.0.1:9",
     };
+
+    await mkdir(omittedPlatformRoot, { recursive: true });
+    await writeConsumerManifest(omittedPlatformRoot, "ferrite-cli-omitted-platform");
+    run(
+      npmCommand,
+      [
+        "install",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--package-lock=false",
+        "--omit=optional",
+        wrapperTarball,
+      ],
+      { cwd: omittedPlatformRoot, env: offlineEnvironment },
+    );
+    await assertPathAbsent(
+      join(
+        omittedPlatformRoot,
+        "node_modules",
+        "@ferrite",
+        candidate.platformPackage.split("/")[1],
+      ),
+      "omitted CLI platform package",
+    );
+    const omittedFerrite = installedFerritePath(omittedPlatformRoot);
+    const omittedPlatform = run(omittedFerrite, ["--version"], {
+      cwd: omittedPlatformRoot,
+      expectFailure: true,
+    });
+    const missingPlatformMessage =
+      `binary package ${candidate.platformPackage}@${candidate.packageVersion} ` +
+      "is not installed";
+    if (!omittedPlatform.stderr.includes(missingPlatformMessage)) {
+      throw new Error(
+        "Packaged Ferrite CLI did not fail closed when its optional platform package was omitted.",
+      );
+    }
+
+    await mkdir(consumerRoot, { recursive: true });
+    await writeConsumerManifest(consumerRoot, "ferrite-cli-consumer");
     run(
       npmCommand,
       [
@@ -65,12 +109,7 @@ export async function verifyCliConsumer({
       { cwd: consumerRoot, env: offlineEnvironment },
     );
 
-    const ferrite = join(
-      consumerRoot,
-      "node_modules",
-      ".bin",
-      process.platform === "win32" ? "ferrite.cmd" : "ferrite",
-    );
+    const ferrite = installedFerritePath(consumerRoot);
     const version = run(ferrite, ["--version"], { cwd: consumerRoot }).stdout.trim();
     const expectedVersion = ferriteBinaryVersionForPackage(candidate.packageVersion);
     if (version !== expectedVersion) {
@@ -132,6 +171,7 @@ export async function verifyCliConsumer({
       bytes: verified.bytes,
       binaryVersion: version,
       offlineInstall: "passed",
+      omittedPlatformRejection: "passed",
       existingTargetRefusal: "passed",
       tamperRejection: "passed",
       applicationDependencies: "not installed; registry or complete local tarballs required",
@@ -139,6 +179,32 @@ export async function verifyCliConsumer({
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
+}
+
+async function writeConsumerManifest(root, name) {
+  await writeFile(
+    join(root, "package.json"),
+    `${JSON.stringify({ name, private: true }, null, 2)}\n`,
+  );
+}
+
+function installedFerritePath(root) {
+  return join(
+    root,
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "ferrite.cmd" : "ferrite",
+  );
+}
+
+async function assertPathAbsent(path, label) {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(`${label} unexpectedly exists at ${path}.`);
 }
 
 function pack(npmCommand, packageDirectory, tarballRoot, cwd) {
