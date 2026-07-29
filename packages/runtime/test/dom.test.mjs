@@ -181,6 +181,131 @@ test("update replaces event handlers and removes stale handlers", () => {
   assert.deepEqual(calls, ["first", "second"]);
 });
 
+test("React-compatible onDoubleClick maps to the native dblclick event", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+
+  mount(
+    createElement(
+      "button",
+      {
+        onDoubleClick: () => calls.push("double"),
+      },
+      "Open",
+    ),
+    container,
+  );
+
+  container
+    .querySelector("button")
+    ?.dispatchEvent(new window.Event("dblclick", { bubbles: true }));
+
+  assert.deepEqual(calls, ["double"]);
+});
+
+test("React-compatible Capture event props run before target and bubble handlers", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+
+  mount(
+    createElement(
+      "div",
+      {
+        onClickCapture: () => calls.push("parent capture"),
+        onClick: () => calls.push("parent bubble"),
+      },
+      createElement(
+        "button",
+        {
+          onClick: () => calls.push("child bubble"),
+        },
+        "Save",
+      ),
+    ),
+    container,
+  );
+
+  container
+    .querySelector("button")
+    ?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.deepEqual(calls, [
+    "parent capture",
+    "child bubble",
+    "parent bubble",
+  ]);
+});
+
+test("event names that end in Capture remain native event names", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+
+  mount(
+    createElement(
+      "button",
+      {
+        onGotPointerCapture: () => calls.push("got pointer capture"),
+      },
+      "Drag",
+    ),
+    container,
+  );
+
+  const button = container.querySelector("button");
+  button?.dispatchEvent(new window.Event("gotpointer", { bubbles: true }));
+  button?.dispatchEvent(new window.Event("gotpointercapture", { bubbles: true }));
+
+  assert.deepEqual(calls, ["got pointer capture"]);
+});
+
+test("capture handlers are replaced and removed without changing the DOM node", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+  const root = mount(
+    createElement("button", { onClickCapture: () => calls.push("first") }, "Save"),
+    container,
+  );
+  const button = container.querySelector("button");
+
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+  root.update(createElement("button", { onClickCapture: () => calls.push("second") }, "Save"));
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+  root.update(createElement("button", null, "Save"));
+  button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+
+  assert.equal(container.querySelector("button"), button);
+  assert.deepEqual(calls, ["first", "second"]);
+});
+
+test("existing native dblclick event props remain compatible with onDoubleClick", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+  const root = mount(
+    createElement("button", { onDblClick: () => calls.push("native") }, "Open"),
+    container,
+  );
+  const button = container.querySelector("button");
+
+  button?.dispatchEvent(new window.Event("dblclick", { bubbles: true }));
+  root.update(createElement("button", { onDoubleClick: () => calls.push("react") }, "Open"));
+  button?.dispatchEvent(new window.Event("dblclick", { bubbles: true }));
+
+  assert.deepEqual(calls, ["native", "react"]);
+});
+
+test("capture event props reject non-function handlers without mutating the current tree", () => {
+  const { container } = createContainer();
+  const root = mount(createElement("button", { type: "button" }, "Save"), container);
+  const button = container.querySelector("button");
+
+  assert.throws(
+    () => root.update(createElement("button", { onClickCapture: "not a function" }, "Invalid")),
+    /event prop "onClickCapture" must be a function/,
+  );
+  assert.equal(container.querySelector("button"), button);
+  assert.equal(container.innerHTML, '<button type="button">Save</button>');
+});
+
 test("keyed child updates reorder existing DOM nodes", () => {
   const { container } = createContainer();
 

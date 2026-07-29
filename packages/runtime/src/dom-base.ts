@@ -85,6 +85,13 @@ type NamedSubmitter = HTMLElement & {
   type?: string;
   value?: string;
 };
+type EventBinding = {
+  eventName: string;
+  capture: boolean;
+};
+type RegisteredEventHandler = EventBinding & {
+  listener: EventListener;
+};
 
 const SERVER_PAYLOAD_HISTORY_STATE_KEY = "__ferriteServerPayloadNavigation";
 const SERVER_ACTION_URL = "/_ferrite/action";
@@ -1507,7 +1514,7 @@ class DomRoot {
   private child: Child;
   private readonly container: Element;
   private readonly document: Document;
-  private readonly eventHandlers = new WeakMap<Element, Map<string, EventListener>>();
+  private readonly eventHandlers = new WeakMap<Element, Map<string, RegisteredEventHandler>>();
   private readonly nodeKeys = new WeakMap<Node, string>();
   private readonly hookState = new Map<string, HookState>();
   private errorBoundaryState = new Map<string, ErrorBoundaryState>();
@@ -2049,12 +2056,12 @@ class DomRoot {
       throw new TypeError(`Ferrite event prop "${name}" must be a function.`);
     }
 
-    const eventName = eventNameFromProp(name);
-    if (!eventName) {
+    const binding = eventBindingFromProp(name);
+    if (!binding) {
       throw new TypeError(`Ferrite event prop "${name}" is invalid.`);
     }
 
-    this.setEventHandler(element, eventName, value as EventListener);
+    this.setEventHandler(element, binding, value as EventListener);
   }
 
   private applyAttributeProp(element: Element, name: string, value: unknown): void {
@@ -2450,41 +2457,42 @@ class DomRoot {
     }
   }
 
-  private setEventHandler(element: Element, eventName: string, listener: EventListener): void {
+  private setEventHandler(element: Element, binding: EventBinding, listener: EventListener): void {
     let handlers = this.eventHandlers.get(element);
     if (!handlers) {
       handlers = new Map();
       this.eventHandlers.set(element, handlers);
     }
 
-    const previous = handlers.get(eventName);
+    const bindingKey = eventBindingKey(binding);
+    const previous = handlers.get(bindingKey);
     if (previous) {
-      element.removeEventListener(eventName, previous);
+      element.removeEventListener(previous.eventName, previous.listener, previous.capture);
     }
 
-    handlers.set(eventName, listener);
-    element.addEventListener(eventName, listener);
+    handlers.set(bindingKey, { ...binding, listener });
+    element.addEventListener(binding.eventName, listener, binding.capture);
   }
 
   private syncEventHandlers(target: Element, source: Element): void {
-    const targetHandlers = this.eventHandlers.get(target) ?? new Map<string, EventListener>();
-    const sourceHandlers = this.eventHandlers.get(source) ?? new Map<string, EventListener>();
+    const targetHandlers = this.eventHandlers.get(target) ?? new Map<string, RegisteredEventHandler>();
+    const sourceHandlers = this.eventHandlers.get(source) ?? new Map<string, RegisteredEventHandler>();
 
-    for (const [eventName, listener] of targetHandlers) {
-      if (!sourceHandlers.has(eventName)) {
-        target.removeEventListener(eventName, listener);
-        targetHandlers.delete(eventName);
+    for (const [bindingKey, handler] of targetHandlers) {
+      if (!sourceHandlers.has(bindingKey)) {
+        target.removeEventListener(handler.eventName, handler.listener, handler.capture);
+        targetHandlers.delete(bindingKey);
       }
     }
 
-    for (const [eventName, listener] of sourceHandlers) {
-      if (targetHandlers.get(eventName) !== listener) {
-        const previous = targetHandlers.get(eventName);
+    for (const [bindingKey, handler] of sourceHandlers) {
+      if (targetHandlers.get(bindingKey)?.listener !== handler.listener) {
+        const previous = targetHandlers.get(bindingKey);
         if (previous) {
-          target.removeEventListener(eventName, previous);
+          target.removeEventListener(previous.eventName, previous.listener, previous.capture);
         }
-        target.addEventListener(eventName, listener);
-        targetHandlers.set(eventName, listener);
+        target.addEventListener(handler.eventName, handler.listener, handler.capture);
+        targetHandlers.set(bindingKey, handler);
       }
     }
 
@@ -2745,7 +2753,11 @@ function cloneErrorBoundaryState(source: Map<string, ErrorBoundaryState>): Map<s
   return clone;
 }
 
-function eventNameFromProp(name: string): string | null {
+const EVENT_CAPTURE_SUFFIX = "Capture";
+const REACT_EVENT_NAME_ALIASES = new Map<string, string>([["DoubleClick", "dblclick"]]);
+const EVENT_NAMES_ENDING_IN_CAPTURE = new Set(["GotPointerCapture", "LostPointerCapture"]);
+
+function eventBindingFromProp(name: string): EventBinding | null {
   if (name.length <= 2 || !name.startsWith("on")) {
     return null;
   }
@@ -2755,5 +2767,21 @@ function eventNameFromProp(name: string): string | null {
     return null;
   }
 
-  return raw.toLowerCase();
+  const capture =
+    raw.length > EVENT_CAPTURE_SUFFIX.length &&
+    raw.endsWith(EVENT_CAPTURE_SUFFIX) &&
+    !EVENT_NAMES_ENDING_IN_CAPTURE.has(raw);
+  const eventName = capture ? raw.slice(0, -EVENT_CAPTURE_SUFFIX.length) : raw;
+  if (!/^[A-Z][A-Za-z]*$/.test(eventName)) {
+    return null;
+  }
+
+  return {
+    eventName: REACT_EVENT_NAME_ALIASES.get(eventName) ?? eventName.toLowerCase(),
+    capture,
+  };
+}
+
+function eventBindingKey(binding: EventBinding): string {
+  return `${binding.capture ? "capture" : "bubble"}:${binding.eventName}`;
 }
