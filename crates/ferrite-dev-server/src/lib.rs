@@ -61,6 +61,8 @@ const DEFAULT_PRODUCTION_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_DEV_MAX_REQUEST_BYTES: usize = DEFAULT_PRODUCTION_MAX_REQUEST_BYTES;
 const DEFAULT_PRODUCTION_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const MAX_HTTP_REQUEST_HEADERS: usize = 100;
+const MAX_MULTIPART_PARTS: usize = 128;
+const MAX_MULTIPART_PART_HEADERS: usize = 16;
 const PRODUCTION_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_PRODUCTION_OVERLOAD_WORKERS: usize = 4;
 const PRODUCTION_OVERLOAD_REQUEST_DRAIN_TIMEOUT: Duration = Duration::from_millis(25);
@@ -4044,48 +4046,222 @@ fn parse_multipart_form(
     body: &[u8],
 ) -> FormParseResult<BTreeMap<String, ServerActionFormValue>> {
     let boundary = multipart_boundary(content_type)?;
-    let body = std::str::from_utf8(body)
-        .map_err(|_| "multipart server action forms must be UTF-8 text".to_owned())?;
-    let delimiter = format!("--{boundary}");
-    let mut fields = BTreeMap::new();
-    let mut saw_boundary = false;
+    validate_multipart_envelope(body, &boundary)?;
 
-    for raw_part in body.split(&delimiter).skip(1) {
-        saw_boundary = true;
-        if raw_part.starts_with("--") {
-            break;
+    parse_multipart_text_fields(body, &format!("--{boundary}"))
+}
+
+fn parse_multipart_text_fields(
+    body: &[u8],
+    opening: &str,
+) -> FormParseResult<BTreeMap<String, ServerActionFormValue>> {
+    let boundary_prefix = format!("\r\n{opening}");
+    let mut fields = BTreeMap::new();
+    let mut cursor = opening.len();
+    let mut part_count = 0usize;
+
+    loop {
+        if body[cursor..].starts_with(b"--") {
+            let suffix = &body[cursor + 2..];
+            if suffix.is_empty() || suffix == b"\r\n" {
+                return Ok(fields);
+            }
+            return Err(
+                "multipart server action body contains bytes after its terminal boundary"
+                    .to_owned(),
+            );
         }
-        let part = raw_part.strip_prefix("\r\n").unwrap_or(raw_part);
-        let part = part.strip_suffix("\r\n").unwrap_or(part);
-        if part.is_empty() {
-            continue;
+        if !body[cursor..].starts_with(b"\r\n") {
+            return Err("multipart server action boundary line is malformed".to_owned());
         }
-        let Some((headers, value)) = part.split_once("\r\n\r\n") else {
-            return Err("multipart server action part is missing headers".to_owned());
+        cursor += 2;
+
+        let header_end = find_bytes(&body[cursor..], b"\r\n\r\n")
+            .map(|offset| cursor + offset)
+            .ok_or_else(|| "multipart server action part is missing headers".to_owned())?;
+        let header_block = &body[cursor..header_end + 4];
+        if !uses_exact_crlf(header_block) {
+            return Err(
+                "multipart server action part headers must use exact CRLF line endings".to_owned(),
+            );
+        }
+        let mut header_slots =
+            [httparse::EMPTY_HEADER; MAX_MULTIPART_PART_HEADERS.saturating_add(1)];
+        let parsed_headers = match httparse::parse_headers(header_block, &mut header_slots) {
+            Ok(httparse::Status::Complete((consumed, headers)))
+                if consumed == header_block.len() =>
+            {
+                headers
+            }
+            Ok(_) => {
+                return Err("multipart server action part contains incomplete headers".to_owned());
+            }
+            Err(httparse::Error::TooManyHeaders) => {
+                return Err(format!(
+                    "multipart server action part exceeds the {MAX_MULTIPART_PART_HEADERS}-header limit"
+                ));
+            }
+            Err(_) => {
+                return Err("multipart server action part contains an invalid header".to_owned());
+            }
         };
-        let headers = parse_multipart_headers(headers)?;
-        let disposition = headers.get("content-disposition").ok_or_else(|| {
+        if parsed_headers.len() > MAX_MULTIPART_PART_HEADERS {
+            return Err(format!(
+                "multipart server action part exceeds the {MAX_MULTIPART_PART_HEADERS}-header limit"
+            ));
+        }
+
+        let mut dispositions = parsed_headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("content-disposition"));
+        let disposition = dispositions.next().ok_or_else(|| {
             "multipart server action part is missing Content-Disposition".to_owned()
         })?;
-        if !multipart_disposition_is_form_data(disposition) {
+        if dispositions.next().is_some() {
+            return Err(
+                "multipart server action part contains duplicate Content-Disposition headers"
+                    .to_owned(),
+            );
+        }
+        let disposition = std::str::from_utf8(disposition.value).map_err(|_| {
+            "multipart server action part has an invalid Content-Disposition header".to_owned()
+        })?;
+        if !disposition
+            .split(';')
+            .next()
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("form-data"))
+        {
             return Err("multipart server action part must use form-data disposition".to_owned());
         }
         if multipart_disposition_has_file(disposition) {
             return Err("multipart server action file parts are not supported".to_owned());
         }
-        let name = multipart_disposition_param(disposition, "name")
+        let name = multipart_disposition_param(disposition, "name")?
+            .filter(|name| !name.is_empty())
             .ok_or_else(|| "multipart server action part is missing a name".to_owned())?;
-        if name.is_empty() {
-            return Err("server action form field name must be non-empty".to_owned());
+
+        if parsed_headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("content-type"))
+            .count()
+            > 1
+        {
+            return Err(
+                "multipart server action part contains duplicate Content-Type headers".to_owned(),
+            );
         }
-        insert_form_value(&mut fields, name, value.to_owned());
+
+        part_count += 1;
+        if part_count > MAX_MULTIPART_PARTS {
+            return Err(format!(
+                "multipart server action form exceeds the {MAX_MULTIPART_PARTS}-part limit"
+            ));
+        }
+
+        cursor = header_end + 4;
+        let boundary_offset = find_multipart_boundary(&body[cursor..], &boundary_prefix)
+            .ok_or_else(|| {
+                "multipart server action body is incomplete or missing its terminal boundary"
+                    .to_owned()
+            })?;
+        let value_end = cursor + boundary_offset;
+        let value = std::str::from_utf8(&body[cursor..value_end])
+            .map_err(|_| "multipart server action text fields must be UTF-8".to_owned())?
+            .to_owned();
+        insert_form_value(&mut fields, name, value);
+        cursor = value_end + boundary_prefix.len();
+    }
+}
+
+fn validate_multipart_envelope(body: &[u8], boundary: &str) -> FormParseResult<()> {
+    let opening = format!("--{boundary}");
+    if !body.starts_with(opening.as_bytes()) {
+        return Err("multipart server action body did not contain the opening boundary".to_owned());
     }
 
-    if !saw_boundary {
-        return Err("multipart server action body did not contain the boundary".to_owned());
+    let body_without_optional_crlf = body.strip_suffix(b"\r\n").unwrap_or(body);
+    let terminal = format!("--{boundary}--");
+    if !body_without_optional_crlf.ends_with(terminal.as_bytes()) {
+        return Err("multipart server action body is missing its terminal boundary".to_owned());
     }
 
-    Ok(fields)
+    Ok(())
+}
+
+fn find_multipart_boundary(bytes: &[u8], boundary_prefix: &str) -> Option<usize> {
+    let mut search_from = 0usize;
+    while let Some(offset) = find_bytes(&bytes[search_from..], boundary_prefix.as_bytes()) {
+        let offset = search_from + offset;
+        let suffix = &bytes[offset + boundary_prefix.len()..];
+        if suffix.starts_with(b"\r\n") || suffix.starts_with(b"--") {
+            return Some(offset);
+        }
+        search_from = offset + boundary_prefix.len();
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn uses_exact_crlf(bytes: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => index += 2,
+            b'\r' | b'\n' => return false,
+            _ => index += 1,
+        }
+    }
+    true
+}
+
+fn multipart_boundary(content_type: &str) -> FormParseResult<String> {
+    let mut boundary = None;
+    for parameter in content_type.split(';').skip(1) {
+        let Some((name, value)) = parameter.trim().split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            continue;
+        }
+        if boundary.is_some() {
+            return Err("multipart server action form contains duplicate boundaries".to_owned());
+        }
+        let value = multipart_parameter_value(value)?;
+        if value.is_empty()
+            || value.len() > 70
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'\''
+                            | b'('
+                            | b')'
+                            | b'+'
+                            | b'_'
+                            | b','
+                            | b'-'
+                            | b'.'
+                            | b'/'
+                            | b':'
+                            | b'='
+                            | b'?'
+                    )
+            })
+        {
+            return Err("multipart boundary is invalid".to_owned());
+        }
+        boundary = Some(value);
+    }
+
+    boundary.ok_or_else(|| "multipart server action form is missing a boundary".to_owned())
 }
 
 fn server_action_request_from_form(
@@ -4629,76 +4805,72 @@ fn insert_form_value(
     }
 }
 
-fn multipart_boundary(content_type: &str) -> FormParseResult<String> {
-    for parameter in content_type.split(';').skip(1) {
-        let Some((name, value)) = parameter.trim().split_once('=') else {
-            continue;
-        };
-        if !name.trim().eq_ignore_ascii_case("boundary") {
-            continue;
-        }
-        let value = strip_optional_quotes(value.trim());
-        if value.is_empty() || value.contains(['\r', '\n']) {
-            return Err("multipart boundary must be non-empty".to_owned());
-        }
-        return Ok(value.to_owned());
-    }
-
-    Err("multipart server action form is missing a boundary".to_owned())
-}
-
-fn parse_multipart_headers(headers: &str) -> FormParseResult<BTreeMap<String, String>> {
-    let mut parsed = BTreeMap::new();
-    for line in headers.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err("multipart server action part contains an invalid header".to_owned());
-        };
-        let name = name.trim().to_ascii_lowercase();
-        if name.is_empty() {
-            return Err("multipart server action part contains an invalid header".to_owned());
-        }
-        parsed.insert(name, value.trim().to_owned());
-    }
-    Ok(parsed)
-}
-
-fn multipart_disposition_is_form_data(value: &str) -> bool {
-    value
-        .split(';')
-        .next()
-        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("form-data"))
-}
-
 fn multipart_disposition_has_file(value: &str) -> bool {
     value.split(';').skip(1).any(|parameter| {
         parameter
             .trim()
             .split_once('=')
             .is_some_and(|(name, _value)| {
-                let name = name.trim();
-                name.eq_ignore_ascii_case("filename") || name.eq_ignore_ascii_case("filename*")
+                let name = name
+                    .chars()
+                    .filter(|character| !character.is_ascii_whitespace())
+                    .collect::<String>();
+                name.eq_ignore_ascii_case("filename")
+                    || name
+                        .get(..9)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("filename*"))
             })
     })
 }
 
-fn multipart_disposition_param(value: &str, expected_name: &str) -> Option<String> {
-    value.split(';').skip(1).find_map(|parameter| {
-        let (name, value) = parameter.trim().split_once('=')?;
-        if !name.trim().eq_ignore_ascii_case(expected_name) {
-            return None;
+fn multipart_disposition_param(
+    value: &str,
+    expected_name: &str,
+) -> FormParseResult<Option<String>> {
+    let mut found = None;
+    for parameter in value.split(';').skip(1) {
+        let (name, raw_value) = parameter.trim().split_once('=').ok_or_else(|| {
+            "multipart server action part contains an invalid disposition parameter".to_owned()
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(
+                "multipart server action part contains an invalid disposition parameter".to_owned(),
+            );
         }
-        Some(strip_optional_quotes(value.trim()).to_owned())
-    })
+        let parsed_value = multipart_parameter_value(raw_value)?;
+        if !name.eq_ignore_ascii_case(expected_name) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(format!(
+                "multipart server action part contains duplicate `{expected_name}` parameters"
+            ));
+        }
+        found = Some(parsed_value);
+    }
+    Ok(found)
 }
 
-fn strip_optional_quotes(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
+fn multipart_parameter_value(value: &str) -> FormParseResult<String> {
+    let value = value.trim();
+    let value = if let Some(quoted) = value.strip_prefix('"') {
+        quoted
+            .strip_suffix('"')
+            .ok_or_else(|| "multipart parameter contains an unterminated quoted value".to_owned())?
+    } else {
+        if value.contains('"') {
+            return Err("multipart parameter contains an invalid quote".to_owned());
+        }
+        value
+    };
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || matches!(byte, b'"' | b'\\'))
+    {
+        return Err("multipart parameter contains an unsupported character".to_owned());
+    }
+    Ok(value.to_owned())
 }
 
 fn route_response_mode(raw_path: &str) -> std::result::Result<RouteResponseMode, String> {
@@ -6155,6 +6327,174 @@ process.exit(1);
     }
 
     #[test]
+    fn multipart_action_form_rejects_a_missing_terminal_boundary() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let body =
+            b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\ntruncated";
+
+        let error = parse_multipart_form(content_type, body).unwrap_err();
+
+        assert!(error.contains("terminal boundary"), "{error}");
+    }
+
+    #[test]
+    fn multipart_action_form_rejects_every_truncated_prefix() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\ncomplete\r\n--FerriteBoundary--";
+
+        for end in 0..body.len() {
+            assert!(
+                parse_multipart_form(content_type, &body[..end]).is_err(),
+                "accepted truncated prefix ending at byte {end}"
+            );
+        }
+        assert!(parse_multipart_form(content_type, body).is_ok());
+    }
+
+    #[test]
+    fn multipart_action_form_rejects_duplicate_content_disposition_headers() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"asset\"; filename=\"../../etc/passwd\"\r\nContent-Disposition: form-data; name=\"asset\"\r\n\r\npayload\r\n--FerriteBoundary--\r\n";
+
+        let error = parse_multipart_form(content_type, body).unwrap_err();
+
+        assert!(error.contains("duplicate Content-Disposition"), "{error}");
+    }
+
+    #[test]
+    fn multipart_action_form_rejects_mixed_lf_part_headers() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\nX-Test: accepted-by-lenient-parser\r\n\r\npayload\r\n--FerriteBoundary--\r\n";
+
+        let error = parse_multipart_form(content_type, body).unwrap_err();
+
+        assert!(error.contains("exact CRLF"), "{error}");
+    }
+
+    #[test]
+    fn multipart_action_form_preserves_boundary_like_text_and_accepts_quoted_boundary() {
+        let content_type = "multipart/form-data; boundary=\"FerriteBoundary\"";
+        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nline one\r\n--FerriteBoundary-not-a-delimiter\r\nline two\r\n--FerriteBoundary--\r\n";
+
+        let form = parse_multipart_form(content_type, body).unwrap();
+
+        assert_eq!(
+            form.get("title"),
+            Some(&ServerActionFormValue::String(
+                "line one\r\n--FerriteBoundary-not-a-delimiter\r\nline two".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn multipart_action_form_rejects_binary_text_and_filename_star_parts() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let binary_text = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\n\xff\r\n--FerriteBoundary--\r\n";
+        let binary_error = parse_multipart_form(content_type, binary_text).unwrap_err();
+        assert!(binary_error.contains("must be UTF-8"), "{binary_error}");
+
+        for disposition in [
+            "form-data; name=\"asset\"; filename*=UTF-8''..%2Fsecret.txt",
+            "form-data; name=\"asset\"; filename*0*=UTF-8''..%2F",
+            "form-data; name=\"asset\"; filename*1*=secret.txt",
+            "form-data; name=\"asset\"; filename*0=secret.txt",
+        ] {
+            let body = format!(
+                "--FerriteBoundary\r\nContent-Disposition: {disposition}\r\nContent-Type: text/plain\r\n\r\npayload\r\n--FerriteBoundary--\r\n"
+            );
+            let filename_error = parse_multipart_form(content_type, body.as_bytes()).unwrap_err();
+            assert!(
+                filename_error.contains("file parts"),
+                "{disposition}: {filename_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_action_form_rejects_portable_path_filename_forms() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let filenames = [
+            "../../etc/passwd",
+            r"C:\Users\Public\secret.txt",
+            r"\\server\share\secret.txt",
+            "decomposed-e\u{301}.txt",
+        ];
+
+        for filename in filenames {
+            let body = format!(
+                "--FerriteBoundary\r\nContent-Disposition: form-data; name=\"asset\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\npayload\r\n--FerriteBoundary--\r\n"
+            );
+            let error = parse_multipart_form(content_type, body.as_bytes()).unwrap_err();
+            assert!(error.contains("file parts"), "{filename}: {error}");
+        }
+    }
+
+    #[test]
+    fn multipart_action_form_rejects_empty_epilogue_and_duplicate_content_type() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let empty_error = parse_multipart_form(content_type, b"").unwrap_err();
+        assert!(empty_error.contains("opening boundary"), "{empty_error}");
+
+        let epilogue = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello\r\n--FerriteBoundary--\r\nignored";
+        let epilogue_error = parse_multipart_form(content_type, epilogue).unwrap_err();
+        assert!(
+            epilogue_error.contains("terminal boundary"),
+            "{epilogue_error}"
+        );
+
+        let duplicate_content_type = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\nContent-Type: text/plain\r\nContent-Type: text/html\r\n\r\nHello\r\n--FerriteBoundary--\r\n";
+        let duplicate_error =
+            parse_multipart_form(content_type, duplicate_content_type).unwrap_err();
+        assert!(
+            duplicate_error.contains("duplicate Content-Type"),
+            "{duplicate_error}"
+        );
+    }
+
+    #[test]
+    fn multipart_action_form_rejects_invalid_boundary_parameters() {
+        let body = b"--FerriteBoundary--\r\n";
+        for content_type in [
+            "multipart/form-data",
+            "multipart/form-data; boundary=FerriteBoundary; boundary=Other",
+            "multipart/form-data; boundary=contains space",
+            "multipart/form-data; boundary=\"unterminated",
+        ] {
+            let error = parse_multipart_form(content_type, body).unwrap_err();
+            assert!(
+                error.contains("boundary")
+                    || error.contains("boundaries")
+                    || error.contains("quoted"),
+                "{content_type}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_action_form_enforces_part_and_header_count_budgets() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        let mut too_many_parts = String::new();
+        for index in 0..=MAX_MULTIPART_PARTS {
+            too_many_parts.push_str(&format!(
+                "--FerriteBoundary\r\nContent-Disposition: form-data; name=\"field-{index}\"\r\n\r\nvalue\r\n"
+            ));
+        }
+        too_many_parts.push_str("--FerriteBoundary--\r\n");
+        let part_error = parse_multipart_form(content_type, too_many_parts.as_bytes()).unwrap_err();
+        assert!(part_error.contains("part limit"), "{part_error}");
+
+        let mut too_many_headers =
+            String::from("--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n");
+        for index in 0..MAX_MULTIPART_PART_HEADERS {
+            too_many_headers.push_str(&format!("X-Test-{index}: value\r\n"));
+        }
+        too_many_headers.push_str("\r\nvalue\r\n--FerriteBoundary--\r\n");
+        let header_error =
+            parse_multipart_form(content_type, too_many_headers.as_bytes()).unwrap_err();
+        assert!(header_error.contains("header limit"), "{header_error}");
+    }
+
+    #[test]
     fn http_request_head_accepts_the_supported_http_1_1_shape() {
         let request = parse_http_request_head(
             b"GET /posts/hello?view=full HTTP/1.1\r\nHost: Example.COM:3000\r\nAccept-Encoding: gzip\r\n\r\n",
@@ -6603,6 +6943,71 @@ process.exit(1);
             assert!(headers.contains("Connection: close"), "{adapter} action");
             assert_eq!(body["status"], "ok", "{adapter} action");
             assert_eq!(body["data"]["routePath"], "/posts/abc", "{adapter} action");
+        }
+    }
+
+    #[test]
+    fn dev_and_production_reject_truncated_multipart_before_action_invocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let invocation_marker = temp.path().join("action-invoked");
+        let marker_json = serde_json::to_string(&invocation_marker).unwrap();
+        let renderer = format!(
+            r#"
+import {{ writeFile }} from "node:fs/promises";
+if (process.argv[2] === "--server-action") {{
+  await writeFile({marker_json}, "invoked");
+  process.stdout.write(JSON.stringify({{
+    ferrite: "server-action-response",
+    version: 1,
+    status: "ok",
+    data: null
+  }}));
+  process.exit(0);
+}}
+process.exit(1);
+"#
+        );
+        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_action\"\r\n\r\napp/posts/[id]/page.tsx#savePost\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_route\"\r\n\r\n/posts/abc\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nmust not execute";
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=FerriteBoundary\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+
+        let responses = [
+            (
+                "dev",
+                dev_http_request(action_project_for(&app, &renderer), request.as_bytes()),
+            ),
+            (
+                "production",
+                production_http_request(
+                    action_production_project_for(&app, &renderer),
+                    request.as_bytes(),
+                ),
+            ),
+        ];
+
+        for (adapter, response) in responses {
+            let headers = response_headers(&response);
+            let response_body = String::from_utf8_lossy(response_body(&response));
+            assert!(
+                headers.starts_with("HTTP/1.1 400 Bad Request"),
+                "{adapter}: {headers}"
+            );
+            assert!(
+                response_body.contains("terminal boundary"),
+                "{adapter}: {response_body}"
+            );
+            assert!(
+                !invocation_marker.exists(),
+                "{adapter} invoked the action for a truncated multipart body"
+            );
         }
     }
 

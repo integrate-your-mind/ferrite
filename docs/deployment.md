@@ -103,6 +103,17 @@ The Rust dev and production adapters intentionally share one narrow proxy-upstre
 - duplicate framing or interpreted fields are rejected case-insensitively, including `Content-Length`, `Transfer-Encoding`, `Host`, `Content-Type`, `Cookie`, `Expect`, `Origin`, `Referer`, and trusted `X-Forwarded-*` fields; comma-joined forwarded proto/host values also fail closed, while other repeatable fields are comma-combined in wire order
 - one request is processed per connection and every response closes the connection; already-buffered bytes beyond the declared request are rejected, and HTTP pipelining is unsupported
 
+Server-action multipart requests are limited to UTF-8 text fields. Ferrite
+requires exact CRLF part headers plus exact opening and terminal boundaries,
+rejects duplicate `Content-Disposition` and `Content-Type` part headers, caps a
+request at 128 parts and 16 headers per part, and rejects binary text plus
+`filename`, `filename*`, and continued filename parameters before action
+invocation. There is no request streaming, temporary upload directory,
+file-value protocol, per-file persistence, disconnect-to-action cancellation,
+or upload cleanup lifecycle. The existing whole-request byte limit and
+production read deadline remain the only body budgets. Do not enable file
+inputs or claim cross-platform upload support.
+
 The supplied nginx template keeps request buffering enabled, accepts HTTP/1.1 and HTTP/2 at the TLS edge, and speaks HTTP/1.1 to Ferrite. It fails closed on request-target forms by default, allowing only origin-form targets that do not begin with `//` and canonical HTTPS absolute-form targets for the configured public authority. It also rejects raw `Host` authorities outside that public host, overwrites the accepted authority and forwarded-origin fields, clears hop-by-hop `Connection`, and strips `Expect`. Keep both `map` entries and `server_name` aligned when changing the public host; the raw-authority and raw-target maps deliberately reject missing hosts, explicit ports, mismatched or alternate schemes, network-path targets, and alternate absolute-form authorities. As a conservative normalization defense, the stock target map rejects any path containing percent-encoded `.`, `/`, or `\` bytes and any literal `.` or `..` path segment. This also rejects otherwise legitimate opaque identifiers containing those encodings; applications that require them need a separately reviewed edge policy and regression matrix rather than silently weakening the supplied map. The [nginx request-buffering contract](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_request_buffering) reads the complete client body before sending it upstream. The template requires nginx 1.25.1 or newer because it uses the non-deprecated `http2` directive. An exact local evidence run against official `nginx:1.29.3-alpine` proves that client-side chunked and HTTP/2 DATA-frame action bodies are normalized into Ferrite-compatible requests in that version; rerun the matrix against the exact deployed proxy image rather than assuming all versions behave identically. Do not expose Ferrite as an unmanaged Internet edge or configure a proxy that forwards raw ambiguous framing.
 
 ## Build And Start

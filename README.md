@@ -60,6 +60,13 @@ Ferrite currently provides a buildable framework foundation with:
 
 Ferrite is not a drop-in React or Next.js replacement. It does not yet provide a stable registry install path, full React Server Components, automatic `"use server"` discovery, distributed replay state, general auth middleware, file uploads, complete tracing, broad platform proof, or a supported public HTTP edge.
 
+The current upload boundary is intentionally fail-closed: server actions accept
+bounded URL-encoded fields and UTF-8 multipart text fields, while binary fields
+and every `filename` or `filename*` part return `400`. Ferrite does not yet
+stream request bodies, create upload temp files, propagate client disconnects
+to a running action, or claim native upload behavior beyond the exact tested
+host platform.
+
 ## Requirements
 
 The repository currently targets:
