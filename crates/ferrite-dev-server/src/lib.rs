@@ -8090,6 +8090,100 @@ process.exit(1);
     }
 
     #[test]
+    fn production_action_session_bound_replay_guard_allows_one_concurrent_invocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let invocation_log = temp.path().join("action-invocations.log");
+        let config = action_production_project_for(
+            &app,
+            r##"
+import { appendFileSync } from "node:fs";
+if (process.argv[2] === "--server-action") {
+  appendFileSync(new URL("./action-invocations.log", import.meta.url), "invoked\n");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  process.stdout.write(JSON.stringify({
+    ferrite: "server-action-response",
+    version: 1,
+    status: "ok",
+    data: { routePath: JSON.parse(process.argv[7]).routePath }
+  }));
+  process.exit(0);
+}
+console.error(`unexpected renderer mode ${process.argv[2]}`);
+process.exit(1);
+"##,
+        )
+        .config
+        .with_server_action_csrf_token("token-123")
+        .with_server_action_replay_ttl(Duration::from_secs(30))
+        .with_server_action_session_cookie_name("app_session");
+        let project = Arc::new(ProductionProject::new(config));
+        project.ensure_ready().unwrap();
+
+        let mut headers = action_headers_with_host("application/x-www-form-urlencoded");
+        headers.insert("cookie".to_owned(), "app_session=session-123".to_owned());
+        let context = project.request_context(&headers, None);
+        let nonce = project
+            .issue_server_action_replay_nonce("/posts/abc", &context)
+            .unwrap()
+            .expect("a valid session receives a bound nonce");
+        let body = action_form_body_with_csrf_and_nonce("/posts/abc", "token-123", &nonce);
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let project = Arc::clone(&project);
+                let headers = headers.clone();
+                let body = body.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    project
+                        .handle_post("/_ferrite/action", &headers, &body)
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let mut responses = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        responses.sort_by_key(|response| response.status);
+
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.status)
+                .collect::<Vec<_>>(),
+            vec![200, 403]
+        );
+        assert_eq!(
+            responses[1].body_text(),
+            "Forbidden: server action replay nonce is invalid or already used\n"
+        );
+        assert_eq!(
+            fs::read_to_string(invocation_log).unwrap(),
+            "invoked\n",
+            "the same session-bound nonce must invoke the action exactly once"
+        );
+        assert!(
+            project
+                .replay_nonces
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn production_header_aware_get_renders_only_a_matching_session_nonce() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
