@@ -43,9 +43,13 @@ The previous event-prop conversion lowercased every name after `on`:
 Ferrite now parses the React-facing names into an explicit native event binding:
 
 - `onDoubleClick` maps to `dblclick`.
-- a trailing `Capture` selects the native capture phase;
-- `onGotPointerCapture` and `onLostPointerCapture` remain native event names
-  rather than being mistaken for phase suffixes;
+- a trailing `Capture` on a name in React's DOM event contract selects the
+  native capture phase;
+- unknown native custom event names such as `onFileCapture`, plus the React
+  event names `onGotPointerCapture` and `onLostPointerCapture`, remain native
+  event names rather than being mistaken for phase suffixes;
+- a repeated suffix such as `onFileCaptureCapture` opts a native custom event
+  ending in `Capture` into the capture phase;
 - capture props with non-function handlers fail closed without mutating the
   current tree;
 - existing native-style props such as `onClick` and `onDblClick` continue to
@@ -56,6 +60,12 @@ Coverage lives in
 This slice improves prop-name compatibility only. Event objects remain native
 DOM events, listeners remain attached per element, and React's delegated
 synthetic event behavior is outside this claim.
+
+React event names take precedence over identically spelled custom events.
+`onClickCapture` therefore means capture-phase `click`, not a bubbling custom
+event named `clickcapture`. Repeated `Capture` suffixes are reserved for the
+custom-event capture opt-in and cannot express a bubbling custom event whose
+prop name itself ends in `CaptureCapture`.
 
 ## Migration guidance
 
@@ -80,6 +90,7 @@ matrix.
   [queueing state updates](https://react.dev/learn/queueing-a-series-of-state-updates)
 - [Responding to events](https://react.dev/learn/responding-to-events) and
   [common DOM event props](https://react.dev/reference/react-dom/components/common)
+- [React DOM event registry](https://github.com/facebook/react/blob/main/packages/react-dom-bindings/src/events/DOMEventProperties.js)
 - [`useContext`](https://react.dev/reference/react/useContext) and
   [`createContext`](https://react.dev/reference/react/createContext)
 - [`useEffect`](https://react.dev/reference/react/useEffect)

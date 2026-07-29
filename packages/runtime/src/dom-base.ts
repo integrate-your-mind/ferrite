@@ -2755,8 +2755,8 @@ function cloneErrorBoundaryState(source: Map<string, ErrorBoundaryState>): Map<s
 
 const EVENT_CAPTURE_SUFFIX = "Capture";
 const REACT_EVENT_NAME_ALIASES = new Map<string, string>([["DoubleClick", "dblclick"]]);
-// React documents Capture variants for these DOM event props. Unknown names
-// retain Ferrite's existing native custom-event mapping.
+// React's DOM event contract exposes Capture variants for these props. Unknown
+// names retain Ferrite's existing native custom-event mapping.
 const REACT_CAPTURE_EVENT_NAMES = new Set([
   "Abort",
   "AnimationEnd",
@@ -2764,6 +2764,7 @@ const REACT_CAPTURE_EVENT_NAMES = new Set([
   "AnimationStart",
   "AuxClick",
   "BeforeInput",
+  "BeforeToggle",
   "Blur",
   "CanPlay",
   "CanPlayThrough",
@@ -2781,6 +2782,7 @@ const REACT_CAPTURE_EVENT_NAMES = new Set([
   "Drag",
   "DragEnd",
   "DragEnter",
+  "DragExit",
   "DragLeave",
   "DragOver",
   "DragStart",
@@ -2791,6 +2793,8 @@ const REACT_CAPTURE_EVENT_NAMES = new Set([
   "Ended",
   "Error",
   "Focus",
+  "FullscreenChange",
+  "FullscreenError",
   "GotPointerCapture",
   "Input",
   "Invalid",
@@ -2822,6 +2826,7 @@ const REACT_CAPTURE_EVENT_NAMES = new Set([
   "Reset",
   "Resize",
   "Scroll",
+  "ScrollEnd",
   "Seeked",
   "Seeking",
   "Select",
@@ -2834,7 +2839,10 @@ const REACT_CAPTURE_EVENT_NAMES = new Set([
   "TouchEnd",
   "TouchMove",
   "TouchStart",
+  "TransitionCancel",
   "TransitionEnd",
+  "TransitionRun",
+  "TransitionStart",
   "VolumeChange",
   "Waiting",
   "Wheel",

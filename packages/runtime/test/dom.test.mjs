@@ -251,7 +251,8 @@ test("React-compatible Capture props cover current two-phase DOM event names", (
   for (const [captureProp, eventName] of cases) {
     const { window, container } = createContainer();
     const calls = [];
-    const bubbleProp = captureProp.slice(0, -"Capture".length);
+    const captureSuffix = "Capture";
+    const bubbleProp = captureProp.slice(0, -captureSuffix.length);
 
     mount(
       createElement(
