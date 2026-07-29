@@ -2772,9 +2772,6 @@ function eventBindingFromProp(name: string): EventBinding | null {
     raw.endsWith(EVENT_CAPTURE_SUFFIX) &&
     !EVENT_NAMES_ENDING_IN_CAPTURE.has(raw);
   const eventName = capture ? raw.slice(0, -EVENT_CAPTURE_SUFFIX.length) : raw;
-  if (!/^[A-Z][A-Za-z]*$/.test(eventName)) {
-    return null;
-  }
 
   return {
     eventName: REACT_EVENT_NAME_ALIASES.get(eventName) ?? eventName.toLowerCase(),

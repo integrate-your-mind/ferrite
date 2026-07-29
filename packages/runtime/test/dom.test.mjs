@@ -306,6 +306,17 @@ test("capture event props reject non-function handlers without mutating the curr
   assert.equal(container.innerHTML, '<button type="button">Save</button>');
 });
 
+test("malformed event prop names fail closed without mounting partial UI", () => {
+  for (const name of ["on", "onclick"]) {
+    const { container } = createContainer();
+    assert.throws(
+      () => mount(createElement("button", { [name]: () => {} }, "Invalid"), container),
+      new RegExp(`event prop "${name}" is invalid`),
+    );
+    assert.equal(container.innerHTML, "");
+  }
+});
+
 test("keyed child updates reorder existing DOM nodes", () => {
   const { container } = createContainer();
 
