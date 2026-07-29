@@ -4088,11 +4088,7 @@ fn parse_multipart_text_fields(
         let mut header_slots =
             [httparse::EMPTY_HEADER; MAX_MULTIPART_PART_HEADERS.saturating_add(1)];
         let parsed_headers = match httparse::parse_headers(header_block, &mut header_slots) {
-            Ok(httparse::Status::Complete((consumed, headers)))
-                if consumed == header_block.len() =>
-            {
-                headers
-            }
+            Ok(httparse::Status::Complete((_consumed, headers))) => headers,
             Ok(_) => {
                 return Err("multipart server action part contains incomplete headers".to_owned());
             }
@@ -4211,12 +4207,12 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn uses_exact_crlf(bytes: &[u8]) -> bool {
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\r' if bytes.get(index + 1) == Some(&b'\n') => index += 2,
+    let mut bytes = bytes.iter();
+    while let Some(byte) = bytes.next().copied() {
+        match byte {
+            b'\r' if bytes.next().copied() == Some(b'\n') => {}
             b'\r' | b'\n' => return false,
-            _ => index += 1,
+            _ => {}
         }
     }
     true
@@ -6316,7 +6312,7 @@ process.exit(1);
     #[test]
     fn multipart_action_form_accepts_text_fields_and_rejects_file_parts() {
         let content_type = "multipart/form-data; boundary=FerriteBoundary";
-        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello multipart\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\nrust\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\ntsx\r\n--FerriteBoundary--\r\n";
+        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\nContent-Type: text/plain\r\n\r\nHello multipart\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\nrust\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\ntsx\r\n--FerriteBoundary--\r\n";
         let form = parse_multipart_form(content_type, body).unwrap();
 
         assert_eq!(
@@ -6413,6 +6409,28 @@ process.exit(1);
                 error.contains("duplicate `name`")
                     || error.contains("invalid disposition parameter"),
                 "unexpected error for {disposition}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_helpers_reject_non_crlf_and_unsafe_parameter_bytes() {
+        assert!(uses_exact_crlf(
+            b"Content-Disposition: form-data\r\nContent-Type: text/plain\r\n\r\n"
+        ));
+        for bytes in [
+            &b"Content-Disposition: form-data\rX"[..],
+            &b"abc\r\n\n"[..],
+            &b"Content-Disposition: form-data\n"[..],
+        ] {
+            assert!(!uses_exact_crlf(bytes));
+        }
+
+        for value in [r#""back\slash""#, r#""embedded"quote""#, "\u{1}"] {
+            let error = multipart_parameter_value(value).unwrap_err();
+            assert!(
+                error.contains("unsupported character"),
+                "{value:?}: {error}"
             );
         }
     }
