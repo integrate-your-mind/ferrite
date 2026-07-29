@@ -18,6 +18,11 @@ name, version, `os`, `cpu`, executable mode, size, and SHA-256 before every
 execution, then invokes the binary without a shell. It never downloads a
 binary, falls back to `PATH`, or runs an install lifecycle script.
 
+The clean-consumer gate also requires the executable's reported Cargo version
+to equal the exact SemVer core of the npm package version. For example,
+`@ferrite/cli@0.1.0-alpha.0` must execute a binary that reports
+`ferrite 0.1.0`.
+
 The npm package version is passed to the Rust process through an
 installer-owned environment value. `ferrite init` validates that value as exact
 SemVer and pins both `@ferrite/runtime` and `@ferrite/cli` to it. A direct
