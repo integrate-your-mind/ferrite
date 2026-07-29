@@ -81,10 +81,35 @@ test("resolveCliBinary names an omitted optional package", () => {
           "/wrapper/package.json": JSON.stringify({
             name: "@ferrite/cli",
             version: "0.1.0-alpha.0",
+            optionalDependencies: {
+              "@ferrite/cli-darwin-arm64": "0.1.0-alpha.0",
+            },
           }),
         }),
       }),
     /@ferrite\/cli-darwin-arm64@0\.1\.0-alpha\.0 is not installed/,
+  );
+});
+
+test("resolveCliBinary rejects a mismatched optional package declaration", () => {
+  const files = validFiles();
+  files["/wrapper/package.json"] = JSON.stringify({
+    name: "@ferrite/cli",
+    version: "0.1.0-alpha.0",
+    optionalDependencies: {
+      "@ferrite/cli-darwin-arm64": "0.1.0-alpha.1",
+    },
+  });
+  assert.throws(
+    () =>
+      resolveCliBinary({
+        platform: "darwin",
+        arch: "arm64",
+        packageRoot: "/wrapper",
+        requireFunction: validRequire(),
+        readFileSync: fakeRead(files),
+      }),
+    /must declare exact optional dependency/,
   );
 });
 
@@ -131,6 +156,7 @@ test("verifyChecksumManifest rejects size and digest tampering", () => {
     file: "bin/ferrite",
     algorithm: "sha256",
     packageVersion: "0.1.0-alpha.0",
+    runtimeVersion: "0.1.0-alpha.0",
     bytes: binary.length,
     sha256,
   };
@@ -151,6 +177,14 @@ test("verifyChecksumManifest rejects size and digest tampering", () => {
       ),
     /checksum mismatch/,
   );
+  assert.throws(
+    () =>
+      verifyChecksumManifest(
+        { ...manifest, runtimeVersion: "0.1.0-alpha.1" },
+        checksumOptions(),
+      ),
+    /runtime version.*does not match/,
+  );
 });
 
 test("launchFerrite passes exact argv and a wrapper-owned npm version", () => {
@@ -158,7 +192,7 @@ test("launchFerrite passes exact argv and a wrapper-owned npm version", () => {
   const result = launchFerrite(["init", "app with spaces"], {
     env: {
       KEEP: "yes",
-      FERRITE_NPM_PACKAGE_VERSION: "attacker-controlled",
+      FERRITE_INTERNAL_NPM_PACKAGE_VERSION: "attacker-controlled",
     },
     resolveBinary: () => ({
       path: "/verified/ferrite",
@@ -176,7 +210,7 @@ test("launchFerrite passes exact argv and a wrapper-owned npm version", () => {
   assert.equal(invocation.options.shell, false);
   assert.equal(invocation.options.env.KEEP, "yes");
   assert.equal(
-    invocation.options.env.FERRITE_NPM_PACKAGE_VERSION,
+    invocation.options.env.FERRITE_INTERNAL_NPM_PACKAGE_VERSION,
     "0.1.0-alpha.0",
   );
 });
@@ -221,6 +255,9 @@ function validFiles() {
     "/wrapper/package.json": JSON.stringify({
       name: "@ferrite/cli",
       version: "0.1.0-alpha.0",
+      optionalDependencies: {
+        "@ferrite/cli-darwin-arm64": "0.1.0-alpha.0",
+      },
     }),
     "/platform/package.json": JSON.stringify({
       name: "@ferrite/cli-darwin-arm64",
@@ -232,6 +269,7 @@ function validFiles() {
       file: "bin/ferrite",
       algorithm: "sha256",
       packageVersion: "0.1.0-alpha.0",
+      runtimeVersion: "0.1.0-alpha.0",
       bytes: binary.length,
       sha256,
     }),

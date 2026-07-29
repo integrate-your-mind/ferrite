@@ -923,15 +923,15 @@ fn initialize_project_with_npm_version(
 }
 
 fn npm_package_version_from_environment() -> Result<Option<String>> {
-    let Some(value) = env::var_os("FERRITE_NPM_PACKAGE_VERSION") else {
+    let Some(value) = env::var_os("FERRITE_INTERNAL_NPM_PACKAGE_VERSION") else {
         return Ok(None);
     };
     let value = value.into_string().map_err(|_| {
-        CliError::Config("FERRITE_NPM_PACKAGE_VERSION must be valid Unicode".to_owned())
+        CliError::Config("FERRITE_INTERNAL_NPM_PACKAGE_VERSION must be valid Unicode".to_owned())
     })?;
     if !is_exact_semver(&value) {
         return Err(CliError::Config(
-            "FERRITE_NPM_PACKAGE_VERSION must be an exact semantic version".to_owned(),
+            "FERRITE_INTERNAL_NPM_PACKAGE_VERSION must be an exact semantic version".to_owned(),
         ));
     }
     Ok(Some(value))

@@ -32,6 +32,7 @@ const checksumFile = "ferrite-cli.sha256.json";
 export async function createCliCandidate({
   binaryPath,
   destinationRoot = join(workspaceRoot, "dist", "cli-candidate"),
+  runtimeManifestPath = join(workspaceRoot, "packages", "runtime", "package.json"),
   platform = currentPlatform,
   arch = currentArch,
   renameImpl = rename,
@@ -57,6 +58,19 @@ export async function createCliCandidate({
     throw new Error("CLI source manifest must be private @ferrite/cli.");
   }
   assertExactVersion(sourceManifest.version, "CLI package manifest");
+  const runtimeManifest = parseJson(
+    await readRegularFile(resolve(runtimeManifestPath), "runtime package manifest"),
+    "runtime package manifest",
+  );
+  if (
+    runtimeManifest.name !== "@ferrite/runtime" ||
+    runtimeManifest.version !== sourceManifest.version
+  ) {
+    throw new Error(
+      `CLI package ${sourceManifest.version} requires a matching @ferrite/runtime source version; ` +
+        `found ${String(runtimeManifest.name)}@${String(runtimeManifest.version)}.`,
+    );
+  }
 
   const binary = await readRegularFile(resolve(binaryPath), "Ferrite CLI binary", {
     executable: platform !== "win32",
@@ -82,6 +96,18 @@ export async function createCliCandidate({
     "CLI candidate parent",
   );
   const canonicalDestination = join(destinationParent, basename(destination));
+  const existingDestination = await lstat(canonicalDestination).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  if (existingDestination) {
+    await verifyCliCandidate(canonicalDestination, { platform, arch }).catch((error) => {
+      throw new Error(
+        `Refusing to replace an unverified CLI candidate at ${destination}: ${error.message}`,
+        { cause: error },
+      );
+    });
+  }
 
   const staging = join(
     destinationParent,
@@ -147,6 +173,7 @@ export async function createCliCandidate({
       file: target.binaryFile,
       algorithm: CLI_CHECKSUM_ALGORITHM,
       packageVersion: sourceManifest.version,
+      runtimeVersion: runtimeManifest.version,
       bytes: binary.length,
       sha256: createHash(CLI_CHECKSUM_ALGORITHM).update(binary).digest("hex"),
     };
@@ -170,7 +197,13 @@ export async function createCliCandidate({
     );
 
     await verifyCliCandidate(staging, { platform, arch });
-    await publishCandidate(staging, canonicalDestination, { renameImpl, removeImpl });
+    await publishCandidate(staging, canonicalDestination, {
+      expectedExisting: Boolean(existingDestination),
+      platform,
+      arch,
+      renameImpl,
+      removeImpl,
+    });
     stagingLive = false;
   } catch (error) {
     operationError = error;
@@ -265,6 +298,28 @@ export async function verifyCliCandidate(
   }
   assertExactVersion(wrapperManifest.version, "CLI wrapper manifest");
   if (
+    wrapperManifest.bin?.ferrite !== "./bin/ferrite.mjs" ||
+    !sameStringSet(wrapperManifest.files, ["bin", "lib"]) ||
+    wrapperManifest.publishConfig?.access !== "public" ||
+    typeof wrapperManifest.engines?.node !== "string"
+  ) {
+    throw new Error(
+      "CLI wrapper manifest must expose only the launcher files, public access, and a Node engine.",
+    );
+  }
+  if (
+    Object.hasOwn(wrapperManifest, "scripts") ||
+    hasEntries(wrapperManifest.dependencies) ||
+    hasEntries(wrapperManifest.peerDependencies) ||
+    hasEntries(wrapperManifest.devDependencies) ||
+    hasEntries(wrapperManifest.bundleDependencies) ||
+    hasEntries(wrapperManifest.bundledDependencies)
+  ) {
+    throw new Error(
+      "CLI wrapper candidate must not contain scripts or non-optional dependencies.",
+    );
+  }
+  if (
     Object.keys(wrapperManifest.optionalDependencies ?? {}).length !== 1 ||
     wrapperManifest.optionalDependencies?.[target.packageName] !==
       wrapperManifest.version
@@ -279,7 +334,15 @@ export async function verifyCliCandidate(
     platformManifest.os?.length !== 1 ||
     platformManifest.os[0] !== target.os ||
     platformManifest.cpu?.length !== 1 ||
-    platformManifest.cpu[0] !== target.cpu
+    platformManifest.cpu[0] !== target.cpu ||
+    !sameStringSet(platformManifest.files, ["bin", checksumFile]) ||
+    platformManifest.publishConfig?.access !== "public" ||
+    platformManifest.exports?.[`./${target.binaryFile}`] !==
+      `./${target.binaryFile}` ||
+    platformManifest.exports?.[`./${checksumFile}`] !== `./${checksumFile}` ||
+    platformManifest.exports?.["./package.json"] !== "./package.json" ||
+    Object.hasOwn(platformManifest, "scripts") ||
+    hasEntries(platformManifest.dependencies)
   ) {
     throw new Error("CLI platform manifest does not match the wrapper target contract.");
   }
@@ -311,13 +374,31 @@ export async function verifyCliCandidate(
   };
 }
 
-async function publishCandidate(staging, destination, { renameImpl, removeImpl }) {
+async function publishCandidate(
+  staging,
+  destination,
+  {
+    expectedExisting,
+    platform,
+    arch,
+    renameImpl,
+    removeImpl,
+  },
+) {
   const destinationInfo = await lstat(destination).catch((error) => {
     if (error?.code === "ENOENT") return null;
     throw error;
   });
   if (destinationInfo?.isSymbolicLink()) {
     throw new Error(`CLI candidate destination must not be a symbolic link: ${destination}.`);
+  }
+  if (Boolean(destinationInfo) !== expectedExisting) {
+    throw new Error(
+      `CLI candidate destination changed during creation; refusing to publish: ${destination}.`,
+    );
+  }
+  if (destinationInfo) {
+    await verifyCliCandidate(destination, { platform, arch });
   }
 
   const backup = `${destination}.backup-${process.pid}-${randomUUID()}`;
@@ -326,6 +407,7 @@ async function publishCandidate(staging, destination, { renameImpl, removeImpl }
     if (destinationInfo) {
       await renameImpl(destination, backup);
       priorMoved = true;
+      await verifyCliCandidate(backup, { platform, arch });
     }
     await renameImpl(staging, destination);
   } catch (error) {
@@ -425,6 +507,20 @@ function assertExactEntries(actual, expected, label) {
       `${label} must contain exactly ${expected.join(", ")}; found ${sorted.join(", ")}.`,
     );
   }
+}
+
+function hasEntries(value) {
+  return value !== undefined && Object.keys(value).length > 0;
+}
+
+function sameStringSet(actual, expected) {
+  if (!Array.isArray(actual) || actual.length !== expected.length) {
+    return false;
+  }
+  const expectedSorted = [...expected].sort();
+  return [...actual]
+    .sort()
+    .every((entry, index) => entry === expectedSorted[index]);
 }
 
 function parseJson(bytes, label) {

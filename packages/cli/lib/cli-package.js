@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const checksumFile = "ferrite-cli.sha256.json";
-const npmVersionEnvironmentVariable = "FERRITE_NPM_PACKAGE_VERSION";
+const npmVersionEnvironmentVariable = "FERRITE_INTERNAL_NPM_PACKAGE_VERSION";
 
 export const CLI_CHECKSUM_ALGORITHM = "sha256";
 export const SUPPORTED_CLI_TARGETS = Object.freeze([
@@ -86,6 +86,14 @@ export function resolveCliBinary({
     readFileSync,
   );
   assertPackageVersion(wrapperManifest, "@ferrite/cli package manifest");
+  if (
+    wrapperManifest.optionalDependencies?.[target.packageName] !==
+    wrapperManifest.version
+  ) {
+    throw new Error(
+      `@ferrite/cli must declare exact optional dependency ${target.packageName}@${wrapperManifest.version}.`,
+    );
+  }
 
   const paths = resolveTargetFiles(requireFunction, target);
   if (!paths) {
@@ -183,6 +191,12 @@ export function verifyChecksumManifest(
   if (manifest.packageVersion !== packageVersion) {
     throw new Error(
       `${packageName} ${checksumFile} package version ${String(manifest.packageVersion)} ` +
+        `does not match @ferrite/cli ${packageVersion}.`,
+    );
+  }
+  if (manifest.runtimeVersion !== packageVersion) {
+    throw new Error(
+      `${packageName} ${checksumFile} runtime version ${String(manifest.runtimeVersion)} ` +
         `does not match @ferrite/cli ${packageVersion}.`,
     );
   }

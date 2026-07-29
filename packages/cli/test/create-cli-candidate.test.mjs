@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   chmod,
   lstat,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -93,6 +94,30 @@ test("createCliCandidate rejects unverified platforms before writing output", as
   });
 });
 
+test("createCliCandidate rejects CLI and runtime package version drift", async () => {
+  await usingFixture(async ({ binary, root }) => {
+    const runtimeManifest = join(root, "runtime-package.json");
+    await writeFile(
+      runtimeManifest,
+      `${JSON.stringify({
+        name: "@ferrite/runtime",
+        version: "0.1.0-alpha.1",
+      })}\n`,
+    );
+    const destination = join(root, "version-drift-output");
+
+    await assert.rejects(
+      createCliCandidate({
+        binaryPath: binary,
+        destinationRoot: destination,
+        runtimeManifestPath: runtimeManifest,
+      }),
+      /requires a matching @ferrite\/runtime source version/,
+    );
+    await assert.rejects(lstat(destination), { code: "ENOENT" });
+  });
+});
+
 test("verifyCliCandidate rejects a modified packaged binary", async () => {
   await usingFixture(async ({ binary, root }) => {
     const destination = join(root, "candidate");
@@ -108,12 +133,68 @@ test("verifyCliCandidate rejects a modified packaged binary", async () => {
   });
 });
 
+test("verifyCliCandidate rejects lifecycle scripts and broken platform exports", async () => {
+  await usingFixture(async ({ binary, root }) => {
+    const lifecycleDestination = join(root, "lifecycle-candidate");
+    await createCliCandidate({
+      binaryPath: binary,
+      destinationRoot: lifecycleDestination,
+    });
+    const wrapperManifestPath = join(
+      lifecycleDestination,
+      "cli",
+      "package.json",
+    );
+    const wrapperManifest = JSON.parse(
+      await readFile(wrapperManifestPath, "utf8"),
+    );
+    wrapperManifest.scripts = { postinstall: "node download-binary.js" };
+    await writeFile(
+      wrapperManifestPath,
+      `${JSON.stringify(wrapperManifest, null, 2)}\n`,
+    );
+    await assert.rejects(
+      verifyCliCandidate(lifecycleDestination),
+      /must not contain scripts or non-optional dependencies/,
+    );
+
+    const exportsDestination = join(root, "exports-candidate");
+    await createCliCandidate({
+      binaryPath: binary,
+      destinationRoot: exportsDestination,
+    });
+    const platformManifestPath = join(
+      exportsDestination,
+      "cli-darwin-arm64",
+      "package.json",
+    );
+    const platformManifest = JSON.parse(
+      await readFile(platformManifestPath, "utf8"),
+    );
+    delete platformManifest.exports["./bin/ferrite"];
+    await writeFile(
+      platformManifestPath,
+      `${JSON.stringify(platformManifest, null, 2)}\n`,
+    );
+    await assert.rejects(
+      verifyCliCandidate(exportsDestination),
+      /platform manifest does not match/,
+    );
+  });
+});
+
 test("createCliCandidate restores prior output when publication fails", async () => {
   await usingFixture(async ({ binary, root }) => {
     const destination = join(root, "candidate");
     await createCliCandidate({ binaryPath: binary, destinationRoot: destination });
-    const marker = join(destination, "owned-marker");
-    await writeFile(marker, "keep\n");
+    const priorChecksum = await readFile(
+      join(
+        destination,
+        "cli-darwin-arm64",
+        "ferrite-cli.sha256.json",
+      ),
+      "utf8",
+    );
 
     await assert.rejects(
       createCliCandidate({
@@ -129,11 +210,37 @@ test("createCliCandidate restores prior output when publication fails", async ()
       /injected publication failure/,
     );
 
-    assert.equal(await readFile(marker, "utf8"), "keep\n");
+    assert.equal(
+      await readFile(
+        join(
+          destination,
+          "cli-darwin-arm64",
+          "ferrite-cli.sha256.json",
+        ),
+        "utf8",
+      ),
+      priorChecksum,
+    );
+    await verifyCliCandidate(destination);
     const residue = (await readdir(root)).filter(
       (name) => name.includes(".staging-") || name.includes(".backup-"),
     );
     assert.deepEqual(residue, []);
+  });
+});
+
+test("createCliCandidate preserves an unrelated existing destination", async () => {
+  await usingFixture(async ({ binary, root }) => {
+    const destination = join(root, "owned-directory");
+    await mkdir(destination, { recursive: true });
+    const marker = join(destination, "owned.txt");
+    await writeFile(marker, "keep\n");
+
+    await assert.rejects(
+      createCliCandidate({ binaryPath: binary, destinationRoot: destination }),
+      /Refusing to replace an unverified CLI candidate/,
+    );
+    assert.equal(await readFile(marker, "utf8"), "keep\n");
   });
 });
 
