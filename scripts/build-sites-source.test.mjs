@@ -87,7 +87,11 @@ test("Sites source build rejects ambiguous or unsafe origins", () => {
 });
 
 test("Sites source build avoids recursive package-manager scripts", () => {
-  const plan = buildPlan("/trusted/cargo");
+  const plan = buildPlan("/trusted/cargo", {
+    artifactDirectory: "/isolated/artifact",
+    distDirectory: "/isolated/dist",
+    typesOutput: "/isolated/types/routes.d.ts",
+  });
   assert.equal(plan.length, 4);
   assert.deepEqual(
     plan.map(({ command }) => command),
@@ -102,7 +106,21 @@ test("Sites source build avoids recursive package-manager scripts", () => {
     /packages[/\\]runtime[/\\]tsconfig\.json/,
   );
   assert.deepEqual(plan[2].args.slice(0, 2), ["run", "--locked"]);
+  const outIndex = plan[2].args.indexOf("--out");
+  const typesOutIndex = plan[2].args.indexOf("--types-out");
+  assert.deepEqual(
+    plan[2].args.slice(outIndex, outIndex + 2),
+    ["--out", "/isolated/artifact"],
+  );
+  assert.deepEqual(
+    plan[2].args.slice(typesOutIndex, typesOutIndex + 2),
+    ["--types-out", "/isolated/types/routes.d.ts"],
+  );
   assert.match(plan[3].args[0], /website[/\\]deploy-adapter\.mjs$/);
+  assert.deepEqual(
+    plan[3].args.slice(1),
+    ["/isolated/artifact", "/isolated/dist"],
+  );
   for (const step of plan) {
     assert.notEqual(step.command, "pnpm");
     assert.notEqual(step.command, "npm");
@@ -600,26 +618,84 @@ test("explicit bootstrap flag wins over ambient Cargo", async () => {
 
 test("Sites source build cleans the pinned toolchain after downstream failure", async () => {
   let cleanups = 0;
-  await assert.rejects(
-    buildSitesSource({
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-build-fail-"));
+  try {
+    await assert.rejects(
+      buildSitesSource({
+        env: {},
+        scratchParent: directory,
+        resolveCargoImpl: async () => ({
+          command: "/pinned/cargo",
+          env: {},
+          cleanup: async () => {
+            cleanups += 1;
+          },
+        }),
+        buildPlanImpl: () => [
+          { command: "failure", args: [], timeoutMs: 1 },
+        ],
+        runImpl: async () => {
+          throw new Error("downstream build failed");
+        },
+      }),
+      /downstream build failed/,
+    );
+    assert.equal(cleanups, 1);
+    assert.deepEqual(await readdir(directory), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Sites source build isolates each artifact and packaged output", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-build-"));
+  const destination = join(directory, "destination");
+  let planOptions;
+  let sourceForReplacement;
+  let toolchainCleanups = 0;
+  try {
+    const result = await buildSitesSource({
       env: {},
+      scratchParent: join(directory, "scratch"),
+      outputDist: destination,
       resolveCargoImpl: async () => ({
         command: "/pinned/cargo",
         env: {},
         cleanup: async () => {
-          cleanups += 1;
+          toolchainCleanups += 1;
         },
       }),
-      buildPlanImpl: () => [
-        { command: "failure", args: [], timeoutMs: 1 },
-      ],
-      runImpl: async () => {
-        throw new Error("downstream build failed");
+      buildPlanImpl: (_cargo, options) => {
+        planOptions = options;
+        return [{ command: "success", args: [], timeoutMs: 1 }];
       },
-    }),
-    /downstream build failed/,
-  );
-  assert.equal(cleanups, 1);
+      runImpl: async () => {},
+      requireDirectoryImpl: async () => {},
+      replaceSiteOutputImpl: async (source, output) => {
+        sourceForReplacement = source;
+        assert.equal(output, destination);
+      },
+    });
+
+    assert.equal(result.outputDist, destination);
+    assert.equal(sourceForReplacement, planOptions.distDirectory);
+    assert.equal(
+      planOptions.artifactDirectory,
+      join(
+        planOptions.distDirectory,
+        "..",
+        "artifact",
+      ),
+    );
+    assert.equal(
+      planOptions.typesOutput,
+      join(planOptions.distDirectory, "..", "types", "routes.d.ts"),
+    );
+    assert.equal(toolchainCleanups, 1);
+    assert.deepEqual(await readdir(join(directory, "scratch")), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("site output replacement preserves npm release and CI evidence", async () => {
@@ -835,6 +911,81 @@ test("site output replacement serializes concurrent transactions", async () => {
     );
   } finally {
     releaseCopy?.();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement rejects source drift before activation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-source-drift-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  let copies = 0;
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination, {
+        cpImpl: async (...args) => {
+          await cp(...args);
+          copies += 1;
+          if (copies === 1) {
+            await writeFile(
+              join(source, "client", "marker.txt"),
+              "raced:client",
+            );
+          }
+        },
+      }),
+      /website dist changed during site output snapshot/,
+    );
+
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `old:${name}`,
+      );
+    }
+    assert.equal(
+      (await readdir(destination)).includes(SITE_OUTPUT_LOCK),
+      false,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement rejects a corrupted staged copy before activation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-copy-drift-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination, {
+        cpImpl: async (from, to, options) => {
+          await cp(from, to, options);
+          if (from === join(source, "client")) {
+            await writeFile(join(to, "marker.txt"), "corrupt:client");
+          }
+        },
+      }),
+      /website dist changed during site output snapshot/,
+    );
+
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `old:${name}`,
+      );
+    }
+    assert.equal(
+      (await readdir(destination)).includes(SITE_OUTPUT_LOCK),
+      false,
+    );
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
