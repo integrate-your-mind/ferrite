@@ -6473,22 +6473,44 @@ process.exit(1);
     #[test]
     fn multipart_action_form_enforces_part_and_header_count_budgets() {
         let content_type = "multipart/form-data; boundary=FerriteBoundary";
-        let mut too_many_parts = String::new();
-        for index in 0..=MAX_MULTIPART_PARTS {
-            too_many_parts.push_str(&format!(
-                "--FerriteBoundary\r\nContent-Disposition: form-data; name=\"field-{index}\"\r\n\r\nvalue\r\n"
-            ));
-        }
-        too_many_parts.push_str("--FerriteBoundary--\r\n");
+        let multipart_with_parts = |part_count: usize| {
+            let mut body = String::new();
+            for index in 0..part_count {
+                body.push_str(&format!(
+                    "--FerriteBoundary\r\nContent-Disposition: form-data; name=\"field-{index}\"\r\n\r\nvalue\r\n"
+                ));
+            }
+            body.push_str("--FerriteBoundary--\r\n");
+            body
+        };
+
+        let exact_parts = multipart_with_parts(MAX_MULTIPART_PARTS);
+        let exact_form = parse_multipart_form(content_type, exact_parts.as_bytes()).unwrap();
+        assert_eq!(exact_form.len(), MAX_MULTIPART_PARTS);
+
+        let too_many_parts = multipart_with_parts(MAX_MULTIPART_PARTS + 1);
         let part_error = parse_multipart_form(content_type, too_many_parts.as_bytes()).unwrap_err();
         assert!(part_error.contains("part limit"), "{part_error}");
 
-        let mut too_many_headers =
-            String::from("--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n");
-        for index in 0..MAX_MULTIPART_PART_HEADERS {
-            too_many_headers.push_str(&format!("X-Test-{index}: value\r\n"));
-        }
-        too_many_headers.push_str("\r\nvalue\r\n--FerriteBoundary--\r\n");
+        let multipart_with_extra_headers = |extra_header_count: usize| {
+            let mut body = String::from(
+                "--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n",
+            );
+            for index in 0..extra_header_count {
+                body.push_str(&format!("X-Test-{index}: value\r\n"));
+            }
+            body.push_str("\r\nvalue\r\n--FerriteBoundary--\r\n");
+            body
+        };
+
+        let exact_headers = multipart_with_extra_headers(MAX_MULTIPART_PART_HEADERS - 1);
+        let exact_form = parse_multipart_form(content_type, exact_headers.as_bytes()).unwrap();
+        assert_eq!(
+            exact_form.get("title"),
+            Some(&ServerActionFormValue::String("value".to_owned()))
+        );
+
+        let too_many_headers = multipart_with_extra_headers(MAX_MULTIPART_PART_HEADERS);
         let header_error =
             parse_multipart_form(content_type, too_many_headers.as_bytes()).unwrap_err();
         assert!(header_error.contains("header limit"), "{header_error}");
@@ -6947,7 +6969,7 @@ process.exit(1);
     }
 
     #[test]
-    fn dev_and_production_reject_truncated_multipart_before_action_invocation() {
+    fn dev_and_production_reject_unsafe_multipart_before_action_invocation() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
         write(
@@ -6972,42 +6994,55 @@ if (process.argv[2] === "--server-action") {{
 process.exit(1);
 "#
         );
-        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_action\"\r\n\r\napp/posts/[id]/page.tsx#savePost\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_route\"\r\n\r\n/posts/abc\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nmust not execute";
-        let request = format!(
-            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=FerriteBoundary\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            String::from_utf8_lossy(body)
-        );
-
-        let responses = [
+        let cases: &[(&str, &[u8], &str)] = &[
             (
-                "dev",
-                dev_http_request(action_project_for(&app, &renderer), request.as_bytes()),
+                "truncated",
+                b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_action\"\r\n\r\napp/posts/[id]/page.tsx#savePost\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_route\"\r\n\r\n/posts/abc\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nmust not execute",
+                "terminal boundary",
             ),
             (
-                "production",
-                production_http_request(
-                    action_production_project_for(&app, &renderer),
-                    request.as_bytes(),
-                ),
+                "filename traversal",
+                b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_action\"\r\n\r\napp/posts/[id]/page.tsx#savePost\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_route\"\r\n\r\n/posts/abc\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"asset\"; filename=\"../../etc/passwd\"\r\nContent-Type: application/octet-stream\r\n\r\nmust not execute\r\n--FerriteBoundary--\r\n",
+                "file parts",
             ),
         ];
 
-        for (adapter, response) in responses {
-            let headers = response_headers(&response);
-            let response_body = String::from_utf8_lossy(response_body(&response));
-            assert!(
-                headers.starts_with("HTTP/1.1 400 Bad Request"),
-                "{adapter}: {headers}"
+        for &(case, body, expected_error) in cases {
+            let request = format!(
+                "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=FerriteBoundary\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
             );
-            assert!(
-                response_body.contains("terminal boundary"),
-                "{adapter}: {response_body}"
-            );
-            assert!(
-                !invocation_marker.exists(),
-                "{adapter} invoked the action for a truncated multipart body"
-            );
+            let responses = [
+                (
+                    "dev",
+                    dev_http_request(action_project_for(&app, &renderer), request.as_bytes()),
+                ),
+                (
+                    "production",
+                    production_http_request(
+                        action_production_project_for(&app, &renderer),
+                        request.as_bytes(),
+                    ),
+                ),
+            ];
+
+            for (adapter, response) in responses {
+                let headers = response_headers(&response);
+                let response_body = String::from_utf8_lossy(response_body(&response));
+                assert!(
+                    headers.starts_with("HTTP/1.1 400 Bad Request"),
+                    "{adapter} {case}: {headers}"
+                );
+                assert!(
+                    response_body.contains(expected_error),
+                    "{adapter} {case}: {response_body}"
+                );
+                assert!(
+                    !invocation_marker.exists(),
+                    "{adapter} invoked the action for {case} multipart"
+                );
+            }
         }
     }
 
