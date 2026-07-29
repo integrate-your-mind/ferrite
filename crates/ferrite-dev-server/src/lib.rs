@@ -4225,11 +4225,21 @@ fn uses_exact_crlf(bytes: &[u8]) -> bool {
 fn multipart_boundary(content_type: &str) -> FormParseResult<String> {
     let mut boundary = None;
     for parameter in content_type.split(';').skip(1) {
-        let Some((name, value)) = parameter.trim().split_once('=') else {
-            continue;
-        };
-        if !name.trim().eq_ignore_ascii_case("boundary") {
-            continue;
+        let parameter = parameter.trim();
+        if parameter.is_empty() {
+            return Err("multipart server action form contains an empty parameter".to_owned());
+        }
+        let (name, value) = parameter.split_once('=').ok_or_else(|| {
+            "multipart server action form contains an invalid parameter".to_owned()
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("multipart server action form contains an invalid parameter".to_owned());
+        }
+        if !name.eq_ignore_ascii_case("boundary") {
+            return Err(format!(
+                "multipart server action form contains unsupported `{name}` parameter"
+            ));
         }
         if boundary.is_some() {
             return Err("multipart server action form contains duplicate boundaries".to_owned());
@@ -6362,6 +6372,27 @@ process.exit(1);
     }
 
     #[test]
+    fn multipart_action_form_rejects_invalid_or_duplicate_disposition_parameters() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        for disposition in [
+            "form-data; name=\"first\"; name=\"second\"",
+            "form-data; name=\"first\"; malformed",
+        ] {
+            let body = format!(
+                "--FerriteBoundary\r\nContent-Disposition: {disposition}\r\n\r\npayload\r\n--FerriteBoundary--\r\n"
+            );
+
+            let error = parse_multipart_form(content_type, body.as_bytes()).unwrap_err();
+
+            assert!(
+                error.contains("duplicate `name`")
+                    || error.contains("invalid disposition parameter"),
+                "unexpected error for {disposition}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn multipart_action_form_rejects_mixed_lf_part_headers() {
         let content_type = "multipart/form-data; boundary=FerriteBoundary";
         let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\nX-Test: accepted-by-lenient-parser\r\n\r\npayload\r\n--FerriteBoundary--\r\n";
@@ -6454,18 +6485,45 @@ process.exit(1);
     #[test]
     fn multipart_action_form_rejects_invalid_boundary_parameters() {
         let body = b"--FerriteBoundary--\r\n";
-        for content_type in [
-            "multipart/form-data",
-            "multipart/form-data; boundary=FerriteBoundary; boundary=Other",
-            "multipart/form-data; boundary=contains space",
-            "multipart/form-data; boundary=\"unterminated",
+        for (content_type, expected_error) in [
+            ("multipart/form-data", "missing a boundary"),
+            (
+                "multipart/form-data; boundary=FerriteBoundary; boundary=Other",
+                "duplicate boundaries",
+            ),
+            (
+                "multipart/form-data; boundary; boundary=FerriteBoundary",
+                "invalid parameter",
+            ),
+            (
+                "multipart/form-data; boundary=FerriteBoundary; boundary",
+                "invalid parameter",
+            ),
+            (
+                "multipart/form-data; =ignored; boundary=FerriteBoundary",
+                "invalid parameter",
+            ),
+            (
+                "multipart/form-data; boundary=FerriteBoundary;",
+                "empty parameter",
+            ),
+            (
+                "multipart/form-data; note=\"unterminated; boundary=FerriteBoundary",
+                "unsupported `note` parameter",
+            ),
+            (
+                "multipart/form-data; boundary=contains space",
+                "boundary is invalid",
+            ),
+            (
+                "multipart/form-data; boundary=\"unterminated",
+                "unterminated quoted value",
+            ),
         ] {
             let error = parse_multipart_form(content_type, body).unwrap_err();
             assert!(
-                error.contains("boundary")
-                    || error.contains("boundaries")
-                    || error.contains("quoted"),
-                "{content_type}: {error}"
+                error.contains(expected_error),
+                "{content_type}: expected `{expected_error}`, received `{error}`"
             );
         }
     }

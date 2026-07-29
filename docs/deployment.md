@@ -104,9 +104,10 @@ The Rust dev and production adapters intentionally share one narrow proxy-upstre
 - one request is processed per connection and every response closes the connection; already-buffered bytes beyond the declared request are rejected, and HTTP pipelining is unsupported
 
 Server-action multipart requests are limited to UTF-8 text fields. Ferrite
-requires exact CRLF part headers plus exact opening and terminal boundaries,
+requires exactly one validated `boundary` media-type parameter, exact CRLF part
+headers, and exact opening and terminal boundaries,
 rejects duplicate `Content-Disposition` and `Content-Type` part headers, caps a
-request at 128 parts and 16 headers per part, and rejects binary text plus
+request at 128 parts and 16 headers per part, and rejects non-UTF-8 values plus
 `filename`, `filename*`, and continued filename parameters before action
 invocation. There is no request streaming, temporary upload directory,
 file-value protocol, per-file persistence, disconnect-to-action cancellation,
