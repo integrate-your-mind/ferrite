@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   symlink,
@@ -24,6 +25,7 @@ import {
   installZigLinker,
   readBoundedBody,
   replaceSiteOutput,
+  run,
   resolveXzReadableStream,
   resolveCargo,
   RUST_TOOLCHAIN,
@@ -724,6 +726,9 @@ test("site output replacement preserves npm release and CI evidence", async () =
     await writeFile(receipt, "immutable receipt");
     await writeFile(tarball, "immutable tarball");
     await writeFile(ciReceipt, "immutable CI evidence");
+    const cliSentinel = join(destination, "cli", "ferrite");
+    await mkdir(join(destination, "cli"), { recursive: true });
+    await writeFile(cliSentinel, "immutable cli launcher");
 
     await replaceSiteOutput(source, destination);
 
@@ -736,6 +741,7 @@ test("site output replacement preserves npm release and CI evidence", async () =
     assert.equal(await readFile(receipt, "utf8"), "immutable receipt");
     assert.equal(await readFile(tarball, "utf8"), "immutable tarball");
     assert.equal(await readFile(ciReceipt, "utf8"), "immutable CI evidence");
+    assert.equal(await readFile(cliSentinel, "utf8"), "immutable cli launcher");
     assert.deepEqual(
       (await readdir(destination)).filter((name) => name.startsWith(".site-")),
       [],
@@ -768,6 +774,9 @@ test("site output replacement rolls back without touching release evidence", asy
     });
     await writeFile(receipt, "immutable receipt");
     await writeFile(tarball, "immutable tarball");
+    const cliSentinel = join(destination, "cli", "ferrite");
+    await mkdir(join(destination, "cli"), { recursive: true });
+    await writeFile(cliSentinel, "immutable cli launcher");
 
     await assert.rejects(
       replaceSiteOutput(source, destination, {
@@ -792,6 +801,7 @@ test("site output replacement rolls back without touching release evidence", asy
     }
     assert.equal(await readFile(receipt, "utf8"), "immutable receipt");
     assert.equal(await readFile(tarball, "utf8"), "immutable tarball");
+    assert.equal(await readFile(cliSentinel, "utf8"), "immutable cli launcher");
     assert.equal(
       (await readdir(destination)).includes(SITE_OUTPUT_LOCK),
       false,
@@ -815,6 +825,9 @@ test("site output replacement rejects unexpected source entries before mutation"
     await mkdir(join(source, "npm-packages"), { recursive: true });
     await mkdir(join(destination, "npm-packages"), { recursive: true });
     await writeFile(receipt, "immutable receipt");
+    const cliSentinel = join(destination, "cli", "ferrite");
+    await mkdir(join(destination, "cli"), { recursive: true });
+    await writeFile(cliSentinel, "immutable cli launcher");
 
     await assert.rejects(
       replaceSiteOutput(source, destination),
@@ -822,7 +835,91 @@ test("site output replacement rejects unexpected source entries before mutation"
     );
 
     assert.equal(await readFile(receipt, "utf8"), "immutable receipt");
-    assert.deepEqual(await readdir(destination), ["npm-packages"]);
+    assert.equal(await readFile(cliSentinel, "utf8"), "immutable cli launcher");
+    assert.deepEqual((await readdir(destination)).sort(), ["cli", "npm-packages"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement rejects nested symlinks before mutating destination", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-nested-symlink-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  const outside = join(directory, "outside.txt");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+    await writeFile(outside, "outside");
+    await symlink(outside, join(source, "client", "outside.txt"));
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination),
+      /website dist snapshot must not contain symlinks/,
+    );
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `old:${name}`,
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement rejects special files before mutating destination", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("mkfifo is unavailable on Windows");
+    return;
+  }
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-special-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  const special = join(source, "server", "socket");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+    const fifo = spawnSync("mkfifo", [special]);
+    assert.equal(fifo.status, 0, fifo.stderr?.toString() ?? "mkfifo failed");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination),
+      /website dist snapshot must contain only directories and regular files/,
+    );
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `old:${name}`,
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement rejects canonical-root escape before mutation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-canonical-escape-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+    const sourceRoot = await realpath(source);
+    const escaped = join(directory, "outside");
+    await assert.rejects(
+      replaceSiteOutput(source, destination, {
+        realpathImpl: async (path) =>
+          path === join(sourceRoot, "client") ? escaped : realpath(path),
+      }),
+      /website dist snapshot escaped its canonical root/,
+    );
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `old:${name}`,
+      );
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -932,7 +1029,7 @@ test("site output replacement rejects source drift before activation", async () 
           if (copies === 1) {
             await writeFile(
               join(source, "client", "marker.txt"),
-              "raced:client",
+              "old:client",
             );
           }
         },
@@ -1136,6 +1233,99 @@ test("site output replacement reports lock removal failure without hiding instal
         `new:${name}`,
       );
     }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement aggregates operation and cleanup failures", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-error-aggregate-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+    await assert.rejects(
+      replaceSiteOutput(source, destination, {
+        renameImpl: async (from, to) => {
+          if (from.includes(".site-next-") && from.endsWith("server")) {
+            throw new Error("injected operation failure");
+          }
+          await rename(from, to);
+        },
+        rmImpl: async (path, options) => {
+          if (path.includes(".site-next-")) {
+            throw new Error("injected cleanup failure");
+          }
+          await rm(path, options);
+        },
+      }),
+      (error) => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(
+          error.errors.map(({ message }) => message),
+          ["injected operation failure", "injected cleanup failure"],
+        );
+        assert.match(error.message, /preserve .*site-build-lock.*remaining scratch/);
+        return true;
+      },
+    );
+    const names = await readdir(destination);
+    assert.ok(names.includes(SITE_OUTPUT_LOCK));
+    assert.ok(names.some((name) => name.startsWith(".site-next-")));
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `old:${name}`,
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("run timeout terminates the owned descendant process group", {
+  skip: process.platform === "win32" ? "process groups are not supported" : false,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-run-timeout-"));
+  const marker = join(directory, "descendant-survived");
+  const groupFile = join(directory, "owned-process-group");
+  const parentScript = join(directory, "parent.mjs");
+  try {
+    await writeFile(
+      parentScript,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        "writeFileSync(process.env.FERRITE_TIMEOUT_GROUP, String(process.pid));",
+        "spawn(process.execPath, [",
+        '  "-e",',
+        '  "process.on(\'SIGTERM\', () => {}); setTimeout(() => require(\'node:fs\').writeFileSync(process.env.FERRITE_TIMEOUT_MARKER, \'survived\'), 2000); setInterval(() => {}, 1000);",',
+        "], { env: process.env, stdio: \"ignore\" });",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    await assert.rejects(
+      run(
+        process.execPath,
+        [parentScript],
+        {
+          ...process.env,
+          FERRITE_TIMEOUT_GROUP: groupFile,
+          FERRITE_TIMEOUT_MARKER: marker,
+        },
+        500,
+        50,
+      ),
+      /timed out after 500ms/,
+    );
+    const ownedGroup = Number(await readFile(groupFile, "utf8"));
+    assert.ok(Number.isSafeInteger(ownedGroup) && ownedGroup > 0);
+    assert.throws(
+      () => process.kill(-ownedGroup, 0),
+      (error) => error?.code === "ESRCH",
+    );
+    await assert.rejects(readFile(marker), (error) => error?.code === "ENOENT");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

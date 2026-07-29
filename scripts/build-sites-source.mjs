@@ -144,7 +144,35 @@ function terminate(child, detached, signal) {
   }
 }
 
-export async function run(command, args, env, timeoutMs = 2 * 60_000) {
+function processGroupExists(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code === "EPERM") return true;
+    throw error;
+  }
+}
+
+async function waitForOwnedProcessGroupExit(pid, detached, timeoutMs) {
+  if (!detached || !pid) return;
+  const deadline = Date.now() + timeoutMs;
+  while (processGroupExists(pid)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`owned process group ${pid} did not terminate within ${timeoutMs}ms`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+export async function run(
+  command,
+  args,
+  env,
+  timeoutMs = 2 * 60_000,
+  terminateGraceMs = 5_000,
+) {
   await new Promise((accept, reject) => {
     const detached = process.platform !== "win32";
     const child = spawn(command, args, {
@@ -153,6 +181,7 @@ export async function run(command, args, env, timeoutMs = 2 * 60_000) {
       env,
       stdio: "inherit",
     });
+    const ownedPid = child.pid;
     let settled = false;
     let timeoutError = null;
     let killTimer = null;
@@ -169,8 +198,7 @@ export async function run(command, args, env, timeoutMs = 2 * 60_000) {
         } catch (error) {
           timeoutError = new Error(`${timeoutError.message}; forced termination failed: ${error.message}`);
         }
-        finish(timeoutError);
-      }, 5_000);
+      }, terminateGraceMs);
     }, timeoutMs);
     const finish = (error) => {
       if (settled) return;
@@ -183,6 +211,17 @@ export async function run(command, args, env, timeoutMs = 2 * 60_000) {
     child.once("error", finish);
     child.once("close", (code, signal) => {
       if (timeoutError) {
+        void waitForOwnedProcessGroupExit(
+          ownedPid,
+          detached,
+          terminateGraceMs + 5_000,
+        ).then(
+          () => finish(timeoutError),
+          (cleanupError) => finish(new AggregateError(
+            [timeoutError, cleanupError],
+            `${timeoutError.message}; owned process cleanup failed: ${cleanupError.message}`,
+          )),
+        );
         return;
       }
       if (code === 0) {

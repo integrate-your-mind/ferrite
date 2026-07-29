@@ -21,6 +21,37 @@ export const PORTABLE_RELEASE_PACKAGES = Object.freeze([
   "@ferrite/runtime",
 ]);
 
+export const REQUIRED_BUILDKITE_JOBS = Object.freeze([
+  Object.freeze({
+    stepKey: "ferrite-pipeline-upload",
+    command: "./.buildkite/scripts/upload-pipeline.mjs",
+  }),
+  Object.freeze({
+    stepKey: "ferrite-verify",
+    command: "./.buildkite/scripts/ci.mjs verify",
+  }),
+  Object.freeze({
+    stepKey: "ferrite-packages",
+    command: "./.buildkite/scripts/ci.mjs packages",
+  }),
+  Object.freeze({
+    stepKey: "ferrite-coverage-rust",
+    command: "./.buildkite/scripts/ci.mjs coverage-rust",
+  }),
+  Object.freeze({
+    stepKey: "ferrite-coverage-js",
+    command: "./.buildkite/scripts/ci.mjs coverage-js",
+  }),
+  Object.freeze({
+    stepKey: "ferrite-native",
+    command: "./.buildkite/scripts/ci.mjs native",
+  }),
+  Object.freeze({
+    stepKey: "ferrite-nginx",
+    command: "./.buildkite/scripts/ci.mjs nginx",
+  }),
+]);
+
 export async function prepareNpmRelease({
   reportPath,
   version = "0.1.0-alpha.0",
@@ -150,14 +181,40 @@ export async function verifyBuildkiteReport({
   ) {
     throw new Error("npm release report Buildkite build identity is not a passed exact-source build.");
   }
-  const job = build.jobs?.find(({ id }) => id === buildIdentity.jobId);
+  const currentJobs = (build.jobs ?? []).filter((job) => job?.retried !== true);
+  const requiredKeys = new Set(REQUIRED_BUILDKITE_JOBS.map(({ stepKey }) => stepKey));
+  const currentScriptJobs = currentJobs.filter((job) => job?.type === "script");
   if (
-    !job ||
-    job.step_key !== "ferrite-packages" ||
-    job.command !== "./.buildkite/scripts/ci.mjs packages" ||
-    job.state !== "passed" ||
-    job.exit_status !== 0
+    currentScriptJobs.length !== REQUIRED_BUILDKITE_JOBS.length ||
+    currentScriptJobs.some((job) => !requiredKeys.has(job.step_key))
   ) {
+    throw new Error("npm release report Buildkite job topology does not match Ferrite CI.");
+  }
+
+  for (const expected of REQUIRED_BUILDKITE_JOBS) {
+    const matches = currentScriptJobs.filter(({ step_key }) => step_key === expected.stepKey);
+    if (matches.length !== 1) {
+      throw new Error(
+        `npm release report requires one current Buildkite ${expected.stepKey} job.`,
+      );
+    }
+    const [job] = matches;
+    if (
+      job.command !== expected.command ||
+      job.state !== "passed" ||
+      job.exit_status !== 0 ||
+      job.soft_failed !== false
+    ) {
+      throw new Error(
+        `npm release report Buildkite ${expected.stepKey} job did not pass its exact contract.`,
+      );
+    }
+  }
+
+  const packageJob = currentScriptJobs.find(
+    ({ step_key }) => step_key === "ferrite-packages",
+  );
+  if (packageJob?.id !== buildIdentity.jobId) {
     throw new Error("npm release report is not bound to the passed Ferrite packages job.");
   }
 

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   atomicReplaceDirectory,
@@ -36,6 +38,39 @@ const fixtureFiles = {
   "server/home.mjs": "export default {};",
   "server/docs.mjs": "export default {};",
 };
+
+const adapterScript = fileURLToPath(new URL("../deploy-adapter.mjs", import.meta.url));
+
+function runAdapterCli(args, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [adapterScript, ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`deploy adapter CLI timed out after ${timeoutMs}ms`));
+        return;
+      }
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+}
 
 function fileRecords(files) {
   return Object.entries(files)
@@ -117,6 +152,41 @@ test("deploy adapter CLI accepts defaults or an isolated artifact/output pair", 
     ["/artifact", "/dist", "/extra"],
   ]) {
     assert.throws(() => parsePackageArguments(args), /usage:/);
+  }
+});
+
+test("deploy adapter CLI packages an isolated artifact into paths containing spaces", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "ferrite adapter cli spaces "));
+  const artifact = join(fixture, "artifact input");
+  const dist = join(fixture, "dist output");
+  try {
+    await writeFixture(artifact);
+    const result = await runAdapterCli([artifact, dist]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /Ferrite Sites artifact packaged at/);
+    assert.equal(await readFile(join(dist, "client", "index.html"), "utf8"), "<h1>Home</h1>");
+    assert.equal(await readFile(join(dist, "client", "docs/index.html"), "utf8"), "<h1>Docs</h1>");
+    assert.ok((await readFile(join(dist, "server", "source-build.json"), "utf8")).includes("sourceBuildId"));
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("deploy adapter CLI rejects an invalid artifact without replacing the destination", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "ferrite adapter cli invalid "));
+  const artifact = join(fixture, "artifact");
+  const dist = join(fixture, "dist");
+  try {
+    await writeFixture(artifact);
+    await rm(join(artifact, "ferrite-server.json"));
+    await mkdir(dist, { recursive: true });
+    await writeFile(join(dist, "sentinel"), "preserve this destination");
+    const result = await runAdapterCli([artifact, dist]);
+    assert.notEqual(result.code, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /manifest|artifact/i);
+    assert.equal(await readFile(join(dist, "sentinel"), "utf8"), "preserve this destination");
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
   }
 });
 

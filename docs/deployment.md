@@ -47,19 +47,27 @@ cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/b
 cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path '/posts/abc?__ferrite_payload=stream'
 ```
 
-Remote release gates are still required before release. The GitHub repository and PR flow now exist, but hosted Actions has not yet produced job-level proof for this codebase:
+Buildkite is the active CI path. Its dedicated macOS arm64 agent executes repository-owned commands through the allowlisted hooks documented in
+[`buildkite-local-ci.md`](buildkite-local-ci.md). A passed Buildkite build must
+be bound to the exact release commit and include every required job:
 
-- CI lint, typecheck, build, tests, and browser tests
-- npm package tarball verification in CI
-- native prebuild dry-run matrix on supported hosted runners
+- lint, typecheck, build, tests, and browser tests
+- npm package tarball verification
+- Rust and JavaScript coverage
+- native prebuild verification
+- nginx proxy/runtime proof
 - artifact upload and review for npm package reports and native prebuilds
+
+Because the agent runs on a maintainer-controlled local Mac, a green Buildkite
+build is exact-SHA CI evidence but not independent hosted-runner or
+cross-platform proof. GitHub Actions is not used.
 
 ## Private Alpha Operator Gate
 
 Before giving this to an external private-alpha team, capture evidence for the
 exact revision and artifact they will use:
 
-- GitHub PR and remote CI link for the revision.
+- GitHub PR and exact-commit Buildkite link for the revision.
 - Release artifact source, either private npm package, verified tarball bundle,
   or pinned source checkout.
 - Hosted staging URL behind the chosen proxy/TLS boundary.
@@ -207,7 +215,7 @@ This command requires Node.js, OpenSSL, `tar`, and a reachable Docker daemon. It
 
 The harness runs the production image and nginx as separate containers on the same private bridge network. It does not rely on Docker host networking or a platform-specific host-gateway alias. The successful local certificate is intentionally self-signed; the harness disables verification only for the successful matrix and separately proves that the secure default rejects it. Run this command from a clean exact commit for release evidence. `FERRITE_NGINX_ALLOW_DIRTY=1` exists only for non-release development runs; such runs are labeled dirty and are not exact-SHA proof. The harness prints the candidate image id, source labels, nginx digest and architecture, and the Ferrite production build id emitted by the image build.
 
-The nginx reference is an immutable multi-platform index, so the harness records the architecture-specific image that Docker resolves rather than claiming the same image id across platforms. The candidate Dockerfile pins its Rust 1.95.0 builder to an immutable multi-platform index and asserts the compiler version before adding the WASM target. Its Node runtime tag and external Debian/NodeSource package repositories remain mutable, so this is executable source/runtime proof, not a bit-for-bit reproducible image build. The harness currently assumes POSIX process signals and Docker's `127.0.0.1:<port>` publication format, as provided by the tested macOS/Linux Docker path. Native Windows host behavior remains unproven.
+The nginx reference is an immutable multi-platform index, so the harness records the architecture-specific image that Docker resolves rather than claiming the same image id across platforms. The candidate Dockerfile pins its Rust 1.95.0 builder and Node 24 toolchain/runtime to immutable multi-platform index digests, asserts their versions, and installs no toolchain through a mutable remote setup script. Debian package snapshots and transitive package metadata can still change across rebuilds, so this is executable source/runtime proof rather than a complete bit-for-bit reproducible image claim. The harness currently assumes POSIX process signals and Docker's `127.0.0.1:<port>` publication format, as provided by the tested macOS/Linux Docker path. Native Windows host behavior remains unproven.
 
 To test an already-running candidate proxy instead, start Ferrite with `--access-log json`, retain its absolute log path, and invoke the lower-level raw framing verifier:
 
@@ -312,7 +320,7 @@ Application code may expose an expected public action failure by throwing `Ferri
 ## Known Gaps
 
 - No npm packages are published yet.
-- The GitHub remote and PR path exist, but hosted Actions has not yet produced job-level CI proof; exact-SHA local receipts remain the current executable evidence.
+- The GitHub remote and PR path exist. Buildkite is the active CI path, but its maintainer-controlled local agent does not establish independent hosted-runner or cross-platform proof.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
 - The production CLI exposes the main request/render/write limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and an in-memory Prometheus text metrics endpoint, but not tracing sinks or external audit sinks.
 - First-pass container, systemd, and nginx templates exist with local static verification; the self-contained Docker harness builds a clean exact Git archive into the artifact-only production image and runs 43 raw HTTP/1 TLS cases, seven negotiated HTTP/2 cases, five proxy-level no-upstream framing checks, nine proxy-level no-upstream malformed-target checks, and fail-closed controls against official nginx 1.29.3 selected by immutable index digest. No official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.

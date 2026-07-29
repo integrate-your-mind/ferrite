@@ -8,10 +8,12 @@ export async function publishBuildOutputs(
   stagingOutDir,
   finalOutDir,
   outputs,
-  { renameFile = rename } = {},
+  { renameFile = rename, removeDirectory = rm } = {},
 ) {
   const publishRoot = await realpath(await mkdtemp(join(finalOutDir, ".ferrite-publish-")));
   const publications = [];
+  let operationError;
+  let preservePublishRoot = false;
   try {
     for (const [index, output] of outputs.entries()) {
       const source = resolve(stagingOutDir, output);
@@ -75,15 +77,35 @@ export async function publishBuildOutputs(
     } catch (publishError) {
       const rollbackErrors = await rollbackPublishedOutputs(publications, renameFile);
       if (rollbackErrors.length > 0) {
+        preservePublishRoot = true;
         throw new AggregateError(
           [publishError, ...rollbackErrors],
-          "Ferrite client output publication failed and could not be fully rolled back.",
+          `Ferrite client output publication failed and could not be fully rolled back; recovery files are preserved at ${publishRoot}.`,
         );
       }
       throw publishError;
     }
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
-    await rm(publishRoot, { recursive: true, force: true });
+    if (!preservePublishRoot) {
+      try {
+        await removeDirectory(publishRoot, { recursive: true, force: true });
+      } catch (cleanupError) {
+        preservePublishRoot = true;
+        if (operationError) {
+          throw new AggregateError(
+            [operationError, cleanupError],
+            `Ferrite client output publication failed and scratch is preserved at ${publishRoot} because cleanup also failed.`,
+          );
+        }
+        throw new Error(
+          `Ferrite client output publication completed, but scratch is preserved at ${publishRoot} because cleanup failed.`,
+          { cause: cleanupError },
+        );
+      }
+    }
   }
 }
 

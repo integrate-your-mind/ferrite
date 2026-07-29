@@ -98,6 +98,17 @@ test("container template runs as a non-root runtime user with a health check", a
     dockerfile,
     /ARG RUST_IMAGE=rust:1\.95\.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1/,
   );
+  assert.match(
+    dockerfile,
+    /ARG NODE_IMAGE=node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d/,
+  );
+  assert.equal((dockerfile.match(/FROM \$\{NODE_IMAGE\}/g) ?? []).length, 2);
+  assert.match(dockerfile, /COPY --from=node-toolchain \/usr\/local\/ \/usr\/local\//);
+  assert.match(dockerfile, /node --version \| grep -q '\^v24\\\.'/);
+  assert.doesNotMatch(dockerfile, /deb\.nodesource\.com/);
+  assert.doesNotMatch(dockerfile, /curl\s+-fsSL/);
+  assert.doesNotMatch(dockerfile, /NODE_MAJOR/);
+  assert.doesNotMatch(dockerfile, /^FROM node:24-bookworm-slim AS runtime$/m);
   assert.match(dockerfile, /rustc --version \| grep -q '\^rustc 1\\\.95\\\.0 '/);
   assert.doesNotMatch(dockerfile, /ARG RUST_IMAGE=rust:1-bookworm/);
   assert.match(dockerfile, /USER ferrite/);

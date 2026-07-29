@@ -1,19 +1,22 @@
 # syntax=docker/dockerfile:1.7
 
 ARG RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
-ARG NODE_MAJOR=24
+ARG NODE_IMAGE=node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+
+FROM ${NODE_IMAGE} AS node-toolchain
 
 FROM ${RUST_IMAGE} AS builder
-ARG NODE_MAJOR
 WORKDIR /workspace
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
-  && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
-  && apt-get install -y --no-install-recommends nodejs \
-  && rustc --version | grep -q '^rustc 1\.95\.0 ' \
+COPY --from=node-toolchain /usr/local/ /usr/local/
+
+RUN rustc --version | grep -q '^rustc 1\.95\.0 ' \
+  && node --version | grep -q '^v24\.' \
+  && corepack --version \
   && rustup target add wasm32-unknown-unknown \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
   && corepack enable \
   && rm -rf /var/lib/apt/lists/*
 
@@ -23,7 +26,7 @@ RUN pnpm install --frozen-lockfile \
   && cargo install --path crates/ferrite-cli --locked --root /opt/ferrite \
   && /opt/ferrite/bin/ferrite build --project examples/basic
 
-FROM node:24-bookworm-slim AS runtime
+FROM ${NODE_IMAGE} AS runtime
 WORKDIR /srv/ferrite
 
 RUN useradd --create-home --home-dir /home/ferrite --shell /usr/sbin/nologin ferrite
