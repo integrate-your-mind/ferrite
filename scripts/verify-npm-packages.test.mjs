@@ -119,6 +119,7 @@ test("concurrent report verifiers fail closed instead of interleaving output", a
   const root = await mkdtemp(join(tmpdir(), "ferrite-npm-concurrency-guard-"));
   const reportDir = join(root, "reports");
   const source = { commit: "a".repeat(40), tree: "b".repeat(40) };
+  const packageFixture = await createMinimalProtocolReleaseFixture(root);
   let installed = 0;
   let releaseInstalls;
   let allInstalledResolve;
@@ -155,7 +156,7 @@ test("concurrent report verifiers fail closed instead of interleaving output", a
   const invoke = () =>
     verifyNpmPackages({
       buildIdentity: testReportIdentity.buildIdentity,
-      releasePackages: [],
+      ...packageFixture,
       workspaceRoot: root,
       reportDir,
       readSourceIdentity: readSourceIdentity(),
@@ -211,13 +212,14 @@ test("backup rename failures preserve all prior release evidence", async (t) => 
       const priorTarball = Buffer.from("prior tarball bytes\n");
       let renameCalls = 0;
       try {
+        const packageFixture = await createMinimalProtocolReleaseFixture(root);
         await mkdir(dirname(tarballPath), { recursive: true });
         await writeFile(reportPath, priorReport);
         await writeFile(tarballPath, priorTarball);
         await assert.rejects(
           verifyNpmPackages({
             ...testReportIdentity,
-            releasePackages: [],
+            ...packageFixture,
             workspaceRoot: root,
             reportDir,
             runCommand: async () => {},
@@ -1467,6 +1469,32 @@ function completeReleaseManifest(name) {
   const manifest = completeSourceManifest(name);
   delete manifest.private;
   return manifest;
+}
+
+async function createMinimalProtocolReleaseFixture(root) {
+  const packageDir = join(root, "packages", "protocol");
+  await mkdir(join(packageDir, "dist"), { recursive: true });
+  await writeFile(join(packageDir, "dist", "index.js"), "export {};\n");
+  await writeFile(join(packageDir, "dist", "index.d.ts"), "export {};\n");
+  return {
+    releasePackages: [
+      {
+        name: "@ferrite/protocol",
+        directory: "packages/protocol",
+        build: ["pnpm", ["--filter", "@ferrite/protocol", "build"]],
+        requiredFiles: ["dist/index.js", "dist/index.d.ts"],
+        forbiddenFiles: ["src/index.ts", "test"],
+      },
+    ],
+    nativePackageNames: [],
+    packageManifests: new Map([
+      ["@ferrite/protocol", completeSourceManifest("@ferrite/protocol")],
+    ]),
+    packPackage: async () => ({
+      files: ["package/dist/index.js", "package/dist/index.d.ts"],
+      packedManifest: completeReleaseManifest("@ferrite/protocol"),
+    }),
+  };
 }
 
 function createNativePrebuildFixture(packageName) {
