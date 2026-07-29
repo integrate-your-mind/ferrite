@@ -3298,8 +3298,8 @@ pub fn serve_production_listener_once(
 
 fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()> {
     let request = match read_http_request(stream, DEFAULT_DEV_MAX_REQUEST_BYTES)? {
-        Ok(RequestReadResult::Request(request)) => request,
-        Ok(RequestReadResult::Response(response)) => {
+        RequestReadResult::Request(request) => request,
+        RequestReadResult::Response(response) => {
             let response = response.with_cache_control("no-store");
             write_response(stream, &response)?;
             return Ok(());
@@ -3378,6 +3378,7 @@ fn handle_production_stream_concurrent(
     )
 }
 
+#[cfg(test)]
 fn handle_production_stream_with_limits<F>(
     stream: &mut TcpStream,
     request_read_timeout: Duration,
@@ -3435,8 +3436,8 @@ where
             }
             return Err(error);
         }
-        RequestReadResult::Request(request) => request,
-        RequestReadResult::Response(response) => {
+        Ok(RequestReadResult::Request(request)) => request,
+        Ok(RequestReadResult::Response(response)) => {
             let response = response.with_cache_control("no-store");
             if let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id.as_ref()) {
                 let (outcome, error_class, failure_phase) =
