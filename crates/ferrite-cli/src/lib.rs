@@ -1107,8 +1107,7 @@ fn resolve_server_action_session_cookie_name(
     };
     if !replay_protection_enabled {
         return Err(CliError::Config(
-            "--server-action-session-cookie-name requires --server-action-replay-ttl-ms"
-                .to_owned(),
+            "--server-action-session-cookie-name requires --server-action-replay-ttl-ms".to_owned(),
         ));
     }
     if !is_valid_cookie_name(cookie_name) {

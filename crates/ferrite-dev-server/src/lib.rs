@@ -77,7 +77,6 @@ pub enum DevServerError {
     Io(std::io::Error),
     Json(serde_json::Error),
     InvalidRequestPath(String),
-    InvalidProductionConfig(String),
     NoSocketAddress,
 }
 
@@ -91,9 +90,6 @@ impl fmt::Display for DevServerError {
             DevServerError::Json(error) => write!(f, "{error}"),
             DevServerError::InvalidRequestPath(path) => {
                 write!(f, "request path must start with `/`: {path}")
-            }
-            DevServerError::InvalidProductionConfig(message) => {
-                write!(f, "invalid production server configuration: {message}")
             }
             DevServerError::NoSocketAddress => write!(f, "could not resolve server address"),
         }
@@ -439,6 +435,7 @@ struct ProductionReplayBinding {
 }
 
 impl ProductionReplayNonces {
+    #[cfg(test)]
     fn new(ttl: Duration) -> Self {
         Self::new_with_session_cookie(ttl, None)
     }
@@ -452,6 +449,7 @@ impl ProductionReplayNonces {
         }
     }
 
+    #[cfg(test)]
     fn issue(&mut self) -> std::result::Result<String, Box<DevResponse>> {
         self.issue_for(None)
     }
@@ -488,6 +486,7 @@ impl ProductionReplayNonces {
         Ok(nonce)
     }
 
+    #[cfg(test)]
     fn consume(&mut self, nonce: &str) -> bool {
         self.consume_for(nonce, None)
     }
@@ -497,7 +496,7 @@ impl ProductionReplayNonces {
         if self
             .entries
             .get(nonce)
-            .is_none_or(|entry| entry.binding.as_ref() != binding)
+            .is_none_or(|entry| !production_replay_bindings_match(entry.binding.as_ref(), binding))
         {
             return false;
         }
@@ -520,6 +519,20 @@ impl ProductionReplayNonces {
             let oldest = self.issuance_order.pop_front().expect("front entry exists");
             self.entries.remove(&oldest);
         }
+    }
+}
+
+fn production_replay_bindings_match(
+    stored: Option<&ProductionReplayBinding>,
+    received: Option<&ProductionReplayBinding>,
+) -> bool {
+    match (stored, received) {
+        (None, None) => true,
+        (Some(stored), Some(received)) => {
+            stored.route_path == received.route_path
+                && constant_time_eq(&stored.session_fingerprint, &received.session_fingerprint)
+        }
+        _ => false,
     }
 }
 
@@ -736,26 +749,32 @@ fn validate_production_server_action_config(config: &ProductionServerConfig) -> 
         return Ok(());
     };
     if !is_valid_cookie_name(session_cookie_name) {
-        return Err(DevServerError::InvalidProductionConfig(
-            "server-action session cookie name must be a non-empty RFC6265 cookie name".to_owned(),
+        return Err(invalid_production_server_config(
+            "server-action session cookie name must be a non-empty RFC6265 cookie name",
         ));
     }
     if config.server_action_replay_ttl.is_none() {
-        return Err(DevServerError::InvalidProductionConfig(
-            "server-action session cookie binding requires replay protection".to_owned(),
+        return Err(invalid_production_server_config(
+            "server-action session cookie binding requires replay protection",
         ));
     }
     if config.server_action_csrf_token.is_none() {
-        return Err(DevServerError::InvalidProductionConfig(
-            "server-action session cookie binding requires a CSRF token".to_owned(),
+        return Err(invalid_production_server_config(
+            "server-action session cookie binding requires a CSRF token",
         ));
     }
     if config.server_action_csrf_cookie_name.as_deref() == Some(session_cookie_name) {
-        return Err(DevServerError::InvalidProductionConfig(
-            "server-action session cookie must differ from the global CSRF cookie".to_owned(),
+        return Err(invalid_production_server_config(
+            "server-action session cookie must differ from the global CSRF cookie",
         ));
     }
     Ok(())
+}
+
+fn invalid_production_server_config(message: &str) -> DevServerError {
+    DevServerError::Artifact(ProductionArtifactError::Invalid(format!(
+        "invalid production server configuration: {message}"
+    )))
 }
 
 #[derive(Debug)]
@@ -1454,7 +1473,15 @@ impl ProductionProject {
     }
 
     pub fn handle_get(&self, raw_path: &str) -> Result<DevResponse> {
-        self.handle_get_with_context(raw_path, self.request_context(&HttpHeaders::new(), None))
+        self.handle_get_with_headers(raw_path, &HttpHeaders::new())
+    }
+
+    pub fn handle_get_with_headers(
+        &self,
+        raw_path: &str,
+        headers: &HttpHeaders,
+    ) -> Result<DevResponse> {
+        self.handle_get_with_context(raw_path, self.request_context(headers, None))
     }
 
     fn handle_get_with_context(
@@ -1484,12 +1511,7 @@ impl ProductionProject {
         headers: &HttpHeaders,
         body: &[u8],
     ) -> Result<DevResponse> {
-        self.handle_post_with_context(
-            raw_path,
-            headers,
-            body,
-            self.request_context(headers, None),
-        )
+        self.handle_post_with_context(raw_path, headers, body, self.request_context(headers, None))
     }
 
     fn handle_post_with_context(
@@ -1603,9 +1625,7 @@ impl ProductionProject {
                 .config
                 .server_action_session_cookie_name
                 .as_deref()
-                .and_then(|cookie_name| {
-                    server_action_session_fingerprint(headers, cookie_name)
-                }),
+                .and_then(|cookie_name| server_action_session_fingerprint(headers, cookie_name)),
         }
     }
 
@@ -1669,8 +1689,7 @@ impl ProductionProject {
         let snapshot = self.snapshot.get().expect("snapshot built before response");
 
         let response = if let Some(match_result) = match_route(path, &snapshot.routes) {
-            let replay_nonce =
-                match self.issue_server_action_replay_nonce(path, request_context) {
+            let replay_nonce = match self.issue_server_action_replay_nonce(path, request_context) {
                 Ok(replay_nonce) => replay_nonce,
                 Err(response) => return *response,
             };
@@ -4232,7 +4251,14 @@ fn server_action_request_from_form(
     let id = remove_required_action_field(&mut form, SERVER_ACTION_ID_FIELD)?;
     let route_path = remove_required_action_field(&mut form, SERVER_ACTION_ROUTE_FIELD)?;
     enforce_server_action_csrf_token(&mut form, headers, expected_csrf_token, csrf_cookie_name)?;
-    let replay_nonce = take_server_action_replay_nonce(&mut form, replay_nonces.is_some())?;
+    let session_binding_enabled = replay_nonces
+        .as_ref()
+        .is_some_and(|replay_nonces| replay_nonces.session_cookie_name.is_some());
+    let replay_nonce = take_server_action_replay_nonce(
+        &mut form,
+        replay_nonces.is_some(),
+        session_binding_enabled,
+    )?;
     let request = ServerActionRequest {
         ferrite: SERVER_ACTION_REQUEST_MARKER.to_owned(),
         version: SERVER_ACTION_REQUEST_VERSION,
@@ -4299,6 +4325,7 @@ fn enforce_server_action_csrf_token(
 fn take_server_action_replay_nonce(
     form: &mut BTreeMap<String, ServerActionFormValue>,
     replay_protection_enabled: bool,
+    session_binding_enabled: bool,
 ) -> std::result::Result<Option<String>, Box<DevResponse>> {
     if !replay_protection_enabled {
         form.remove(SERVER_ACTION_REPLAY_NONCE_FIELD);
@@ -4307,9 +4334,12 @@ fn take_server_action_replay_nonce(
 
     let received_nonce = remove_required_action_field(form, SERVER_ACTION_REPLAY_NONCE_FIELD)
         .map_err(|_| {
-            Box::new(DevResponse::forbidden(
-                "server action replay nonce is required",
-            ))
+            let message = if session_binding_enabled {
+                "server action replay nonce is invalid or already used"
+            } else {
+                "server action replay nonce is required"
+            };
+            Box::new(DevResponse::forbidden(message))
         })?;
     Ok(Some(received_nonce))
 }
@@ -4330,8 +4360,7 @@ fn enforce_server_action_replay_nonce(
     };
     let binding = match replay_nonces.session_cookie_name.as_deref() {
         Some(cookie_name) => {
-            let Some(session_fingerprint) =
-                server_action_session_fingerprint(headers, cookie_name)
+            let Some(session_fingerprint) = server_action_session_fingerprint(headers, cookie_name)
             else {
                 return Err(Box::new(DevResponse::forbidden(
                     "server action replay nonce is invalid or already used",
@@ -4372,10 +4401,7 @@ fn server_action_cookie_value(headers: &HttpHeaders, cookie_name: &str) -> Optio
     None
 }
 
-fn server_action_session_fingerprint(
-    headers: &HttpHeaders,
-    cookie_name: &str,
-) -> Option<[u8; 32]> {
+fn server_action_session_fingerprint(headers: &HttpHeaders, cookie_name: &str) -> Option<[u8; 32]> {
     let header = headers.get("cookie")?;
     let mut fingerprint = None;
     for part in header.split(';') {
@@ -7295,6 +7321,35 @@ process.exit(1);
     }
 
     #[test]
+    fn session_cookie_fingerprint_rejects_ambiguous_or_malformed_values() {
+        let fingerprint = |cookie: &str| {
+            server_action_session_fingerprint(
+                &BTreeMap::from([("cookie".to_owned(), cookie.to_owned())]),
+                "app_session",
+            )
+        };
+
+        assert_eq!(
+            fingerprint("app_session=session-123"),
+            fingerprint("app_session=\"session-123\"")
+        );
+        for malformed in [
+            "app_session=",
+            "app_session=\"session-123",
+            "app_session=session-123\"",
+            "app_session=\"session-123; theme=dark",
+            "app_session=session-123; app_session=session-456",
+            "app_session=session-123, app_session=session-456",
+        ] {
+            assert_eq!(
+                fingerprint(malformed),
+                None,
+                "malformed session cookie must fail closed: {malformed}"
+            );
+        }
+    }
+
+    #[test]
     fn action_form_replay_nonce_guard_consumes_once() {
         let headers = action_headers_with_host("application/x-www-form-urlencoded");
         let mut replay_nonces = ProductionReplayNonces::new(Duration::from_secs(30));
@@ -7350,11 +7405,27 @@ process.exit(1);
             }))
             .unwrap();
         let body = action_form_body_with_csrf_and_nonce("/posts/abc", "token-123", &nonce);
-        let mut victim_headers = action_headers_with_host("application/x-www-form-urlencoded");
-        victim_headers.insert(
-            "cookie".to_owned(),
-            "app_session=victim-session".to_owned(),
+        let malformed_body = format!(
+            "__ferrite_action=not-an-id&__ferrite_route=%2Fposts%2Fabc&__ferrite_csrf=token-123&__ferrite_nonce={nonce}"
         );
+        let malformed = server_action_request_from_form(
+            &attacker_headers,
+            malformed_body.as_bytes(),
+            Some("token-123"),
+            None,
+            None,
+            Some(&mut replay_nonces),
+        )
+        .expect_err("an invalid action request must fail before consuming its nonce");
+        assert_eq!(malformed.status, 400);
+        assert!(
+            malformed
+                .body_text()
+                .contains("server action id must be formatted")
+        );
+
+        let mut victim_headers = action_headers_with_host("application/x-www-form-urlencoded");
+        victim_headers.insert("cookie".to_owned(), "app_session=victim-session".to_owned());
 
         let transferred = server_action_request_from_form(
             &victim_headers,
@@ -7998,6 +8069,84 @@ process.exit(1);
     }
 
     #[test]
+    fn production_header_aware_get_renders_only_a_matching_session_nonce() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let base = production_project_for(&app);
+        make_script(
+            &base.config.page_renderer,
+            r#"
+const mode = process.argv[2];
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+if (mode === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/posts/[id]", routePattern: "/posts/[id]", actions: [] }));
+  process.exit(0);
+}
+if (mode === "--stream") {
+  const options = JSON.parse(process.argv[7]);
+  process.stdout.write(JSON.stringify({
+    ferrite: "render-stream",
+    version: 1,
+    shell: [2, "main", {}, [[0, options.serverActionReplayNonce ?? "missing-session-nonce"]]],
+    chunks: []
+  }));
+  process.exit(0);
+}
+console.error(`unexpected renderer mode ${mode}`);
+process.exit(1);
+"#,
+        );
+        let config = base
+            .config
+            .with_server_action_csrf_token("token-123")
+            .with_server_action_replay_ttl(Duration::from_secs(30))
+            .with_server_action_session_cookie_name("app_session");
+        let project = ProductionProject::new(config);
+
+        let anonymous = project.handle_get("/posts/abc").unwrap();
+        assert_eq!(anonymous.status, 200);
+        assert!(anonymous.body_text().contains("missing-session-nonce"));
+        assert!(
+            project
+                .replay_nonces
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        let headers = BTreeMap::from([(
+            "cookie".to_owned(),
+            "theme=dark; app_session=session-123".to_owned(),
+        )]);
+        let bound = project
+            .handle_get_with_headers("/posts/abc", &headers)
+            .unwrap();
+        assert_eq!(bound.status, 200);
+        let nonce = project
+            .replay_nonces
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .entries
+            .keys()
+            .next()
+            .cloned()
+            .expect("header-aware GET must issue a bound nonce");
+        assert!(bound.body_text().contains(&nonce));
+    }
+
+    #[test]
     fn production_action_replay_binding_requires_session_and_survives_rotation_rejections() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -8020,6 +8169,18 @@ process.exit(1);
                 .is_none(),
             "anonymous requests must not receive a session-bound nonce"
         );
+        let anonymous_post = project
+            .handle_post(
+                "/_ferrite/action",
+                &action_headers_with_host("application/x-www-form-urlencoded"),
+                &action_form_body_with_csrf("/posts/abc", "current-token"),
+            )
+            .unwrap();
+        assert_eq!(anonymous_post.status, 403);
+        assert_eq!(
+            anonymous_post.body_text(),
+            "Forbidden: server action replay nonce is invalid or already used\n"
+        );
 
         let duplicate_headers = BTreeMap::from([(
             "cookie".to_owned(),
@@ -8034,8 +8195,7 @@ process.exit(1);
             "ambiguous session cookies must not receive a nonce"
         );
 
-        let mut old_session_headers =
-            action_headers_with_host("application/x-www-form-urlencoded");
+        let mut old_session_headers = action_headers_with_host("application/x-www-form-urlencoded");
         old_session_headers.insert(
             "cookie".to_owned(),
             "theme=dark; app_session=old-session".to_owned(),
@@ -8046,14 +8206,27 @@ process.exit(1);
             .unwrap()
             .expect("a valid session receives a bound nonce");
 
+        let duplicate_body =
+            action_form_body_with_csrf_and_nonce("/posts/abc", "current-token", &old_nonce);
+        let mut duplicate_post_headers =
+            action_headers_with_host("application/x-www-form-urlencoded");
+        duplicate_post_headers.insert(
+            "cookie".to_owned(),
+            "app_session=one; app_session=two".to_owned(),
+        );
+        let duplicate_post = project
+            .handle_post("/_ferrite/action", &duplicate_post_headers, &duplicate_body)
+            .unwrap();
+        assert_eq!(duplicate_post.status, 403);
+        assert_eq!(duplicate_post.body, anonymous_post.body);
+
         let mut rotated_session_headers =
             action_headers_with_host("application/x-www-form-urlencoded");
         rotated_session_headers.insert(
             "cookie".to_owned(),
             "app_session=rotated-session".to_owned(),
         );
-        let body =
-            action_form_body_with_csrf_and_nonce("/posts/abc", "current-token", &old_nonce);
+        let body = action_form_body_with_csrf_and_nonce("/posts/abc", "current-token", &old_nonce);
         let rotated_session = project
             .handle_post("/_ferrite/action", &rotated_session_headers, &body)
             .unwrap();
@@ -8088,13 +8261,72 @@ process.exit(1);
         let rotated_body =
             action_form_body_with_csrf_and_nonce("/posts/abc", "current-token", &rotated_nonce);
         let rotated_accepted = project
-            .handle_post(
-                "/_ferrite/action",
-                &rotated_session_headers,
-                &rotated_body,
-            )
+            .handle_post("/_ferrite/action", &rotated_session_headers, &rotated_body)
             .unwrap();
         assert_eq!(rotated_accepted.status, 200);
+    }
+
+    #[test]
+    fn production_action_timeout_consumes_nonce_and_next_nonce_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let base = action_production_project_for(
+            &app,
+            r#"
+if (process.argv[2] === "--server-action") {
+  setInterval(() => {}, 1000);
+} else {
+  process.exit(1);
+}
+"#,
+        );
+        let config = base
+            .config
+            .with_render_timeout(Duration::from_millis(20))
+            .with_server_action_csrf_token("token-123")
+            .with_server_action_replay_ttl(Duration::from_secs(30))
+            .with_server_action_session_cookie_name("app_session");
+        let project = ProductionProject::new(config);
+        let mut headers = action_headers_with_host("application/x-www-form-urlencoded");
+        headers.insert(
+            "cookie".to_owned(),
+            "app_session=session-123".to_owned(),
+        );
+        let context = project.request_context(&headers, None);
+        let timed_out_nonce = project
+            .issue_server_action_replay_nonce("/posts/abc", &context)
+            .unwrap()
+            .unwrap();
+        let timed_out_body =
+            action_form_body_with_csrf_and_nonce("/posts/abc", "token-123", &timed_out_nonce);
+
+        let timed_out = project
+            .handle_post("/_ferrite/action", &headers, &timed_out_body)
+            .unwrap();
+        assert_eq!(timed_out.status, 504);
+        assert_eq!(timed_out.reason, "Gateway Timeout");
+        assert!(!timed_out.body_text().contains("timed out"));
+
+        let replayed = project
+            .handle_post("/_ferrite/action", &headers, &timed_out_body)
+            .unwrap();
+        assert_eq!(replayed.status, 403);
+
+        make_script(&project.config.page_renderer, action_renderer_body());
+        let recovery_nonce = project
+            .issue_server_action_replay_nonce("/posts/abc", &context)
+            .unwrap()
+            .unwrap();
+        let recovery_body =
+            action_form_body_with_csrf_and_nonce("/posts/abc", "token-123", &recovery_nonce);
+        let recovered = project
+            .handle_post("/_ferrite/action", &headers, &recovery_body)
+            .unwrap();
+        assert_eq!(recovered.status, 200);
     }
 
     #[test]

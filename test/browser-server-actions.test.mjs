@@ -164,6 +164,9 @@ test("production serve handles browser hydration, payloads, and action success a
   const port = await reserveLoopbackPort();
   const origin = `http://127.0.0.1:${port}`;
   const csrfToken = "ferrite-production-browser-proof";
+  const sessionCookieName = "ferrite_test_session";
+  const initialSession = "browser-session-initial";
+  const rotatedSession = "browser-session-rotated";
   const server = spawn(
     ferriteBinary,
     [
@@ -182,6 +185,8 @@ test("production serve handles browser hydration, payloads, and action success a
       "FERRITE_TEST_ACTION_CSRF",
       "--server-action-replay-ttl-ms",
       "60000",
+      "--server-action-session-cookie-name",
+      sessionCookieName,
       "--access-log",
       "json",
       "--action-log",
@@ -201,6 +206,15 @@ test("production serve handles browser hydration, payloads, and action success a
     await waitForServer(origin, server, logs);
     browser = await chromium.launch({ executablePath: chromeExecutable, headless: true });
     const page = await browser.newPage();
+    await page.context().addCookies([
+      {
+        name: sessionCookieName,
+        value: initialSession,
+        url: origin,
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
     await page.addInitScript(() => {
       const fetchImpl = globalThis.fetch.bind(globalThis);
       globalThis.__ferriteActionResponses = [];
@@ -238,6 +252,30 @@ test("production serve handles browser hydration, payloads, and action success a
     );
     assert.ok((await page.locator('input[name="__ferrite_nonce"]').inputValue()).length > 0);
 
+    await page.context().addCookies([
+      {
+        name: sessionCookieName,
+        value: rotatedSession,
+        url: origin,
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+    await page.getByRole("button", { name: "Like alpha: 0" }).click();
+    await page.waitForFunction(() => globalThis.__ferriteActionResponses.length === 1);
+    assert.deepEqual((await capturedActionResponses(page))[0], {
+      status: 403,
+      body: "Forbidden: server action replay nonce is invalid or already used\n",
+    });
+    await page.context().addCookies([
+      {
+        name: sessionCookieName,
+        value: initialSession,
+        url: origin,
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
     await page.getByRole("button", { name: "Like alpha: 0" }).click();
     await page.getByRole("button", { name: "Like alpha: 1" }).waitFor();
 
@@ -316,6 +354,8 @@ test("production serve handles browser hydration, payloads, and action success a
   }
 
   assert.doesNotMatch(`${logs.stdout}\n${logs.stderr}`, new RegExp(csrfToken));
+  assert.doesNotMatch(`${logs.stdout}\n${logs.stderr}`, new RegExp(initialSession));
+  assert.doesNotMatch(`${logs.stdout}\n${logs.stderr}`, new RegExp(rotatedSession));
   const actionEntries = parseJsonLogEntries(logs.stderr).filter((entry) => "action_id" in entry);
   assert.ok(
     actionEntries.some(
