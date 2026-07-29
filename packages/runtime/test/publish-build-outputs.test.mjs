@@ -76,7 +76,7 @@ test("retains recovery backups when rollback fails", async () => {
       ),
       (error) =>
         error instanceof AggregateError &&
-        /recovery files preserved at .*\.ferrite-publish-/.test(error.message) &&
+        /recovery files are preserved at .*\.ferrite-publish-/.test(error.message) &&
         error.errors.some((entry) => /injected rename failure 4/.test(entry.message)) &&
         error.errors.some((entry) => /injected rename failure 5/.test(entry.message)),
     );
@@ -115,7 +115,7 @@ test("aggregates cleanup failure with the primary publication error and preserve
       ),
       (error) =>
         error instanceof AggregateError &&
-        /scratch preserved at .*\.ferrite-publish-/.test(error.message) &&
+        /scratch is preserved at .*\.ferrite-publish-/.test(error.message) &&
         error.errors.some((entry) => /escapes its build directory/.test(entry.message)) &&
         error.errors.some((entry) => /injected scratch cleanup failure/.test(entry.message)),
     );
