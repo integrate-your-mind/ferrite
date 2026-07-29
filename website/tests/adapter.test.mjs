@@ -10,6 +10,7 @@ import {
   computeManifestBuildId,
   createSiteServer,
   packageArtifact,
+  parsePackageArguments,
 } from "../deploy-adapter.mjs";
 
 const bundle = {
@@ -100,6 +101,24 @@ async function request(server, path, options) {
 async function close(server) {
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
+
+test("deploy adapter CLI accepts defaults or an isolated artifact/output pair", () => {
+  assert.deepEqual(parsePackageArguments([]), {});
+  assert.deepEqual(
+    parsePackageArguments(["/isolated/artifact", "/isolated/dist"]),
+    {
+      artifactDirectory: "/isolated/artifact",
+      distDirectory: "/isolated/dist",
+    },
+  );
+  for (const args of [
+    ["/artifact"],
+    ["/artifact", ""],
+    ["/artifact", "/dist", "/extra"],
+  ]) {
+    assert.throws(() => parsePackageArguments(args), /usage:/);
+  }
+});
 
 test("packages verified prerendered routes/assets and serves deep links without a home fallback", async () => {
   const fixture = await mkdtemp(join(tmpdir(), "ferrite-adapter-fixture-"));
