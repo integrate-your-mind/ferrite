@@ -8175,7 +8175,8 @@ process.exit(1);
             &app.join("posts/[id]/page.tsx"),
             "export default function Page() {}",
         );
-        let base = action_production_project_for(&app, "process.exit(1);");
+        let base = production_project_for(&app);
+        make_script(&base.config.page_renderer, "process.exit(1);");
         let config = base
             .config
             .with_server_action_csrf_token("token-123")
@@ -8200,7 +8201,31 @@ process.exit(1);
             "a render failure must not leave an unreachable nonce until expiry"
         );
 
-        make_script(&project.config.page_renderer, action_renderer_body());
+        make_script(
+            &project.config.page_renderer,
+            r#"
+const mode = process.argv[2];
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+if (mode === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/posts/[id]", routePattern: "/posts/[id]", actions: [] }));
+  process.exit(0);
+}
+if (mode === "--stream") {
+  process.stdout.write(JSON.stringify({
+    ferrite: "render-stream",
+    version: 1,
+    shell: [2, "main", {}, [[0, "recovered"]]],
+    chunks: []
+  }));
+  process.exit(0);
+}
+console.error(`unexpected renderer mode ${mode}`);
+process.exit(1);
+"#,
+        );
         let recovered = project
             .handle_get_with_headers("/posts/abc", &headers)
             .unwrap();
@@ -8363,7 +8388,7 @@ if (process.argv[2] === "--server-action") {
             .with_server_action_csrf_token("token-123")
             .with_server_action_replay_ttl(Duration::from_secs(30))
             .with_server_action_session_cookie_name("app_session");
-        let project = ProductionProject::new(config);
+        let mut project = ProductionProject::new(config);
         let mut headers = action_headers_with_host("application/x-www-form-urlencoded");
         headers.insert("cookie".to_owned(), "app_session=session-123".to_owned());
         let context = project.request_context(&headers, None);
@@ -8387,6 +8412,7 @@ if (process.argv[2] === "--server-action") {
         assert_eq!(replayed.status, 403);
 
         make_script(&project.config.page_renderer, action_renderer_body());
+        project.config.render_timeout = Duration::from_secs(2);
         let recovery_nonce = project
             .issue_server_action_replay_nonce("/posts/abc", &context)
             .unwrap()
