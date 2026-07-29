@@ -18,6 +18,7 @@ import {
   DEFAULT_SITE_ORIGIN,
   installZigLinker,
   readBoundedBody,
+  resolveXzReadableStream,
   resolveCargo,
   RUST_TOOLCHAIN,
   RUSTUP_INIT_SHA256,
@@ -208,6 +209,31 @@ test("real XZ decoder streams bytes and enforces output destinations", async () 
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("XZ decoder resolves native ESM and UMD module shapes", () => {
+  class Constructor {}
+  assert.equal(
+    resolveXzReadableStream({ XzReadableStream: Constructor }),
+    Constructor,
+  );
+  assert.equal(
+    resolveXzReadableStream({
+      default: { XzReadableStream: Constructor },
+    }),
+    Constructor,
+  );
+  assert.equal(
+    resolveXzReadableStream({
+      XzReadableStream: {},
+      default: { XzReadableStream: Constructor },
+    }),
+    Constructor,
+  );
+  assert.throws(
+    () => resolveXzReadableStream({ default: {} }),
+    /does not expose the expected XzReadableStream constructor/,
+  );
 });
 
 test("Zig linker install is pinned and produces a bounded cc wrapper", async () => {

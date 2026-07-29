@@ -247,7 +247,9 @@ export async function decompressXzArchive(
   destination,
   maximumBytes = zigTarMaximumBytes,
 ) {
-  const { XzReadableStream } = await import("xz-decompress");
+  const XzReadableStream = resolveXzReadableStream(
+    await import("xz-decompress"),
+  );
   const decoded = new XzReadableStream(
     Readable.toWeb(createReadStream(source)),
   );
@@ -271,6 +273,18 @@ export async function decompressXzArchive(
     throw new Error("pinned Zig archive has an invalid expanded size");
   }
   return total;
+}
+
+export function resolveXzReadableStream(module) {
+  if (typeof module?.XzReadableStream === "function") {
+    return module.XzReadableStream;
+  }
+  if (typeof module?.default?.XzReadableStream === "function") {
+    return module.default.XzReadableStream;
+  }
+  throw new Error(
+    "xz-decompress does not expose the expected XzReadableStream constructor",
+  );
 }
 
 export async function installZigLinker(options) {
