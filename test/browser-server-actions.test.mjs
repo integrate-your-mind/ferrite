@@ -261,7 +261,7 @@ test("production serve handles browser hydration, payloads, and action success a
         sameSite: "Lax",
       },
     ]);
-    await page.getByRole("button", { name: "Like alpha: 0" }).click();
+    await page.getByRole("button", { name: "Save" }).click();
     await page.waitForFunction(() => globalThis.__ferriteActionResponses.length === 1);
     assert.deepEqual((await capturedActionResponses(page))[0], {
       status: 403,

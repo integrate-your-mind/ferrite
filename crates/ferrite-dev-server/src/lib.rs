@@ -7350,9 +7350,13 @@ process.exit(1);
             )
         };
 
-        assert_eq!(
-            fingerprint("app_session=session-123"),
-            fingerprint("app_session=\"session-123\"")
+        let expected = fingerprint("app_session=session-123")
+            .expect("a valid session cookie must produce a fingerprint");
+        assert_eq!(fingerprint("app_session=\"session-123\""), Some(expected));
+        assert_ne!(
+            fingerprint("app_session=session-456"),
+            Some(expected),
+            "different session values must not share a fingerprint"
         );
         for malformed in [
             "app_session=",
@@ -7532,6 +7536,44 @@ process.exit(1);
 
         assert_eq!(expired.status, 403);
         assert!(expired.body_text().contains("invalid or already used"));
+    }
+
+    #[test]
+    fn production_replay_nonce_discard_removes_only_the_selected_entry() {
+        let mut replay_nonces = ProductionReplayNonces::new(Duration::from_secs(30));
+        let first = replay_nonces.issue().unwrap();
+        let second = replay_nonces.issue().unwrap();
+
+        replay_nonces.discard(&first);
+
+        assert_eq!(
+            replay_nonces.entries.keys().collect::<Vec<_>>(),
+            vec![&second]
+        );
+        assert_eq!(
+            replay_nonces.issuance_order.iter().collect::<Vec<_>>(),
+            vec![&second]
+        );
+    }
+
+    #[test]
+    fn production_replay_nonce_expiration_includes_the_exact_deadline() {
+        let deadline = Instant::now();
+        let nonce = "deadline-nonce".to_owned();
+        let mut replay_nonces = ProductionReplayNonces::new(Duration::from_secs(30));
+        replay_nonces.entries.insert(
+            nonce.clone(),
+            ProductionReplayNonce {
+                expires_at: deadline,
+                binding: None,
+            },
+        );
+        replay_nonces.issuance_order.push_back(nonce);
+
+        replay_nonces.prune_expired(deadline);
+
+        assert!(replay_nonces.entries.is_empty());
+        assert!(replay_nonces.issuance_order.is_empty());
     }
 
     #[test]
