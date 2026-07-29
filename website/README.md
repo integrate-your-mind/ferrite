@@ -19,6 +19,18 @@ pnpm run build
 pnpm run start
 ```
 
+For a source-connected Sites deployment, build from the repository root:
+
+```bash
+pnpm build:site
+```
+
+That command compiles the protocol and runtime directly, builds this app with
+the Rust CLI, packages the verified artifact for Sites, and copies only the
+deployable output to the repository-root `dist/` directory. It intentionally
+does not invoke a package manager from inside the deployment build, because the
+Sites builder may install with pnpm and execute the build through npm.
+
 The website has its own pinned `pnpm-lock.yaml`; `@ferrite/runtime` is wired as
 a local link to `../packages/runtime`, so this command must be run from this
 directory with the Ferrite source checkout present. The runtime's workspace

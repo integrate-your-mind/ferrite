@@ -7,6 +7,7 @@
   "type": "module",
   "scripts": {
     "build": "cargo build --workspace && pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/protocol-wasm build && pnpm --filter @ferrite/runtime build && pnpm --filter @ferrite/node build",
+    "build:site": "node scripts/build-sites-source.mjs",
     "build:example": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- build --project examples/basic",
     "check": "cargo run -p ferrite-cli -- check --project examples/basic",
     "dev:once": "pnpm --filter @ferrite/protocol build && pnpm --filter @ferrite/runtime build && cargo run -p ferrite-cli -- dev --project examples/basic --once --request-path /posts/abc",
