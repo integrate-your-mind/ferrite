@@ -318,8 +318,9 @@ test("React event names without a capture prop remain native custom events", () 
 
   const button = container.querySelector("button");
   button?.dispatchEvent(new window.Event("mouseenter", { bubbles: true }));
-  button?.dispatchEvent(new window.Event("mouseentercapture", { bubbles: true }));
+  assert.deepEqual(calls, [], "onMouseEnterCapture must not bind mouseenter");
 
+  button?.dispatchEvent(new window.Event("mouseentercapture", { bubbles: true }));
   assert.deepEqual(calls, ["mouse enter capture"]);
 });
 
@@ -340,7 +341,10 @@ test("native custom event names ending in Capture remain backward compatible", (
 
   const button = container.querySelector("button");
   button?.dispatchEvent(new window.Event("file", { bubbles: true }));
+  assert.deepEqual(calls, [], "onFileCapture must not bind file");
+
   button?.dispatchEvent(new window.Event("filecapture", { bubbles: true }));
+  assert.deepEqual(calls, ["file capture"]);
 
   root.update(
     createElement(
@@ -351,11 +355,15 @@ test("native custom event names ending in Capture remain backward compatible", (
       "Upload",
     ),
   );
+  button?.dispatchEvent(new window.Event("file", { bubbles: true }));
+  assert.deepEqual(calls, ["file capture"], "updated handler must not bind file");
+
   button?.dispatchEvent(new window.Event("filecapture", { bubbles: true }));
+  assert.deepEqual(calls, ["file capture", "updated file capture"]);
 
   root.update(createElement("button", null, "Upload"));
+  button?.dispatchEvent(new window.Event("file", { bubbles: true }));
   button?.dispatchEvent(new window.Event("filecapture", { bubbles: true }));
-
   assert.deepEqual(calls, ["file capture", "updated file capture"]);
 });
 
