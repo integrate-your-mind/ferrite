@@ -105,6 +105,7 @@ fn is_generated_directory(name: &std::ffi::OsStr) -> bool {
         ".git" | ".ferrite" | "node_modules" | "target"
     ) || name.starts_with(".ferrite-build-")
         || name.starts_with(".ferrite-verified-build-")
+        || name.starts_with(".ferrite-verified-types-")
         || name.starts_with(".ferrite-previous-")
 }
 
@@ -196,6 +197,19 @@ mod tests {
         fs::write(types_out, "generated").unwrap();
         fs::create_dir_all(project.path().join(".ferrite/tmp")).unwrap();
         fs::write(project.path().join(".ferrite/tmp/state"), "state").unwrap();
+        fs::create_dir_all(
+            project
+                .path()
+                .join("generated/.ferrite-verified-types-residue"),
+        )
+        .unwrap();
+        fs::write(
+            project
+                .path()
+                .join("generated/.ferrite-verified-types-residue/routes.d.ts"),
+            "staged",
+        )
+        .unwrap();
 
         let current = ProjectSourceSnapshot::capture(
             project.path(),

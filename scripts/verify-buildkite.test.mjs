@@ -150,6 +150,7 @@ test("local CI retains the host-executable validation gate categories", async ()
     "pnpm --dir website test",
     "pnpm --dir website package:sites",
     "pnpm --dir website audit --prod --audit-level high",
+    "pnpm build:site",
     "./.buildkite/scripts/upload-pipeline.mjs --dry-run",
     "gitleaks git --no-banner --redact",
   ]) {
@@ -199,6 +200,7 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /COVERAGE_RUST_LINES_FLOOR="90\.00"/);
   assert.match(source, /COVERAGE_RUNTIME_LINES_FLOOR="80\.00"/);
   assert.match(source, /COVERAGE_NATIVE_LINES_FLOOR="78\.00"/);
+  assert.match(source, /COVERAGE_SITE_LINES_FLOOR="70\.00"/);
   assert.match(source, /check_coverage_floor/);
   assert.match(source, /MIN_FREE_KIB=20971520/);
   assert.match(source, /\/bin\/df -Pk "\$\{ROOT\}"/);
@@ -240,11 +242,24 @@ test("local CI retains the host-executable validation gate categories", async ()
     source.indexOf("coverage_js()"),
     source.indexOf("native_current_host()"),
   );
+  assert.match(
+    coverageJs,
+    /run_gate coverage-site node --test/,
+    "JS coverage must exercise the production site builder and deploy adapter",
+  );
+  assert.match(
+    coverageJs,
+    /scripts\/build-sites-source\.test\.mjs website\/tests\/adapter\.test\.mjs/,
+  );
+  assert.match(coverageJs, /check_coverage_sources js/);
+  assert.match(coverageJs, /scripts\/build-sites-source\.mjs/);
+  assert.match(coverageJs, /website\/deploy-adapter\.mjs/);
   for (const [first, second] of [
     ["coverage-runtime-prerequisites", "coverage-native-prerequisites"],
     ["coverage-native-prerequisites", "coverage-prerequisites-clean"],
     ["coverage-prerequisites-clean", "coverage-runtime bash"],
     ["coverage-runtime bash", "coverage-native bash"],
+    ["coverage-native bash", "coverage-site"],
   ]) {
     assert.ok(
       coverageJs.indexOf(first) < coverageJs.indexOf(second),
@@ -814,10 +829,78 @@ test("coverage floors accept valid reports and reject empty, malformed, and unde
     await writeFile(join(tempRoot, "rust-low.log"), "TOTAL 90 15 89.99%\n");
     await writeFile(join(tempRoot, "js-malformed.log"), "# all files | n/a | 70.00 |\n");
     await writeFile(join(tempRoot, "js-misleading.log"), "not all files | 99.99 | 99.99 |\n");
+    await writeFile(
+      join(tempRoot, "js-site-ok.log"),
+      [
+        "\u2139 file                           | line % | branch % | funcs % | uncovered lines",
+        "\u2139 scripts                        |        |          |         |",
+        "\u2139  build-sites-source.mjs        |  72.00 |    68.00 |   75.00 |",
+        "\u2139 decoy                         |        |          |         |",
+        "\u2139  deploy-adapter.mjs            | 100.00 |   100.00 |  100.00 |",
+        "\u2139 website                       |        |          |         |",
+        "\u2139  deploy-adapter.mjs            |  74.00 |    69.00 |   77.00 |",
+        "\u2139 all files | 73.00 | 68.50 | 76.00 |",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(tempRoot, "js-site-missing.log"),
+      [
+        "\u2139 decoy                         |        |          |         |",
+        "\u2139  build-sites-source.mjs        | 100.00 |   100.00 |  100.00 |",
+        "\u2139 website                       |        |          |         |",
+        "\u2139  deploy-adapter.mjs            |  74.00 |    69.00 |   77.00 |",
+        "\u2139 all files                     |  73.00 |    68.50 |   76.00 |",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(tempRoot, "js-site-low.log"),
+      [
+        "\u2139 scripts                        |        |          |         |",
+        "\u2139  build-sites-source.mjs        |  69.00 |    68.00 |   69.00 |",
+        "\u2139 website                       |        |          |         |",
+        "\u2139  deploy-adapter.mjs            |  74.00 |    69.00 |   77.00 |",
+        "\u2139 all files | 73.00 | 68.50 | 76.00 |",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(tempRoot, "js-site-duplicate.log"),
+      [
+        "\u2139 scripts                        |        |          |         |",
+        "\u2139  build-sites-source.mjs        |  72.00 |    68.00 |   75.00 |",
+        "\u2139  build-sites-source.mjs        |  72.00 |    68.00 |   75.00 |",
+        "\u2139 website                       |        |          |         |",
+        "\u2139  deploy-adapter.mjs            |  74.00 |    69.00 |   77.00 |",
+        "\u2139 all files | 73.00 | 68.50 | 76.00 |",
+      ].join("\n"),
+    );
     assert.notEqual(invoke(`check_coverage_floor rust '${tempRoot}/rust-low.log' 90.00`).status, 0);
     assert.notEqual(invoke(`check_coverage_floor js '${tempRoot}/js-malformed.log' 80.00`).status, 0);
     assert.notEqual(invoke(`check_coverage_floor js '${tempRoot}/js-misleading.log' 80.00`).status, 0);
     assert.notEqual(invoke(`check_coverage_floor js '${tempRoot}/missing.log' 80.00`).status, 0);
+    assert.equal(
+      invoke(
+        `check_coverage_sources js '${tempRoot}/js-site-ok.log' 70.00 scripts/build-sites-source.mjs website/deploy-adapter.mjs`,
+      ).status,
+      0,
+    );
+    assert.notEqual(
+      invoke(
+        `check_coverage_sources js '${tempRoot}/js-site-missing.log' 70.00 scripts/build-sites-source.mjs website/deploy-adapter.mjs`,
+      ).status,
+      0,
+    );
+    assert.notEqual(
+      invoke(
+        `check_coverage_sources js '${tempRoot}/js-site-low.log' 70.00 scripts/build-sites-source.mjs website/deploy-adapter.mjs`,
+      ).status,
+      0,
+    );
+    assert.notEqual(
+      invoke(
+        `check_coverage_sources js '${tempRoot}/js-site-duplicate.log' 70.00 scripts/build-sites-source.mjs website/deploy-adapter.mjs`,
+      ).status,
+      0,
+    );
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }

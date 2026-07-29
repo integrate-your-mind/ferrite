@@ -17,6 +17,7 @@ import { gzipSync } from "node:zlib";
 
 import {
   PORTABLE_RELEASE_PACKAGES,
+  REQUIRED_BUILDKITE_JOBS,
   downloadBuildkiteArtifact,
   parseArgs,
   prepareNpmRelease,
@@ -230,12 +231,83 @@ test("rejects a report that names the wrong Buildkite package job", async () => 
   await withReport(async ({ reportPath, report }) => {
     await writeReport(reportPath, report);
     const evidence = await buildkiteEvidence(reportPath, report, {
-      job: { command: "./.buildkite/scripts/ci.mjs verify" },
+      mutateJobs: (jobs) =>
+        jobs.map((job) =>
+          job.step_key === "ferrite-packages"
+            ? { ...job, id: "different-package-job" }
+            : job,
+        ),
     });
 
     await assert.rejects(
       verifyBuildkiteReport({ report, reportPath, ...evidence }),
       /not bound to the passed Ferrite packages job/,
+    );
+  });
+});
+
+test("rejects every missing or weakened required Buildkite gate", async () => {
+  for (const required of REQUIRED_BUILDKITE_JOBS) {
+    for (const [caseName, mutateJob] of [
+      ["changed-command", (job) => ({ ...job, command: `${job.command} --changed` })],
+      ["failed", (job) => ({ ...job, state: "failed", exit_status: 1 })],
+      ["nonzero", (job) => ({ ...job, exit_status: 1 })],
+      ["skipped", (job) => ({ ...job, state: "skipped", exit_status: null })],
+      ["soft-failed", (job) => ({ ...job, soft_failed: true })],
+    ]) {
+      await withReport(async ({ reportPath, report }) => {
+        await writeReport(reportPath, report);
+        const evidence = await buildkiteEvidence(reportPath, report, {
+          mutateJobs: (jobs) =>
+            jobs.map((job) =>
+              job.step_key === required.stepKey ? mutateJob(job) : job,
+            ),
+        });
+
+        await assert.rejects(
+          verifyBuildkiteReport({ report, reportPath, ...evidence }),
+          new RegExp(`Buildkite ${required.stepKey} job did not pass its exact contract`),
+          `${required.stepKey}:${caseName}`,
+        );
+      });
+    }
+
+    await withReport(async ({ reportPath, report }) => {
+      await writeReport(reportPath, report);
+      const evidence = await buildkiteEvidence(reportPath, report, {
+        mutateJobs: (jobs) =>
+          jobs.filter((job) => job.step_key !== required.stepKey),
+      });
+
+      await assert.rejects(
+        verifyBuildkiteReport({ report, reportPath, ...evidence }),
+        /Buildkite job topology does not match Ferrite CI/,
+        `${required.stepKey}:missing`,
+      );
+    });
+  }
+});
+
+test("ignores superseded Buildkite retries but rejects duplicate current jobs", async () => {
+  await withReport(async ({ reportPath, report }) => {
+    await writeReport(reportPath, report);
+    const retriedEvidence = await buildkiteEvidence(reportPath, report, {
+      mutateJobs: (jobs) => [
+        ...jobs,
+        { ...jobs[1], id: "old-retried-job", retried: true, state: "failed", exit_status: 1 },
+      ],
+    });
+    await verifyBuildkiteReport({ report, reportPath, ...retriedEvidence });
+
+    const duplicateEvidence = await buildkiteEvidence(reportPath, report, {
+      mutateJobs: (jobs) => [
+        ...jobs,
+        { ...jobs[1], id: "duplicate-current-job" },
+      ],
+    });
+    await assert.rejects(
+      verifyBuildkiteReport({ report, reportPath, ...duplicateEvidence }),
+      /Buildkite job topology does not match Ferrite CI/,
     );
   });
 });
@@ -408,13 +480,7 @@ test("rejects unsafe report artifact paths before reading Buildkite-bound files"
             web_url: build.url,
             commit: source.commit,
             state: "passed",
-            jobs: [{
-              id: build.jobId,
-              step_key: "ferrite-packages",
-              command: "./.buildkite/scripts/ci.mjs packages",
-              state: "passed",
-              exit_status: 0,
-            }],
+            jobs: buildkiteJobsFixture(),
           };
         },
       }),
@@ -477,11 +543,13 @@ async function buildkiteEvidence(
   report,
   {
     build: buildOverrides = {},
-    job: jobOverrides = {},
+    mutateJobs,
     mutateArtifacts,
     mutateDownloads,
   } = {},
 ) {
+  let jobs = buildkiteJobsFixture();
+  if (mutateJobs) jobs = mutateJobs(jobs);
   const buildResponse = {
     pipeline: {
       slug: "ferrite",
@@ -494,16 +562,7 @@ async function buildkiteEvidence(
     web_url: build.url,
     commit: report.source.commit,
     state: "passed",
-    jobs: [
-      {
-        id: build.jobId,
-        step_key: "ferrite-packages",
-        command: "./.buildkite/scripts/ci.mjs packages",
-        state: "passed",
-        exit_status: 0,
-        ...jobOverrides,
-      },
-    ],
+    jobs,
     ...buildOverrides,
   };
   const artifactEntries = [
@@ -556,6 +615,19 @@ async function buildkiteEvidence(
       return bytes;
     },
   };
+}
+
+function buildkiteJobsFixture() {
+  return REQUIRED_BUILDKITE_JOBS.map(({ stepKey, command }, index) => ({
+    id: stepKey === "ferrite-packages" ? build.jobId : `job-${index + 1}`,
+    type: "script",
+    step_key: stepKey,
+    command,
+    state: "passed",
+    exit_status: 0,
+    retried: false,
+    soft_failed: false,
+  }));
 }
 
 function refreshPackageSetDigest(report) {

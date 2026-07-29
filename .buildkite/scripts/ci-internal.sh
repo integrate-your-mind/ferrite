@@ -19,6 +19,7 @@ readonly RUST_TOOLCHAIN
 COVERAGE_RUST_LINES_FLOOR="90.00"
 COVERAGE_RUNTIME_LINES_FLOOR="80.00"
 COVERAGE_NATIVE_LINES_FLOOR="78.00"
+COVERAGE_SITE_LINES_FLOOR="70.00"
 TEE_BIN="${TEE_BIN:-/usr/bin/tee}"
 
 # Keep clean local-agent jobs reproducible and bound Rust's generated output.
@@ -163,6 +164,68 @@ check_coverage_floor() {
     fail "${kind} coverage ${actual}% is below the ${floor}% lines floor"
   printf '%s_lines_coverage=%s\n%s_lines_floor=%s\n' \
     "${kind}" "${actual}" "${kind}" "${floor}" >> "${REPORT_DIR}/coverage-results.tsv"
+}
+
+check_coverage_sources() {
+  local kind="$1"
+  local log="$2"
+  local floor="$3"
+  shift 3
+  [[ -s "${log}" ]] || fail "${kind} coverage report is empty"
+  local source
+  for source in "$@"; do
+    local source_lines
+    source_lines="$(/usr/bin/awk -F'|' -v source="${source}" '
+      NF >= 2 {
+        label = $1
+        value = $2
+        gsub(/[[:space:]%]/, "", value)
+        name = label
+        sub(/^[^[:alnum:]._-]*/, "", name)
+        sub(/[[:space:]]+$/, "", name)
+        if (name == "") next
+        prefix_length = index(label, name) - 1
+
+        if (value == "") {
+          directories[prefix_length] = name
+          for (level in directories) {
+            if (level + 0 > prefix_length) delete directories[level]
+          }
+          next
+        }
+        if (value !~ /^[0-9]+([.][0-9]+)?$/) next
+
+        path = ""
+        for (level = 0; level < prefix_length; level += 1) {
+          if (level in directories) {
+            path = path == "" ? directories[level] : path "/" directories[level]
+          }
+        }
+        path = path == "" ? name : path "/" name
+        if (path != source) next
+        if (found) exit 3
+        found = 1
+      }
+      END {
+        if (!found) exit 1
+        print value
+      }
+    ' "${log}")" || {
+      local status="$?"
+      if (( status == 1 )); then
+        fail "${kind} coverage report is missing production source ${source}"
+      fi
+      if (( status == 3 )); then
+        fail "${kind} coverage report contains duplicate production source ${source}"
+      fi
+      fail "${kind} coverage report has an invalid lines percentage for ${source}"
+    }
+    /usr/bin/awk -v actual="${source_lines}" -v floor="${floor}" \
+      'BEGIN { if (actual + 0 < floor + 0) exit 1 }' ||
+      fail "${kind} coverage ${source} lines ${source_lines}% is below the ${floor}% source floor"
+  done
+  check_coverage_floor "${kind}" "${log}" "${floor}"
+  printf '%s_coverage_sources=%s\n' "${kind}" "$*" >> "${REPORT_DIR}/coverage-results.tsv"
 }
 
 activate_rust_toolchain() {
@@ -339,6 +402,7 @@ packages() {
   run_gate website-lint pnpm --dir website lint
   run_gate website-typecheck pnpm --dir website typecheck
   run_gate website-build pnpm --dir website build
+  run_gate site-build pnpm build:site
   run_gate website-test pnpm --dir website test
   run_gate website-package pnpm --dir website package:sites
   run_gate website-production-audit pnpm --dir website audit --prod --audit-level high
@@ -370,6 +434,10 @@ coverage_js() {
   run_gate coverage-native bash -c \
     'cd packages/node && exec node --test --experimental-test-coverage test/*.test.mjs'
   check_coverage_floor js "${REPORT_DIR}/coverage-native.log" "${COVERAGE_NATIVE_LINES_FLOOR}"
+  run_gate coverage-site node --test --experimental-test-coverage \
+    scripts/build-sites-source.test.mjs website/tests/adapter.test.mjs
+  check_coverage_sources js "${REPORT_DIR}/coverage-site.log" "${COVERAGE_SITE_LINES_FLOOR}" \
+    "scripts/build-sites-source.mjs" "website/deploy-adapter.mjs"
 }
 
 coverage() {

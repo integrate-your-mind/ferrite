@@ -10,6 +10,7 @@ pub use legacy::{
     finalize_production_artifact_manifest, load_production_artifact,
 };
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use ferrite_router::{Route, find_document_file, scan_app_dir, validate_route_types_output};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use source_snapshot::ProjectSourceSnapshot;
 
@@ -47,6 +49,33 @@ struct BuildInputContract {
     document_file: Option<PathBuf>,
     project_sources: ProjectSourceSnapshot,
     server_inputs: Vec<ServerBuildInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildOutputContract {
+    build: DestinationIdentity,
+    route_types: DestinationIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DestinationIdentity {
+    Missing,
+    File { size: u64, sha256: String },
+    Directory(Vec<DestinationEntryIdentity>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DestinationEntryIdentity {
+    path: PathBuf,
+    kind: DestinationEntryKind,
+    size: u64,
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestinationEntryKind {
+    Directory,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -80,7 +109,7 @@ struct ServerBuildInputRoute {
 }
 
 pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
-    validate_build_output_ownership(config)?;
+    let output_contract = validate_build_output_ownership(config)?;
     let initial_contract = capture_build_input_contract(config)?;
     let out_parent = config.out_dir.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(out_parent)?;
@@ -89,21 +118,70 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
         .prefix(".ferrite-verified-build-")
         .tempdir_in(out_parent)?;
     let candidate_path = candidate_holder.path().join("candidate");
+    let candidate_types_path = candidate_holder.path().join("types/routes.d.ts");
     let mut candidate_config = config.clone();
     candidate_config.out_dir = candidate_path.clone();
+    candidate_config.types_out = candidate_types_path.clone();
 
     let mut report = legacy::build_project(&candidate_config)?;
     ensure_build_contract_unchanged(&initial_contract, &capture_build_input_contract(config)?)?;
-
-    if let Err(error) = install_verified_build(&candidate_path, &config.out_dir) {
-        let _ = fs::remove_dir_all(&candidate_path);
-        return Err(error.into());
-    }
     rebase_build_report(&mut report, &candidate_path, &config.out_dir)?;
+
+    let types_parent = config.types_out.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(types_parent)?;
+    let staged_types_holder = tempfile::Builder::new()
+        .prefix(".ferrite-verified-types-")
+        .tempdir_in(types_parent)?;
+    let staged_types_path = staged_types_holder.path().join("routes.d.ts");
+    fs::copy(&candidate_types_path, &staged_types_path)?;
+    fs::remove_file(&candidate_types_path)?;
+    if let Some(candidate_types_parent) = candidate_types_path.parent() {
+        fs::remove_dir(candidate_types_parent)?;
+    }
+
+    let candidate_root = candidate_holder.keep();
+    let staged_types_root = staged_types_holder.keep();
+    let cancellation_flag = build_cancellation_flag();
+    let activation = install_verified_outputs_unless_cancelled(
+        &candidate_path,
+        &config.out_dir,
+        &staged_types_path,
+        &config.types_out,
+        cancellation_flag.as_ref(),
+        &output_contract,
+    );
+    let mut scratch_errors = Vec::new();
+    for (label, root, retained_path) in [
+        ("build", candidate_root.as_path(), candidate_path.as_path()),
+        (
+            "route types",
+            staged_types_root.as_path(),
+            staged_types_path.as_path(),
+        ),
+    ] {
+        if retained_path.exists() {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir(root) {
+            scratch_errors.push(format!(
+                "could not remove empty {label} scratch root `{}`: {error}; the scratch root was preserved",
+                root.display()
+            ));
+        }
+    }
+    if let Err(error) = activation {
+        return Err(activation_error(error, scratch_errors).into());
+    }
+    if !scratch_errors.is_empty() {
+        return Err(BuildError::Io(io::Error::other(format!(
+            "verified build outputs were activated, but scratch cleanup was incomplete: {}",
+            scratch_errors.join("; ")
+        ))));
+    }
     Ok(report)
 }
 
-fn validate_build_output_ownership(config: &BuildConfig) -> Result<()> {
+fn validate_build_output_ownership(config: &BuildConfig) -> Result<BuildOutputContract> {
     let project = normalized_path(&config.project)?;
     let app_dir = normalized_path(&config.app_dir)?;
     let out_dir = normalized_path(&config.out_dir)?;
@@ -134,15 +212,21 @@ fn validate_build_output_ownership(config: &BuildConfig) -> Result<()> {
         )));
     }
 
-    validate_existing_build_destination(&project, &out_dir)?;
+    let build = validate_existing_build_destination(&project, &out_dir)?;
     validate_route_types_output(&config.types_out)?;
-    Ok(())
+    let route_types = capture_destination_identity(&types_out)?;
+    Ok(BuildOutputContract { build, route_types })
 }
 
-fn validate_existing_build_destination(project: &Path, out_dir: &Path) -> Result<()> {
+fn validate_existing_build_destination(
+    project: &Path,
+    out_dir: &Path,
+) -> Result<DestinationIdentity> {
     let metadata = match fs::symlink_metadata(out_dir) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DestinationIdentity::Missing);
+        }
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -154,16 +238,254 @@ fn validate_existing_build_destination(project: &Path, out_dir: &Path) -> Result
 
     let generated_root = normalized_path(&project.join(".ferrite"))?;
     if out_dir.starts_with(&generated_root) || fs::read_dir(out_dir)?.next().is_none() {
-        return Ok(());
+        return Ok(capture_destination_identity(out_dir)?);
     }
-    if load_production_artifact(out_dir).is_ok() {
-        return Ok(());
+    if let Ok(artifact) = load_production_artifact(out_dir) {
+        let identity = capture_destination_identity(out_dir)?;
+        validate_exact_artifact_ownership(&artifact, &identity)?;
+        return Ok(identity);
     }
 
     Err(invalid_output_path(format!(
         "refusing to replace non-build output `{}`",
         out_dir.display()
     )))
+}
+
+fn validate_exact_artifact_ownership(
+    artifact: &LoadedProductionArtifact,
+    identity: &DestinationIdentity,
+) -> Result<()> {
+    let DestinationIdentity::Directory(entries) = identity else {
+        return Err(invalid_output_path(format!(
+            "refusing to replace non-build output `{}`",
+            artifact.root.display()
+        )));
+    };
+
+    let mut allowed_files = artifact
+        .manifest
+        .files
+        .iter()
+        .map(|file| PathBuf::from(&file.path))
+        .collect::<BTreeSet<_>>();
+    allowed_files.insert(PathBuf::from(FERRITE_PRODUCTION_ARTIFACT_MANIFEST));
+    allowed_files.insert(PathBuf::from("ferrite-build.json"));
+
+    let mut allowed_directories = [
+        PathBuf::from("_ferrite"),
+        PathBuf::from("_ferrite/static"),
+        PathBuf::from("server"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for path in &allowed_files {
+        let mut parent = path.parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            allowed_directories.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+
+    for entry in entries {
+        let declared = match entry.kind {
+            DestinationEntryKind::Directory => allowed_directories.contains(&entry.path),
+            DestinationEntryKind::File => allowed_files.contains(&entry.path),
+        };
+        if !declared {
+            return Err(invalid_output_path(format!(
+                "refusing to replace artifact `{}` because it contains undeclared entry `{}`",
+                artifact.root.display(),
+                entry.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn capture_destination_identity(path: &Path) -> io::Result<DestinationIdentity> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DestinationIdentity::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("destination `{}` is a symbolic link", path.display()),
+        ));
+    }
+    if metadata.is_file() {
+        return Ok(DestinationIdentity::File {
+            size: metadata.len(),
+            sha256: sha256_file(path)?,
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "destination `{}` is not a regular file or directory",
+                path.display()
+            ),
+        ));
+    }
+
+    let canonical_root = fs::canonicalize(path)?;
+    let mut entries = Vec::new();
+    capture_directory_entries(path, path, &canonical_root, &mut entries)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(DestinationIdentity::Directory(entries))
+}
+
+fn capture_directory_entries(
+    root: &Path,
+    directory: &Path,
+    canonical_root: &Path,
+    entries: &mut Vec<DestinationEntryIdentity>,
+) -> io::Result<()> {
+    let mut children = fs::read_dir(directory)?.collect::<io::Result<Vec<_>>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("destination entry `{}` escaped its root", path.display()),
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination entry `{}` is a symbolic link",
+                    relative.display()
+                ),
+            ));
+        }
+        let canonical = fs::canonicalize(&path)?;
+        if !canonical.starts_with(canonical_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination entry `{}` resolves outside its root",
+                    relative.display()
+                ),
+            ));
+        }
+        if metadata.is_dir() {
+            entries.push(DestinationEntryIdentity {
+                path: relative.to_path_buf(),
+                kind: DestinationEntryKind::Directory,
+                size: 0,
+                sha256: None,
+            });
+            capture_directory_entries(root, &path, canonical_root, entries)?;
+        } else if metadata.is_file() {
+            entries.push(DestinationEntryIdentity {
+                path: relative.to_path_buf(),
+                kind: DestinationEntryKind::File,
+                size: metadata.len(),
+                sha256: Some(sha256_file(&path)?),
+            });
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination entry `{}` is not a regular file or directory",
+                    relative.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let digest = digest.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(io::Error::from)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))
+))]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "atomic no-clobber rename from `{}` to `{}` is unsupported on this platform",
+            source.display(),
+            destination.display()
+        ),
+    ))
+}
+
+#[cfg(windows)]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both buffers are NUL-terminated UTF-16 paths and remain alive for the call.
+    let result = unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn normalized_path(path: &Path) -> io::Result<PathBuf> {
@@ -575,38 +897,359 @@ fn ensure_build_contract_unchanged(
     )))
 }
 
-fn install_verified_build(candidate: &Path, destination: &Path) -> io::Result<()> {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let mut backup = None;
-    if destination.exists() {
-        let backup_holder = tempfile::Builder::new()
-            .prefix(".ferrite-previous-")
-            .tempdir_in(parent)?;
-        let backup_path = backup_holder.keep();
-        fs::remove_dir(&backup_path)?;
-        fs::rename(destination, &backup_path)?;
-        backup = Some(backup_path);
-    }
+fn install_verified_outputs(
+    candidate_build: &Path,
+    build_destination: &Path,
+    candidate_types: &Path,
+    types_destination: &Path,
+    expected: &BuildOutputContract,
+) -> io::Result<()> {
+    install_verified_outputs_with_ops(
+        candidate_build,
+        build_destination,
+        candidate_types,
+        types_destination,
+        expected,
+        rename_noreplace,
+        remove_owned_path,
+    )
+}
 
-    if let Err(error) = fs::rename(candidate, destination) {
-        if let Some(backup_path) = backup.as_ref() {
-            if let Err(rollback_error) = fs::rename(backup_path, destination) {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "could not activate verified build: {error}; could not restore previous build from `{}`: {rollback_error}",
-                        backup_path.display()
-                    ),
-                ));
-            }
+fn install_verified_outputs_unless_cancelled(
+    candidate_build: &Path,
+    build_destination: &Path,
+    candidate_types: &Path,
+    types_destination: &Path,
+    cancellation_flag: &AtomicBool,
+    expected: &BuildOutputContract,
+) -> io::Result<()> {
+    if cancellation_flag.load(Ordering::Acquire) {
+        let primary = io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Ferrite build activation was cancelled",
+        );
+        let lifecycle_errors =
+            cleanup_candidates(candidate_build, candidate_types, &mut remove_owned_path);
+        return Err(activation_error(primary, lifecycle_errors));
+    }
+    install_verified_outputs(
+        candidate_build,
+        build_destination,
+        candidate_types,
+        types_destination,
+        expected,
+    )
+}
+
+fn install_verified_outputs_with_ops<R, C>(
+    candidate_build: &Path,
+    build_destination: &Path,
+    candidate_types: &Path,
+    types_destination: &Path,
+    expected: &BuildOutputContract,
+    mut move_noreplace: R,
+    mut cleanup: C,
+) -> io::Result<()>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+    C: FnMut(&Path) -> io::Result<()>,
+{
+    let build_backup = match claim_expected_destination(
+        build_destination,
+        &expected.build,
+        ".ferrite-previous-build-",
+        &mut move_noreplace,
+    ) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let lifecycle_errors =
+                cleanup_candidates(candidate_build, candidate_types, &mut cleanup);
+            return Err(activation_error(error, lifecycle_errors));
         }
-        return Err(error);
+    };
+    let types_backup = match claim_expected_destination(
+        types_destination,
+        &expected.route_types,
+        ".ferrite-previous-types-",
+        &mut move_noreplace,
+    ) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let mut lifecycle_errors = restore_backups(
+                build_backup.as_deref(),
+                build_destination,
+                None,
+                types_destination,
+                &mut move_noreplace,
+            );
+            lifecycle_errors.extend(cleanup_candidates(
+                candidate_build,
+                candidate_types,
+                &mut cleanup,
+            ));
+            return Err(activation_error(error, lifecycle_errors));
+        }
+    };
+
+    if let Err(error) = move_noreplace(candidate_build, build_destination) {
+        let error = candidate_activation_error(error, build_destination);
+        let mut lifecycle_errors = restore_backups(
+            build_backup.as_deref(),
+            build_destination,
+            types_backup.as_deref(),
+            types_destination,
+            &mut move_noreplace,
+        );
+        lifecycle_errors.extend(cleanup_candidates(
+            candidate_build,
+            candidate_types,
+            &mut cleanup,
+        ));
+        return Err(activation_error(error, lifecycle_errors));
     }
 
-    if let Some(backup_path) = backup {
-        let _ = fs::remove_dir_all(backup_path);
+    if let Err(error) = move_noreplace(candidate_types, types_destination) {
+        let error = candidate_activation_error(error, types_destination);
+        let mut lifecycle_errors = return_installed_candidate(
+            "build",
+            build_destination,
+            candidate_build,
+            &mut move_noreplace,
+        );
+        lifecycle_errors.extend(restore_backups(
+            build_backup.as_deref(),
+            build_destination,
+            types_backup.as_deref(),
+            types_destination,
+            &mut move_noreplace,
+        ));
+        lifecycle_errors.extend(cleanup_candidates(
+            candidate_build,
+            candidate_types,
+            &mut cleanup,
+        ));
+        return Err(activation_error(error, lifecycle_errors));
+    }
+
+    let mut cleanup_errors = Vec::new();
+    for (label, backup) in [
+        ("previous build", build_backup.as_deref()),
+        ("previous route types", types_backup.as_deref()),
+    ] {
+        if let Some(backup) = backup
+            && let Err(error) = cleanup(backup)
+        {
+            cleanup_errors.push(format!(
+                "could not remove {label} recovery path `{}` after activation: {error}; the recovery path was preserved",
+                backup.display()
+            ));
+        }
+    }
+    if !cleanup_errors.is_empty() {
+        return Err(io::Error::other(format!(
+            "verified build outputs were activated, but recovery cleanup was incomplete: {}",
+            cleanup_errors.join("; ")
+        )));
     }
     Ok(())
+}
+
+fn claim_expected_destination<R>(
+    destination: &Path,
+    expected: &DestinationIdentity,
+    prefix: &str,
+    move_noreplace: &mut R,
+) -> io::Result<Option<PathBuf>>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    if matches!(expected, DestinationIdentity::Missing) {
+        // The final no-clobber move is the compare-and-swap for an absent destination.
+        // A separate existence check would only reopen a check-to-rename race.
+        return Ok(None);
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "destination `{}` changed after validation; the expected path is missing",
+                    destination.display()
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let backup_holder = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
+    let backup_path = backup_holder.keep();
+    fs::remove_dir(&backup_path)?;
+    move_noreplace(destination, &backup_path)?;
+
+    let claimed = capture_destination_identity(&backup_path);
+    if claimed.as_ref().is_ok_and(|claimed| claimed == expected) {
+        return Ok(Some(backup_path));
+    }
+
+    let primary = match claimed {
+        Ok(_) => io::Error::other(format!(
+            "destination `{}` changed after validation; refusing to activate over the claimed path",
+            destination.display()
+        )),
+        Err(error) => io::Error::new(
+            error.kind(),
+            format!(
+                "could not verify claimed destination `{}` after validation: {error}",
+                backup_path.display()
+            ),
+        ),
+    };
+    if let Err(restore_error) = move_noreplace(&backup_path, destination) {
+        return Err(activation_error(
+            primary,
+            vec![format!(
+                "could not restore changed destination from recovery path `{}` to `{}`: {restore_error}; the recovery path was preserved",
+                backup_path.display(),
+                destination.display()
+            )],
+        ));
+    }
+    Err(primary)
+}
+
+fn candidate_activation_error(error: io::Error, destination: &Path) -> io::Error {
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "destination `{}` changed after validation; atomic activation refused to replace it: {error}",
+                destination.display()
+            ),
+        )
+    } else {
+        error
+    }
+}
+
+fn return_installed_candidate<R>(
+    label: &str,
+    destination: &Path,
+    candidate: &Path,
+    move_noreplace: &mut R,
+) -> Vec<String>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    match move_noreplace(destination, candidate) {
+        Ok(()) => Vec::new(),
+        Err(error) => vec![format!(
+            "could not return candidate {label} from `{}` to `{}`: {error}; the active candidate path was preserved",
+            destination.display(),
+            candidate.display()
+        )],
+    }
+}
+
+fn restore_backups<R>(
+    build_backup: Option<&Path>,
+    build_destination: &Path,
+    types_backup: Option<&Path>,
+    types_destination: &Path,
+    move_noreplace: &mut R,
+) -> Vec<String>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    let mut errors = Vec::new();
+    for (label, backup, destination) in [
+        ("route types", types_backup, types_destination),
+        ("build", build_backup, build_destination),
+    ] {
+        if let Some(backup) = backup
+            && let Err(error) = move_noreplace(backup, destination)
+        {
+            errors.push(format!(
+                "could not restore previous {label} from `{}` to `{}`: {error}",
+                backup.display(),
+                destination.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn cleanup_candidates<C>(
+    candidate_build: &Path,
+    candidate_types: &Path,
+    cleanup: &mut C,
+) -> Vec<String>
+where
+    C: FnMut(&Path) -> io::Result<()>,
+{
+    let mut errors = Vec::new();
+    for (label, path) in [("build", candidate_build), ("route types", candidate_types)] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push(format!(
+                    "could not inspect candidate {label} at `{}` before cleanup: {error}; the candidate path was preserved",
+                    path.display()
+                ));
+                continue;
+            }
+        }
+        if let Err(error) = cleanup(path) {
+            errors.push(format!(
+                "could not remove candidate {label} at `{}`: {error}; the candidate path was preserved",
+                path.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn remove_owned_path(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to remove symbolic link `{}`", path.display()),
+        ));
+    }
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else if metadata.is_file() {
+        fs::remove_file(path)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to remove non-file, non-directory path `{}`",
+                path.display()
+            ),
+        ))
+    }
+}
+
+fn activation_error(primary: io::Error, lifecycle_errors: Vec<String>) -> io::Error {
+    if lifecycle_errors.is_empty() {
+        primary
+    } else {
+        io::Error::new(
+            primary.kind(),
+            format!(
+                "could not activate verified build outputs: {primary}; {}",
+                lifecycle_errors.join("; ")
+            ),
+        )
+    }
 }
 
 fn rebase_build_report(report: &mut BuildReport, from: &Path, to: &Path) -> Result<()> {
@@ -655,6 +1298,517 @@ mod tests {
             root.join("render-page.mjs"),
             root.join("build-client.mjs"),
         )
+    }
+
+    fn write_test_file(path: &Path, value: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, value).unwrap();
+    }
+
+    fn successful_public_build_config(root: &Path) -> BuildConfig {
+        let config = test_config(root);
+        write_test_file(
+            &config.page_renderer,
+            r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const mode = process.argv[2];
+if (mode === "--build-artifact") {
+  const output = process.argv[4];
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  await fs.writeFile(
+    output,
+    "export const pageModule = {}; export const layoutModules = []; export const documentModule = null; export const conventionModules = {}; export const routePattern = '/';\n",
+  );
+  process.exit(0);
+}
+if (mode === "--static-params") {
+  process.stdout.write(JSON.stringify({ has_generate_static_params: false, params: [] }));
+  process.exit(0);
+}
+if (mode === "--server-action-manifest") {
+  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
+  process.exit(0);
+}
+if (mode === "--metadata") {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
+"#,
+        );
+        write_test_file(
+            &config.client_bundler,
+            r#"
+process.stdout.write(JSON.stringify({
+  script: null,
+  styles: [],
+  outputs: [],
+  sourcemaps: [],
+  assets: [],
+  inputSnapshot: []
+}));
+"#,
+        );
+        write_test_file(
+            &root.join("verify-build-inputs.mjs"),
+            r#"
+for await (const _chunk of process.stdin) {}
+process.stdout.write(JSON.stringify({ inputs: [] }));
+"#,
+        );
+        config
+    }
+
+    fn seed_previous_outputs(config: &BuildConfig) {
+        write_test_file(
+            &config.out_dir.join("previous.txt"),
+            "previous build output\n",
+        );
+        write_test_file(
+            &config.types_out,
+            &format!("{GENERATED_ROUTE_TYPES_HEADER}\nprevious route types\n"),
+        );
+    }
+
+    fn assert_previous_outputs(config: &BuildConfig) {
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("previous.txt")).unwrap(),
+            "previous build output\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&config.types_out).unwrap(),
+            format!("{GENERATED_ROUTE_TYPES_HEADER}\nprevious route types\n")
+        );
+    }
+
+    fn output_contract_for(
+        build_destination: &Path,
+        types_destination: &Path,
+    ) -> BuildOutputContract {
+        BuildOutputContract {
+            build: capture_destination_identity(build_destination).unwrap(),
+            route_types: capture_destination_identity(types_destination).unwrap(),
+        }
+    }
+
+    fn seed_empty_owned_artifact(out_dir: &Path) {
+        fs::create_dir_all(out_dir).unwrap();
+        let manifest =
+            ProductionArtifactManifest::new("/_ferrite/static", false, Vec::new(), Vec::new())
+                .unwrap();
+        fs::write(
+            out_dir.join(FERRITE_PRODUCTION_ARTIFACT_MANIFEST),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(out_dir.join("ferrite-build.json"), "{}\n").unwrap();
+    }
+
+    #[test]
+    fn activates_build_and_route_types_as_one_verified_output_set() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        install_verified_outputs(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(build_destination.join("new.txt")).unwrap(),
+            "new build\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "new types\n"
+        );
+        assert!(!build_destination.join("old.txt").exists());
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn route_types_activation_failure_restores_both_previous_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                if from == candidate_types {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic route types activation failure",
+                    ));
+                }
+                rename_noreplace(from, to)
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read_to_string(build_destination.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "old types\n"
+        );
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn changed_destination_is_restored_without_activating_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+        write_test_file(
+            &build_destination.join("external-sentinel.txt"),
+            "preserve me\n",
+        );
+
+        let error = install_verified_outputs(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed after validation"));
+        assert_eq!(
+            fs::read_to_string(build_destination.join("external-sentinel.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(!build_destination.join("new.txt").exists());
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn cleanup_failure_after_activation_preserves_recovery_path() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            rename_noreplace,
+            |path| {
+                if path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".ferrite-previous-build-")
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic build backup cleanup failure",
+                    ));
+                }
+                remove_owned_path(path)
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("recovery cleanup was incomplete")
+        );
+        assert_eq!(
+            fs::read_to_string(build_destination.join("new.txt")).unwrap(),
+            "new build\n"
+        );
+        let recovery = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".ferrite-previous-build-")
+                })
+            })
+            .expect("build recovery path");
+        assert_eq!(
+            fs::read_to_string(recovery.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+    }
+
+    #[test]
+    fn activation_and_rollback_failures_preserve_previous_build() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                if from == candidate_types {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic route types activation failure",
+                    ));
+                }
+                if from == build_destination && to == candidate_build {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic build rollback failure",
+                    ));
+                }
+                rename_noreplace(from, to)
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("synthetic route types activation failure"));
+        assert!(message.contains("synthetic build rollback failure"));
+        assert!(message.contains("could not restore previous build"));
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "old types\n"
+        );
+        assert_eq!(
+            fs::read_to_string(build_destination.join("new.txt")).unwrap(),
+            "new build\n"
+        );
+        let recovery = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".ferrite-previous-build-")
+                })
+            })
+            .expect("preserved previous build");
+        assert_eq!(
+            fs::read_to_string(recovery.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+    }
+
+    #[test]
+    fn candidate_cleanup_failure_is_reported_and_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&candidate_types, "new types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+        write_test_file(&build_destination.join("external.txt"), "preserve me\n");
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            rename_noreplace,
+            |path| {
+                if path == candidate_build {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic candidate cleanup failure",
+                    ));
+                }
+                remove_owned_path(path)
+            },
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("changed after validation"));
+        assert!(message.contains("synthetic candidate cleanup failure"));
+        assert!(message.contains(&candidate_build.display().to_string()));
+        assert_eq!(
+            fs::read_to_string(build_destination.join("external.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert_eq!(
+            fs::read_to_string(candidate_build.join("new.txt")).unwrap(),
+            "new build\n"
+        );
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn cancelled_activation_preserves_both_previous_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let cancellation_flag = AtomicBool::new(true);
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        let error = install_verified_outputs_unless_cancelled(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &cancellation_flag,
+            &expected,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            fs::read_to_string(build_destination.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "old types\n"
+        );
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn successful_public_build_replaces_output_and_route_types_together() {
+        let root = tempfile::tempdir().unwrap();
+        let config = successful_public_build_config(root.path());
+        seed_previous_outputs(&config);
+
+        build_project(&config).unwrap();
+
+        assert!(!config.out_dir.join("previous.txt").exists());
+        let route_types = fs::read_to_string(&config.types_out).unwrap();
+        assert!(route_types.starts_with(GENERATED_ROUTE_TYPES_HEADER));
+        assert!(!route_types.contains("previous route types"));
+    }
+
+    #[test]
+    fn renderer_failure_preserves_previous_output_and_route_types() {
+        let root = tempfile::tempdir().unwrap();
+        let config = successful_public_build_config(root.path());
+        seed_previous_outputs(&config);
+        write_test_file(
+            &config.page_renderer,
+            "console.error('synthetic renderer failure'); process.exit(1);\n",
+        );
+
+        assert!(build_project(&config).is_err());
+
+        assert_previous_outputs(&config);
+    }
+
+    #[test]
+    fn bundler_failure_preserves_previous_output_and_route_types() {
+        let root = tempfile::tempdir().unwrap();
+        let config = successful_public_build_config(root.path());
+        seed_previous_outputs(&config);
+        write_test_file(
+            &config.client_bundler,
+            "console.error('synthetic bundler failure'); process.exit(1);\n",
+        );
+
+        assert!(build_project(&config).is_err());
+
+        assert_previous_outputs(&config);
+    }
+
+    #[test]
+    fn source_drift_preserves_previous_output_and_route_types() {
+        let root = tempfile::tempdir().unwrap();
+        let counter = tempfile::NamedTempFile::new().unwrap();
+        let config = successful_public_build_config(root.path());
+        seed_previous_outputs(&config);
+        let counter_json = serde_json::to_string(counter.path()).unwrap();
+        let input_json = serde_json::to_string(&config.app_dir.join("page.tsx")).unwrap();
+        write_test_file(
+            &root.path().join("verify-build-inputs.mjs"),
+            &format!(
+                r#"
+const fs = await import("node:fs/promises");
+for await (const _chunk of process.stdin) {{}}
+const counter = {counter_json};
+const count = Number((await fs.readFile(counter, "utf8")) || "0");
+await fs.writeFile(counter, String(count + 1));
+process.stdout.write(JSON.stringify({{
+  inputs: [{{
+    path: {input_json},
+    value: `sha256:${{(count === 0 ? "a" : "b").repeat(64)}}`
+  }}]
+}}));
+"#
+            ),
+        );
+
+        let error = build_project(&config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed during the production build")
+        );
+        assert_previous_outputs(&config);
     }
 
     #[test]
@@ -712,6 +1866,222 @@ mod tests {
             fs::read_to_string(config.out_dir.join("owned.md")).unwrap(),
             "keep\n"
         );
+    }
+
+    #[test]
+    fn rejects_valid_artifact_with_undeclared_sibling_without_mutation() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("dist");
+        seed_empty_owned_artifact(&config.out_dir);
+        fs::write(config.out_dir.join("sentinel.txt"), "preserve me\n").unwrap();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(error.to_string().contains("undeclared"));
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("sentinel.txt")).unwrap(),
+            "preserve me\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_owned_artifact_with_nested_symlink_without_mutation() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("dist");
+        seed_empty_owned_artifact(&config.out_dir);
+        fs::create_dir_all(config.out_dir.join("nested")).unwrap();
+        std::os::unix::fs::symlink(
+            project.path().join("app/page.tsx"),
+            config.out_dir.join("nested/escape"),
+        )
+        .unwrap();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(config.out_dir.join("nested/escape").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_owned_artifact_with_special_file_without_mutation() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("dist");
+        seed_empty_owned_artifact(&config.out_dir);
+        let fifo = config.out_dir.join("unexpected.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid, NUL-terminated path owned by this temporary test directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("not a regular file or directory")
+        );
+        assert!(fifo.exists());
+    }
+
+    #[test]
+    fn atomic_activation_rejects_destination_created_between_validation_and_move() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&candidate_types, "new types\n");
+
+        assert!(!build_destination.exists());
+        let expected = output_contract_for(&build_destination, &types_destination);
+        let mut injected_race = false;
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                if !injected_race && from == candidate_build && to == build_destination {
+                    injected_race = true;
+                    write_test_file(
+                        &build_destination.join("external-sentinel.txt"),
+                        "preserve me\n",
+                    );
+                }
+                rename_noreplace(from, to)
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        assert!(injected_race);
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("changed after validation"));
+        assert_eq!(
+            fs::read_to_string(build_destination.join("external-sentinel.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn claimed_destination_recreation_preserves_external_path_and_old_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+        let mut injected_race = false;
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                let result = rename_noreplace(from, to);
+                if result.is_ok()
+                    && !injected_race
+                    && from == build_destination
+                    && to.file_name().is_some_and(|name| {
+                        name.to_string_lossy()
+                            .starts_with(".ferrite-previous-build-")
+                    })
+                {
+                    injected_race = true;
+                    write_test_file(
+                        &build_destination.join("external-sentinel.txt"),
+                        "preserve me\n",
+                    );
+                }
+                result
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        assert!(injected_race);
+        let message = error.to_string();
+        assert!(message.contains("changed after validation"));
+        assert!(message.contains("could not restore previous build"));
+        assert_eq!(
+            fs::read_to_string(build_destination.join("external-sentinel.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(!build_destination.join("new.txt").exists());
+        let recovery = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".ferrite-previous-build-")
+                })
+            })
+            .expect("preserved previous build");
+        assert_eq!(
+            fs::read_to_string(recovery.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn route_types_race_rolls_back_new_build_without_clobbering_external_file() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&candidate_types, "new types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+        let mut injected_race = false;
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                if !injected_race && from == candidate_types && to == types_destination {
+                    injected_race = true;
+                    write_test_file(&types_destination, "external types\n");
+                }
+                rename_noreplace(from, to)
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        assert!(injected_race);
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("changed after validation"));
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "external types\n"
+        );
+        assert!(!build_destination.exists());
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
     }
 
     #[test]

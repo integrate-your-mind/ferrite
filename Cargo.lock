@@ -206,6 +206,7 @@ dependencies = [
  "ferrite-router",
  "libc",
  "process-wrap",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
