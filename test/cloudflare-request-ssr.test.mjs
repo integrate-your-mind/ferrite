@@ -15,6 +15,7 @@ const execFileAsync = promisify(execFile);
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const renderPageScript = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const runtimePackage = join(workspaceRoot, "packages/runtime");
+const BUILD_ID = `sha256:${"a".repeat(64)}`;
 const wasmPath = join(
   workspaceRoot,
   "packages/protocol-wasm/dist/ferrite_protocol_wasm.wasm",
@@ -68,6 +69,12 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
         JSON.stringify(document),
         "{}",
         "/",
+        JSON.stringify({
+          sourceBuildId: BUILD_ID,
+          assetBuildId: BUILD_ID,
+          fallbackPath: "/index.html",
+          observedActions: [],
+        }),
       ],
       { cwd: project, maxBuffer: 1024 * 1024 },
     );
@@ -80,7 +87,21 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
     const env = {
       ASSETS: {
         async fetch(request) {
-          fallbackRequests.push(new URL(request.url).pathname);
+          const pathname = new URL(request.url).pathname;
+          if (pathname === "/ferrite-server.json") {
+            return new Response(JSON.stringify({
+              format: { name: "ferrite-server", major: 1, minor: 0 },
+              buildId: BUILD_ID,
+              routes: [{
+                path: "/",
+                prerendered: { "/": "index.html" },
+                observedActions: [],
+              }],
+            }), {
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          fallbackRequests.push(pathname);
           return new Response("<!doctype html><p>prerender fallback</p>", {
             headers: { "Content-Type": "text/html; charset=utf-8" },
           });
@@ -89,9 +110,6 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
     };
     const handler = createCloudflareSsrHandler({
       routes: [{
-        path: "/",
-        fallbackPath: "/index.html",
-        observedActions: [],
         module: routeModule,
         document: { rootId: "edge-root" },
       }],

@@ -299,7 +299,15 @@ async function executeEntryModule(entryModule, server) {
 }
 
 async function buildServerArtifact(buildArgs, targetRuntime) {
-  const [sourcePageFile, outputFile, layoutsJson = "[]", documentJson = "null", conventionsJson = "{}", routePattern] =
+  const [
+    sourcePageFile,
+    outputFile,
+    layoutsJson = "[]",
+    documentJson = "null",
+    conventionsJson = "{}",
+    routePattern,
+    cloudflareMetadataJson,
+  ] =
     buildArgs;
   if (!sourcePageFile || !outputFile || !routePattern) {
     throw new TypeError(
@@ -327,6 +335,9 @@ async function buildServerArtifact(buildArgs, targetRuntime) {
   if (!routePattern.startsWith("/") || routePattern.includes("?") || routePattern.includes("#")) {
     throw new TypeError("artifact route pattern must be an absolute URL path pattern");
   }
+  const cloudflareMetadata = targetRuntime === "cloudflare"
+    ? parseCloudflareMetadata(cloudflareMetadataJson, routePattern)
+    : undefined;
 
   const resolvedPage = resolve(sourcePageFile);
   const resolvedLayouts = sourceLayouts.map((file) => resolve(file));
@@ -356,6 +367,7 @@ async function buildServerArtifact(buildArgs, targetRuntime) {
         documentFile: resolvedDocument,
         conventionFiles: resolvedConventions,
         routePattern,
+        cloudflareMetadata,
       }),
     );
     await mkdir(dirname(resolve(outputFile)), { recursive: true });
@@ -371,7 +383,14 @@ async function buildServerArtifact(buildArgs, targetRuntime) {
   }
 }
 
-function serverArtifactEntrySource({ pageFile, layoutFiles, documentFile, conventionFiles, routePattern }) {
+function serverArtifactEntrySource({
+  pageFile,
+  layoutFiles,
+  documentFile,
+  conventionFiles,
+  routePattern,
+  cloudflareMetadata,
+}) {
   return [
     `import * as serverRuntime from "@ferrite/runtime/server";`,
     `import * as pageModule from ${JSON.stringify(resolve(pageFile))};`,
@@ -393,8 +412,92 @@ function serverArtifactEntrySource({ pageFile, layoutFiles, documentFile, conven
       .filter(Boolean)
       .join(", ")}};`,
     `export const routePattern = ${JSON.stringify(routePattern ?? null)};`,
+    ...(cloudflareMetadata
+      ? [`export const cloudflare = Object.freeze(${JSON.stringify(cloudflareMetadata)});`]
+      : []),
     "",
   ].join("\n");
+}
+
+function parseCloudflareMetadata(source, routePattern) {
+  if (!source) {
+    throw new TypeError(
+      "Ferrite Cloudflare artifacts require metadata JSON from the validated production manifest.",
+    );
+  }
+  let metadata;
+  try {
+    metadata = JSON.parse(source);
+  } catch (error) {
+    throw new TypeError(
+      `Ferrite Cloudflare artifact metadata must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new TypeError("Ferrite Cloudflare artifact metadata must be an object.");
+  }
+  const keys = Object.keys(metadata);
+  const expected = new Set([
+    "sourceBuildId",
+    "assetBuildId",
+    "fallbackPath",
+    "observedActions",
+  ]);
+  const unknown = keys.filter((key) => !expected.has(key));
+  if (unknown.length > 0) {
+    throw new TypeError(`Ferrite Cloudflare artifact metadata contains unknown fields: ${unknown.join(", ")}`);
+  }
+  if (
+    typeof metadata.sourceBuildId !== "string" ||
+    !/^sha256:[a-f0-9]{64}$/.test(metadata.sourceBuildId)
+  ) {
+    throw new TypeError(
+      "Ferrite Cloudflare artifact metadata sourceBuildId must be a SHA-256 build identity.",
+    );
+  }
+  if (
+    typeof metadata.assetBuildId !== "string" ||
+    !/^sha256:[a-f0-9]{64}$/.test(metadata.assetBuildId)
+  ) {
+    throw new TypeError(
+      "Ferrite Cloudflare artifact metadata assetBuildId must be a SHA-256 build identity.",
+    );
+  }
+  if (
+    typeof metadata.fallbackPath !== "string" ||
+    !metadata.fallbackPath.startsWith("/") ||
+    metadata.fallbackPath.includes("%") ||
+    metadata.fallbackPath.includes("\\") ||
+    metadata.fallbackPath.includes("\0") ||
+    metadata.fallbackPath.includes("?") ||
+    metadata.fallbackPath.includes("#") ||
+    metadata.fallbackPath.includes("//") ||
+    metadata.fallbackPath.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    throw new TypeError(
+      "Ferrite Cloudflare artifact metadata fallbackPath must be a canonical unencoded absolute asset path.",
+    );
+  }
+  if (
+    !Array.isArray(metadata.observedActions) ||
+    metadata.observedActions.some((action) => typeof action !== "string" || action.length === 0)
+  ) {
+    throw new TypeError(
+      "Ferrite Cloudflare artifact metadata observedActions must be an array of non-empty strings.",
+    );
+  }
+  if (metadata.observedActions.length > 0) {
+    throw new TypeError("Ferrite Cloudflare artifacts do not support routes with observed server actions.");
+  }
+  return {
+    format: "ferrite-cloudflare-route",
+    version: 1,
+    sourceBuildId: metadata.sourceBuildId,
+    assetBuildId: metadata.assetBuildId,
+    path: routePattern,
+    fallbackPath: metadata.fallbackPath,
+    observedActions: metadata.observedActions,
+  };
 }
 
 async function bundleServerArtifact({

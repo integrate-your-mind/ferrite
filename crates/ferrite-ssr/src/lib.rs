@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use ferrite_core::{AttributeValue, Node, element, fragment, render_to_html, text};
+use ferrite_core::{
+    AttributeValue, Node, element, fragment, render_to_html, render_to_html_with_limit, text,
+};
 pub use ferrite_protocol::{
     COMPACT_ELEMENT_OPCODE, COMPACT_FRAGMENT_OPCODE, COMPACT_TEXT_OPCODE, CompactNode,
     RENDER_PACKET_MARKER, RENDER_PACKET_VERSION, RENDER_STREAM_MARKER, RenderPacket,
@@ -131,9 +133,32 @@ pub fn render_serializable_to_html(node: &SerializableNode) -> Result<String> {
 }
 
 pub fn render_packet_to_html(packet: &RenderPacket) -> Result<String> {
+    render_packet_to_html_with_limit(packet, usize::MAX)
+}
+
+pub fn render_packet_json_to_html_with_limit(
+    input: &str,
+    max_output_bytes: usize,
+) -> Result<String> {
+    let value: Value = serde_json::from_str(input)?;
+    let marker = ferrite_marker(&value)?;
+    if marker != Some(RENDER_PACKET_MARKER) {
+        return Err(SsrError::InvalidRenderPacket(format!(
+            "expected ferrite marker \"{RENDER_PACKET_MARKER}\""
+        )));
+    }
+
+    let packet: RenderPacket = serde_json::from_value(value)?;
+    render_packet_to_html_with_limit(&packet, max_output_bytes)
+}
+
+pub fn render_packet_to_html_with_limit(
+    packet: &RenderPacket,
+    max_output_bytes: usize,
+) -> Result<String> {
     validate_packet(packet)?;
     let core_node = compact_to_core_node(&packet.root)?;
-    Ok(render_to_html(&core_node)?)
+    Ok(render_to_html_with_limit(&core_node, max_output_bytes)?)
 }
 
 pub fn render_stream_json_to_parts(input: &str) -> Result<RenderStreamParts> {
@@ -324,6 +349,24 @@ mod tests {
             render_json_to_html(input).unwrap(),
             "<main class=\"shell\" data-count=\"2\"><h1>Ferrite</h1> &amp; Rust</main>"
         );
+    }
+
+    #[test]
+    fn enforces_compact_render_packet_output_limit_while_serializing() {
+        let input = r#"{
+          "ferrite": "render-packet",
+          "version": 1,
+          "root": [2, "p", {}, [[0, "<&>"]]]
+        }"#;
+
+        assert_eq!(
+            render_packet_json_to_html_with_limit(input, 20).unwrap(),
+            "<p>&lt;&amp;&gt;</p>"
+        );
+        assert!(matches!(
+            render_packet_json_to_html_with_limit(input, 19).unwrap_err(),
+            SsrError::Core(ferrite_core::CoreError::OutputLimitExceeded(19))
+        ));
     }
 
     #[test]

@@ -23,13 +23,15 @@ The first tier deliberately accepts only:
 - exact, static `GET` and `HEAD` routes registered through static ESM imports
 - route modules whose edge build has no Node built-ins except Ferrite runtime's `node:async_hooks`
 - Cloudflare Workers configured with `nodejs_compat`
-- routes with no observed server actions
+- routes whose generated artifact records no build-observed server actions and whose rendered packet contains no action controls
 - HTML responses with a declared, same-route prerender fallback
 - buffered compact render packets and buffered HTML within explicit byte and wall-time limits
 
 It rejects dynamic/catch-all route patterns, server actions, reserved payload-stream requests, unsupported methods or representations, malformed and encoded separator/traversal paths, and application imports of Node built-ins. These are compatibility constraints, not future-complete claims.
 
 The current Ferrite stream API resolves every deferred Suspense chunk before it returns a packet. The Worker adapter therefore does not claim progressive SSR streaming. A deadline or aborted request abandons the response path, but JavaScript cannot forcibly cancel an arbitrary user promise that ignores `AbortSignal`.
+
+Every generated route artifact embeds the source artifact `buildId`, the final packaged asset `buildId`, fallback path, and observed-action inventory. Before request-time rendering, the adapter fetches the deployed `/ferrite-server.json` through `ASSETS` and requires the final asset identity plus the exact action-free route-to-prerender mapping. This prevents request-time HTML from running against a stale client/fallback asset set. The production generator must supply both identities from its already validated source and packaged manifests; hand-authored identities are not release evidence.
 
 ## Build A Route Artifact
 
@@ -45,10 +47,11 @@ node packages/runtime/bin/render-page.mjs \
   '[]' \
   '"app/document.tsx"' \
   '{}' \
-  /
+  / \
+  '{"sourceBuildId":"sha256:<64 lowercase source-manifest hex characters>","assetBuildId":"sha256:<64 lowercase packaged-manifest hex characters>","fallbackPath":"/index.html","observedActions":[]}'
 ```
 
-The build uses an isolate-oriented ESM target and fails if application code imports a Node built-in. The only external allowed by this first profile is `node:async_hooks` from Ferrite's own server runtime.
+The build uses an isolate-oriented ESM target and fails if application code imports a Node built-in. The only external allowed by this first profile is `node:async_hooks` from Ferrite's own server runtime. `PROFILE=release pnpm --filter @ferrite/protocol-wasm build` builds the release-profile WASM used for bundle-size and production proof.
 
 ## Worker Entry
 
@@ -64,14 +67,11 @@ const renderer = await instantiateFerriteProtocolWasm(ferriteWasm);
 
 export default createCloudflareSsrHandler({
   routes: [{
-    path: "/",
-    fallbackPath: "/index.html",
-    observedActions: [],
     module: route,
     document: { rootId: "ferrite-root" },
   }],
   renderer,
-  maxRenderMs: 50,
+  responseDeadlineMs: 50,
   maxPacketBytes: 2 * 1024 * 1024,
   maxHtmlBytes: 8 * 1024 * 1024,
   shouldRender(_request, env) {
@@ -80,7 +80,7 @@ export default createCloudflareSsrHandler({
 });
 ```
 
-Generated deployment code must retain those named exports and validate its artifact manifest before registration.
+Generated deployment code must retain those named exports. The adapter validates the embedded identity against the actual asset manifest before every request-time render.
 
 Cloudflare configuration needs a current compatibility date, Node compatibility for `AsyncLocalStorage`, and Worker-first asset routing:
 
@@ -106,11 +106,13 @@ Official constraints and configuration references:
 ## Failure And Rollback Contract
 
 - A malformed request, unsupported method, unsupported `Accept`, or payload-stream request never invokes the route or asset binding.
-- A route exception, invalid/oversized packet, invalid/oversized HTML, or deadline failure may fetch only that route's declared fallback path.
+- A route exception, action control, invalid/oversized packet, invalid/oversized HTML, or deadline failure may fetch only that route's declared fallback path.
 - An aborted request is rethrown as `AbortError`; it must not start fallback work.
-- A missing, throwing, or non-success fallback binding produces a generic no-store `500` or `504` without exposing the route error.
+- Fallback requests strip range and conditional headers and accept only a full `200` document. A missing, throwing, partial, conditional, or non-success fallback produces a generic no-store `500` or `504` without exposing the route error.
 - `shouldRender` is the rollback gate. Returning `false` bypasses request rendering and serves the declared prerender.
 - Unknown paths and declared static assets remain owned by `env.ASSETS`.
+
+`responseDeadlineMs` bounds manifest verification plus request rendering. A fallback binding gets a fresh deadline of the same duration so recovery remains possible after a render timeout. These are response deadlines, not CPU budgets or forced-cancellation guarantees: synchronous code or a non-cooperative promise can continue after the response path has selected fallback.
 
 ## Not Yet Proven
 
@@ -122,6 +124,7 @@ Official constraints and configuration references:
 - Forced cancellation of non-cooperative component work
 - Distributed data caches, tracing, or multi-region consistency
 - Worker bundle size, CPU, and memory headroom for a real application corpus
+- Production generation that records the edge route-module digest in the immutable artifact receipt
 - Cross-platform Wrangler parity or a hosted Buildkite Worker-runtime gate
 
 The next promotion gate is a local workerd/Wrangler run of the exact committed fixture followed by exact-head Buildkite proof. Deployment remains a separate authorization boundary.

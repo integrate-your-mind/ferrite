@@ -6,7 +6,7 @@ type FerriteProtocolWasmExports = WebAssembly.Exports & {
   ferrite_dealloc(ptr: number, len: number): void;
   ferrite_validate_server_payload_json(ptr: number, len: number): number;
   ferrite_validate_server_payload_stream_frame_json(ptr: number, len: number): number;
-  ferrite_render_json_to_html(ptr: number, len: number, maxOutputLen: number): number;
+  ferrite_render_packet_json_to_html(ptr: number, len: number, maxOutputLen: number): number;
   ferrite_render_output_ptr(): number;
   ferrite_render_output_len(): number;
   ferrite_clear_render_output(): void;
@@ -20,7 +20,7 @@ export type FerriteProtocolWasm = {
   validateServerPayload(payload: ServerPayloadPacket): ServerPayloadPacket;
   validateServerPayloadStreamFrameJson(json: string): void;
   validateServerPayloadStreamFrame(frame: ServerPayloadStreamFrame): ServerPayloadStreamFrame;
-  renderJsonToHtml(json: string, maxOutputBytes?: number): string;
+  renderPacketJsonToHtml(json: string, maxOutputBytes?: number): string;
 };
 
 const DEFAULT_MAX_RENDER_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -42,7 +42,7 @@ export async function instantiateFerriteProtocolWasm(
     validateJsonWithWasm(json, exports.ferrite_validate_server_payload_stream_frame_json);
   }
 
-  function renderJsonToHtml(
+  function renderPacketJsonToHtml(
     json: string,
     maxOutputBytes = DEFAULT_MAX_RENDER_OUTPUT_BYTES,
   ): string {
@@ -61,7 +61,7 @@ export async function instantiateFerriteProtocolWasm(
     const ptr = exports.ferrite_alloc(bytes.length);
     try {
       new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
-      if (exports.ferrite_render_json_to_html(ptr, bytes.length, maxOutputBytes) !== 1) {
+      if (exports.ferrite_render_packet_json_to_html(ptr, bytes.length, maxOutputBytes) !== 1) {
         throw new TypeError(readLastError(exports, decoder));
       }
       const outputPtr = exports.ferrite_render_output_ptr();
@@ -100,7 +100,7 @@ export async function instantiateFerriteProtocolWasm(
       validateServerPayloadStreamFrameJson(JSON.stringify(frame));
       return frame;
     },
-    renderJsonToHtml,
+    renderPacketJsonToHtml,
   };
 }
 
@@ -130,7 +130,7 @@ function validateExports(exports: WebAssembly.Exports): FerriteProtocolWasmExpor
     "ferrite_dealloc",
     "ferrite_validate_server_payload_json",
     "ferrite_validate_server_payload_stream_frame_json",
-    "ferrite_render_json_to_html",
+    "ferrite_render_packet_json_to_html",
     "ferrite_render_output_ptr",
     "ferrite_render_output_len",
     "ferrite_clear_render_output",

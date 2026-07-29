@@ -87,7 +87,7 @@ pub unsafe extern "C" fn ferrite_validate_server_payload_stream_frame_json(
 /// When `len` is non-zero, `ptr` must point to `len` readable bytes in WASM
 /// memory. The bytes are read synchronously and are not retained.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ferrite_render_json_to_html(
+pub unsafe extern "C" fn ferrite_render_packet_json_to_html(
     ptr: *const u8,
     len: usize,
     max_output_len: usize,
@@ -103,7 +103,7 @@ pub unsafe extern "C" fn ferrite_render_json_to_html(
     }
 
     let bytes = unsafe { slice::from_raw_parts(ptr, len) };
-    match render_json_to_html_bytes(bytes, max_output_len) {
+    match render_packet_json_to_html_bytes(bytes, max_output_len) {
         Ok(output) => {
             *RENDER_OUTPUT.lock().expect("render output lock poisoned") = output;
             clear_last_error();
@@ -196,17 +196,15 @@ pub fn validate_server_payload_stream_frame_json_bytes(bytes: &[u8]) -> Result<(
     }
 }
 
-pub fn render_json_to_html_bytes(bytes: &[u8], max_output_len: usize) -> Result<Vec<u8>, String> {
+pub fn render_packet_json_to_html_bytes(
+    bytes: &[u8],
+    max_output_len: usize,
+) -> Result<Vec<u8>, String> {
     let source = str::from_utf8(bytes)
         .map_err(|error| format!("Ferrite render packet JSON must be UTF-8: {error}"))?;
-    let output = ferrite_ssr::render_json_to_html(source)
+    let output = ferrite_ssr::render_packet_json_to_html_with_limit(source, max_output_len)
         .map_err(|error| format!("Ferrite render packet is invalid: {error}"))?
         .into_bytes();
-    if output.len() > max_output_len {
-        return Err(format!(
-            "Ferrite rendered HTML exceeds the {max_output_len}-byte output limit"
-        ));
-    }
     Ok(output)
 }
 
@@ -309,7 +307,7 @@ mod tests {
         }"#;
 
         assert_eq!(
-            render_json_to_html_bytes(packet, 1024).unwrap(),
+            render_packet_json_to_html_bytes(packet, 1024).unwrap(),
             br#"<main data-label="&quot;&lt;&amp;">&lt;Ferrite &amp; Workers&gt;</main>"#
         );
     }
@@ -317,7 +315,7 @@ mod tests {
     #[test]
     fn rejects_malformed_packets_and_oversized_render_output() {
         assert!(
-            render_json_to_html_bytes(b"{", 1024)
+            render_packet_json_to_html_bytes(b"{", 1024)
                 .unwrap_err()
                 .contains("invalid")
         );
@@ -328,8 +326,8 @@ mod tests {
           "root": [0, "larger than four bytes"]
         }"#;
         assert_eq!(
-            render_json_to_html_bytes(packet, 4).unwrap_err(),
-            "Ferrite rendered HTML exceeds the 4-byte output limit"
+            render_packet_json_to_html_bytes(packet, 4).unwrap_err(),
+            "Ferrite render packet is invalid: rendered HTML exceeds the 4-byte output limit"
         );
     }
 }

@@ -17,6 +17,7 @@ const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..
 const buildClientScript = join(workspaceRoot, "packages/runtime/bin/build-client.mjs");
 const renderPageScript = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const runtimePackage = join(workspaceRoot, "packages/runtime");
+const CLOUDFLARE_BUILD_ID = `sha256:${"a".repeat(64)}`;
 
 async function withTempProject(run) {
   const projectRoot = await mkdtemp(join(tmpdir(), "ferrite-render-page-"));
@@ -86,6 +87,12 @@ async function buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
   document = null,
   conventions = {},
   routePattern = "/",
+  cloudflareMetadata = {
+    sourceBuildId: CLOUDFLARE_BUILD_ID,
+    assetBuildId: CLOUDFLARE_BUILD_ID,
+    fallbackPath: "/index.html",
+    observedActions: [],
+  },
 } = {}) {
   await execFileAsync(
     "node",
@@ -98,6 +105,7 @@ async function buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
       JSON.stringify(document),
       JSON.stringify(conventions),
       routePattern,
+      JSON.stringify(cloudflareMetadata),
     ],
     {
       cwd: projectRoot,
@@ -263,6 +271,15 @@ test("build-cloudflare-artifact emits an isolate-targeted route module with only
 
     const route = await import(`${pathToFileURL(outputFile).href}?test=${Date.now()}`);
     assert.equal(route.routePattern, "/");
+    assert.deepEqual(route.cloudflare, {
+      format: "ferrite-cloudflare-route",
+      version: 1,
+      sourceBuildId: CLOUDFLARE_BUILD_ID,
+      assetBuildId: CLOUDFLARE_BUILD_ID,
+      path: "/",
+      fallbackPath: "/index.html",
+      observedActions: [],
+    });
     const first = await route.serverRuntime.renderPageModuleToPacket(
       route.pageModule,
       {},
@@ -279,6 +296,44 @@ test("build-cloudflare-artifact emits an isolate-targeted route module with only
     );
     assert.equal(first.root[2]["data-render"], 1);
     assert.equal(second.root[2]["data-render"], 2);
+  });
+});
+
+test("build-cloudflare-artifact requires manifest-bound identity and rejects observed server actions", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, "export default function Page() { return <main>Edge</main>; }\n");
+
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        [
+          renderPageScript,
+          "--build-cloudflare-artifact",
+          pageFile,
+          outputFile,
+          "[]",
+          "null",
+          "{}",
+          "/",
+        ],
+        { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+      ),
+      /require metadata JSON/,
+    );
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+        cloudflareMetadata: {
+          sourceBuildId: CLOUDFLARE_BUILD_ID,
+          assetBuildId: CLOUDFLARE_BUILD_ID,
+          fallbackPath: "/index.html",
+          observedActions: ["save"],
+        },
+      }),
+      /do not support routes with observed server actions/,
+    );
   });
 });
 

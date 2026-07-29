@@ -3,13 +3,30 @@ import test from "node:test";
 
 import { createCloudflareSsrHandler } from "../dist/cloudflare.js";
 
-function routeModule(render) {
+const BUILD_ID = `sha256:${"a".repeat(64)}`;
+
+function routeModule(render, {
+  path = "/docs",
+  fallbackPath = "/docs/index.html",
+  sourceBuildId = BUILD_ID,
+  assetBuildId = BUILD_ID,
+  observedActions = [],
+} = {}) {
   return {
     pageModule: { default() {} },
     layoutModules: [],
     documentModule: null,
     conventionModules: {},
-    routePattern: "/docs",
+    routePattern: path,
+    cloudflare: {
+      format: "ferrite-cloudflare-route",
+      version: 1,
+      sourceBuildId,
+      assetBuildId,
+      path,
+      fallbackPath,
+      observedActions,
+    },
     serverRuntime: {
       async collectPageMetadata() {
         return {};
@@ -26,7 +43,7 @@ function routeModule(render) {
 
 function textRenderer() {
   return {
-    renderJsonToHtml(json, maxOutputBytes) {
+    renderPacketJsonToHtml(json, maxOutputBytes) {
       const packet = JSON.parse(json);
       const text = packet.root[1];
       if (new TextEncoder().encode(text).byteLength > maxOutputBytes) {
@@ -40,11 +57,25 @@ function textRenderer() {
 function assets(seen, response = new Response("static docs", {
   status: 200,
   headers: { "Content-Type": "text/html; charset=utf-8" },
-})) {
+}), buildId = BUILD_ID) {
   return {
     ASSETS: {
       async fetch(request) {
-        seen.push({ method: request.method, pathname: new URL(request.url).pathname });
+        const pathname = new URL(request.url).pathname;
+        if (pathname === "/ferrite-server.json") {
+          return new Response(JSON.stringify({
+            format: { name: "ferrite-server", major: 1, minor: 0 },
+            buildId,
+            routes: [{
+              path: "/docs",
+              prerendered: { "/docs": "docs/index.html" },
+              observedActions: [],
+            }],
+          }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        seen.push({ method: request.method, pathname });
         return response.clone();
       },
     },
@@ -56,9 +87,6 @@ test("renders exact deep routes at request time and leaves assets on the binding
   const seen = [];
   const handler = createCloudflareSsrHandler({
     routes: [{
-      path: "/docs",
-      fallbackPath: "/docs/index.html",
-      observedActions: [],
       module: routeModule(() => ({
         ferrite: "render-packet",
         version: 1,
@@ -107,7 +135,7 @@ test("falls back only to the declared static route on render failure, deadline, 
     {
       name: "deadline",
       render: () => new Promise(() => {}),
-      maxRenderMs: 5,
+      responseDeadlineMs: 5,
     },
     {
       name: "packet limit",
@@ -133,13 +161,10 @@ test("falls back only to the declared static route on render failure, deadline, 
     const seen = [];
     const handler = createCloudflareSsrHandler({
       routes: [{
-        path: "/docs",
-        fallbackPath: "/docs/index.html",
-        observedActions: [],
         module: routeModule(scenario.render),
       }],
       renderer: textRenderer(),
-      maxRenderMs: scenario.maxRenderMs,
+      responseDeadlineMs: scenario.responseDeadlineMs,
       maxPacketBytes: scenario.maxPacketBytes,
       maxHtmlBytes: scenario.maxHtmlBytes,
     });
@@ -155,13 +180,10 @@ test("falls back only to the declared static route on render failure, deadline, 
 
   const deadlineWithoutFallback = createCloudflareSsrHandler({
     routes: [{
-      path: "/docs",
-      fallbackPath: "/docs/index.html",
-      observedActions: [],
       module: routeModule(() => new Promise(() => {})),
     }],
     renderer: textRenderer(),
-    maxRenderMs: 5,
+    responseDeadlineMs: 5,
   });
   const timedOut = await deadlineWithoutFallback.fetch(
     new Request("https://example.test/docs"),
@@ -174,9 +196,6 @@ test("falls back only to the declared static route on render failure, deadline, 
   const seen = [];
   const rollback = createCloudflareSsrHandler({
     routes: [{
-      path: "/docs",
-      fallbackPath: "/docs/index.html",
-      observedActions: [],
       module: routeModule(() => {
         renders += 1;
         return { ferrite: "render-packet", version: 1, root: [0, "dynamic"] };
@@ -191,6 +210,139 @@ test("falls back only to the declared static route on render failure, deadline, 
   );
   assert.equal(renders, 0);
   assert.deepEqual(seen, [{ method: "GET", pathname: "/docs/index.html" }]);
+
+  const invalidRendererSeen = [];
+  const invalidRenderer = createCloudflareSsrHandler({
+    routes: [{
+      module: routeModule(() => ({
+        ferrite: "render-packet",
+        version: 1,
+        root: [0, "dynamic"],
+      })),
+    }],
+    renderer: {
+      renderPacketJsonToHtml() {
+        return { html: "not text" };
+      },
+    },
+  });
+  const invalidRendererResponse = await invalidRenderer.fetch(
+    new Request("https://example.test/docs"),
+    assets(invalidRendererSeen),
+  );
+  assert.equal(invalidRendererResponse.status, 200);
+  assert.equal(invalidRendererResponse.headers.get("x-ferrite-render"), "static-fallback");
+  assert.deepEqual(invalidRendererSeen, [{ method: "GET", pathname: "/docs/index.html" }]);
+});
+
+test("fails closed when route code and static assets do not share one build identity", async () => {
+  let renders = 0;
+  const handler = createCloudflareSsrHandler({
+    routes: [{
+      module: routeModule(() => {
+        renders += 1;
+        return { ferrite: "render-packet", version: 1, root: [0, "dynamic"] };
+      }),
+    }],
+    renderer: textRenderer(),
+  });
+
+  const environments = [
+    assets([], undefined, `sha256:${"b".repeat(64)}`),
+    {
+      ASSETS: {
+        async fetch() {
+          return new Response("x".repeat((64 * 1024) + 1));
+        },
+      },
+    },
+    ...[
+      {
+        path: "/docs",
+        prerendered: { "/docs": "private.html" },
+        observedActions: [],
+      },
+      {
+        path: "/docs",
+        prerendered: { "/docs": "docs/index.html" },
+        observedActions: ["save"],
+      },
+    ].map((route) => ({
+      ASSETS: {
+        async fetch() {
+          return new Response(JSON.stringify({
+            format: { name: "ferrite-server", major: 1, minor: 0 },
+            buildId: BUILD_ID,
+            routes: [route],
+          }));
+        },
+      },
+    })),
+  ];
+  for (const env of environments) {
+    const response = await handler.fetch(
+      new Request("https://example.test/docs"),
+      env,
+    );
+    assert.equal(response.status, 500);
+    assert.equal(await response.text(), "Internal server error");
+  }
+  assert.equal(renders, 0);
+});
+
+test("sanitizes full-document rollback requests and rejects partial fallback HTML", async () => {
+  const fallbackRequests = [];
+  const handler = createCloudflareSsrHandler({
+    routes: [{
+      module: routeModule(() => {
+        throw new Error("render failed");
+      }),
+    }],
+    renderer: textRenderer(),
+  });
+  const env = {
+    ASSETS: {
+      async fetch(request) {
+        const pathname = new URL(request.url).pathname;
+        if (pathname === "/ferrite-server.json") {
+          return new Response(JSON.stringify({
+            format: { name: "ferrite-server", major: 1, minor: 0 },
+            buildId: BUILD_ID,
+            routes: [{
+              path: "/docs",
+              prerendered: { "/docs": "docs/index.html" },
+              observedActions: [],
+            }],
+          }));
+        }
+        fallbackRequests.push({
+          pathname,
+          range: request.headers.get("range"),
+          ifNoneMatch: request.headers.get("if-none-match"),
+        });
+        return new Response("partial", {
+          status: 206,
+          headers: { "Content-Range": "bytes 0-6/20" },
+        });
+      },
+    },
+  };
+  const response = await handler.fetch(
+    new Request("https://example.test/docs", {
+      headers: {
+        Range: "bytes=0-6",
+        "If-None-Match": "\"stale\"",
+      },
+    }),
+    env,
+  );
+  assert.equal(response.status, 500);
+  assert.equal(await response.text(), "Internal server error");
+  assert.deepEqual(fallbackRequests, [{
+    pathname: "/docs/index.html",
+    range: null,
+    ifNoneMatch: null,
+  }]);
 });
 
 test("fails closed for malformed, unsupported, aborted, and unavailable fallback paths", async () => {
@@ -198,9 +350,6 @@ test("fails closed for malformed, unsupported, aborted, and unavailable fallback
   const seen = [];
   const handler = createCloudflareSsrHandler({
     routes: [{
-      path: "/docs",
-      fallbackPath: "/docs/index.html",
-      observedActions: [],
       module: routeModule(() => {
         renders += 1;
         throw new Error("render failed");
@@ -256,9 +405,6 @@ test("fails closed for malformed, unsupported, aborted, and unavailable fallback
   const duringSeen = [];
   const pendingHandler = createCloudflareSsrHandler({
     routes: [{
-      path: "/docs",
-      fallbackPath: "/docs/index.html",
-      observedActions: [],
       module: routeModule(() => new Promise(() => {})),
     }],
     renderer: textRenderer(),
@@ -270,43 +416,112 @@ test("fails closed for malformed, unsupported, aborted, and unavailable fallback
   duringController.abort();
   await assert.rejects(pending, (error) => error?.name === "AbortError");
   assert.deepEqual(duringSeen, []);
+
+  const componentAbort = createCloudflareSsrHandler({
+    routes: [{
+      module: routeModule(() => {
+        throw new DOMException("component failure", "AbortError");
+      }),
+    }],
+    renderer: textRenderer(),
+  });
+  const componentAbortSeen = [];
+  const componentAbortResponse = await componentAbort.fetch(
+    new Request("https://example.test/docs"),
+    assets(componentAbortSeen),
+  );
+  assert.equal(componentAbortResponse.status, 200);
+  assert.equal(componentAbortResponse.headers.get("x-ferrite-render"), "static-fallback");
+  assert.deepEqual(componentAbortSeen, [{ method: "GET", pathname: "/docs/index.html" }]);
+});
+
+test("rejects server-action controls found in the rendered packet", async () => {
+  for (const root of [
+    [2, "form", { action: "/_ferrite/action" }, [[0, "Save"]]],
+    [2, "section", {}, [[2, "input", { name: "__ferrite_action", value: "save" }, []]]],
+  ]) {
+    const seen = [];
+    const handler = createCloudflareSsrHandler({
+      routes: [{
+        module: routeModule(() => ({
+          ferrite: "render-packet",
+          version: 1,
+          root,
+        })),
+      }],
+      renderer: textRenderer(),
+    });
+    const response = await handler.fetch(
+      new Request("https://example.test/docs"),
+      assets(seen),
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-ferrite-render"), "static-fallback");
+    assert.deepEqual(seen, [{ method: "GET", pathname: "/docs/index.html" }]);
+  }
 });
 
 test("rejects routes outside the initial static, action-free Worker compatibility tier", () => {
   const base = {
-    fallbackPath: "/docs/index.html",
-    observedActions: [],
     module: routeModule(() => ({ ferrite: "render-packet", version: 1, root: [0, "ok"] })),
   };
   const renderer = textRenderer();
 
   assert.throws(
     () => createCloudflareSsrHandler({
-      routes: [{ ...base, path: "/posts/:slug" }],
+      routes: [{
+        module: routeModule(
+          () => ({ ferrite: "render-packet", version: 1, root: [0, "ok"] }),
+          { path: "/posts/:slug" },
+        ),
+      }],
       renderer,
     }),
     /exact routes only/,
   );
   assert.throws(
     () => createCloudflareSsrHandler({
-      routes: [{ ...base, path: "/docs", observedActions: ["save"] }],
+      routes: [{
+        module: routeModule(
+          () => ({ ferrite: "render-packet", version: 1, root: [0, "ok"] }),
+          { observedActions: ["save"] },
+        ),
+      }],
       renderer,
     }),
     /server actions/,
   );
-  const { observedActions: _actions, ...withoutActionInventory } = base;
+  const withoutIdentity = structuredClone(base);
+  delete withoutIdentity.module.cloudflare;
   assert.throws(
     () => createCloudflareSsrHandler({
-      routes: [{ ...withoutActionInventory, path: "/docs" }],
+      routes: [withoutIdentity],
       renderer,
     }),
-    /build-observed server action list/,
+    /generated edge identity/,
   );
   assert.throws(
     () => createCloudflareSsrHandler({
-      routes: [{ ...base, path: "/other" }],
+      routes: [{
+        module: {
+          ...base.module,
+          routePattern: "/other",
+        },
+      }],
       renderer,
     }),
     /does not match module pattern/,
+  );
+  assert.throws(
+    () => createCloudflareSsrHandler({
+      routes: [{
+        module: routeModule(
+          () => ({ ferrite: "render-packet", version: 1, root: [0, "ok"] }),
+          { fallbackPath: "/docs/%2e%2e/private" },
+        ),
+      }],
+      renderer,
+    }),
+    /cannot contain percent-encoded/,
   );
 });

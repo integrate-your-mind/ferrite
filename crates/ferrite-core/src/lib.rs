@@ -265,15 +265,18 @@ mod tests {
     }
 
     #[test]
-    fn enforces_output_limit_during_escaping() {
-        let tree = element("p", [], vec![text("<&>")]).unwrap();
+    fn enforces_output_limit_during_escaping_across_multiple_nodes() {
+        let tree = fragment(vec![
+            element("p", [], vec![text("<&>")]).unwrap(),
+            element("span", [], vec![text("x")]).unwrap(),
+        ]);
         assert_eq!(
-            render_to_html_with_limit(&tree, 20).unwrap(),
-            "<p>&lt;&amp;&gt;</p>"
+            render_to_html_with_limit(&tree, 34).unwrap(),
+            "<p>&lt;&amp;&gt;</p><span>x</span>"
         );
         assert_eq!(
-            render_to_html_with_limit(&tree, 19).unwrap_err(),
-            CoreError::OutputLimitExceeded(19)
+            render_to_html_with_limit(&tree, 33).unwrap_err(),
+            CoreError::OutputLimitExceeded(33)
         );
     }
 }

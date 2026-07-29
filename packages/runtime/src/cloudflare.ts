@@ -7,7 +7,7 @@ import type {
   RouteConventionModules,
   ServerRenderOptions,
 } from "./server.js";
-import type { RenderPacket } from "./index.js";
+import type { CompactNode, RenderPacket } from "./index.js";
 
 const SECURITY_HEADERS = Object.freeze({
   "Content-Security-Policy":
@@ -19,7 +19,10 @@ const SECURITY_HEADERS = Object.freeze({
 
 const DEFAULT_MAX_PACKET_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_HTML_BYTES = 8 * 1024 * 1024;
-const DEFAULT_MAX_RENDER_MS = 1_000;
+const DEFAULT_RESPONSE_DEADLINE_MS = 1_000;
+const MAX_ASSET_MANIFEST_BYTES = 64 * 1024;
+const SERVER_ACTION_URL = "/_ferrite/action";
+const SERVER_ACTION_ID_FIELD = "__ferrite_action";
 
 export type CloudflareAssetsBinding = {
   fetch(request: Request): Promise<Response>;
@@ -31,7 +34,7 @@ export type CloudflareSsrEnv = {
 };
 
 export type CloudflareHtmlRenderer = {
-  renderJsonToHtml(json: string, maxOutputBytes?: number): string;
+  renderPacketJsonToHtml(json: string, maxOutputBytes?: number): string;
 };
 
 export type CloudflareServerRuntime = {
@@ -64,14 +67,20 @@ export type CloudflareRouteModule = {
   layoutModules?: LayoutModule[];
   documentModule?: DocumentModule | null;
   conventionModules?: RouteConventionModules;
+  cloudflare: {
+    format: "ferrite-cloudflare-route";
+    version: 1;
+    sourceBuildId: string;
+    assetBuildId: string;
+    path: string;
+    fallbackPath: string;
+    observedActions: string[];
+  };
 };
 
 export type CloudflareSsrRoute = {
-  path: string;
-  fallbackPath: string;
   module: CloudflareRouteModule;
   props?: Record<string, unknown>;
-  observedActions: string[];
   document?: Omit<DocumentRenderOptions, "metadata" | "routePath" | "routePattern">;
 };
 
@@ -80,31 +89,40 @@ export type CloudflareSsrOptions<Env extends CloudflareSsrEnv = CloudflareSsrEnv
   renderer: CloudflareHtmlRenderer;
   maxPacketBytes?: number;
   maxHtmlBytes?: number;
-  maxRenderMs?: number;
+  responseDeadlineMs?: number;
   shouldRender?: (request: Request, env: Env) => boolean;
 };
 
 type PreparedRoute = CloudflareSsrRoute & {
+  path: string;
+  fallbackPath: string;
+  sourceBuildId: string;
+  assetBuildId: string;
   layoutModules: LayoutModule[];
   conventionModules: RouteConventionModules;
   props: Record<string, unknown>;
 };
 
-class RenderDeadlineError extends Error {
+class ResponseDeadlineError extends Error {
   constructor() {
-    super("Ferrite Cloudflare request-time render exceeded its deadline.");
-    this.name = "RenderDeadlineError";
+    super("Ferrite Cloudflare request-time response exceeded its deadline.");
+    this.name = "ResponseDeadlineError";
   }
 }
 
 export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = CloudflareSsrEnv>(
   options: CloudflareSsrOptions<Env>,
 ): { fetch(request: Request, env: Env): Promise<Response> } {
-  const routes = prepareRoutes(options.routes);
+  const prepared = prepareRoutes(options.routes);
+  const routes = prepared.routes;
   const maxPacketBytes = positiveLimit(options.maxPacketBytes, DEFAULT_MAX_PACKET_BYTES, "packet byte");
   const maxHtmlBytes = positiveLimit(options.maxHtmlBytes, DEFAULT_MAX_HTML_BYTES, "HTML byte");
-  const maxRenderMs = positiveLimit(options.maxRenderMs, DEFAULT_MAX_RENDER_MS, "render millisecond");
-  if (!options.renderer || typeof options.renderer.renderJsonToHtml !== "function") {
+  const responseDeadlineMs = positiveLimit(
+    options.responseDeadlineMs,
+    DEFAULT_RESPONSE_DEADLINE_MS,
+    "response deadline millisecond",
+  );
+  if (!options.renderer || typeof options.renderer.renderPacketJsonToHtml !== "function") {
     throw new TypeError("Ferrite Cloudflare SSR requires a packet-to-HTML renderer.");
   }
   if (options.shouldRender !== undefined && typeof options.shouldRender !== "function") {
@@ -133,6 +151,26 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
         return errorResponse(501, "Ferrite Worker payload streaming is not supported");
       }
       throwIfAborted(request.signal);
+      const deadline = monotonicNow() + responseDeadlineMs;
+      try {
+        await withinRequestBudget(
+          verifyAssetsBuildIdentity(
+            request,
+            env,
+            prepared.assetBuildId,
+            routes.values(),
+          ),
+          request.signal,
+          deadline,
+        );
+      } catch (error) {
+        if (request.signal.aborted) {
+          throw abortError();
+        }
+        return error instanceof ResponseDeadlineError
+          ? errorResponse(504, "Gateway timeout")
+          : errorResponse(500, "Internal server error");
+      }
 
       let useSsr = true;
       try {
@@ -141,10 +179,9 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
         useSsr = false;
       }
       if (!useSsr) {
-        return fetchFallback(request, env, route.fallbackPath, 500);
+        return fetchFallback(request, env, route.fallbackPath, 500, responseDeadlineMs);
       }
 
-      const deadline = monotonicNow() + maxRenderMs;
       try {
         const packet = await withinRequestBudget(
           renderRoutePacket(route, parsed.pathname),
@@ -156,7 +193,13 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
           throw new TypeError(`Ferrite render packet exceeds the ${maxPacketBytes}-byte limit.`);
         }
         ensureBeforeDeadline(deadline);
-        const html = options.renderer.renderJsonToHtml(packetJson, maxHtmlBytes);
+        if (containsServerAction(packet.root)) {
+          throw new TypeError("Ferrite Cloudflare routes cannot render server actions.");
+        }
+        const html = options.renderer.renderPacketJsonToHtml(packetJson, maxHtmlBytes);
+        if (typeof html !== "string") {
+          throw new TypeError("Ferrite Cloudflare packet renderer must return HTML text.");
+        }
         if (byteLength(html) > maxHtmlBytes) {
           throw new TypeError(`Ferrite rendered HTML exceeds the ${maxHtmlBytes}-byte limit.`);
         }
@@ -174,11 +217,11 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
           }),
         });
       } catch (error) {
-        if (isAbortError(error) || request.signal.aborted) {
+        if (request.signal.aborted) {
           throw abortError();
         }
-        const status = error instanceof RenderDeadlineError ? 504 : 500;
-        return fetchFallback(request, env, route.fallbackPath, status);
+        const status = error instanceof ResponseDeadlineError ? 504 : 500;
+        return fetchFallback(request, env, route.fallbackPath, status, responseDeadlineMs);
       }
     },
   };
@@ -222,27 +265,55 @@ async function renderRoutePacket(route: PreparedRoute, pathname: string): Promis
   );
 }
 
-function prepareRoutes(routes: CloudflareSsrRoute[]): Map<string, PreparedRoute> {
+function prepareRoutes(routes: CloudflareSsrRoute[]): {
+  routes: Map<string, PreparedRoute>;
+  sourceBuildId: string;
+  assetBuildId: string;
+} {
   if (!Array.isArray(routes) || routes.length === 0) {
     throw new TypeError("Ferrite Cloudflare SSR requires at least one route.");
   }
   const prepared = new Map<string, PreparedRoute>();
+  let sourceBuildId: string | undefined;
+  let assetBuildId: string | undefined;
   for (const route of routes) {
     if (!route || typeof route !== "object") {
       throw new TypeError("Ferrite Cloudflare SSR routes must be objects.");
     }
-    const path = canonicalPath(route.path, "route path");
+    if (!route.module || typeof route.module !== "object") {
+      throw new TypeError("Ferrite Cloudflare SSR route is missing its module.");
+    }
+    const identity = route.module.cloudflare;
+    if (
+      !identity ||
+      identity.format !== "ferrite-cloudflare-route" ||
+      identity.version !== 1
+    ) {
+      throw new TypeError("Ferrite Cloudflare SSR route is missing its generated edge identity.");
+    }
+    if (!/^sha256:[a-f0-9]{64}$/.test(identity.sourceBuildId)) {
+      throw new TypeError("Ferrite Cloudflare SSR route has an invalid source build identity.");
+    }
+    if (sourceBuildId !== undefined && identity.sourceBuildId !== sourceBuildId) {
+      throw new TypeError("Ferrite Cloudflare SSR routes must come from one source build identity.");
+    }
+    sourceBuildId = identity.sourceBuildId;
+    if (!/^sha256:[a-f0-9]{64}$/.test(identity.assetBuildId)) {
+      throw new TypeError("Ferrite Cloudflare SSR route has an invalid asset build identity.");
+    }
+    if (assetBuildId !== undefined && identity.assetBuildId !== assetBuildId) {
+      throw new TypeError("Ferrite Cloudflare SSR routes must come from one asset build identity.");
+    }
+    assetBuildId = identity.assetBuildId;
+    const path = configuredPath(identity.path, "route path");
     if (path.split("/").some((segment) => segment.startsWith(":") || segment.startsWith("*"))) {
       throw new TypeError(
         `Ferrite Cloudflare SSR route "${path}" is dynamic; the initial Worker adapter accepts exact routes only.`,
       );
     }
-    canonicalPath(route.fallbackPath, `fallback path for "${path}"`);
+    const fallbackPath = configuredPath(identity.fallbackPath, `fallback path for "${path}"`);
     if (prepared.has(path)) {
       throw new TypeError(`Ferrite Cloudflare SSR route "${path}" is duplicated.`);
-    }
-    if (!route.module || typeof route.module !== "object") {
-      throw new TypeError(`Ferrite Cloudflare SSR route "${path}" is missing its module.`);
     }
     if (!route.module.pageModule || typeof route.module.pageModule.default !== "function") {
       throw new TypeError(`Ferrite Cloudflare SSR route "${path}" is missing its page component.`);
@@ -281,17 +352,17 @@ function prepareRoutes(routes: CloudflareSsrRoute[]): Map<string, PreparedRoute>
     ) {
       throw new TypeError(`Ferrite Cloudflare SSR route "${path}" has invalid convention modules.`);
     }
-    if (!Array.isArray(route.observedActions)) {
+    if (!Array.isArray(identity.observedActions)) {
       throw new TypeError(
         `Ferrite Cloudflare SSR route "${path}" must include its build-observed server action list.`,
       );
     }
-    if (route.observedActions.length > 0) {
+    if (identity.observedActions.length > 0) {
       throw new TypeError(
         `Ferrite Cloudflare SSR route "${path}" contains server actions, which the initial Worker adapter does not support.`,
       );
     }
-    if (route.observedActions.some((action) => typeof action !== "string" || action.length === 0)) {
+    if (identity.observedActions.some((action) => typeof action !== "string" || action.length === 0)) {
       throw new TypeError(
         `Ferrite Cloudflare SSR route "${path}" has an invalid build-observed server action list.`,
       );
@@ -302,12 +373,165 @@ function prepareRoutes(routes: CloudflareSsrRoute[]): Map<string, PreparedRoute>
     prepared.set(path, {
       ...route,
       path,
+      fallbackPath,
+      sourceBuildId: identity.sourceBuildId,
+      assetBuildId: identity.assetBuildId,
       props: route.props ?? {},
       layoutModules: route.module.layoutModules ?? [],
       conventionModules: route.module.conventionModules ?? {},
     });
   }
-  return prepared;
+  return {
+    routes: prepared,
+    sourceBuildId: sourceBuildId as string,
+    assetBuildId: assetBuildId as string,
+  };
+}
+
+async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
+  request: Request,
+  env: Env,
+  expectedAssetBuildId: string,
+  expectedRoutes: Iterable<PreparedRoute>,
+): Promise<void> {
+  const binding = env?.ASSETS;
+  if (!binding || typeof binding.fetch !== "function") {
+    throw new TypeError("Ferrite Cloudflare SSR requires an ASSETS binding.");
+  }
+  const manifestUrl = new URL(request.url);
+  manifestUrl.pathname = "/ferrite-server.json";
+  manifestUrl.search = "";
+  manifestUrl.hash = "";
+  const response = await binding.fetch(new Request(manifestUrl, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+    signal: request.signal,
+  }));
+  if (response.status !== 200) {
+    throw new TypeError("Ferrite Cloudflare asset manifest is unavailable.");
+  }
+  const declaredSize = response.headers.get("content-length");
+  if (
+    declaredSize !== null &&
+    (!/^(?:0|[1-9][0-9]*)$/.test(declaredSize) ||
+      Number(declaredSize) > MAX_ASSET_MANIFEST_BYTES)
+  ) {
+    throw new TypeError("Ferrite Cloudflare asset manifest exceeds its byte limit.");
+  }
+  const bytes = await readBoundedResponseBody(response, MAX_ASSET_MANIFEST_BYTES);
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new TypeError("Ferrite Cloudflare asset manifest is invalid.");
+  }
+  if (
+    !manifest ||
+    typeof manifest !== "object" ||
+    Array.isArray(manifest) ||
+    !("format" in manifest) ||
+    !manifest.format ||
+    typeof manifest.format !== "object" ||
+    Array.isArray(manifest.format) ||
+    !("name" in manifest.format) ||
+    manifest.format.name !== "ferrite-server" ||
+    !("major" in manifest.format) ||
+    manifest.format.major !== 1 ||
+    !("buildId" in manifest) ||
+    manifest.buildId !== expectedAssetBuildId ||
+    !("routes" in manifest) ||
+    !Array.isArray(manifest.routes)
+  ) {
+    throw new TypeError("Ferrite Cloudflare asset manifest does not match the route build identity.");
+  }
+  for (const expected of expectedRoutes) {
+    const route = manifest.routes.find((candidate) =>
+      isRecord(candidate) &&
+      candidate.path === expected.path
+    );
+    const prerendered = isRecord(route?.prerendered)
+      ? route.prerendered
+      : undefined;
+    const observedActions = route?.observedActions;
+    if (
+      !route ||
+      !prerendered ||
+      prerendered[expected.path] !== expected.fallbackPath.slice(1) ||
+      !Array.isArray(observedActions) ||
+      observedActions.length !== 0
+    ) {
+      throw new TypeError(
+        `Ferrite Cloudflare asset manifest does not bind route "${expected.path}" to its action-free fallback.`,
+      );
+    }
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+async function readBoundedResponseBody(response: Response, maxBytes: number): Promise<Uint8Array> {
+  if (!response.body) {
+    return new Uint8Array();
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel("Ferrite Cloudflare asset manifest exceeds its byte limit.");
+        } catch {
+          // The size violation remains authoritative when the binding cannot cancel.
+        }
+        throw new TypeError("Ferrite Cloudflare asset manifest exceeds its byte limit.");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function containsServerAction(node: CompactNode): boolean {
+  if (!Array.isArray(node) || node.length < 2) {
+    return false;
+  }
+  if (node[0] === 0) {
+    return false;
+  }
+  if (node[0] === 1) {
+    return Array.isArray(node[1]) && node[1].some(containsServerAction);
+  }
+  if (node[0] !== 2 || node.length !== 4) {
+    return false;
+  }
+  const tag = typeof node[1] === "string" ? node[1].toLowerCase() : "";
+  const props = node[2];
+  if (
+    props &&
+    typeof props === "object" &&
+    !Array.isArray(props) &&
+    ((tag === "form" && props.action === SERVER_ACTION_URL) ||
+      (tag === "input" && props.name === SERVER_ACTION_ID_FIELD))
+  ) {
+    return true;
+  }
+  return Array.isArray(node[3]) && node[3].some(containsServerAction);
 }
 
 function requestPath(request: Request): { url: URL; pathname: string; error?: never } | { error: Response } {
@@ -349,11 +573,22 @@ function canonicalPath(value: unknown, label: string, normalizeTrailingSlash = f
   return normalized;
 }
 
+function configuredPath(value: unknown, label: string): string {
+  const path = canonicalPath(value, label);
+  if (path.includes("%")) {
+    throw new TypeError(
+      `Ferrite Cloudflare ${label} "${path}" cannot contain percent-encoded or literal percent bytes.`,
+    );
+  }
+  return path;
+}
+
 async function fetchFallback<Env extends CloudflareSsrEnv>(
   request: Request,
   env: Env,
   fallbackPath: string,
   failureStatus: number,
+  responseDeadlineMs: number,
 ): Promise<Response> {
   throwIfAborted(request.signal);
   const binding = env?.ASSETS;
@@ -365,32 +600,48 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
   url.search = "";
   url.hash = "";
   try {
-    const response = await binding.fetch(
-      new Request(url.toString(), {
-        method: request.method,
-        headers: request.headers,
-        signal: request.signal,
-      }),
+    const headers = new Headers(request.headers);
+    for (const name of [
+      "if-match",
+      "if-modified-since",
+      "if-none-match",
+      "if-range",
+      "if-unmodified-since",
+      "range",
+    ]) {
+      headers.delete(name);
+    }
+    const response = await withinRequestBudget(
+      binding.fetch(
+        new Request(url.toString(), {
+          method: request.method,
+          headers,
+          signal: request.signal,
+        }),
+      ),
+      request.signal,
+      monotonicNow() + responseDeadlineMs,
     );
-    if (![200, 206, 304, 412, 416].includes(response.status)) {
+    if (response.status !== 200) {
       return errorResponse(failureStatus, failureStatus === 504 ? "Gateway timeout" : "Internal server error");
     }
     return new Response(
-      request.method === "HEAD" || responseStatusForbidsBody(response.status) ? null : response.body,
+      request.method === "HEAD" ? null : response.body,
       {
         status: response.status,
         statusText: response.statusText,
-        headers: responseHeaders(response.status === 412 || response.status === 416 ? "no-store" : "no-cache", {
+        headers: responseHeaders("no-cache", {
           ...Object.fromEntries(response.headers),
           "X-Ferrite-Render": "static-fallback",
         }),
       },
     );
   } catch (error) {
-    if (isAbortError(error) || request.signal.aborted) {
+    if (request.signal.aborted) {
       throw abortError();
     }
-    return errorResponse(failureStatus, failureStatus === 504 ? "Gateway timeout" : "Internal server error");
+    const status = error instanceof ResponseDeadlineError ? 504 : failureStatus;
+    return errorResponse(status, status === 504 ? "Gateway timeout" : "Internal server error");
   }
 }
 
@@ -409,8 +660,8 @@ async function fetchAsset<Env extends CloudflareSsrEnv>(request: Request, env: E
         headers: responseHeaders(response.headers.get("cache-control"), response.headers),
       },
     );
-  } catch (error) {
-    if (isAbortError(error) || request.signal.aborted) {
+  } catch {
+    if (request.signal.aborted) {
       throw abortError();
     }
     return errorResponse(500, "Internal server error");
@@ -430,7 +681,7 @@ async function withinRequestBudget<T>(
     return await Promise.race([
       operation,
       new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new RenderDeadlineError()), remaining);
+        timeout = setTimeout(() => reject(new ResponseDeadlineError()), remaining);
       }),
       new Promise<never>((_resolve, reject) => {
         onAbort = () => reject(abortError());
@@ -452,7 +703,7 @@ async function withinRequestBudget<T>(
 
 function ensureBeforeDeadline(deadline: number): void {
   if (monotonicNow() > deadline) {
-    throw new RenderDeadlineError();
+    throw new ResponseDeadlineError();
   }
 }
 
@@ -468,10 +719,6 @@ function throwIfAborted(signal: AbortSignal): void {
 
 function abortError(): DOMException {
   return new DOMException("Ferrite Cloudflare request was aborted.", "AbortError");
-}
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function acceptsHtml(accept: string | null): boolean {
