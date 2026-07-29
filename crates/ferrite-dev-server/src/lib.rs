@@ -7219,6 +7219,24 @@ process.exit(1);
     }
 
     #[test]
+    fn action_post_reader_rejects_disconnected_multipart_body() {
+        let result = read_request_from_client(
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=FerriteBoundary\r\nContent-Length: 128\r\n\r\n--FerriteBoundary\r\n",
+            1024,
+        );
+
+        let RequestReadResult::Response(response) = result else {
+            panic!("expected a disconnected multipart body to be rejected");
+        };
+        assert_eq!(response.status, 400);
+        assert!(
+            response
+                .body_text()
+                .contains("incomplete server action request body")
+        );
+    }
+
+    #[test]
     fn request_reader_rejects_bytes_after_non_action_headers() {
         let result = finish_buffered_request(
             b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\nunexpected",
