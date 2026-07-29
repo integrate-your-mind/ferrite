@@ -156,7 +156,7 @@ test("Cloudflare proof records and monitors tracked input bytes", async () => {
     const first = await trackedSourceSnapshot(contract, root);
     assert.equal(first.trackedFileCount, 1);
     assert.match(first.trackedInputSha256, /^sha256:[a-f0-9]{64}$/);
-    monitor = startTrackedSourceMonitor(["source.mjs"], root);
+    monitor = await startTrackedSourceMonitor(["source.mjs"], root);
     await writeFile(join(root, "source.mjs"), "export const value = 2;\n");
     await assert.rejects(
       trackedSourceSnapshot(contract, root),
@@ -182,7 +182,7 @@ test("Cloudflare source monitor rejects a transient untracked Cargo build script
     await mkdir(crate, { recursive: true });
     await writeFile(join(root, "package.json"), "{}\n");
     await writeFile(join(crate, "Cargo.toml"), "[package]\nname = \"fixture\"\n");
-    monitor = startTrackedSourceMonitor(
+    monitor = await startTrackedSourceMonitor(
       ["package.json", "crates/ferrite-protocol-wasm/Cargo.toml"],
       root,
       {
@@ -223,11 +223,11 @@ test("Cloudflare fixture and bundle monitors reject restored ABA replacements", 
     await writeFile(join(bundle, "worker.mjs"), "export default { fetch() {} };\n");
     const fixtureBefore = await inventoryFiles(fixture);
     const bundleBefore = await inventoryFiles(bundle);
-    fixtureMonitor = startTrackedSourceMonitor(
+    fixtureMonitor = await startTrackedSourceMonitor(
       fixtureBefore.files.map(({ path }) => path),
       fixture,
     );
-    bundleMonitor = startTrackedSourceMonitor(
+    bundleMonitor = await startTrackedSourceMonitor(
       bundleBefore.files.map(({ path }) => path),
       bundle,
     );
@@ -299,6 +299,7 @@ test("captured command rejects and terminates descendants left after normal exit
         'import { writeFileSync } from "node:fs";',
         "const child = spawn(process.execPath, [process.argv[2]], { stdio: \"ignore\" });",
         "writeFileSync(process.argv[3], String(child.pid));",
+        "child.unref();",
         "",
       ].join("\n"),
     );

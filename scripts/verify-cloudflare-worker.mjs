@@ -49,7 +49,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 async function verifyCloudflareWorker() {
   const committedSource = await committedSourceContract();
   const trackedPaths = committedSource.records.map(({ path }) => path);
-  const sourceMonitor = startTrackedSourceMonitor(trackedPaths, workspaceRoot, {
+  const sourceMonitor = await startTrackedSourceMonitor(trackedPaths, workspaceRoot, {
     allowedWritePrefixes: workspaceProofOutputPaths,
     rejectUnexpectedPaths: true,
   });
@@ -106,7 +106,7 @@ async function verifyCloudflareWorker() {
       fixtureRoot,
       [fixture.app, fixture.assets, fixture.generated, ...fixture.inputFiles],
     );
-    fixtureInputMonitor = startTrackedSourceMonitor(
+    fixtureInputMonitor = await startTrackedSourceMonitor(
       fixtureInputs.files.map(({ path }) => path),
       fixtureRoot,
     );
@@ -136,7 +136,7 @@ async function verifyCloudflareWorker() {
       ],
       { cwd: fixtureRoot, timeoutMs: commandTimeoutMs },
     );
-    bundleMetafileMonitor = startTrackedSourceMonitor(
+    bundleMetafileMonitor = await startTrackedSourceMonitor(
       [relative(fixtureRoot, bundleMetafile).replaceAll("\\", "/")],
       fixtureRoot,
     );
@@ -152,7 +152,7 @@ async function verifyCloudflareWorker() {
     );
     await fixtureInputMonitor.assertUnchanged();
     bundle = await inventoryFiles(fixture.bundle);
-    bundleMonitor = startTrackedSourceMonitor(
+    bundleMonitor = await startTrackedSourceMonitor(
       bundle.files.map(({ path }) => path),
       fixture.bundle,
     );
@@ -196,7 +196,7 @@ async function verifyCloudflareWorker() {
       fixtureRoot,
       bundle,
     );
-    runtimeConfigMonitor = startTrackedSourceMonitor(
+    runtimeConfigMonitor = await startTrackedSourceMonitor(
       [relative(fixtureRoot, runtimeConfig).replaceAll("\\", "/")],
       fixtureRoot,
     );
@@ -1344,7 +1344,7 @@ export function gitBlobObjectId(bytes, objectFormat) {
     .digest("hex");
 }
 
-export function startTrackedSourceMonitor(
+export async function startTrackedSourceMonitor(
   paths,
   root = workspaceRoot,
   {
@@ -1368,6 +1368,14 @@ export function startTrackedSourceMonitor(
   const directories = new Set();
   for (const path of paths) {
     directories.add(dirname(path));
+  }
+
+  // FSEvents can deliver writes completed immediately before a directory
+  // watcher is registered. Establish the monitoring boundary only after those
+  // setup writes have settled; callers await this function before consuming
+  // any of the protected inputs.
+  if (platform === "darwin") {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   }
 
   const changes = [];
