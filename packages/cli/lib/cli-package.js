@@ -64,6 +64,13 @@ export function isExactSemver(value) {
   );
 }
 
+export function ferriteBinaryVersionForPackage(packageVersion) {
+  if (!isExactSemver(packageVersion)) {
+    throw new Error("Ferrite CLI package version must be exact semantic version.");
+  }
+  return `ferrite ${packageVersion.split(/[+-]/, 1)[0]}`;
+}
+
 export function resolveCliBinary({
   platform = currentPlatform,
   arch = currentArch,

@@ -9,6 +9,7 @@ import {
   createCliCandidate,
   verifyCliCandidate,
 } from "./create-cli-candidate.mjs";
+import { ferriteBinaryVersionForPackage } from "../lib/cli-package.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaceRoot = resolve(packageRoot, "../..");
@@ -71,8 +72,11 @@ export async function verifyCliConsumer({
       process.platform === "win32" ? "ferrite.cmd" : "ferrite",
     );
     const version = run(ferrite, ["--version"], { cwd: consumerRoot }).stdout.trim();
-    if (!/^ferrite [0-9]+\.[0-9]+\.[0-9]+/.test(version)) {
-      throw new Error(`Packaged Ferrite CLI returned an unexpected version: ${version}`);
+    const expectedVersion = ferriteBinaryVersionForPackage(candidate.packageVersion);
+    if (version !== expectedVersion) {
+      throw new Error(
+        `Packaged Ferrite CLI returned ${version}; expected ${expectedVersion}.`,
+      );
     }
 
     const project = join(consumerRoot, "app with spaces");

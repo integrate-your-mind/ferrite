@@ -885,10 +885,6 @@ fn serve_production_until_signal(addr: String, project: ProductionProject) -> Re
     result.map_err(CliError::from)
 }
 
-fn initialize_project(project: &Path) -> Result<PathBuf> {
-    initialize_project_with_npm_version(project, None)
-}
-
 fn initialize_project_with_npm_version(
     project: &Path,
     npm_package_version: Option<&str>,
@@ -1515,7 +1511,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let project = parent.path().join("nested/app");
 
-        let initialized = initialize_project(&project).unwrap();
+        let initialized = initialize_project_with_npm_version(&project, None).unwrap();
 
         assert_eq!(initialized, project);
         let package = fs::read_to_string(project.join("package.json")).unwrap();
@@ -1579,7 +1575,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         fs::write(project.path().join("owned.txt"), "keep").unwrap();
 
-        let error = initialize_project(project.path()).unwrap_err();
+        let error = initialize_project_with_npm_version(project.path(), None).unwrap_err();
 
         assert!(matches!(error, CliError::Config(_)));
         assert!(error.to_string().contains("non-empty directory"));
@@ -1596,7 +1592,7 @@ mod tests {
         let target = parent.path().join("existing");
         fs::write(&target, "keep").unwrap();
 
-        let error = initialize_project(&target).unwrap_err();
+        let error = initialize_project_with_npm_version(&target, None).unwrap_err();
 
         assert!(error.to_string().contains("not a directory"));
         assert_eq!(fs::read_to_string(target).unwrap(), "keep");

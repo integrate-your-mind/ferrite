@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   CLI_CHECKSUM_ALGORITHM,
   cliTarget,
+  ferriteBinaryVersionForPackage,
   isExactSemver,
   launchFerrite,
   resolveCliBinary,
@@ -38,6 +39,21 @@ test("isExactSemver rejects tags, ranges, and ambiguous numeric identifiers", ()
   ]) {
     assert.equal(isExactSemver(version), false, version);
   }
+});
+
+test("ferriteBinaryVersionForPackage binds npm prereleases to the Cargo core", () => {
+  assert.equal(
+    ferriteBinaryVersionForPackage("0.1.0-alpha.0"),
+    "ferrite 0.1.0",
+  );
+  assert.equal(
+    ferriteBinaryVersionForPackage("1.2.3+build.7"),
+    "ferrite 1.2.3",
+  );
+  assert.throws(
+    () => ferriteBinaryVersionForPackage("latest"),
+    /exact semantic version/,
+  );
 });
 
 test("resolveCliBinary verifies package metadata, mode, size, and checksum", () => {
