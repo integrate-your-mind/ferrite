@@ -239,10 +239,10 @@ test("createCliCandidate preserves a verified backup when rollback fails", async
         binaryPath: binary,
         destinationRoot: destination,
         async renameImpl(source, target) {
-          if (source.includes(".staging-") && target === destination) {
+          if (source.includes(".staging-") && target.endsWith("/candidate")) {
             throw new Error("injected publication failure");
           }
-          if (source.includes(".backup-") && target === destination) {
+          if (source.includes(".backup-") && target.endsWith("/candidate")) {
             throw new Error("injected rollback failure");
           }
           return rename(source, target);
