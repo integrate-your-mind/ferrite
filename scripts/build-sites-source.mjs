@@ -594,7 +594,7 @@ async function siteOutputIdentity(path, options = {}) {
   const records = [];
 
   async function visit(parts) {
-    const absolute = join(canonicalRoot, ...parts);
+    const absolute = join(path, ...parts);
     const info = await lstatImpl(absolute);
     if (info.isSymbolicLink()) {
       throw new Error("website dist snapshot must not contain symlinks");
