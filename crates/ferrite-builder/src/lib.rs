@@ -19,6 +19,10 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ferrite_core::observability::{
+    BuildFields, Component as ObservabilityComponent, CorrelationId, ErrorClass, Event,
+    EventEmitter, FailurePhase, Operation as ObservabilityOperation, Outcome,
+};
 use ferrite_router::{Route, find_document_file, scan_app_dir, validate_route_types_output};
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +84,50 @@ struct ServerBuildInputRoute {
 }
 
 pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
+    build_project_inner(config)
+}
+
+pub fn build_project_with_observability(
+    config: &BuildConfig,
+    emitter: &EventEmitter,
+) -> Result<BuildReport> {
+    let correlation_id = CorrelationId::generate();
+    let started = Instant::now();
+    let _ = emitter.emit(
+        Event::started(
+            correlation_id.clone(),
+            0,
+            ObservabilityComponent::Builder,
+            ObservabilityOperation::BuildProject,
+        )
+        .with_build(BuildFields::new(None)),
+    );
+
+    let result = build_project_inner(config);
+    let (outcome, error_class, routes) = match &result {
+        Ok(report) => (Outcome::Success, None, Some(report.routes_count)),
+        Err(error) => {
+            let (outcome, error_class) = classify_build_error(error);
+            (outcome, Some(error_class), None)
+        }
+    };
+    let _ = emitter.emit(
+        Event::completed(
+            correlation_id,
+            1,
+            ObservabilityComponent::Builder,
+            ObservabilityOperation::BuildProject,
+            outcome,
+            error_class,
+            Some(FailurePhase::Build),
+            started.elapsed(),
+        )
+        .with_build(BuildFields::new(routes)),
+    );
+    result
+}
+
+fn build_project_inner(config: &BuildConfig) -> Result<BuildReport> {
     validate_build_output_ownership(config)?;
     let initial_contract = capture_build_input_contract(config)?;
     let out_parent = config.out_dir.parent().unwrap_or_else(|| Path::new("."));
@@ -101,6 +149,76 @@ pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
     }
     rebase_build_report(&mut report, &candidate_path, &config.out_dir)?;
     Ok(report)
+}
+
+fn classify_build_error(error: &BuildError) -> (Outcome, ErrorClass) {
+    match error {
+        BuildError::ClientBundle(error) => match error {
+            ferrite_client_bundler::ClientBundleError::Cancelled => {
+                (Outcome::Cancelled, ErrorClass::Cancelled)
+            }
+            ferrite_client_bundler::ClientBundleError::TimedOut { .. } => {
+                (Outcome::Timeout, ErrorClass::Timeout)
+            }
+            ferrite_client_bundler::ClientBundleError::OutputLimitExceeded { .. } => {
+                (Outcome::Error, ErrorClass::ResourceExhausted)
+            }
+            ferrite_client_bundler::ClientBundleError::NodeFailed { .. } => {
+                (Outcome::Error, ErrorClass::Dependency)
+            }
+            ferrite_client_bundler::ClientBundleError::Protocol(_) => {
+                (Outcome::Error, ErrorClass::Protocol)
+            }
+            ferrite_client_bundler::ClientBundleError::StaleInputSnapshot { .. } => {
+                (Outcome::Error, ErrorClass::StaleInput)
+            }
+            ferrite_client_bundler::ClientBundleError::Io(error) => classify_io_error(error),
+            ferrite_client_bundler::ClientBundleError::Json(_)
+            | ferrite_client_bundler::ClientBundleError::InvalidModuleGraph { .. } => {
+                (Outcome::Error, ErrorClass::InvalidInput)
+            }
+        },
+        BuildError::PageRender(error) => match error {
+            ferrite_page_renderer::PageRenderError::Cancelled => {
+                (Outcome::Cancelled, ErrorClass::Cancelled)
+            }
+            ferrite_page_renderer::PageRenderError::TimedOut { .. } => {
+                (Outcome::Timeout, ErrorClass::Timeout)
+            }
+            ferrite_page_renderer::PageRenderError::OutputLimitExceeded { .. } => {
+                (Outcome::Error, ErrorClass::ResourceExhausted)
+            }
+            ferrite_page_renderer::PageRenderError::NodeFailed { .. } => {
+                (Outcome::Error, ErrorClass::Dependency)
+            }
+            ferrite_page_renderer::PageRenderError::Protocol(_) => {
+                (Outcome::Error, ErrorClass::Protocol)
+            }
+            ferrite_page_renderer::PageRenderError::Io(error) => classify_io_error(error),
+            ferrite_page_renderer::PageRenderError::Json(_)
+            | ferrite_page_renderer::PageRenderError::Ssr(_) => {
+                (Outcome::Error, ErrorClass::InvalidInput)
+            }
+        },
+        BuildError::DuplicateStaticOutput { .. }
+        | BuildError::InvalidStaticParams { .. }
+        | BuildError::Router(_)
+        | BuildError::Json(_) => (Outcome::Error, ErrorClass::InvalidInput),
+        BuildError::Artifact(_) => (Outcome::Error, ErrorClass::Protocol),
+        BuildError::Io(error) => classify_io_error(error),
+    }
+}
+
+fn classify_io_error(error: &std::io::Error) -> (Outcome, ErrorClass) {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            (Outcome::Timeout, ErrorClass::Timeout)
+        }
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+            (Outcome::Error, ErrorClass::InvalidInput)
+        }
+        _ => (Outcome::Error, ErrorClass::Io),
+    }
 }
 
 fn validate_build_output_ownership(config: &BuildConfig) -> Result<()> {
@@ -675,6 +793,39 @@ mod tests {
             fs::read_to_string(page).unwrap(),
             "export default function Page() {}\n"
         );
+    }
+
+    #[test]
+    fn observed_build_failure_is_correlated_classified_and_message_free() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = config.app_dir.clone();
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(4);
+
+        let error = build_project_with_observability(&config, &emitter).unwrap_err();
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert!(
+            error
+                .to_string()
+                .contains("overlaps Ferrite project source")
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event,
+            ferrite_core::observability::EventName::OperationStarted
+        );
+        assert_eq!(
+            events[1].event,
+            ferrite_core::observability::EventName::OperationCompleted
+        );
+        assert_eq!(events[0].correlation_id, events[1].correlation_id);
+        assert_eq!(events[1].outcome, Some(Outcome::Error));
+        assert_eq!(events[1].error_class, Some(ErrorClass::InvalidInput));
+        assert_eq!(events[1].failure_phase, Some(FailurePhase::Build));
+        let encoded = events[1].to_json_line().unwrap();
+        assert!(!encoded.contains("overlaps Ferrite project source"));
+        assert!(!encoded.contains(project.path().to_string_lossy().as_ref()));
     }
 
     #[test]

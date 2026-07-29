@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrite_builder::{BuildConfig, BuildReport};
+use ferrite_core::observability::{EventEmitter, RoutePattern, bounded_channel};
 use ferrite_dev_server::{
     DevProject, DevResponse, DevServerConfig, ProductionActionEvent, ProductionActionOutcome,
     ProductionProject, ProductionRequestEvent, ProductionServerConfig,
@@ -306,6 +308,13 @@ struct ServeArgs {
 
     #[arg(
         long,
+        value_enum,
+        help = "Emit bounded privacy-safe Ferrite v1 events to stderr; this is not distributed tracing"
+    )]
+    event_log: Option<EventLogFormat>,
+
+    #[arg(
+        long,
         help = "Expose in-memory production request/action counters as Prometheus text at this absolute path"
     )]
     metrics_path: Option<String>,
@@ -314,6 +323,11 @@ struct ServeArgs {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum AccessLogFormat {
     Plain,
+    Json,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum EventLogFormat {
     Json,
 }
 
@@ -360,6 +374,13 @@ struct BuildArgs {
         help = "Client bundler script path, relative to the current directory unless absolute"
     )]
     client_bundler: PathBuf,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Emit bounded privacy-safe Ferrite v1 build events to stderr; this is not distributed tracing"
+    )]
+    event_log: Option<EventLogFormat>,
 }
 
 #[derive(Debug)]
@@ -616,6 +637,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 trusted_proxy.is_some(),
             )?;
             let metrics_path = resolve_metrics_path(args.metrics_path.as_deref())?;
+            let event_log = args.event_log.map(EventLogWriter::start).transpose()?;
             let mut config = ProductionServerConfig::from_artifact(
                 project.clone(),
                 artifact.clone(),
@@ -653,6 +675,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 config = config.with_action_observer(move |event| {
                     eprintln!("{}", format_action_log_event(&event, format));
                 });
+            }
+            if let Some(event_log) = &event_log {
+                config = config.with_observability_emitter(event_log.emitter());
             }
             let production_project = ProductionProject::from_artifact(config)?;
             let production_limits = ServeLimitsOutput::from(production_project.config());
@@ -726,15 +751,21 @@ fn run_cli(cli: Cli) -> Result<()> {
             let types_out = resolve_project_path(&project, &args.types_out);
             let page_renderer = normalize_current_path(&args.page_renderer)?;
             let client_bundler = normalize_current_path(&args.client_bundler)?;
+            let event_log = args.event_log.map(EventLogWriter::start).transpose()?;
             let _signal_guard = BuildSignalGuard::register()?;
-            let report = ferrite_builder::build_project(&BuildConfig::new(
+            let config = BuildConfig::new(
                 project,
                 app_dir,
                 out_dir,
                 types_out,
                 page_renderer,
                 client_bundler,
-            ))?;
+            );
+            let report = if let Some(event_log) = &event_log {
+                ferrite_builder::build_project_with_observability(&config, &event_log.emitter())?
+            } else {
+                ferrite_builder::build_project(&config)?
+            };
 
             if cli.json {
                 print_json(&report)?;
@@ -1200,7 +1231,7 @@ fn format_access_log_event(event: &ProductionRequestEvent, format: AccessLogForm
     let output = AccessLogEventOutput::from(event);
     match format {
         AccessLogFormat::Plain => {
-            let route = output.route_pattern.unwrap_or("-");
+            let route = output.route_pattern.as_deref().unwrap_or("-");
             let client_ip = output.client_ip.unwrap_or("-");
             format!(
                 "method={} path={} status={} route={} client_ip={} elapsed_ms={}",
@@ -1218,8 +1249,8 @@ fn format_action_log_event(event: &ProductionActionEvent, format: AccessLogForma
     match format {
         AccessLogFormat::Plain => {
             let action = output.action_id.unwrap_or("-");
-            let route = output.route_path.unwrap_or("-");
-            let pattern = output.route_pattern.unwrap_or("-");
+            let route = output.route_path.as_deref().unwrap_or("-");
+            let pattern = output.route_pattern.as_deref().unwrap_or("-");
             let client_ip = output.client_ip.unwrap_or("-");
             format!(
                 "action={} route={} pattern={} status={} outcome={} client_ip={} elapsed_ms={}",
@@ -1234,6 +1265,54 @@ fn format_action_log_event(event: &ProductionActionEvent, format: AccessLogForma
         }
         AccessLogFormat::Json => {
             serde_json::to_string(&output).expect("action log event output is serializable")
+        }
+    }
+}
+
+struct EventLogWriter {
+    emitter: Option<EventEmitter>,
+    writer: Option<JoinHandle<()>>,
+}
+
+impl EventLogWriter {
+    fn start(format: EventLogFormat) -> std::io::Result<Self> {
+        let (emitter, receiver) = bounded_channel(256);
+        let writer = thread::Builder::new()
+            .name("ferrite-event-log".to_owned())
+            .spawn(move || {
+                let stderr = std::io::stderr();
+                let mut stderr = stderr.lock();
+                for event in receiver {
+                    let line = match format {
+                        EventLogFormat::Json => event.to_json_line(),
+                    };
+                    let Ok(line) = line else {
+                        continue;
+                    };
+                    if writeln!(stderr, "{line}").is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            emitter: Some(emitter),
+            writer: Some(writer),
+        })
+    }
+
+    fn emitter(&self) -> EventEmitter {
+        self.emitter
+            .as_ref()
+            .expect("event emitter remains available while the writer is active")
+            .clone()
+    }
+}
+
+impl Drop for EventLogWriter {
+    fn drop(&mut self) {
+        drop(self.emitter.take());
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
         }
     }
 }
@@ -1312,10 +1391,10 @@ struct ServeStartedOutput<'a> {
 #[derive(Debug, Serialize)]
 struct AccessLogEventOutput<'a> {
     method: &'a str,
-    path: &'a str,
+    path: String,
     status: u16,
-    route_pattern: Option<&'a str>,
-    client_ip: Option<&'a str>,
+    route_pattern: Option<String>,
+    client_ip: Option<&'static str>,
     elapsed_ms: u64,
 }
 
@@ -1323,38 +1402,51 @@ impl<'a> From<&'a ProductionRequestEvent> for AccessLogEventOutput<'a> {
     fn from(event: &'a ProductionRequestEvent) -> Self {
         Self {
             method: &event.method,
-            path: &event.path,
+            path: privacy_safe_route_label(event.route_pattern.as_deref()),
             status: event.status,
-            route_pattern: event.route_pattern.as_deref(),
-            client_ip: event.client_ip.as_deref(),
+            route_pattern: event
+                .route_pattern
+                .as_deref()
+                .map(|route| privacy_safe_route_label(Some(route))),
+            client_ip: None,
             elapsed_ms: duration_millis_u64(event.elapsed),
         }
     }
 }
 
 #[derive(Debug, Serialize)]
-struct ActionLogEventOutput<'a> {
-    action_id: Option<&'a str>,
-    route_path: Option<&'a str>,
-    route_pattern: Option<&'a str>,
+struct ActionLogEventOutput {
+    action_id: Option<&'static str>,
+    route_path: Option<String>,
+    route_pattern: Option<String>,
     status: u16,
     outcome: ProductionActionOutcome,
-    client_ip: Option<&'a str>,
+    client_ip: Option<&'static str>,
     elapsed_ms: u64,
 }
 
-impl<'a> From<&'a ProductionActionEvent> for ActionLogEventOutput<'a> {
-    fn from(event: &'a ProductionActionEvent) -> Self {
+impl From<&ProductionActionEvent> for ActionLogEventOutput {
+    fn from(event: &ProductionActionEvent) -> Self {
         Self {
-            action_id: event.action_id.as_deref(),
-            route_path: event.route_path.as_deref(),
-            route_pattern: event.route_pattern.as_deref(),
+            action_id: event.action_id.as_ref().map(|_| "[redacted]"),
+            route_path: event
+                .route_path
+                .as_ref()
+                .map(|_| privacy_safe_route_label(event.route_pattern.as_deref())),
+            route_pattern: event
+                .route_pattern
+                .as_deref()
+                .map(|route| privacy_safe_route_label(Some(route))),
             status: event.status,
             outcome: event.outcome,
-            client_ip: event.client_ip.as_deref(),
+            client_ip: None,
             elapsed_ms: duration_millis_u64(event.elapsed),
         }
     }
+}
+
+fn privacy_safe_route_label(route_pattern: Option<&str>) -> String {
+    RoutePattern::new(route_pattern).as_str().to_owned()
 }
 
 fn action_outcome_str(outcome: ProductionActionOutcome) -> &'static str {
@@ -1743,6 +1835,27 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_event_log_format_flag() {
+        let cli =
+            Cli::try_parse_from(["ferrite", "serve", "--event-log", "json", "--once"]).unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.event_log, Some(EventLogFormat::Json));
+    }
+
+    #[test]
+    fn build_accepts_event_log_format_flag() {
+        let cli = Cli::try_parse_from(["ferrite", "build", "--event-log", "json"]).unwrap();
+
+        let Commands::Build(args) = cli.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(args.event_log, Some(EventLogFormat::Json));
+    }
+
+    #[test]
     fn serve_accepts_metrics_path_flag() {
         let cli = Cli::try_parse_from([
             "ferrite",
@@ -1760,10 +1873,10 @@ mod tests {
     }
 
     #[test]
-    fn formats_access_log_events_without_headers_or_body() {
+    fn formats_access_log_events_without_request_secrets_or_client_addresses() {
         let event = ProductionRequestEvent {
             method: "POST".to_owned(),
-            path: "/_ferrite/action".to_owned(),
+            path: "/posts/private-id?token=super-secret".to_owned(),
             status: 403,
             route_pattern: Some("/posts/[id]".to_owned()),
             client_ip: Some("203.0.113.10".to_owned()),
@@ -1772,26 +1885,29 @@ mod tests {
 
         assert_eq!(
             format_access_log_event(&event, AccessLogFormat::Plain),
-            "method=POST path=/_ferrite/action status=403 route=/posts/[id] client_ip=203.0.113.10 elapsed_ms=17"
+            "method=POST path=/posts/[id] status=403 route=/posts/[id] client_ip=- elapsed_ms=17"
         );
 
         let json: serde_json::Value =
             serde_json::from_str(&format_access_log_event(&event, AccessLogFormat::Json)).unwrap();
         assert_eq!(json["method"], "POST");
-        assert_eq!(json["path"], "/_ferrite/action");
+        assert_eq!(json["path"], "/posts/[id]");
         assert_eq!(json["status"], 403);
         assert_eq!(json["route_pattern"], "/posts/[id]");
-        assert_eq!(json["client_ip"], "203.0.113.10");
+        assert!(json["client_ip"].is_null());
         assert_eq!(json["elapsed_ms"], 17);
         assert!(json.get("headers").is_none());
         assert!(json.get("body").is_none());
+        assert!(!json.to_string().contains("super-secret"));
+        assert!(!json.to_string().contains("private-id"));
+        assert!(!json.to_string().contains("203.0.113.10"));
     }
 
     #[test]
-    fn formats_action_log_events_without_form_data_or_tokens() {
+    fn formats_action_log_events_without_submitted_values_or_client_addresses() {
         let event = ProductionActionEvent {
             action_id: Some("app/posts/[id]/page.tsx#savePost".to_owned()),
-            route_path: Some("/posts/abc".to_owned()),
+            route_path: Some("/posts/private-id?token=super-secret".to_owned()),
             route_pattern: Some("/posts/[id]".to_owned()),
             status: 403,
             outcome: ProductionActionOutcome::Rejected,
@@ -1801,22 +1917,27 @@ mod tests {
 
         assert_eq!(
             format_action_log_event(&event, AccessLogFormat::Plain),
-            "action=app/posts/[id]/page.tsx#savePost route=/posts/abc pattern=/posts/[id] status=403 outcome=rejected client_ip=203.0.113.10 elapsed_ms=19"
+            "action=[redacted] route=/posts/[id] pattern=/posts/[id] status=403 outcome=rejected client_ip=- elapsed_ms=19"
         );
 
         let json: serde_json::Value =
             serde_json::from_str(&format_action_log_event(&event, AccessLogFormat::Json)).unwrap();
-        assert_eq!(json["action_id"], "app/posts/[id]/page.tsx#savePost");
-        assert_eq!(json["route_path"], "/posts/abc");
+        assert_eq!(json["action_id"], "[redacted]");
+        assert_eq!(json["route_path"], "/posts/[id]");
         assert_eq!(json["route_pattern"], "/posts/[id]");
         assert_eq!(json["status"], 403);
         assert_eq!(json["outcome"], "rejected");
-        assert_eq!(json["client_ip"], "203.0.113.10");
+        assert!(json["client_ip"].is_null());
         assert_eq!(json["elapsed_ms"], 19);
         assert!(json.get("form").is_none());
         assert!(json.get("headers").is_none());
         assert!(json.get("csrf").is_none());
         assert!(json.get("body").is_none());
+        let encoded = json.to_string();
+        assert!(!encoded.contains("super-secret"));
+        assert!(!encoded.contains("private-id"));
+        assert!(!encoded.contains("savePost"));
+        assert!(!encoded.contains("203.0.113.10"));
     }
 
     #[test]

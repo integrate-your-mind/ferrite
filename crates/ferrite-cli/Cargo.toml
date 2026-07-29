@@ -16,6 +16,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 ferrite-builder = { path = "../ferrite-builder", version = "=0.1.0" }
 ferrite-dev-server = { path = "../ferrite-dev-server", version = "=0.1.0" }
+ferrite-core = { path = "../ferrite-core", version = "=0.1.0" }
 ferrite-router = { path = "../ferrite-router", version = "=0.1.0" }
 ferrite-ssr = { path = "../ferrite-ssr", version = "=0.1.0" }
 serde = { workspace = true }

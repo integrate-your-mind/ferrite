@@ -20,6 +20,11 @@ use ferrite_client_bundler::{
     ClientBundleRequest, ClientBundler, fingerprint_client_bundle,
     fingerprint_client_bundle_inputs,
 };
+use ferrite_core::observability::{
+    Component as ObservabilityComponent, CorrelationId, ErrorClass, Event, EventEmitter,
+    FailurePhase, HttpFields, MethodClass, Operation as ObservabilityOperation, Outcome,
+    ResponseMode as ObservabilityResponseMode,
+};
 use ferrite_page_renderer::{
     DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
     ServerActionManifest,
@@ -535,6 +540,7 @@ pub struct ProductionServerConfig {
     pub trusted_proxy_client_ip_hops: Option<usize>,
     pub request_observer: Option<ProductionRequestObserver>,
     pub action_observer: Option<ProductionActionObserver>,
+    pub observability_emitter: Option<EventEmitter>,
     pub metrics_path: Option<String>,
     pub server_action_replay_ttl: Option<Duration>,
     metrics: ProductionMetrics,
@@ -572,6 +578,7 @@ impl ProductionServerConfig {
             trusted_proxy_client_ip_hops: None,
             request_observer: None,
             action_observer: None,
+            observability_emitter: None,
             metrics_path: None,
             server_action_replay_ttl: None,
             metrics: ProductionMetrics::default(),
@@ -600,6 +607,7 @@ impl ProductionServerConfig {
             trusted_proxy_client_ip_hops: None,
             request_observer: None,
             action_observer: None,
+            observability_emitter: None,
             metrics_path: None,
             server_action_replay_ttl: None,
             metrics: ProductionMetrics::default(),
@@ -664,6 +672,11 @@ impl ProductionServerConfig {
         F: Fn(ProductionActionEvent) + Send + Sync + 'static,
     {
         self.action_observer = Some(ProductionActionObserver::new(observer));
+        self
+    }
+
+    pub fn with_observability_emitter(mut self, emitter: EventEmitter) -> Self {
+        self.observability_emitter = Some(emitter);
         self
     }
 
@@ -1363,7 +1376,7 @@ impl ProductionProject {
     }
 
     pub fn handle_get(&self, raw_path: &str) -> Result<DevResponse> {
-        self.handle_get_with_context(raw_path, ProductionRequestContext::default())
+        self.handle_get_with_context(raw_path, self.direct_request_context())
     }
 
     fn handle_get_with_context(
@@ -1371,19 +1384,29 @@ impl ProductionProject {
         raw_path: &str,
         request_context: ProductionRequestContext,
     ) -> Result<DevResponse> {
+        let started = Instant::now();
+        self.emit_request_started("GET", &request_context);
         if !raw_path.starts_with('/') {
-            return Err(DevServerError::InvalidRequestPath(raw_path.to_owned()));
+            let error = DevServerError::InvalidRequestPath(raw_path.to_owned());
+            self.emit_request_error("GET", &request_context, &error, started.elapsed());
+            return Err(error);
         }
 
-        let started = Instant::now();
-        let response = self.handle_get_inner(raw_path)?;
+        let response = match self.handle_get_inner(raw_path) {
+            Ok(response) => response,
+            Err(error) => {
+                self.emit_request_error("GET", &request_context, &error, started.elapsed());
+                return Err(error);
+            }
+        };
         self.observe_request(
             "GET",
             raw_path,
             &response,
             started.elapsed(),
-            request_context,
+            request_context.clone(),
         );
+        self.emit_request_completed("GET", &request_context, &response, started.elapsed());
         Ok(response)
     }
 
@@ -1393,7 +1416,7 @@ impl ProductionProject {
         headers: &HttpHeaders,
         body: &[u8],
     ) -> Result<DevResponse> {
-        self.handle_post_with_context(raw_path, headers, body, ProductionRequestContext::default())
+        self.handle_post_with_context(raw_path, headers, body, self.direct_request_context())
     }
 
     fn handle_post_with_context(
@@ -1403,19 +1426,31 @@ impl ProductionProject {
         body: &[u8],
         request_context: ProductionRequestContext,
     ) -> Result<DevResponse> {
+        let started = Instant::now();
+        self.emit_request_started("POST", &request_context);
         if !raw_path.starts_with('/') {
-            return Err(DevServerError::InvalidRequestPath(raw_path.to_owned()));
+            let error = DevServerError::InvalidRequestPath(raw_path.to_owned());
+            self.emit_request_error("POST", &request_context, &error, started.elapsed());
+            return Err(error);
         }
 
-        let started = Instant::now();
-        let response = self.handle_post_inner(raw_path, headers, body, &request_context)?;
+        let response = match self.handle_post_inner(raw_path, headers, body, &request_context) {
+            Ok(response) => {
+                response.with_observability_response_mode(ObservabilityResponseMode::Action)
+            }
+            Err(error) => {
+                self.emit_request_error("POST", &request_context, &error, started.elapsed());
+                return Err(error);
+            }
+        };
         self.observe_request(
             "POST",
             raw_path,
             &response,
             started.elapsed(),
-            request_context,
+            request_context.clone(),
         );
+        self.emit_request_completed("POST", &request_context, &response, started.elapsed());
         Ok(response)
     }
 
@@ -1426,7 +1461,8 @@ impl ProductionProject {
                 "text/plain; version=0.0.4; charset=utf-8",
                 self.config.metrics.render(),
             )
-            .with_cache_control("no-store"));
+            .with_cache_control("no-store")
+            .with_observability_response_mode(ObservabilityResponseMode::Metrics));
         }
 
         self.ensure_ready()?;
@@ -1439,12 +1475,21 @@ impl ProductionProject {
                 &self.config.client_out_dir,
                 snapshot.verified_static_assets.as_ref(),
             )
-            .with_cache_control(static_asset_cache_control(path)));
+            .with_cache_control(static_asset_cache_control(path))
+            .with_observability_response_mode(ObservabilityResponseMode::Asset));
         }
 
         match route_response_mode(raw_path) {
-            Ok(mode) => Ok(self.route_response(path, mode)),
-            Err(message) => Ok(DevResponse::bad_request(message)),
+            Ok(mode) => Ok(self
+                .route_response(path, mode)
+                .with_observability_response_mode(mode.into())),
+            Err(message) => Ok(
+                DevResponse::bad_request(message).with_observability_failure(
+                    Outcome::Error,
+                    ErrorClass::InvalidInput,
+                    FailurePhase::Read,
+                ),
+            ),
         }
     }
 
@@ -1496,10 +1541,151 @@ impl ProductionProject {
         &self,
         headers: &HttpHeaders,
         peer_ip: Option<IpAddr>,
+        correlation_id: Option<CorrelationId>,
     ) -> ProductionRequestContext {
         ProductionRequestContext {
             client_ip: production_client_ip(headers, peer_ip, &self.config),
+            correlation_id,
         }
+    }
+
+    fn direct_request_context(&self) -> ProductionRequestContext {
+        ProductionRequestContext {
+            client_ip: None,
+            correlation_id: self
+                .config
+                .observability_emitter
+                .as_ref()
+                .map(|_| CorrelationId::generate()),
+        }
+    }
+
+    fn emit_request_started(&self, method: &str, request_context: &ProductionRequestContext) {
+        let (Some(emitter), Some(correlation_id)) = (
+            self.config.observability_emitter.as_ref(),
+            request_context.correlation_id.as_ref(),
+        ) else {
+            return;
+        };
+        let _ = emitter.emit(
+            Event::started(
+                correlation_id.clone(),
+                0,
+                ObservabilityComponent::Server,
+                ObservabilityOperation::HttpRequest,
+            )
+            .with_http(HttpFields::new(
+                MethodClass::from_method(method),
+                None,
+                None,
+                ObservabilityResponseMode::Other,
+            )),
+        );
+    }
+
+    fn emit_request_completed(
+        &self,
+        method: &str,
+        request_context: &ProductionRequestContext,
+        response: &DevResponse,
+        elapsed: Duration,
+    ) {
+        let (Some(emitter), Some(correlation_id)) = (
+            self.config.observability_emitter.as_ref(),
+            request_context.correlation_id.as_ref(),
+        ) else {
+            return;
+        };
+        let (outcome, error_class, failure_phase) = classify_response_observability(response);
+        let http = || {
+            HttpFields::new(
+                MethodClass::from_method(method),
+                Some(response.status),
+                response.route_pattern_header.as_deref(),
+                response.observability.response_mode,
+            )
+        };
+
+        let render_operation = match response.observability.response_mode {
+            ObservabilityResponseMode::Document => Some((
+                ObservabilityComponent::Renderer,
+                ObservabilityOperation::RenderDocument,
+            )),
+            ObservabilityResponseMode::PayloadJson => Some((
+                ObservabilityComponent::Navigation,
+                ObservabilityOperation::RenderNavigation,
+            )),
+            ObservabilityResponseMode::PayloadStream => Some((
+                ObservabilityComponent::Navigation,
+                ObservabilityOperation::RenderStream,
+            )),
+            _ => None,
+        };
+        if response.route_pattern_header.is_some()
+            && let Some((component, operation)) = render_operation
+        {
+            let _ = emitter.emit(
+                Event::completed(
+                    correlation_id.clone(),
+                    1,
+                    component,
+                    operation,
+                    outcome,
+                    error_class,
+                    failure_phase.or(Some(FailurePhase::Render)),
+                    elapsed,
+                )
+                .with_http(http()),
+            );
+        }
+
+        let _ = emitter.emit(
+            Event::completed(
+                correlation_id.clone(),
+                2,
+                ObservabilityComponent::Server,
+                ObservabilityOperation::HttpRequest,
+                outcome,
+                error_class,
+                failure_phase,
+                elapsed,
+            )
+            .with_http(http()),
+        );
+    }
+
+    fn emit_request_error(
+        &self,
+        method: &str,
+        request_context: &ProductionRequestContext,
+        error: &DevServerError,
+        elapsed: Duration,
+    ) {
+        let (Some(emitter), Some(correlation_id)) = (
+            self.config.observability_emitter.as_ref(),
+            request_context.correlation_id.as_ref(),
+        ) else {
+            return;
+        };
+        let (outcome, error_class, failure_phase) = classify_dev_server_error(error);
+        let _ = emitter.emit(
+            Event::completed(
+                correlation_id.clone(),
+                2,
+                ObservabilityComponent::Server,
+                ObservabilityOperation::HttpRequest,
+                outcome,
+                Some(error_class),
+                Some(failure_phase),
+                elapsed,
+            )
+            .with_http(HttpFields::new(
+                MethodClass::from_method(method),
+                None,
+                None,
+                ObservabilityResponseMode::Other,
+            )),
+        );
     }
 
     fn observe_action(
@@ -2212,6 +2398,26 @@ impl ProductionProject {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ProductionRequestContext {
     client_ip: Option<String>,
+    correlation_id: Option<CorrelationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResponseObservability {
+    response_mode: ObservabilityResponseMode,
+    outcome: Option<Outcome>,
+    error_class: Option<ErrorClass>,
+    failure_phase: Option<FailurePhase>,
+}
+
+impl Default for ResponseObservability {
+    fn default() -> Self {
+        Self {
+            response_mode: ObservabilityResponseMode::Other,
+            outcome: None,
+            error_class: None,
+            failure_phase: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2225,6 +2431,7 @@ pub struct DevResponse {
     pub route_pattern_header: Option<String>,
     pub link_headers: Vec<String>,
     pub set_cookie_headers: Vec<String>,
+    observability: ResponseObservability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2245,6 +2452,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2276,6 +2484,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2307,6 +2516,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2321,6 +2531,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2335,6 +2546,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2349,6 +2561,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2363,6 +2576,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2377,6 +2591,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2391,6 +2606,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2405,6 +2621,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2419,6 +2636,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2433,6 +2651,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2447,6 +2666,7 @@ impl DevResponse {
             route_pattern_header: None,
             link_headers: Vec::new(),
             set_cookie_headers: Vec::new(),
+            observability: ResponseObservability::default(),
         }
     }
 
@@ -2457,6 +2677,26 @@ impl DevResponse {
 
     pub fn with_route_pattern(mut self, value: impl Into<String>) -> Self {
         self.route_pattern_header = Some(value.into());
+        self
+    }
+
+    fn with_observability_response_mode(
+        mut self,
+        response_mode: ObservabilityResponseMode,
+    ) -> Self {
+        self.observability.response_mode = response_mode;
+        self
+    }
+
+    fn with_observability_failure(
+        mut self,
+        outcome: Outcome,
+        error_class: ErrorClass,
+        failure_phase: FailurePhase,
+    ) -> Self {
+        self.observability.outcome = Some(outcome);
+        self.observability.error_class = Some(error_class);
+        self.observability.failure_phase = Some(failure_phase);
         self
     }
 
@@ -2531,11 +2771,7 @@ impl ProductionWorkerPool {
                         break;
                     };
                     let _in_flight_guard = ProductionInFlightGuard(Arc::clone(&in_flight));
-                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project) {
-                        if is_response_write_deadline_error(&error) {
-                            eprintln!("Ferrite production response write deadline exceeded");
-                        }
-                    }
+                    let _ = handle_production_stream_concurrent(&mut stream, &project);
                 }
             }));
         }
@@ -2777,6 +3013,16 @@ enum RouteResponseMode {
     Html,
     ServerPayloadJson,
     ServerPayloadStream,
+}
+
+impl From<RouteResponseMode> for ObservabilityResponseMode {
+    fn from(mode: RouteResponseMode) -> Self {
+        match mode {
+            RouteResponseMode::Html => Self::Document,
+            RouteResponseMode::ServerPayloadJson => Self::PayloadJson,
+            RouteResponseMode::ServerPayloadStream => Self::PayloadStream,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -3086,8 +3332,8 @@ pub fn serve_production_listener_once(
 
 fn handle_stream(stream: &mut TcpStream, project: &mut DevProject) -> Result<()> {
     let request = match read_http_request(stream, DEFAULT_DEV_MAX_REQUEST_BYTES)? {
-        RequestReadResult::Request(request) => request,
-        RequestReadResult::Response(response) => {
+        Ok(RequestReadResult::Request(request)) => request,
+        Ok(RequestReadResult::Response(response)) => {
             let response = response.with_cache_control("no-store");
             write_response(stream, &response)?;
             return Ok(());
@@ -3108,18 +3354,19 @@ fn handle_production_stream(stream: &mut TcpStream, project: &ProductionProject)
     let response_write_timeout = project.config.response_write_timeout;
     let max_request_bytes = project.config.max_request_bytes;
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
-    handle_production_stream_with_limits(
+    handle_production_stream_with_observability(
         stream,
         request_read_timeout,
         response_write_timeout,
         max_request_bytes,
-        |request| match request.method.as_str() {
+        project.config.observability_emitter.as_ref(),
+        |request, correlation_id| match request.method.as_str() {
             "GET" => {
-                let context = project.request_context(&request.headers, peer_ip);
+                let context = project.request_context(&request.headers, peer_ip, correlation_id);
                 project.handle_get_with_context(&request.path, context)
             }
             "POST" => {
-                let context = project.request_context(&request.headers, peer_ip);
+                let context = project.request_context(&request.headers, peer_ip, correlation_id);
                 project.handle_post_with_context(
                     &request.path,
                     &request.headers,
@@ -3140,18 +3387,19 @@ fn handle_production_stream_concurrent(
     let request_read_timeout = project.config.request_read_timeout;
     let response_write_timeout = project.config.response_write_timeout;
     let max_request_bytes = project.config.max_request_bytes;
-    handle_production_stream_with_limits(
+    handle_production_stream_with_observability(
         stream,
         request_read_timeout,
         response_write_timeout,
         max_request_bytes,
-        |request| match request.method.as_str() {
+        project.config.observability_emitter.as_ref(),
+        |request, correlation_id| match request.method.as_str() {
             "GET" => {
-                let context = project.request_context(&request.headers, peer_ip);
+                let context = project.request_context(&request.headers, peer_ip, correlation_id);
                 project.handle_get_with_context(&request.path, context)
             }
             "POST" => {
-                let context = project.request_context(&request.headers, peer_ip);
+                let context = project.request_context(&request.headers, peer_ip, correlation_id);
                 project.handle_post_with_context(
                     &request.path,
                     &request.headers,
@@ -3174,25 +3422,89 @@ fn handle_production_stream_with_limits<F>(
 where
     F: FnMut(&ParsedHttpRequest) -> Result<DevResponse>,
 {
+    handle_production_stream_with_observability(
+        stream,
+        request_read_timeout,
+        response_write_timeout,
+        max_request_bytes,
+        None,
+        |request, _correlation_id| handle_request(request),
+    )
+}
+
+fn handle_production_stream_with_observability<F>(
+    stream: &mut TcpStream,
+    request_read_timeout: Duration,
+    response_write_timeout: Duration,
+    max_request_bytes: usize,
+    emitter: Option<&EventEmitter>,
+    mut handle_request: F,
+) -> Result<()>
+where
+    F: FnMut(&ParsedHttpRequest, Option<CorrelationId>) -> Result<DevResponse>,
+{
+    let correlation_id = emitter.map(|_| CorrelationId::generate());
+    let started = Instant::now();
     let request_read_timeout = request_read_timeout.max(MIN_PRODUCTION_REQUEST_READ_TIMEOUT);
     let request_read_deadline = Instant::now() + request_read_timeout;
     let response_write_timeout = response_write_timeout.max(MIN_PRODUCTION_RESPONSE_WRITE_TIMEOUT);
-    let request = match read_http_request_with_deadline(
-        stream,
-        max_request_bytes,
-        Some(request_read_deadline),
-    )? {
+    let read_result =
+        read_http_request_with_deadline(stream, max_request_bytes, Some(request_read_deadline));
+    let request = match read_result {
+        Err(error) => {
+            if let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id.as_ref()) {
+                let (outcome, error_class, failure_phase) = classify_dev_server_error(&error);
+                emit_server_terminal_event(
+                    emitter,
+                    correlation_id,
+                    MethodClass::Other,
+                    None,
+                    None,
+                    ObservabilityResponseMode::Other,
+                    outcome,
+                    Some(error_class),
+                    Some(failure_phase),
+                    started.elapsed(),
+                );
+            }
+            return Err(error);
+        }
         RequestReadResult::Request(request) => request,
         RequestReadResult::Response(response) => {
             let response = response.with_cache_control("no-store");
-            write_response_with_options(
+            if let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id.as_ref()) {
+                let (outcome, error_class, failure_phase) =
+                    classify_response_observability(&response);
+                emit_server_terminal_event(
+                    emitter,
+                    correlation_id,
+                    MethodClass::Other,
+                    Some(response.status),
+                    None,
+                    response.observability.response_mode,
+                    outcome,
+                    error_class,
+                    failure_phase,
+                    started.elapsed(),
+                );
+            }
+            let write_result = write_response_with_options(
                 stream,
                 &response,
                 ResponseWriteOptions {
                     gzip: false,
                     deadline: Some(response_write_timeout),
                 },
-            )?;
+            );
+            emit_transport_terminal_event(
+                emitter,
+                correlation_id.as_ref(),
+                MethodClass::Other,
+                &response,
+                started.elapsed(),
+                write_result.as_ref().err(),
+            );
+            write_result?;
             let _ = stream.shutdown(Shutdown::Write);
             let _ = drain_request_with_budget(
                 stream,
@@ -3209,10 +3521,111 @@ where
         gzip: request.accepts_gzip(),
         deadline: Some(response_write_timeout),
     };
-    let response = handle_request(&request)?;
+    let response = handle_request(&request, correlation_id.clone())?;
+    if !matches!(request.method.as_str(), "GET" | "POST")
+        && let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id.as_ref())
+    {
+        let (outcome, error_class, failure_phase) = classify_response_observability(&response);
+        emit_server_terminal_event(
+            emitter,
+            correlation_id,
+            MethodClass::from_method(&request.method),
+            Some(response.status),
+            response.route_pattern_header.as_deref(),
+            response.observability.response_mode,
+            outcome,
+            error_class,
+            failure_phase,
+            started.elapsed(),
+        );
+    }
 
-    write_response_with_options(stream, &response, write_options)?;
-    Ok(())
+    let write_result = write_response_with_options(stream, &response, write_options);
+    emit_transport_terminal_event(
+        emitter,
+        correlation_id.as_ref(),
+        MethodClass::from_method(&request.method),
+        &response,
+        started.elapsed(),
+        write_result.as_ref().err(),
+    );
+    write_result.map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_server_terminal_event(
+    emitter: &EventEmitter,
+    correlation_id: &CorrelationId,
+    method: MethodClass,
+    status: Option<u16>,
+    route_pattern: Option<&str>,
+    response_mode: ObservabilityResponseMode,
+    outcome: Outcome,
+    error_class: Option<ErrorClass>,
+    failure_phase: Option<FailurePhase>,
+    elapsed: Duration,
+) {
+    let _ = emitter.emit(
+        Event::completed(
+            correlation_id.clone(),
+            2,
+            ObservabilityComponent::Server,
+            ObservabilityOperation::HttpRequest,
+            outcome,
+            error_class,
+            failure_phase,
+            elapsed,
+        )
+        .with_http(HttpFields::new(
+            method,
+            status,
+            route_pattern,
+            response_mode,
+        )),
+    );
+}
+
+fn emit_transport_terminal_event(
+    emitter: Option<&EventEmitter>,
+    correlation_id: Option<&CorrelationId>,
+    method: MethodClass,
+    response: &DevResponse,
+    elapsed: Duration,
+    write_error: Option<&DevServerError>,
+) {
+    let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id) else {
+        return;
+    };
+    let (outcome, error_class, failure_phase) = match write_error {
+        Some(DevServerError::Io(error)) => {
+            let (outcome, error_class) = classify_observability_io_error(error);
+            (outcome, Some(error_class), Some(FailurePhase::Write))
+        }
+        Some(_) => (
+            Outcome::Error,
+            Some(ErrorClass::Internal),
+            Some(FailurePhase::Write),
+        ),
+        None => (Outcome::Success, None, None),
+    };
+    let _ = emitter.emit(
+        Event::completed(
+            correlation_id.clone(),
+            3,
+            ObservabilityComponent::Transport,
+            ObservabilityOperation::ResponseDelivery,
+            outcome,
+            error_class,
+            failure_phase,
+            elapsed,
+        )
+        .with_http(HttpFields::new(
+            method,
+            Some(response.status),
+            response.route_pattern_header.as_deref(),
+            response.observability.response_mode,
+        )),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5180,17 +5593,14 @@ fn production_render_error_response(
     match_result: &RouteMatch,
     error: &PageRenderError,
 ) -> DevResponse {
-    eprintln!(
-        "Ferrite production render failed: path={path:?} pattern={:?} error={:?}",
-        match_result.route.path,
-        error.to_string()
-    );
-    match error {
+    let (outcome, error_class) = classify_page_render_error(error);
+    let response = match error {
         PageRenderError::TimedOut { .. } => {
             DevResponse::gateway_timeout(render_production_render_error(504, path, match_result))
         }
         _ => DevResponse::internal_error(render_production_render_error(500, path, match_result)),
-    }
+    };
+    response.with_observability_failure(outcome, error_class, FailurePhase::Render)
 }
 
 fn render_production_render_error(status: u16, path: &str, match_result: &RouteMatch) -> String {
@@ -5222,16 +5632,123 @@ fn production_bundle_error_response(
     match_result: &RouteMatch,
     error: &ClientBundleError,
 ) -> DevResponse {
-    eprintln!(
-        "Ferrite production bundle failed: path={path:?} pattern={:?} error={:?}",
-        match_result.route.path,
-        error.to_string()
-    );
-    match error {
+    let (outcome, error_class) = classify_client_bundle_error(error);
+    let response = match error {
         ClientBundleError::TimedOut { .. } => {
             DevResponse::gateway_timeout(render_production_bundle_error(504, path, match_result))
         }
         _ => DevResponse::internal_error(render_production_bundle_error(500, path, match_result)),
+    };
+    response.with_observability_failure(outcome, error_class, FailurePhase::Render)
+}
+
+fn classify_response_observability(
+    response: &DevResponse,
+) -> (Outcome, Option<ErrorClass>, Option<FailurePhase>) {
+    if let Some(outcome) = response.observability.outcome {
+        return (
+            outcome,
+            response.observability.error_class,
+            response.observability.failure_phase,
+        );
+    }
+    match response.status {
+        100..=399 => (Outcome::Success, None, None),
+        404 => (
+            Outcome::Error,
+            Some(ErrorClass::NotFound),
+            Some(FailurePhase::Read),
+        ),
+        408 | 504 => (
+            Outcome::Timeout,
+            Some(ErrorClass::Timeout),
+            Some(FailurePhase::Read),
+        ),
+        413 => (
+            Outcome::Error,
+            Some(ErrorClass::ResourceExhausted),
+            Some(FailurePhase::Read),
+        ),
+        400..=499 => (
+            Outcome::Error,
+            Some(ErrorClass::Rejected),
+            Some(FailurePhase::Read),
+        ),
+        _ => (
+            Outcome::Error,
+            Some(ErrorClass::Internal),
+            Some(FailurePhase::Render),
+        ),
+    }
+}
+
+fn classify_page_render_error(error: &PageRenderError) -> (Outcome, ErrorClass) {
+    match error {
+        PageRenderError::Cancelled => (Outcome::Cancelled, ErrorClass::Cancelled),
+        PageRenderError::TimedOut { .. } => (Outcome::Timeout, ErrorClass::Timeout),
+        PageRenderError::OutputLimitExceeded { .. } => {
+            (Outcome::Error, ErrorClass::ResourceExhausted)
+        }
+        PageRenderError::NodeFailed { .. } => (Outcome::Error, ErrorClass::Dependency),
+        PageRenderError::Protocol(_) => (Outcome::Error, ErrorClass::Protocol),
+        PageRenderError::Io(error) => classify_observability_io_error(error),
+        PageRenderError::Json(_) | PageRenderError::Ssr(_) => {
+            (Outcome::Error, ErrorClass::InvalidInput)
+        }
+    }
+}
+
+fn classify_client_bundle_error(error: &ClientBundleError) -> (Outcome, ErrorClass) {
+    match error {
+        ClientBundleError::Cancelled => (Outcome::Cancelled, ErrorClass::Cancelled),
+        ClientBundleError::TimedOut { .. } => (Outcome::Timeout, ErrorClass::Timeout),
+        ClientBundleError::OutputLimitExceeded { .. } => {
+            (Outcome::Error, ErrorClass::ResourceExhausted)
+        }
+        ClientBundleError::NodeFailed { .. } => (Outcome::Error, ErrorClass::Dependency),
+        ClientBundleError::Protocol(_) => (Outcome::Error, ErrorClass::Protocol),
+        ClientBundleError::StaleInputSnapshot { .. } => (Outcome::Error, ErrorClass::StaleInput),
+        ClientBundleError::Io(error) => classify_observability_io_error(error),
+        ClientBundleError::Json(_) | ClientBundleError::InvalidModuleGraph { .. } => {
+            (Outcome::Error, ErrorClass::InvalidInput)
+        }
+    }
+}
+
+fn classify_dev_server_error(error: &DevServerError) -> (Outcome, ErrorClass, FailurePhase) {
+    match error {
+        DevServerError::PageRender(error) => {
+            let (outcome, error_class) = classify_page_render_error(error);
+            (outcome, error_class, FailurePhase::Render)
+        }
+        DevServerError::Io(error) => {
+            let (outcome, error_class) = classify_observability_io_error(error);
+            (outcome, error_class, FailurePhase::Read)
+        }
+        DevServerError::Artifact(_) => (Outcome::Error, ErrorClass::Protocol, FailurePhase::Read),
+        DevServerError::Router(_)
+        | DevServerError::Json(_)
+        | DevServerError::InvalidRequestPath(_) => {
+            (Outcome::Error, ErrorClass::InvalidInput, FailurePhase::Read)
+        }
+        DevServerError::NoSocketAddress => (Outcome::Error, ErrorClass::Io, FailurePhase::Read),
+    }
+}
+
+fn classify_observability_io_error(error: &std::io::Error) -> (Outcome, ErrorClass) {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            (Outcome::Timeout, ErrorClass::Timeout)
+        }
+        std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::UnexpectedEof => (Outcome::Disconnected, ErrorClass::Disconnected),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+            (Outcome::Error, ErrorClass::InvalidInput)
+        }
+        _ => (Outcome::Error, ErrorClass::Io),
     }
 }
 
@@ -7394,6 +7911,147 @@ process.exit(1);
         assert_eq!(events[0].status, 200);
         assert_eq!(events[0].route_pattern.as_deref(), Some("/posts/:id"));
         assert!(events[0].client_ip.is_some());
+    }
+
+    #[test]
+    fn structured_events_correlate_render_request_and_delivery_without_request_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(16);
+        let mut project = production_project_for(&app);
+        project.config.observability_emitter = Some(emitter);
+
+        let response = production_http_request(
+            project,
+            b"GET /posts/private-id?token=super-secret HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.10\r\n\r\n",
+        );
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert!(response_headers(&response).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].sequence, 0);
+        assert_eq!(events[1].sequence, 1);
+        assert_eq!(events[2].sequence, 2);
+        assert_eq!(events[3].sequence, 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.correlation_id == events[0].correlation_id)
+        );
+        assert_eq!(events[1].component, ObservabilityComponent::Renderer);
+        assert_eq!(events[1].operation, ObservabilityOperation::RenderDocument);
+        assert_eq!(events[2].component, ObservabilityComponent::Server);
+        assert_eq!(events[3].component, ObservabilityComponent::Transport);
+        assert_eq!(events[3].outcome, Some(Outcome::Success));
+        assert_eq!(
+            events[3].http.as_ref().unwrap().route_pattern.as_str(),
+            "/posts/:id"
+        );
+        for event in events {
+            let encoded = event.to_json_line().unwrap();
+            assert!(!encoded.contains("private-id"));
+            assert!(!encoded.contains("super-secret"));
+            assert!(!encoded.contains("203.0.113.10"));
+            assert!(!encoded.contains("client_ip"));
+            assert!(!encoded.contains("\"path\""));
+        }
+    }
+
+    #[test]
+    fn structured_renderer_failure_is_classified_without_child_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(16);
+        let mut project = action_production_project_for(
+            &app,
+            r#"
+console.error("secret-child-stderr-canary");
+process.exit(17);
+"#,
+        );
+        project.config.observability_emitter = Some(emitter);
+
+        let response = production_http_request(
+            project,
+            b"GET /posts/private-id?token=super-secret HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert!(response_headers(&response).starts_with("HTTP/1.1 500 Internal Server Error"));
+        let render = events
+            .iter()
+            .find(|event| event.component == ObservabilityComponent::Renderer)
+            .expect("renderer event");
+        assert_eq!(render.outcome, Some(Outcome::Error));
+        assert_eq!(render.error_class, Some(ErrorClass::Dependency));
+        for event in events {
+            let encoded = event.to_json_line().unwrap();
+            assert!(!encoded.contains("secret-child-stderr-canary"));
+            assert!(!encoded.contains("private-id"));
+            assert!(!encoded.contains("super-secret"));
+        }
+    }
+
+    #[test]
+    fn structured_transport_distinguishes_disconnects_and_timeouts() {
+        let response = DevResponse::ok("text/plain", "ok")
+            .with_route_pattern("/posts/:id")
+            .with_observability_response_mode(ObservabilityResponseMode::Document);
+        let correlation_id = CorrelationId::generate();
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(4);
+        let disconnected = DevServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "private disconnected detail",
+        ));
+        let timed_out = DevServerError::Io(response_write_deadline_error());
+
+        emit_transport_terminal_event(
+            Some(&emitter),
+            Some(&correlation_id),
+            MethodClass::Get,
+            &response,
+            Duration::from_millis(5),
+            Some(&disconnected),
+        );
+        emit_transport_terminal_event(
+            Some(&emitter),
+            Some(&correlation_id),
+            MethodClass::Get,
+            &response,
+            Duration::from_millis(7),
+            Some(&timed_out),
+        );
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome, Some(Outcome::Disconnected));
+        assert_eq!(events[0].error_class, Some(ErrorClass::Disconnected));
+        assert_eq!(events[1].outcome, Some(Outcome::Timeout));
+        assert_eq!(events[1].error_class, Some(ErrorClass::Timeout));
+        for event in events {
+            let encoded = event.to_json_line().unwrap();
+            assert!(!encoded.contains("private disconnected detail"));
+            assert!(!encoded.contains(PRODUCTION_RESPONSE_WRITE_DEADLINE_MESSAGE));
+        }
+    }
+
+    #[test]
+    fn structured_events_are_opt_in_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+
+        let project = production_project_for(&app);
+
+        assert!(project.config.observability_emitter.is_none());
     }
 
     #[test]
