@@ -15,6 +15,9 @@
 - Registry-shaped `ferrite init` now pins matching `@ferrite/runtime` and
   `@ferrite/cli` prerelease versions when invoked through the verified npm
   wrapper. Source-built initialization remains unchanged.
+- The npm wrapper now owns the asynchronous Rust child lifecycle, forwards
+  termination signals, waits for child cleanup, and removes its signal
+  listeners before returning the child's exit outcome.
 
 ### Known limits
 

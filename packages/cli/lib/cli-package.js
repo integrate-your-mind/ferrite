@@ -1,4 +1,4 @@
-import { spawnSync as defaultSpawnSync } from "node:child_process";
+import { spawn as defaultSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   readFileSync as defaultReadFileSync,
@@ -11,6 +11,7 @@ import {
   env as currentEnv,
   platform as currentPlatform,
 } from "node:process";
+import currentProcess from "node:process";
 import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
@@ -145,39 +146,87 @@ export function resolveCliBinary({
   };
 }
 
-export function launchFerrite(
+export async function launchFerrite(
   args,
   {
     env = currentEnv,
+    processObject = currentProcess,
     resolveBinary = resolveCliBinary,
-    spawnSync = defaultSpawnSync,
+    spawn = defaultSpawn,
     ...resolveOptions
   } = {},
 ) {
   const resolved = resolveBinary(resolveOptions);
-  const result = spawnSync(resolved.path, args, {
-    env: {
-      ...env,
-      [npmVersionEnvironmentVariable]: resolved.packageVersion,
-    },
-    shell: false,
-    stdio: "inherit",
+  let child;
+  try {
+    child = spawn(resolved.path, args, {
+      env: {
+        ...env,
+        [npmVersionEnvironmentVariable]: resolved.packageVersion,
+      },
+      shell: false,
+      stdio: "inherit",
+    });
+  } catch (error) {
+    throw launchError(resolved.path, error);
+  }
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    let forwardedSignal = null;
+    const signalHandlers = new Map();
+
+    const cleanup = () => {
+      for (const [signal, handler] of signalHandlers) {
+        processObject.off(signal, handler);
+      }
+    };
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+      const handler = () => {
+        forwardedSignal ??= signal;
+        try {
+          child.kill(signal);
+        } catch (error) {
+          settle(reject, launchError(resolved.path, error));
+        }
+      };
+      signalHandlers.set(signal, handler);
+      processObject.on(signal, handler);
+    }
+
+    child.once("error", (error) => {
+      settle(reject, launchError(resolved.path, error));
+    });
+    child.once("close", (status, signal) => {
+      const terminationSignal = forwardedSignal ?? signal;
+      if (terminationSignal) {
+        settle(resolve, { status: null, signal: terminationSignal });
+        return;
+      }
+      if (!Number.isInteger(status) || status < 0 || status > 255) {
+        settle(
+          reject,
+          new Error(`Ferrite CLI returned an invalid exit status: ${String(status)}.`),
+        );
+        return;
+      }
+      settle(resolve, { status, signal: null });
+    });
   });
+}
 
-  if (result.error) {
-    throw new Error(
-      `Ferrite CLI failed to launch ${resolved.path}: ${result.error.message}`,
-      { cause: result.error },
-    );
-  }
-  if (result.signal) {
-    return { status: null, signal: result.signal };
-  }
-  if (!Number.isInteger(result.status) || result.status < 0 || result.status > 255) {
-    throw new Error(`Ferrite CLI returned an invalid exit status: ${String(result.status)}.`);
-  }
-
-  return { status: result.status, signal: null };
+function launchError(path, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(`Ferrite CLI failed to launch ${path}: ${message}`, {
+    cause: error,
+  });
 }
 
 export function verifyChecksumManifest(

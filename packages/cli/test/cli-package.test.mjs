@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
+import { spawn as spawnProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import {
+  mkdtemp,
+  readFile,
+  rm,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { env, execPath, kill } from "node:process";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   CLI_CHECKSUM_ALGORITHM,
@@ -203,9 +214,10 @@ test("verifyChecksumManifest rejects size and digest tampering", () => {
   );
 });
 
-test("launchFerrite passes exact argv and a wrapper-owned npm version", () => {
+test("launchFerrite passes exact argv and a wrapper-owned npm version", async () => {
   let invocation;
-  const result = launchFerrite(["init", "app with spaces"], {
+  const processObject = new EventEmitter();
+  const result = await launchFerrite(["init", "app with spaces"], {
     env: {
       KEEP: "yes",
       FERRITE_INTERNAL_NPM_PACKAGE_VERSION: "attacker-controlled",
@@ -214,10 +226,14 @@ test("launchFerrite passes exact argv and a wrapper-owned npm version", () => {
       path: "/verified/ferrite",
       packageVersion: "0.1.0-alpha.0",
     }),
-    spawnSync(path, args, options) {
+    spawn(path, args, options) {
       invocation = { path, args, options };
-      return { status: 17, signal: null };
+      const child = new EventEmitter();
+      child.kill = () => true;
+      queueMicrotask(() => child.emit("close", 17, null));
+      return child;
     },
+    processObject,
   });
 
   assert.deepEqual(result, { status: 17, signal: null });
@@ -229,33 +245,146 @@ test("launchFerrite passes exact argv and a wrapper-owned npm version", () => {
     invocation.options.env.FERRITE_INTERNAL_NPM_PACKAGE_VERSION,
     "0.1.0-alpha.0",
   );
+  assert.equal(processObject.listenerCount("SIGTERM"), 0);
 });
 
-test("launchFerrite preserves signal outcomes and reports spawn errors", () => {
+test("launchFerrite preserves signal outcomes and reports spawn errors", async () => {
   const resolved = () => ({
     path: "/verified/ferrite",
     packageVersion: "0.1.0-alpha.0",
   });
   assert.deepEqual(
-    launchFerrite([], {
+    await launchFerrite([], {
       resolveBinary: resolved,
-      spawnSync: () => ({ status: null, signal: "SIGTERM" }),
+      processObject: new EventEmitter(),
+      spawn: () => {
+        const child = new EventEmitter();
+        child.kill = () => true;
+        queueMicrotask(() => child.emit("close", null, "SIGTERM"));
+        return child;
+      },
     }),
     { status: null, signal: "SIGTERM" },
   );
-  assert.throws(
-    () =>
+  await assert.rejects(
+    async () =>
       launchFerrite([], {
         resolveBinary: resolved,
-        spawnSync: () => ({
-          status: null,
-          signal: null,
-          error: new Error("ENOENT"),
-        }),
+        processObject: new EventEmitter(),
+        spawn: () => {
+          const child = new EventEmitter();
+          child.kill = () => true;
+          queueMicrotask(() => child.emit("error", new Error("ENOENT")));
+          return child;
+        },
       }),
     /failed to launch.*ENOENT/,
   );
 });
+
+test("launchFerrite forwards wrapper signals and removes its listeners", async () => {
+  const processObject = new EventEmitter();
+  let forwardedSignal;
+  const result = await launchFerrite([], {
+    resolveBinary: () => ({
+      path: "/verified/ferrite",
+      packageVersion: "0.1.0-alpha.0",
+    }),
+    processObject,
+    spawn: () => {
+      const child = new EventEmitter();
+      child.kill = (signal) => {
+        forwardedSignal = signal;
+        queueMicrotask(() => child.emit("close", 0, null));
+        return true;
+      };
+      queueMicrotask(() => processObject.emit("SIGTERM"));
+      return child;
+    },
+  });
+
+  assert.deepEqual(result, { status: null, signal: "SIGTERM" });
+  assert.equal(forwardedSignal, "SIGTERM");
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    assert.equal(processObject.listenerCount(signal), 0);
+  }
+});
+
+test("launchFerrite removes signal listeners when forwarding fails", async () => {
+  const processObject = new EventEmitter();
+  await assert.rejects(
+    launchFerrite([], {
+      resolveBinary: () => ({
+        path: "/verified/ferrite",
+        packageVersion: "0.1.0-alpha.0",
+      }),
+      processObject,
+      spawn: () => {
+        const child = new EventEmitter();
+        child.kill = () => {
+          throw new Error("injected signal forwarding failure");
+        };
+        queueMicrotask(() => processObject.emit("SIGTERM"));
+        return child;
+      },
+    }),
+    /failed to launch.*signal forwarding failure/,
+  );
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    assert.equal(processObject.listenerCount(signal), 0);
+  }
+});
+
+test(
+  "the npm wrapper forwards SIGTERM and leaves no child process",
+  { timeout: 10_000 },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "ferrite cli signal "));
+    const pidFile = join(root, "child.pid");
+    const moduleUrl = pathToFileURL(
+      join(import.meta.dirname, "..", "lib", "cli-package.js"),
+    ).href;
+    const childProgram = [
+      'import { writeFileSync } from "node:fs";',
+      'writeFileSync(process.env.FERRITE_TEST_CHILD_PID, String(process.pid));',
+      "setInterval(() => {}, 1_000);",
+    ].join("");
+    const wrapperProgram = [
+      `import { launchFerrite } from ${JSON.stringify(moduleUrl)};`,
+      `const result = await launchFerrite(["--input-type=module", "--eval", ${JSON.stringify(childProgram)}], {`,
+      "  resolveBinary: () => ({ path: process.execPath, packageVersion: \"0.1.0-alpha.0\" }),",
+      "});",
+      "if (result.signal) {",
+      "  process.exitCode = 1;",
+      "  process.kill(process.pid, result.signal);",
+      "} else {",
+      "  process.exitCode = result.status;",
+      "}",
+    ].join("\n");
+    const wrapper = spawnProcess(
+      execPath,
+      ["--input-type=module", "--eval", wrapperProgram],
+      {
+        env: { ...env, FERRITE_TEST_CHILD_PID: pidFile },
+        stdio: "ignore",
+      },
+    );
+    let childPid;
+
+    try {
+      childPid = Number(await waitForFile(pidFile));
+      assert.equal(Number.isSafeInteger(childPid) && childPid > 0, true);
+      wrapper.kill("SIGTERM");
+      const outcome = await waitForClose(wrapper);
+      assert.deepEqual(outcome, { status: null, signal: "SIGTERM" });
+      await waitForProcessExit(childPid);
+    } finally {
+      if (isProcessAlive(wrapper.pid)) wrapper.kill("SIGKILL");
+      if (childPid && isProcessAlive(childPid)) kill(childPid, "SIGKILL");
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 function checksumOptions() {
   return {
@@ -315,4 +444,45 @@ function fakeRead(files) {
     if (Object.hasOwn(files, path)) return files[path];
     throw new Error(`ENOENT: ${path}`);
   };
+}
+
+async function waitForFile(path) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      return await readFile(path, "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw new Error(`Timed out waiting for ${path}.`);
+}
+
+async function waitForClose(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { status: child.exitCode, signal: child.signalCode };
+  }
+  return await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (status, signal) => resolve({ status, signal }));
+  });
+}
+
+async function waitForProcessExit(pid) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (!isProcessAlive(pid)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Child process ${pid} survived wrapper termination.`);
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
 }
