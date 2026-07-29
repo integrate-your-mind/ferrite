@@ -205,10 +205,11 @@ check_coverage_sources() {
         if (path != source) next
         if (found) exit 3
         found = 1
+        matched_value = value
       }
       END {
         if (!found) exit 1
-        print value
+        print matched_value
       }
     ' "${log}")" || {
       local status="$?"

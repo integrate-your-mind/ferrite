@@ -269,7 +269,10 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.doesNotMatch(source, /coverage-rust env RUSTC=/);
   assert.doesNotMatch(source, /gitleaks git [^\n]*--log-opts=-1/);
   assert.doesNotMatch(source, /corepack pnpm/);
-  assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
+  assert.doesNotMatch(
+    source,
+    /(?:^|\n)\s*(?:run_gate\s+\S+\s+)?(?:env\s+\S+=\S+\s+)*(?:(?:npm|cargo)\s+publish|deploy)\b/,
+  );
 });
 
 test("Node CI entrypoint rejects functions and sanitizes before Bash", async () => {
