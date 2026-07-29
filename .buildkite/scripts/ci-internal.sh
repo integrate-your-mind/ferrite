@@ -6,14 +6,49 @@ if [[ -n "$(builtin declare -Fx)" ]]; then
   exit 1
 fi
 
-ROOT="$(git rev-parse --show-toplevel)"
+ROOT="$(cd "$(git rev-parse --show-toplevel)" && /bin/pwd -P)"
 readonly ROOT
-REPORT_DIR="${FERRITE_CI_REPORT_DIR:-${ROOT}/dist/ci}"
-readonly REPORT_DIR
 MODE="${1:-}"
+DIRECT_EXECUTION=0
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  DIRECT_EXECUTION=1
+  case "${MODE}" in
+    preflight | verify | packages | coverage | coverage-rust | coverage-js | native | nginx | all)
+      ;;
+    *)
+      printf 'usage: %s {preflight|verify|packages|coverage|coverage-rust|coverage-js|native|nginx|all}\n' "$0" >&2
+      exit 64
+      ;;
+  esac
+else
+  MODE="sourced"
+fi
 readonly MODE
-MIN_FREE_KIB=20971520
-readonly MIN_FREE_KIB
+readonly DIRECT_EXECUTION
+REPORT_COMMIT="$(git rev-parse HEAD)"
+readonly REPORT_COMMIT
+if [[ ! "${REPORT_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'Ferrite local CI: report commit is not an exact Git SHA\n' >&2
+  exit 1
+fi
+if [[ -n "${BUILDKITE_JOB_ID:-}" ]]; then
+  REPORT_RUN_ID="${BUILDKITE_JOB_ID}"
+else
+  REPORT_RUN_ID="local-$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
+fi
+readonly REPORT_RUN_ID
+if [[ ! "${REPORT_RUN_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  printf 'Ferrite local CI: report run id contains unsupported characters\n' >&2
+  exit 1
+fi
+DEFAULT_REPORT_DIR="${ROOT}/dist/ci/${REPORT_COMMIT}/${MODE}/${REPORT_RUN_ID}"
+readonly DEFAULT_REPORT_DIR
+if (( DIRECT_EXECUTION == 1 )) && [[ -n "${FERRITE_CI_REPORT_DIR:-}" ]]; then
+  printf 'Ferrite local CI: FERRITE_CI_REPORT_DIR is reserved for sourced tests\n' >&2
+  exit 1
+fi
+REPORT_DIR="${FERRITE_CI_REPORT_DIR:-${DEFAULT_REPORT_DIR}}"
+readonly REPORT_DIR
 RUST_TOOLCHAIN="1.95.0"
 readonly RUST_TOOLCHAIN
 COVERAGE_RUST_LINES_FLOOR="90.00"
@@ -33,6 +68,49 @@ cd "${ROOT}"
 fail() {
   printf 'Ferrite local CI: %s\n' "$*" >&2
   exit 1
+}
+
+verify_report_commit() {
+  [[ "$1" == "${REPORT_COMMIT}" ]] ||
+    fail "checkout changed before report creation"
+}
+
+prepare_report_dir() {
+  local path physical_parent report_parent
+
+  if [[ "${REPORT_DIR}" != "${DEFAULT_REPORT_DIR}" ]]; then
+    (( DIRECT_EXECUTION == 0 )) ||
+      fail "custom report directories are reserved for sourced tests"
+    [[ ! -e "${REPORT_DIR}" && ! -L "${REPORT_DIR}" ]] ||
+      fail "report directory already exists"
+    report_parent="$(/usr/bin/dirname "${REPORT_DIR}")"
+    [[ -d "${report_parent}" && ! -L "${report_parent}" ]] ||
+      fail "test report parent must be an existing non-symlink directory"
+    /bin/mkdir "${REPORT_DIR}" || fail "could not create test report directory"
+    return
+  fi
+
+  for path in \
+    "${ROOT}/dist" \
+    "${ROOT}/dist/ci" \
+    "${ROOT}/dist/ci/${REPORT_COMMIT}" \
+    "${ROOT}/dist/ci/${REPORT_COMMIT}/${MODE}"; do
+    [[ ! -L "${path}" ]] || fail "report path contains a symlink"
+    if [[ -e "${path}" ]]; then
+      [[ -d "${path}" ]] || fail "report path contains a non-directory"
+    else
+      /bin/mkdir "${path}" || fail "could not create report parent"
+    fi
+  done
+
+  report_parent="${ROOT}/dist/ci/${REPORT_COMMIT}/${MODE}"
+  physical_parent="$(cd "${report_parent}" && /bin/pwd -P)" ||
+    fail "could not canonicalize report parent"
+  [[ "${physical_parent}" == "${report_parent}" ]] ||
+    fail "report parent escapes repository containment"
+  [[ ! -e "${REPORT_DIR}" && ! -L "${REPORT_DIR}" ]] ||
+    fail "report directory already exists"
+  /bin/mkdir "${REPORT_DIR}" || fail "could not create report directory"
 }
 
 run_gate() {
@@ -205,11 +283,11 @@ check_coverage_sources() {
         if (path != source) next
         if (found) exit 3
         found = 1
-        matched_value = value
+        source_value = value
       }
       END {
         if (!found) exit 1
-        print matched_value
+        print source_value
       }
     ' "${log}")" || {
       local status="$?"
@@ -274,27 +352,8 @@ activate_rust_toolchain() {
 }
 
 preflight() {
-  local available_kib
-  available_kib="$(/bin/df -Pk "${ROOT}" | /usr/bin/awk 'NR == 2 { print $4 }')"
-  [[ "${available_kib}" =~ ^[0-9]+$ ]] ||
-    fail "could not determine available storage for ${ROOT}"
-  (( available_kib >= MIN_FREE_KIB )) ||
-    fail "storage admission requires at least ${MIN_FREE_KIB} KiB free; found ${available_kib} KiB"
-
-  mkdir -p "${REPORT_DIR}"
-  : > "${REPORT_DIR}/results.tsv"
-
   [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] ||
     fail "a clean worktree, including untracked files, is required"
-
-  local head
-  head="$(git rev-parse HEAD)"
-  if [[ "${BUILDKITE:-}" == "true" ]]; then
-    [[ "${BUILDKITE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] ||
-      fail "BUILDKITE_COMMIT must be an exact Git SHA"
-    [[ "${head}" == "${BUILDKITE_COMMIT}" ]] ||
-      fail "checkout ${head} does not match approved build ${BUILDKITE_COMMIT}"
-  fi
 
   [[ "$(uname -s)" == "Darwin" ]] ||
     fail "the committed local-agent lane is intentionally limited to macOS"
@@ -310,7 +369,7 @@ preflight() {
   command -v cargo-llvm-cov >/dev/null || fail "cargo-llvm-cov is unavailable"
   command -v buildkite-agent >/dev/null || fail "Buildkite Agent is unavailable"
 
-  local buildkite_version cargo_verbose node_major pnpm_version rust_verbose rust_version
+  local buildkite_version cargo_verbose head lock_sha node_major pnpm_version rust_verbose rust_version tree
   buildkite_version="$(buildkite-agent --version)"
   [[ "${buildkite_version}" == "buildkite-agent version 3.127."* ]] ||
     fail "Buildkite Agent 3.127.x is required, found ${buildkite_version}"
@@ -328,10 +387,27 @@ preflight() {
   cargo_verbose="$(cargo -vV | /usr/bin/tr '\n' ';')"
   rust_verbose="$(rustc -vV | /usr/bin/tr '\n' ';')"
 
+  head="$(git rev-parse HEAD)"
+  tree="$(git rev-parse 'HEAD^{tree}')"
+  lock_sha="$(cargo_lock_sha)"
+  verify_report_commit "${head}"
+  [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] ||
+    fail "worktree changed before report creation"
+  if [[ "${BUILDKITE:-}" == "true" ]]; then
+    [[ "${BUILDKITE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] ||
+      fail "BUILDKITE_COMMIT must be an exact Git SHA"
+    [[ "${head}" == "${BUILDKITE_COMMIT}" ]] ||
+      fail "checkout ${head} does not match approved build ${BUILDKITE_COMMIT}"
+  fi
+
+  prepare_report_dir
+  : > "${REPORT_DIR}/results.tsv"
+  : > "${REPORT_DIR}/coverage-results.tsv"
+
   {
     printf 'commit=%s\n' "${head}"
-    printf 'tree=%s\n' "$(git rev-parse 'HEAD^{tree}')"
-    printf 'cargo_lock_sha=%s\n' "$(cargo_lock_sha)"
+    printf 'tree=%s\n' "${tree}"
+    printf 'cargo_lock_sha=%s\n' "${lock_sha}"
     printf 'timestamp_utc=%s\n' "$(/bin/date -u +'%Y-%m-%dT%H:%M:%SZ')"
     printf 'node=%s\n' "$(node --version)"
     printf 'pnpm=%s\n' "${pnpm_version}"
@@ -355,9 +431,15 @@ preflight() {
     printf 'cargo_profile_dev_debug=%s\n' "${CARGO_PROFILE_DEV_DEBUG}"
     printf 'cargo_profile_dev_split_debuginfo=%s\n' \
       "${CARGO_PROFILE_DEV_SPLIT_DEBUGINFO}"
-    printf 'storage_available_kib=%s\n' "${available_kib}"
-    printf 'storage_minimum_kib=%s\n' "${MIN_FREE_KIB}"
   } > "${REPORT_DIR}/environment.txt"
+
+  verify_report_commit "$(git rev-parse HEAD)"
+  [[ "$(git rev-parse 'HEAD^{tree}')" == "${tree}" ]] ||
+    fail "checkout tree changed during report creation"
+  [[ "$(cargo_lock_sha)" == "${lock_sha}" ]] ||
+    fail "Cargo.lock changed during report creation"
+  [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] ||
+    fail "worktree changed during report creation"
 }
 
 bootstrap() {

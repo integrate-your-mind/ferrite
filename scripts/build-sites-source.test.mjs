@@ -907,13 +907,21 @@ test("site output replacement rejects canonical-root escape before mutation", as
     await writeSiteOutput(destination, "old");
     const sourceRoot = await realpath(source);
     const escaped = join(directory, "outside");
+    let injected = false;
     await assert.rejects(
       replaceSiteOutput(source, destination, {
-        realpathImpl: async (path) =>
-          path === join(sourceRoot, "client") ? escaped : realpath(path),
+        realpathImpl: async (path) => {
+          const canonical = await realpath(path);
+          if (canonical === join(sourceRoot, "client")) {
+            injected = true;
+            return escaped;
+          }
+          return canonical;
+        },
       }),
       /website dist snapshot escaped its canonical root/,
     );
+    assert.equal(injected, true);
     for (const name of SITE_OUTPUT_ENTRIES) {
       assert.equal(
         await readFile(join(destination, name, "marker.txt"), "utf8"),

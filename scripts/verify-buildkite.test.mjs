@@ -5,8 +5,10 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -202,14 +204,50 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /COVERAGE_NATIVE_LINES_FLOOR="78\.00"/);
   assert.match(source, /COVERAGE_SITE_LINES_FLOOR="70\.00"/);
   assert.match(source, /check_coverage_floor/);
-  assert.match(source, /MIN_FREE_KIB=20971520/);
-  assert.match(source, /\/bin\/df -Pk "\$\{ROOT\}"/);
-  assert.match(source, /storage admission requires at least/);
+  assert.doesNotMatch(source, /MIN_FREE_KIB|\/bin\/df -Pk|storage admission/);
   assert.match(source, /git status --porcelain=v1 --untracked-files=all/);
   assert.doesNotMatch(source, /git diff --quiet/);
+  const preflightSource = source.slice(
+    source.indexOf("preflight() {"),
+    source.indexOf("\nbootstrap() {"),
+  );
+  const cleanlinessIndex = preflightSource.indexOf(
+    "git status --porcelain=v1 --untracked-files=all",
+  );
+  const finalIdentityIndex = preflightSource.lastIndexOf(
+    'verify_report_commit "${head}"',
+  );
+  const reportIndex = preflightSource.indexOf("prepare_report_dir");
+  const finalCleanlinessIndex = preflightSource.lastIndexOf(
+    "git status --porcelain=v1 --untracked-files=all",
+    reportIndex,
+  );
+  const endIdentityIndex = preflightSource.lastIndexOf(
+    'verify_report_commit "$(git rev-parse HEAD)"',
+  );
+  const endCleanlinessIndex = preflightSource.indexOf(
+    "git status --porcelain=v1 --untracked-files=all",
+    reportIndex,
+  );
   assert.ok(
-    source.indexOf("/bin/df -Pk") < source.indexOf('mkdir -p "${REPORT_DIR}"'),
-    "storage admission must run before CI creates report output",
+    cleanlinessIndex >= 0 &&
+      finalIdentityIndex >= 0 &&
+      finalCleanlinessIndex >= 0 &&
+      reportIndex >= 0 &&
+      endIdentityIndex >= 0 &&
+      endCleanlinessIndex >= 0,
+    "preflight ordering markers must exist",
+  );
+  assert.ok(
+    cleanlinessIndex < reportIndex,
+    "cleanliness must run before CI creates report output",
+  );
+  assert.ok(
+      finalIdentityIndex < finalCleanlinessIndex &&
+      finalCleanlinessIndex < reportIndex &&
+      reportIndex < endIdentityIndex &&
+      reportIndex < endCleanlinessIndex,
+    "exact identity and cleanliness must bracket report creation",
   );
   assert.match(
     source,
@@ -271,8 +309,133 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.doesNotMatch(source, /corepack pnpm/);
   assert.doesNotMatch(
     source,
-    /(?:^|\n)\s*(?:run_gate\s+\S+\s+)?(?:env\s+\S+=\S+\s+)*(?:(?:npm|cargo)\s+publish|deploy)\b/,
+    /\bnpm publish\b|\bcargo publish\b|\bwrangler deploy\b/,
   );
+});
+
+test("local CI isolates receipts by commit, mode, and run", async () => {
+  const source = await readFile(ciInternalUrl, "utf8");
+
+  assert.match(source, /REPORT_COMMIT="\$\(git rev-parse HEAD\)"/);
+  assert.match(source, /REPORT_RUN_ID="local-\$\(\/usr\/bin\/uuidgen/);
+  assert.match(source, /case "\$\{MODE\}" in/);
+  assert.match(source, /\^\[A-Za-z0-9\]\[A-Za-z0-9\._-\]\*\$/);
+  assert.match(
+    source,
+    /dist\/ci\/\$\{REPORT_COMMIT\}\/\$\{MODE\}\/\$\{REPORT_RUN_ID\}/,
+  );
+  assert.match(source, /\/bin\/mkdir "\$\{REPORT_DIR\}"/);
+  assert.doesNotMatch(source, /mkdir -p "\$\{REPORT_DIR\}"/);
+  assert.match(source, /: > "\$\{REPORT_DIR\}\/coverage-results\.tsv"/);
+});
+
+test("local CI creates exclusive report runs and rejects symlink collisions", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-report-isolation-test-"));
+  const workspace = join(tempRoot, "workspace");
+  const outside = join(tempRoot, "outside");
+  await mkdir(workspace);
+  await mkdir(outside);
+  const physicalWorkspace = await realpath(workspace);
+  await writeFile(join(workspace, "Cargo.lock"), "# test lockfile\n");
+  for (const args of [
+    ["init", "--quiet"],
+    ["config", "user.email", "ferrite-test@example.invalid"],
+    ["config", "user.name", "Ferrite Test"],
+    ["add", "Cargo.lock"],
+    ["commit", "--quiet", "-m", "test fixture"],
+  ]) {
+    const result = spawnSync("git", args, { cwd: workspace, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  }
+  const head = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+    encoding: "utf8",
+  }).stdout.trim();
+  const invoke = (runId) =>
+    spawnSync(
+      "/bin/bash",
+      ["-c", `source '${ciInternalUrl.pathname}'; prepare_report_dir; printf '%s' "$REPORT_DIR"`],
+      {
+        cwd: workspace,
+        encoding: "utf8",
+        env: {
+          HOME: process.env.HOME,
+          PATH: process.env.PATH,
+          BUILDKITE_JOB_ID: runId,
+        },
+      },
+    );
+  const verifyCommit = (commit) =>
+    spawnSync(
+      "/bin/bash",
+      ["-c", `source '${ciInternalUrl.pathname}'; verify_report_commit "$FERRITE_TEST_HEAD"`],
+      {
+        cwd: workspace,
+        encoding: "utf8",
+        env: {
+          HOME: process.env.HOME,
+          PATH: process.env.PATH,
+          FERRITE_TEST_HEAD: commit,
+        },
+      },
+    );
+
+  try {
+    assert.equal(verifyCommit(head).status, 0);
+    const staleHead = verifyCommit("0".repeat(40));
+    assert.notEqual(staleHead.status, 0);
+    assert.match(staleHead.stderr, /checkout changed before report creation/);
+
+    const first = invoke("run-one");
+    assert.equal(first.status, 0, first.stderr);
+    assert.equal(
+      first.stdout,
+      join(physicalWorkspace, "dist", "ci", head, "sourced", "run-one"),
+    );
+
+    const second = invoke("run-two");
+    assert.equal(second.status, 0, second.stderr);
+    assert.notEqual(second.stdout, first.stdout);
+
+    const collision = invoke("run-one");
+    assert.notEqual(collision.status, 0);
+    assert.match(collision.stderr, /report directory already exists/);
+
+    const traversal = invoke("../escape");
+    assert.notEqual(traversal.status, 0);
+    assert.match(traversal.stderr, /run id contains unsupported characters/);
+    assert.equal(await stat(join(workspace, "dist", "ci", head, "escape")).catch(() => null), null);
+
+    const symlinkRun = join(workspace, "dist", "ci", head, "sourced", "symlink-run");
+    await symlink(outside, symlinkRun, "dir");
+    const linked = invoke("symlink-run");
+    assert.notEqual(linked.status, 0);
+    assert.match(linked.stderr, /report directory already exists/);
+    assert.deepEqual(await readdir(outside), []);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("direct local CI rejects custom report directories before mutation", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "ferrite-report-override-test-"));
+  const escaped = join(tempRoot, "escaped");
+  try {
+    const result = spawnSync(ciInternalUrl.pathname, ["preflight"], {
+      encoding: "utf8",
+      env: {
+        HOME: process.env.HOME,
+        PATH: process.env.PATH,
+        FERRITE_CI_REPORT_DIR: escaped,
+      },
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reserved for sourced tests/);
+    assert.equal(await stat(escaped).catch(() => null), null);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test("Node CI entrypoint rejects functions and sanitizes before Bash", async () => {
@@ -282,7 +445,13 @@ test("Node CI entrypoint rejects functions and sanitizes before Bash", async () 
   assert.match(source, /name\.startsWith\("BASH_FUNC_"\)/);
   assert.match(source, /Object\.fromEntries/);
   assert.match(source, /filter\(\(\[name\]\) => !isDeniedName\(name\)\)/);
-  for (const name of ["BASHOPTS", "BASH_XTRACEFD", "PS4", "SHELLOPTS"]) {
+  for (const name of [
+    "BASHOPTS",
+    "BASH_XTRACEFD",
+    "FERRITE_CI_REPORT_DIR",
+    "PS4",
+    "SHELLOPTS",
+  ]) {
     assert.match(source, new RegExp(`"${name}"`));
   }
   assert.match(source, /spawnSync\("\/bin\/bash", \[script, mode\]/);
@@ -374,6 +543,10 @@ test("Node CI entrypoint removes Bash startup controls before spawning Bash", as
         "  /bin/echo FERRITE_SHELLOPTS_LEAKED >&2",
         "  exit 1",
         "fi",
+        "if /usr/bin/printenv FERRITE_CI_REPORT_DIR >/dev/null; then",
+        "  /bin/echo FERRITE_REPORT_OVERRIDE_LEAKED >&2",
+        "  exit 1",
+        "fi",
         "/bin/echo FERRITE_SANITIZED_BASH",
         "",
       ].join("\n"),
@@ -384,6 +557,7 @@ test("Node CI entrypoint removes Bash startup controls before spawning Bash", as
       env: {
         HOME: process.env.HOME,
         PATH: process.env.PATH,
+        FERRITE_CI_REPORT_DIR: join(tempRoot, "escaped"),
         PS4: '$(/bin/echo FERRITE_PS4_EXECUTED >&2) ',
         SHELLOPTS: "xtrace",
       },
@@ -395,7 +569,10 @@ test("Node CI entrypoint removes Bash startup controls before spawning Bash", as
       `startup-control sanitization failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     );
     assert.match(result.stdout, /FERRITE_SANITIZED_BASH/);
-    assert.doesNotMatch(result.stderr, /FERRITE_PS4_EXECUTED|FERRITE_SHELLOPTS_LEAKED/);
+    assert.doesNotMatch(
+      result.stderr,
+      /FERRITE_PS4_EXECUTED|FERRITE_SHELLOPTS_LEAKED|FERRITE_REPORT_OVERRIDE_LEAKED/,
+    );
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }

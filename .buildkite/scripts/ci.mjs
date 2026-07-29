@@ -26,6 +26,7 @@ const deniedNames = new Set([
   "DYLD_INSERT_LIBRARIES",
   "DYLD_LIBRARY_PATH",
   "ENV",
+  "FERRITE_CI_REPORT_DIR",
   "GIT_ASKPASS",
   "GIT_CONFIG_COUNT",
   "GIT_SSH_COMMAND",

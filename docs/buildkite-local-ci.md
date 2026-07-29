@@ -60,11 +60,13 @@ builds only its ignored runtime and native prerequisites, copies their
 distributable artifacts, then removes the prerequisite Rust target before
 starting the Node coverage runs.
 
-Only direct `cargo llvm-cov` uses its supported `--locked` flag. `cargo audit`
+Direct `cargo llvm-cov` and the `cargo package` command behind
+`pnpm release:verify:cargo` use their supported `--locked` flags. `cargo audit`
 does not provide that flag; it reads the checked-out lockfile under the same
-post-gate digest/cleanliness contract. Cargo commands nested inside existing
-pnpm scripts do not receive a portable lock flag; their fail-closed contract is
-the clean checkout plus the start/end `Cargo.lock` SHA-256 and worktree checks.
+post-gate digest/cleanliness contract. Other Cargo commands nested inside
+existing pnpm scripts do not receive a portable lock flag; their fail-closed
+contract is the clean checkout plus the start/end `Cargo.lock` SHA-256 and
+worktree checks.
 `cargo fmt` and `cargo clean` do not support `--locked`. Coverage is a measured gate: the workspace Rust lines floor
 is 90.00%, runtime JavaScript is 80.00%, and native JavaScript is 78.00%.
 Rust parsing requires a `TOTAL` lines percentage; Node parsing requires a
@@ -73,12 +75,10 @@ reports fail closed. These floors sit below the current exact results (90.99%,
 81.57%, and 79.50%) to detect regressions without pretending to be a quality
 target.
 
-Each of the six proof-mode jobs checks storage before creating reports,
-installing dependencies, or building source. It fails closed unless the
-checkout volume has at least 20 GiB available, then records the observed and
-required KiB values in `dist/ci/environment.txt`. The pipeline-upload bootstrap
-does not build source or create proof reports. Do not bypass the proof-mode
-guard to turn an `ENOSPC` failure into a nominal CI result.
+Run directories are created exclusively, reject symlinked path components,
+and cannot be redirected with `FERRITE_CI_REPORT_DIR` during a direct CI
+invocation. That override exists only for isolated sourced unit tests. The
+pipeline-upload bootstrap does not build source or create proof reports.
 
 Each gate records its starting commit, tree, `Cargo.lock` SHA-256, and
 worktree status, then verifies that all four are unchanged before reporting a
