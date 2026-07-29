@@ -35,7 +35,9 @@ The trusted x86_64 Linux Sites source build may set
 `FERRITE_SITES_BOOTSTRAP_RUST=1` when its image does not include Cargo. That
 path downloads only the pinned official `rustup-init` 1.28.2 binary, verifies
 its checked-in SHA-256, installs the repository's Rust 1.95.0 toolchain with the
-minimal profile into an ephemeral directory, and removes the toolchain and
+minimal profile into an ephemeral directory, and uses the official Zig 0.15.2
+`zig cc` driver from a separately pinned, checksum-verified archive instead of
+trusting an ambient system linker. It removes the toolchain, linker, and
 compilation cache after packaging. Other platforms fail closed.
 
 The website has its own pinned `pnpm-lock.yaml`; `@ferrite/runtime` is wired as

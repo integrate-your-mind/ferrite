@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
+import { createWriteStream } from "node:fs";
 import {
   cp,
   lstat,
@@ -9,6 +10,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_SITE_ORIGIN = "https://ferrite.mondello.dev";
@@ -18,6 +21,12 @@ export const RUSTUP_INIT_URL =
 export const RUSTUP_INIT_SHA256 =
   "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c";
 export const RUSTUP_TARGET = "x86_64-unknown-linux-gnu";
+export const ZIG_VERSION = "0.15.2";
+export const ZIG_ARCHIVE_URL =
+  "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz";
+export const ZIG_ARCHIVE_SHA256 =
+  "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239";
+export const SYSTEM_TAR = "/usr/bin/tar";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const typescript = join(root, "node_modules", "typescript", "bin", "tsc");
@@ -26,6 +35,9 @@ const websiteDist = join(website, "dist");
 const outputDist = join(root, "dist");
 const rustupMaximumBytes = 32 * 1024 * 1024;
 const rustupInstallTimeoutMs = 5 * 60_000;
+const zigMaximumBytes = 60 * 1024 * 1024;
+const zigDownloadTimeoutMs = 2 * 60_000;
+const zigExtractTimeoutMs = 2 * 60_000;
 
 export function siteOrigin(value = DEFAULT_SITE_ORIGIN) {
   const url = new URL(value);
@@ -197,6 +209,112 @@ export async function readBoundedBody(response, maximumBytes = rustupMaximumByte
   }
 }
 
+export async function writeVerifiedBody(
+  response,
+  destination,
+  expectedSha256,
+  maximumBytes,
+) {
+  if (!response.body) throw new Error("pinned download response has no body");
+  const hash = createHash("sha256");
+  let total = 0;
+  const verifier = new Transform({
+    transform(chunk, _encoding, callback) {
+      total += chunk.length;
+      if (total > maximumBytes) {
+        callback(new Error("pinned download exceeds the size limit"));
+        return;
+      }
+      hash.update(chunk);
+      callback(null, chunk);
+    },
+  });
+  await pipeline(
+    Readable.fromWeb(response.body),
+    verifier,
+    createWriteStream(destination, { flags: "wx", mode: 0o600 }),
+  );
+  if (total === 0) throw new Error("pinned download has an invalid size");
+  if (hash.digest("hex") !== expectedSha256) {
+    throw new Error("pinned download checksum mismatch");
+  }
+  return total;
+}
+
+export async function installZigLinker(options) {
+  const toolRoot = options.toolRoot;
+  const env = options.env;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const mkdirImpl = options.mkdirImpl ?? mkdir;
+  const lstatImpl = options.lstatImpl ?? lstat;
+  const runImpl = options.runImpl ?? run;
+  const writeFileImpl = options.writeFileImpl ?? writeFile;
+  const downloadImpl = options.downloadImpl ?? writeVerifiedBody;
+  const zigUrl = options.zigUrl ?? ZIG_ARCHIVE_URL;
+  const expectedSha256 =
+    options.expectedSha256 ?? ZIG_ARCHIVE_SHA256;
+  const maximumBytes = options.maximumBytes ?? zigMaximumBytes;
+  const tarCommand = options.tarCommand ?? SYSTEM_TAR;
+  const archive = join(toolRoot, `zig-${ZIG_VERSION}.tar.xz`);
+  const zigRoot = join(toolRoot, "zig");
+  const zigBinary = join(zigRoot, "zig");
+  const linker = join(toolRoot, "zig-cc.mjs");
+
+  const response = await fetchImpl(zigUrl, {
+    cache: "no-store",
+    redirect: "error",
+    signal: AbortSignal.timeout(zigDownloadTimeoutMs),
+  });
+  if (!response.ok || response.url !== zigUrl) {
+    throw new Error(
+      `pinned Zig download failed with HTTP ${response.status}`,
+    );
+  }
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (
+    !Number.isSafeInteger(contentLength) ||
+    contentLength < 0 ||
+    contentLength > maximumBytes
+  ) {
+    throw new Error("pinned Zig download exceeds the size limit");
+  }
+  await downloadImpl(response, archive, expectedSha256, maximumBytes);
+  await mkdirImpl(zigRoot, { recursive: true });
+  const tarEnv = { ...env };
+  for (const key of ["TAR_OPTIONS", "XZ_DEFAULTS", "XZ_OPT"]) {
+    delete tarEnv[key];
+  }
+  await runImpl(
+    tarCommand,
+    [
+      "-xJf",
+      archive,
+      "--strip-components=1",
+      "--no-same-owner",
+      "--no-same-permissions",
+      "-C",
+      zigRoot,
+    ],
+    tarEnv,
+    zigExtractTimeoutMs,
+  );
+  const info = await lstatImpl(zigBinary);
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new Error("pinned Zig executable must be a non-symlink file");
+  }
+  const wrapper = `#!${process.execPath}
+import { spawnSync } from "node:child_process";
+const result = spawnSync(${JSON.stringify(zigBinary)}, ["cc", ...process.argv.slice(2)], { stdio: "inherit" });
+if (result.error) {
+  console.error(result.error.message);
+  process.exit(1);
+}
+process.exit(result.status ?? 1);
+`;
+  await writeFileImpl(linker, wrapper, { mode: 0o700 });
+  return linker;
+}
+
 function rustEnvironment(baseEnv, toolRoot) {
   const env = { ...baseEnv };
   for (const key of [
@@ -237,6 +355,8 @@ export async function bootstrapCargo(options = {}) {
   const writeFileImpl = options.writeFileImpl ?? writeFile;
   const runImpl = options.runImpl ?? run;
   const fetchImpl = options.fetchImpl ?? fetch;
+  const installLinkerImpl =
+    options.installLinkerImpl ?? installZigLinker;
   const expectedSha256 = options.expectedSha256 ?? RUSTUP_INIT_SHA256;
   const rustupUrl = options.rustupUrl ?? RUSTUP_INIT_URL;
   const maximumBytes = options.maximumBytes ?? rustupMaximumBytes;
@@ -294,6 +414,15 @@ export async function bootstrapCargo(options = {}) {
       env,
       rustupInstallTimeoutMs,
     );
+    const linker = await installLinkerImpl({
+      toolRoot,
+      env,
+      fetchImpl,
+      mkdirImpl,
+      runImpl,
+      writeFileImpl,
+    });
+    env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = linker;
     return {
       command: join(cargoHome, "bin", "cargo"),
       env,
