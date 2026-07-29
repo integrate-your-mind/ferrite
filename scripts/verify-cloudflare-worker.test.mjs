@@ -174,6 +174,43 @@ test("Cloudflare proof records and monitors tracked input bytes", async () => {
   }
 });
 
+test("Cloudflare source monitor rejects a transient untracked Cargo build script", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-source-monitor-"));
+  let monitor;
+  try {
+    const crate = join(root, "crates/ferrite-protocol-wasm");
+    await mkdir(crate, { recursive: true });
+    await writeFile(join(root, "package.json"), "{}\n");
+    await writeFile(join(crate, "Cargo.toml"), "[package]\nname = \"fixture\"\n");
+    monitor = startTrackedSourceMonitor(
+      ["package.json", "crates/ferrite-protocol-wasm/Cargo.toml"],
+      root,
+      {
+        allowedWritePrefixes: ["target"],
+        rejectUnexpectedPaths: true,
+      },
+    );
+
+    await mkdir(join(root, "target"));
+    await writeFile(join(root, "target/output"), "owned build output\n");
+    await monitor.assertUnchanged();
+
+    const buildScript = join(crate, "build.rs");
+    await writeFile(buildScript, "fn main() { println!(\"cargo:rustc-cfg=forged\"); }\n");
+    await rm(buildScript);
+    await monitor.assertUnchanged().then(
+      () => assert.fail("transient untracked build.rs was not observed"),
+      (error) => assert.match(
+        error.message,
+        /tracked source changed during the Worker proof: .*build\.rs/,
+      ),
+    );
+  } finally {
+    monitor?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Cloudflare fixture and bundle monitors reject restored ABA replacements", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-aba-"));
   const fixture = join(root, "fixture");

@@ -83,6 +83,9 @@ and checks:
 - clean and unchanged Git HEAD/tree/branch plus exact working-file mode/blob
   equality with HEAD and the index at proof start and after cleanup; unsupported
   assume-unchanged and skip-worktree flags fail closed
+- workspace source-directory events that reject transient untracked inputs,
+  including Cargo's automatically discovered `build.rs`, while allowing only
+  the verifier-owned `.ferrite`, runtime/WASM `dist`, and Cargo `target` outputs
 - live monitors that reject transient tracked-source, fixture-input, bundle,
   metafile, and runtime-config writes even when their final bytes are restored
 - route receipts, manifest/config/lockfile identities, bounded emitted
@@ -162,7 +165,7 @@ Cloudflare configuration needs a current compatibility date, Node compatibility 
 
 ```toml
 main = "src/worker.ts"
-compatibility_date = "2026-07-28"
+compatibility_date = "2026-07-29"
 compatibility_flags = ["nodejs_compat"]
 
 [assets]

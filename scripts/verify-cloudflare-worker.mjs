@@ -34,6 +34,12 @@ const wrangler = join(
 const renderPage = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const compatibilityDate = "2026-07-29";
 const commandTimeoutMs = 120_000;
+const workspaceProofOutputPaths = Object.freeze([
+  ".ferrite",
+  "packages/protocol-wasm/dist",
+  "packages/runtime/dist",
+  "target",
+]);
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const receipt = await verifyCloudflareWorker();
@@ -43,7 +49,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 async function verifyCloudflareWorker() {
   const committedSource = await committedSourceContract();
   const trackedPaths = committedSource.records.map(({ path }) => path);
-  const sourceMonitor = startTrackedSourceMonitor(trackedPaths);
+  const sourceMonitor = startTrackedSourceMonitor(trackedPaths, workspaceRoot, {
+    allowedWritePrefixes: workspaceProofOutputPaths,
+    rejectUnexpectedPaths: true,
+  });
   let sourceStart;
   try {
     sourceStart = {
@@ -1335,8 +1344,27 @@ export function gitBlobObjectId(bytes, objectFormat) {
     .digest("hex");
 }
 
-export function startTrackedSourceMonitor(paths, root = workspaceRoot) {
+export function startTrackedSourceMonitor(
+  paths,
+  root = workspaceRoot,
+  {
+    allowedWritePrefixes = [],
+    rejectUnexpectedPaths = false,
+  } = {},
+) {
   const trackedEntries = new Set(paths);
+  const allowedWrites = allowedWritePrefixes.map((prefix) => {
+    const normalized = prefix.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
+    if (
+      !normalized ||
+      isAbsolute(normalized) ||
+      normalized === ".." ||
+      normalized.startsWith("../")
+    ) {
+      throw new TypeError(`Ferrite source monitor received invalid output path "${prefix}".`);
+    }
+    return normalized;
+  });
   const directories = new Set();
   for (const path of paths) {
     directories.add(dirname(path));
@@ -1362,7 +1390,10 @@ export function startTrackedSourceMonitor(paths, root = workspaceRoot) {
             root,
             resolve(absoluteDirectory, filename.toString()),
           ).replaceAll("\\", "/");
-          if (trackedEntries.has(path)) {
+          const allowedWrite = allowedWrites.some(
+            (prefix) => path === prefix || path.startsWith(`${prefix}/`),
+          );
+          if (trackedEntries.has(path) || (rejectUnexpectedPaths && !allowedWrite)) {
             changes.push(`${eventType}:${path}`);
           }
         },

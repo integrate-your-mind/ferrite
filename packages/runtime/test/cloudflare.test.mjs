@@ -477,6 +477,48 @@ test("fails closed when route code and static assets do not share one build iden
   assert.equal(renders, 0);
 });
 
+test("bounds manifest hashing before rollback can receive a fresh deadline", async () => {
+  const originalDigest = globalThis.crypto.subtle.digest;
+  let fallbackFetches = 0;
+  globalThis.crypto.subtle.digest = async function delayedDigest(...args) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+    return originalDigest.apply(this, args);
+  };
+  try {
+    const handler = createCloudflareSsrHandler({
+      routes: [{
+        module: routeModule(
+          () => ({ ferrite: "render-packet", version: 1, root: [0, "unused"] }),
+        ),
+      }],
+      renderer: textRenderer(),
+      responseDeadlineMs: 5,
+      shouldRender: () => false,
+    });
+    const response = await handler.fetch(
+      new Request("https://example.test/docs"),
+      {
+        ASSETS: {
+          async fetch(request) {
+            if (new URL(request.url).pathname === "/ferrite-server.json") {
+              return new Response(DEFAULT_MANIFEST_BYTES);
+            }
+            fallbackFetches += 1;
+            return new Response("static docs", {
+              headers: { "Content-Type": "text/html" },
+            });
+          },
+        },
+      },
+    );
+    assert.equal(response.status, 504);
+    assert.equal(await response.text(), "Gateway timeout");
+    assert.equal(fallbackFetches, 0);
+  } finally {
+    globalThis.crypto.subtle.digest = originalDigest;
+  }
+});
+
 test("sanitizes full-document rollback requests and rejects partial fallback HTML", async () => {
   const fallbackRequests = [];
   const handler = createCloudflareSsrHandler({

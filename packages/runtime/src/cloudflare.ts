@@ -453,7 +453,12 @@ async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
     signal,
     deadline,
   );
-  if (await sha256BuildId(bytes) !== expectedManifestSha256) {
+  const observedManifestSha256 = await withinRequestBudget(
+    sha256BuildId(bytes),
+    signal,
+    deadline,
+  );
+  if (observedManifestSha256 !== expectedManifestSha256) {
     throw new TypeError("Ferrite Cloudflare asset manifest bytes do not match the Worker build.");
   }
   let manifest: unknown;
