@@ -67,6 +67,10 @@ event named `clickcapture`. Repeated `Capture` suffixes are reserved for the
 custom-event capture opt-in and cannot express a bubbling custom event whose
 prop name itself ends in `CaptureCapture`.
 
+React does not define `onMouseEnterCapture` or `onPointerEnterCapture` as
+two-phase event props. Ferrite therefore leaves those names in its native
+custom-event mapping rather than claiming React capture compatibility for them.
+
 ## Migration guidance
 
 1. Treat `.tsx` syntax compatibility separately from runtime compatibility.

@@ -279,29 +279,37 @@ test("React-compatible Capture props cover current two-phase DOM event names", (
   }
 });
 
-test("event names that end in Capture remain native event names", () => {
-  const { window, container } = createContainer();
-  const calls = [];
+test("pointer capture event names remain native event names", () => {
+  const cases = [
+    ["onGotPointerCapture", "gotpointer", "gotpointercapture", "got"],
+    ["onLostPointerCapture", "lostpointer", "lostpointercapture", "lost"],
+  ];
 
-  mount(
-    createElement(
-      "button",
-      {
-        onGotPointerCapture: () => calls.push("got pointer capture"),
-      },
-      "Drag",
-    ),
-    container,
-  );
+  for (const [propName, wrongEventName, nativeEventName, label] of cases) {
+    const { window, container } = createContainer();
+    const calls = [];
 
-  const button = container.querySelector("button");
-  button?.dispatchEvent(new window.Event("gotpointer", { bubbles: true }));
-  button?.dispatchEvent(new window.Event("gotpointercapture", { bubbles: true }));
+    mount(
+      createElement(
+        "button",
+        {
+          [propName]: () => calls.push(label),
+        },
+        "Drag",
+      ),
+      container,
+    );
 
-  assert.deepEqual(calls, ["got pointer capture"]);
+    const button = container.querySelector("button");
+    button?.dispatchEvent(new window.Event(wrongEventName, { bubbles: true }));
+    assert.deepEqual(calls, [], `${propName} must not bind ${wrongEventName}`);
+
+    button?.dispatchEvent(new window.Event(nativeEventName, { bubbles: true }));
+    assert.deepEqual(calls, [label], `${propName} must bind ${nativeEventName}`);
+  }
 });
 
-test("React event names without a capture prop remain native custom events", () => {
+test("unsupported React mouse-enter capture syntax remains a native custom event", () => {
   const { window, container } = createContainer();
   const calls = [];
 
