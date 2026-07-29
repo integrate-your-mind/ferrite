@@ -138,7 +138,7 @@ export async function verifyCliConsumer({
       cwd: consumerRoot,
       expectFailure: true,
     });
-    if (!/refusing to initialize non-empty directory/.test(refusal.stderr)) {
+    if (!/refusing to initialize an existing directory/.test(refusal.stderr)) {
       throw new Error("Packaged Ferrite CLI did not report its existing-target refusal.");
     }
     if ((await readFile(marker, "utf8")) !== "keep\n") {
@@ -239,7 +239,7 @@ function defaultBinaryPath() {
   const targetRoot = env.CARGO_TARGET_DIR
     ? resolve(env.CARGO_TARGET_DIR)
     : join(workspaceRoot, "target");
-  return join(targetRoot, "debug", platform === "win32" ? "ferrite.exe" : "ferrite");
+  return join(targetRoot, "release", platform === "win32" ? "ferrite.exe" : "ferrite");
 }
 
 function run(command, args, {

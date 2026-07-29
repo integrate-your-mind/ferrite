@@ -1,11 +1,17 @@
 import { spawn as defaultSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  lstatSync as defaultStatSync,
   readFileSync as defaultReadFileSync,
-  statSync as defaultStatSync,
 } from "node:fs";
+import {
+  mkdtemp as defaultMkdtemp,
+  rm as defaultRm,
+  writeFile as defaultWriteFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   arch as currentArch,
   env as currentEnv,
@@ -124,6 +130,9 @@ export function resolveCliBinary({
     readFileSync,
   );
   const binaryStat = statSync(paths.binary);
+  if (binaryStat.isSymbolicLink?.()) {
+    throw new Error(`${target.packageName} binary must not be a symbolic link: ${paths.binary}.`);
+  }
   if (!binaryStat.isFile()) {
     throw new Error(`${target.packageName} binary is not a regular file: ${paths.binary}.`);
   }
@@ -141,8 +150,53 @@ export function resolveCliBinary({
 
   return {
     path: paths.binary,
+    binary,
     packageName: target.packageName,
     packageVersion: wrapperManifest.version,
+  };
+}
+
+export async function materializeVerifiedBinary(
+  binary,
+  {
+    binaryFile = "ferrite",
+    temporaryRoot = tmpdir(),
+    mkdtemp = defaultMkdtemp,
+    writeFile = defaultWriteFile,
+    rm = defaultRm,
+  } = {},
+) {
+  if (!Buffer.isBuffer(binary) || binary.length === 0) {
+    throw new Error("Ferrite CLI verified binary snapshot must be a non-empty Buffer.");
+  }
+  if (basename(binaryFile) !== binaryFile) {
+    throw new Error("Ferrite CLI snapshot filename must not contain path separators.");
+  }
+
+  const root = await mkdtemp(join(temporaryRoot, "ferrite-cli-"));
+  const path = join(root, binaryFile);
+  try {
+    await writeFile(path, binary, { flag: "wx", mode: 0o700 });
+  } catch (error) {
+    try {
+      await rm(root, { recursive: true, force: true });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `Ferrite CLI snapshot creation and cleanup failed at ${root}.`,
+      );
+    }
+    throw error;
+  }
+
+  let cleaned = false;
+  return {
+    path,
+    async cleanup() {
+      if (cleaned) return;
+      await rm(root, { recursive: true, force: true });
+      cleaned = true;
+    },
   };
 }
 
@@ -150,6 +204,7 @@ export async function launchFerrite(
   args,
   {
     env = currentEnv,
+    materializeBinary = materializeVerifiedBinary,
     processObject = currentProcess,
     resolveBinary = resolveCliBinary,
     spawn = defaultSpawn,
@@ -157,9 +212,14 @@ export async function launchFerrite(
   } = {},
 ) {
   const resolved = resolveBinary(resolveOptions);
+  const executable = Buffer.isBuffer(resolved.binary)
+    ? await materializeBinary(resolved.binary, {
+        binaryFile: basename(resolved.path),
+      })
+    : { path: resolved.path, cleanup: async () => {} };
   let child;
   try {
-    child = spawn(resolved.path, args, {
+    child = spawn(executable.path, args, {
       env: {
         ...env,
         [npmVersionEnvironmentVariable]: resolved.packageVersion,
@@ -168,7 +228,15 @@ export async function launchFerrite(
       stdio: "inherit",
     });
   } catch (error) {
-    throw launchError(resolved.path, error);
+    try {
+      await executable.cleanup();
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [launchError(executable.path, error), cleanupError],
+        `Ferrite CLI launch and snapshot cleanup failed for ${executable.path}.`,
+      );
+    }
+    throw launchError(executable.path, error);
   }
 
   return await new Promise((resolve, reject) => {
@@ -181,10 +249,23 @@ export async function launchFerrite(
         processObject.off(signal, handler);
       }
     };
-    const settle = (callback, value) => {
+    const settle = async (callback, value) => {
       if (settled) return;
       settled = true;
       cleanup();
+      try {
+        await executable.cleanup();
+      } catch (error) {
+        reject(
+          new Error(
+            `Ferrite CLI could not remove verified snapshot ${executable.path}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            { cause: error },
+          ),
+        );
+        return;
+      }
       callback(value);
     };
 
@@ -194,7 +275,7 @@ export async function launchFerrite(
         try {
           child.kill(signal);
         } catch (error) {
-          settle(reject, launchError(resolved.path, error));
+          void settle(reject, launchError(executable.path, error));
         }
       };
       signalHandlers.set(signal, handler);
@@ -202,22 +283,22 @@ export async function launchFerrite(
     }
 
     child.once("error", (error) => {
-      settle(reject, launchError(resolved.path, error));
+      void settle(reject, launchError(executable.path, error));
     });
     child.once("close", (status, signal) => {
       const terminationSignal = forwardedSignal ?? signal;
       if (terminationSignal) {
-        settle(resolve, { status: null, signal: terminationSignal });
+        void settle(resolve, { status: null, signal: terminationSignal });
         return;
       }
       if (!Number.isInteger(status) || status < 0 || status > 255) {
-        settle(
+        void settle(
           reject,
           new Error(`Ferrite CLI returned an invalid exit status: ${String(status)}.`),
         );
         return;
       }
-      settle(resolve, { status, signal: null });
+      void settle(resolve, { status, signal: null });
     });
   });
 }

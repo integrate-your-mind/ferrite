@@ -19,6 +19,11 @@
 - The npm wrapper now owns the asynchronous Rust child lifecycle, forwards
   termination signals, waits for child cleanup, and removes its signal
   listeners before returning the child's exit outcome.
+- CLI execution now runs an integrity-verified private binary snapshot instead
+  of a mutable package pathname, and candidate/starter publication uses the
+  Rust no-replace primitive.
+- `ferrite init` now stages the complete project before publication and rejects
+  existing or symbolic-link targets without writing through them.
 
 ### Known limits
 

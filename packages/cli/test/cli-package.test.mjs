@@ -3,6 +3,7 @@ import { spawn as spawnProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
+  lstat,
   mkdtemp,
   readFile,
   rm,
@@ -19,6 +20,7 @@ import {
   ferriteBinaryVersionForPackage,
   isExactSemver,
   launchFerrite,
+  materializeVerifiedBinary,
   resolveCliBinary,
   verifyChecksumManifest,
 } from "../lib/cli-package.js";
@@ -84,6 +86,7 @@ test("resolveCliBinary verifies package metadata, mode, size, and checksum", () 
 
   assert.deepEqual(resolved, {
     path: "/platform/bin/ferrite",
+    binary,
     packageName: "@ferrite/cli-darwin-arm64",
     packageVersion: "0.1.0-alpha.0",
   });
@@ -178,6 +181,54 @@ test("resolveCliBinary rejects a non-executable binary", () => {
   );
 });
 
+test("resolveCliBinary rejects a symbolic-link binary", () => {
+  assert.throws(
+    () =>
+      resolveCliBinary({
+        platform: "darwin",
+        arch: "arm64",
+        packageRoot: "/wrapper",
+        requireFunction: validRequire(),
+        readFileSync: fakeRead(validFiles()),
+        statSync: () => ({
+          isFile: () => true,
+          isSymbolicLink: () => true,
+          mode: 0o100755,
+        }),
+      }),
+    /must not be a symbolic link/,
+  );
+});
+
+test("materializeVerifiedBinary creates and removes a private executable snapshot", async () => {
+  const snapshot = await materializeVerifiedBinary(binary);
+  assert.deepEqual(await readFile(snapshot.path), binary);
+  assert.notEqual((await lstat(snapshot.path)).mode & 0o111, 0);
+
+  await snapshot.cleanup();
+
+  await assert.rejects(lstat(snapshot.path), { code: "ENOENT" });
+});
+
+test("materializeVerifiedBinary reports creation and cleanup failures together", async () => {
+  await assert.rejects(
+    materializeVerifiedBinary(binary, {
+      temporaryRoot: "/private",
+      mkdtemp: async () => "/private/ferrite-cli-failed",
+      writeFile: async () => {
+        throw new Error("injected snapshot write failure");
+      },
+      rm: async () => {
+        throw new Error("injected snapshot cleanup failure");
+      },
+    }),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.some((entry) => /snapshot write failure/.test(entry.message)) &&
+      error.errors.some((entry) => /snapshot cleanup failure/.test(entry.message)),
+  );
+});
+
 test("verifyChecksumManifest rejects size and digest tampering", () => {
   const manifest = {
     file: "bin/ferrite",
@@ -246,6 +297,66 @@ test("launchFerrite passes exact argv and a wrapper-owned npm version", async ()
     "0.1.0-alpha.0",
   );
   assert.equal(processObject.listenerCount("SIGTERM"), 0);
+});
+
+test("launchFerrite executes the verified snapshot and removes it after exit", async () => {
+  let cleaned = false;
+  let invocationPath;
+  const result = await launchFerrite(["--version"], {
+    resolveBinary: () => ({
+      path: "/installed/ferrite",
+      binary,
+      packageVersion: "0.1.0-alpha.0",
+    }),
+    async materializeBinary(bytes, options) {
+      assert.deepEqual(bytes, binary);
+      assert.equal(options.binaryFile, "ferrite");
+      return {
+        path: "/private/snapshot/ferrite",
+        async cleanup() {
+          cleaned = true;
+        },
+      };
+    },
+    spawn(path) {
+      invocationPath = path;
+      const child = new EventEmitter();
+      child.kill = () => true;
+      queueMicrotask(() => child.emit("close", 0, null));
+      return child;
+    },
+    processObject: new EventEmitter(),
+  });
+
+  assert.deepEqual(result, { status: 0, signal: null });
+  assert.equal(invocationPath, "/private/snapshot/ferrite");
+  assert.equal(cleaned, true);
+});
+
+test("launchFerrite removes the verified snapshot after a synchronous spawn failure", async () => {
+  let cleaned = false;
+  await assert.rejects(
+    launchFerrite([], {
+      resolveBinary: () => ({
+        path: "/installed/ferrite",
+        binary,
+        packageVersion: "0.1.0-alpha.0",
+      }),
+      async materializeBinary() {
+        return {
+          path: "/private/snapshot/ferrite",
+          async cleanup() {
+            cleaned = true;
+          },
+        };
+      },
+      spawn() {
+        throw new Error("injected spawn failure");
+      },
+    }),
+    /injected spawn failure/,
+  );
+  assert.equal(cleaned, true);
 });
 
 test("launchFerrite preserves signal outcomes and reports spawn errors", async () => {

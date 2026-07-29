@@ -179,9 +179,12 @@ A locally built `ferrite` binary can initialize the registry-shaped project skel
 ferrite init my-app
 ```
 
-Initialization refuses non-empty directories. A direct source-built binary
-still emits the source-mode package versions; the verified npm wrapper instead
-pins matching `@ferrite/runtime` and `@ferrite/cli` prerelease versions. Both
+Initialization requires a new, absent directory; it rejects files, existing
+directories, and symbolic links without writing through them. Ferrite stages
+the complete skeleton in a private sibling and publishes it with an
+operating-system no-replace rename. A direct source-built binary still emits
+the source-mode package versions; the verified npm wrapper instead pins
+matching `@ferrite/runtime` and `@ferrite/cli` prerelease versions. Both
 manifests reference unpublished Ferrite packages, so a plain `npm install`
 still returns a registry `404`. Do not use the raw skeleton as an onboarding
 path. Use `pnpm starter:create` above until registry publication and public CLI

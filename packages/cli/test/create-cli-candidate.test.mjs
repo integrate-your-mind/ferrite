@@ -16,9 +16,17 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
-  createCliCandidate,
+  createCliCandidate as createCliCandidateImpl,
   verifyCliCandidate,
 } from "../scripts/create-cli-candidate.mjs";
+
+function createCliCandidate(options) {
+  const { renameImpl, ...candidateOptions } = options;
+  return createCliCandidateImpl({
+    publishDirectoryImpl: renameImpl ?? rename,
+    ...candidateOptions,
+  });
+}
 
 test("createCliCandidate emits a verified current-host package pair", async () => {
   await usingFixture(async ({ binary, root }) => {

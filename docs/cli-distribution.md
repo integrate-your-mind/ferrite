@@ -13,9 +13,11 @@ The candidate contains two packages at the same npm prerelease version:
 - `@ferrite/cli-darwin-arm64`, the Rust binary plus a SHA-256 and byte-count
   manifest.
 
-The launcher selects only an explicitly supported platform package, checks its
-name, version, `os`, `cpu`, executable mode, size, and SHA-256 before every
-execution, then invokes the binary without a shell. It never downloads a
+The launcher selects only an explicitly supported platform package, rejects
+symbolic links, checks its name, version, `os`, `cpu`, executable mode, size,
+and SHA-256, writes the verified bytes to a private temporary executable, then
+invokes that immutable snapshot without a shell. Normal exit, launch failure,
+and forwarded termination signals remove the snapshot. It never downloads a
 binary, falls back to `PATH`, or runs an install lifecycle script.
 
 The clean-consumer gate also requires the executable's reported Cargo version
@@ -38,12 +40,12 @@ pnpm release:verify:cli
 
 The gate:
 
-1. builds the real Rust CLI;
+1. builds the real optimized Rust CLI with Cargo's release profile;
 2. creates both package candidates in a private sibling;
 3. verifies their exact file sets and integrity metadata;
-4. atomically replaces only the ignored candidate output, restoring prior
-   output if publication fails and preserving a verified backup if rollback
-   itself cannot complete;
+4. replaces only the ignored candidate output through the Rust operating-system
+   no-replace primitive, restoring prior output if publication fails and
+   preserving a verified backup if rollback itself cannot complete;
 5. packs both directories with npm;
 6. installs only the wrapper tarball into an empty directory with optional
    dependencies omitted, then proves the real launcher names and rejects the
@@ -53,7 +55,7 @@ The gate:
 8. runs the packaged `ferrite --version`;
 9. initializes a project whose path contains spaces;
 10. verifies exact runtime and CLI dependency versions;
-11. proves non-empty target refusal without changing an owned marker; and
+11. proves existing-target refusal without changing an owned marker; and
 12. tampers with the installed binary and proves execution fails closed.
 
 Generated candidate output lives under `dist/cli-candidate/` and is ignored.
@@ -69,6 +71,8 @@ after the terminal result.
   right to publish them.
 - SHA-256 detects changed bytes after packaging; it does not establish npm
   publisher authenticity, code signing, notarization, or provenance.
+- An uncatchable process termination such as `SIGKILL` can leave a private
+  temporary executable for normal operating-system temporary-file cleanup.
 - The offline gate proves installation and execution of the two CLI tarballs.
   Installing dependencies for the generated application still requires the
   Ferrite runtime packages and their third-party dependencies from a registry

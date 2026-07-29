@@ -21,13 +21,13 @@ ferrite-ssr = { path = "../ferrite-ssr", version = "=0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 signal-hook = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))'.dependencies]
 rustix = { workspace = true }
 
 [dev-dependencies]
 ferrite-client-bundler = { path = "../ferrite-client-bundler", version = "=0.1.0" }
-tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }

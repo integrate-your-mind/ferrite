@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   constants as fsConstants,
   lstat,
@@ -6,7 +7,6 @@ import {
   open,
   readdir,
   realpath,
-  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -35,7 +35,7 @@ export async function createCliCandidate({
   runtimeManifestPath = join(workspaceRoot, "packages", "runtime", "package.json"),
   platform = currentPlatform,
   arch = currentArch,
-  renameImpl = rename,
+  publishDirectoryImpl,
   removeImpl = rm,
   writeFileImpl = writeFile,
 } = {}) {
@@ -197,11 +197,15 @@ export async function createCliCandidate({
     );
 
     await verifyCliCandidate(staging, { platform, arch });
+    const stagedBinary = join(platformDirectory, target.binaryFile);
     await publishCandidate(staging, canonicalDestination, {
       expectedExisting: Boolean(existingDestination),
       platform,
       arch,
-      renameImpl,
+      publishDirectoryImpl:
+        publishDirectoryImpl ??
+        ((source, targetPath) =>
+          publishDirectoryNoReplace(stagedBinary, source, targetPath)),
       removeImpl,
     });
     stagingLive = false;
@@ -381,7 +385,7 @@ async function publishCandidate(
     expectedExisting,
     platform,
     arch,
-    renameImpl,
+    publishDirectoryImpl,
     removeImpl,
   },
 ) {
@@ -405,15 +409,15 @@ async function publishCandidate(
   let priorMoved = false;
   try {
     if (destinationInfo) {
-      await renameImpl(destination, backup);
+      await publishDirectoryImpl(destination, backup);
       priorMoved = true;
       await verifyCliCandidate(backup, { platform, arch });
     }
-    await renameImpl(staging, destination);
+    await publishDirectoryImpl(staging, destination);
   } catch (error) {
     if (priorMoved) {
       try {
-        await renameImpl(backup, destination);
+        await publishDirectoryImpl(backup, destination);
       } catch (rollbackError) {
         throw new AggregateError(
           [error, rollbackError],
@@ -433,6 +437,31 @@ async function publishCandidate(
         { cause: error },
       );
     }
+  }
+}
+
+function publishDirectoryNoReplace(executable, source, target) {
+  const result = spawnSync(
+    executable,
+    ["internal-publish-dir", source, target],
+    {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.error) {
+    throw new Error(
+      `Ferrite CLI could not publish ${source} to ${target}: ${result.error.message}`,
+      { cause: result.error },
+    );
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `Ferrite CLI refused to publish ${source} to ${target} with status ${String(result.status)}: ` +
+        `${result.stderr || result.stdout}`.trim(),
+    );
   }
 }
 

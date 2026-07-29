@@ -11,7 +11,9 @@
 - Creates nested target directories when they do not exist.
 - Writes `package.json`, `tsconfig.json`, `app/page.tsx`, and `.gitignore`.
 - Pins `@ferrite/runtime` to the CLI's own version.
-- Refuses a file target or any non-empty directory without modifying existing files.
+- Requires an absent target, rejects files, existing directories, and symbolic
+  links without modifying them, and publishes a fully staged project with a
+  no-replace rename.
 - Supports machine-readable global `--json` output through the normal CLI path.
 
 ## Integration proof
