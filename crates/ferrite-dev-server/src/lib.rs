@@ -1377,14 +1377,12 @@ impl ProductionProject {
         route_pattern: &str,
         error: &dyn std::fmt::Display,
     ) -> Option<String> {
-        if self.legacy_diagnostics_enabled() {
+        self.legacy_diagnostics_enabled().then(|| {
             let error = error.to_string();
-            Some(format!(
+            format!(
                 "Ferrite production {kind} failed: path={path:?} pattern={route_pattern:?} error={error:?}"
-            ))
-        } else {
-            None
-        }
+            )
+        })
     }
 
     fn legacy_response_write_deadline_diagnostic(
@@ -3660,13 +3658,13 @@ where
     if !matches!(request.method.as_str(), "GET" | "POST") {
         if let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id.as_ref()) {
             let (outcome, error_class, failure_phase) =
-                classify_response_observability(&response, observability_route_pattern.as_deref());
+                classify_response_observability(&response, observability_route_pattern);
             emit_server_terminal_event(
                 emitter,
                 correlation_id,
                 MethodClass::from_method(&request.method),
                 Some(response.status),
-                observability_route_pattern.as_deref(),
+                observability_route_pattern,
                 response_mode,
                 outcome,
                 error_class,
@@ -3683,7 +3681,7 @@ where
         MethodClass::from_method(&request.method),
         &response,
         response_mode,
-        observability_route_pattern.as_deref(),
+        observability_route_pattern,
         started.elapsed(),
         write_result.as_ref().err(),
     );

@@ -87,8 +87,8 @@ execution currently emits server and transport records rather than a separate
 action-renderer span; renderer failures use the `render` failure phase and a
 trusted route pattern when routing succeeded.
 
-Protocol rejections and unsupported methods can begin after request parsing has
-already failed, so they may emit only terminal server and transport events.
+Protocol rejections and unsupported methods are handled outside the accepted
+GET/POST path, so they may emit only terminal server and transport events.
 Direct Rust `handle_get` and `handle_post` calls have no socket delivery event.
 A successful local write does not prove that the remote client received,
 processed, or retained every byte.
