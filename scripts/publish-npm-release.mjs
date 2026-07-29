@@ -23,6 +23,8 @@ export async function publishNpmRelease({
   cleanupStaging = removeStagingDirectory,
   npmPreflight = preflightNpmRelease,
   runNpmCommand,
+  cleanupReadback = removePublishedPackageReadbackDirectory,
+  verifyPublishedPackage = verifyPublishedPackageReadback,
 } = {}) {
   if (!execute) {
     throw new Error("npm publication requires the explicit --execute flag.");
@@ -69,11 +71,14 @@ export async function publishNpmRelease({
 
   let currentName = firstPlan.packages[0]?.name;
   let phase = "revalidation";
+  let publicationPhase;
+  let confirmedFailurePhase;
   let registryConfirmed = false;
   try {
     for (const [index, expected] of firstPlan.packages.entries()) {
       currentName = expected.name;
       phase = "revalidation";
+      confirmedFailurePhase = undefined;
       registryConfirmed = false;
       const currentPlan = await prepareNpmRelease({
         reportPath,
@@ -106,6 +111,7 @@ export async function publishNpmRelease({
 
       phase = "staging";
       const stagingRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-publish-"));
+      let packageError;
       try {
         const stagedArtifact = await stageVerifiedArtifact(current, stagingRoot);
         phase = "receipt_before_publish";
@@ -141,20 +147,67 @@ export async function publishNpmRelease({
           ["publish", stagedArtifact, "--access", "public", "--tag", tag, "--registry", NPM_REGISTRY],
           { cwd: stagingRoot },
         );
+        phase = "registry_readback";
+        let registryReadback;
+        try {
+          registryReadback = await verifyPublishedPackage({
+            package: current,
+            version,
+            tag,
+            registry: NPM_REGISTRY,
+            runCommand: runNpmCommand ?? run,
+            cleanupDownload: cleanupReadback,
+          });
+        } catch (error) {
+          if (error instanceof RegistryReadbackCleanupError) {
+            registryReadback = error.registryReadback;
+            registryConfirmed = true;
+            confirmedFailurePhase = "registry_readback_cleanup";
+            published.push({
+              name: current.name,
+              version,
+              tag,
+              sha256: current.artifact.sha256,
+              registryReadback,
+            });
+          }
+          throw error;
+        }
         registryConfirmed = true;
         published.push({
           name: current.name,
           version,
           tag,
           sha256: current.artifact.sha256,
+          registryReadback,
         });
+      } catch (error) {
+        packageError = error;
+        throw error;
       } finally {
-        phase = registryConfirmed
+        if (!registryConfirmed && (phase === "registry_publish" || phase === "registry_readback")) {
+          publicationPhase = phase;
+        }
+        const cleanupPhase = registryConfirmed
           ? "cleanup_after_confirmed_publish"
-          : phase === "registry_publish"
+          : phase === "registry_publish" || phase === "registry_readback"
             ? "cleanup_after_ambiguous_publish"
             : "cleanup_before_publish";
-        await cleanupStaging(stagingRoot);
+        phase = cleanupPhase;
+        try {
+          await cleanupStaging(stagingRoot);
+        } catch (cleanupError) {
+          if (packageError) {
+            throw new AggregateError(
+              [packageError, cleanupError],
+              `${current.name}: package operation failed and publish staging cleanup also failed.`,
+            );
+          }
+          throw cleanupError;
+        }
+        if (confirmedFailurePhase) {
+          phase = confirmedFailurePhase;
+        }
       }
       phase = "receipt_after_confirmed_publish";
       await writeReceipt(resolvedReceipt, {
@@ -167,7 +220,11 @@ export async function publishNpmRelease({
   } catch (error) {
     const ambiguous =
       !registryConfirmed &&
-      (phase === "registry_publish" || phase === "cleanup_after_ambiguous_publish");
+      (
+        phase === "registry_publish" ||
+        phase === "registry_readback" ||
+        phase === "cleanup_after_ambiguous_publish"
+      );
     const status = registryConfirmed
       ? published.length === firstPlan.packages.length
         ? "complete_with_error"
@@ -191,7 +248,7 @@ export async function publishNpmRelease({
         ? {
             ambiguous: {
               name: currentName,
-              phase: "registry_publish",
+              phase: publicationPhase ?? phase,
               reason: "registry outcome must be read back before retry",
             },
           }
@@ -305,6 +362,162 @@ export async function stageVerifiedArtifact(pkg, stagingRoot) {
   }
   await chmod(stagingRoot, 0o500);
   return destination;
+}
+
+/**
+ * A successful `npm publish` only means the CLI accepted the upload. Treat
+ * the package as published only after the public registry exposes the exact
+ * version/tag/integrity and a fresh download is byte-identical to our staged
+ * artifact. Any missing or malformed field fails closed as ambiguous.
+ */
+export async function verifyPublishedPackageReadback({
+  package: pkg,
+  version,
+  tag,
+  registry = NPM_REGISTRY,
+  runCommand = run,
+  cleanupDownload = removePublishedPackageReadbackDirectory,
+} = {}) {
+  if (!pkg?.name || !pkg?.artifact?.path || !pkg.artifact.sha256) {
+    throw new Error("npm publication readback requires a complete package artifact identity.");
+  }
+  const runNpmJson = (args, cwd) => runCommand(
+    "npm",
+    [...args, "--registry", registry],
+    { cwd, capture: true, shell: false },
+  );
+  const metadata = parseJsonOutput(
+    await runNpmJson(["view", `${pkg.name}@${version}`, "version", "dist-tags", "dist", "--json"]),
+    `npm view ${pkg.name}@${version}`,
+  );
+  if (metadata?.version !== version) {
+    throw new Error(`${pkg.name}@${version}: registry version readback did not match.`);
+  }
+  const tags = metadata?.["dist-tags"] ?? metadata?.distTags;
+  if (!tags || tags[tag] !== version) {
+    throw new Error(`${pkg.name}@${version}: registry dist-tag ${tag} did not resolve to the published version.`);
+  }
+  const registryIntegrity = metadata?.dist?.integrity ?? metadata?.integrity;
+  if (typeof registryIntegrity !== "string" || !registryIntegrity.startsWith("sha512-")) {
+    throw new Error(`${pkg.name}@${version}: registry integrity readback is missing or malformed.`);
+  }
+
+  const downloadRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-readback-"));
+  let registryReadback;
+  let validationError;
+  try {
+    const packed = parseJsonOutput(
+      await runNpmJson(["pack", `${pkg.name}@${version}`, "--json", "--pack-destination", downloadRoot], downloadRoot),
+      `npm pack ${pkg.name}@${version}`,
+    );
+    const entry = normalizeNpmPackReadback(packed, pkg.name, version);
+    if (!entry || typeof entry.filename !== "string" || entry.filename.includes("/") || entry.filename.includes("\\")) {
+      throw new Error(`${pkg.name}@${version}: downloaded tarball readback returned no safe filename.`);
+    }
+    const downloadedPath = join(downloadRoot, entry.filename);
+    const bytes = await readFile(downloadedPath);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const integrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+    if (bytes.byteLength !== pkg.artifact.size || sha256 !== pkg.artifact.sha256) {
+      throw new Error(`${pkg.name}@${version}: downloaded tarball bytes do not match the published artifact.`);
+    }
+    if (registryIntegrity !== integrity) {
+      throw new Error(`${pkg.name}@${version}: registry integrity does not match the downloaded tarball.`);
+    }
+    registryReadback = {
+      version,
+      tag,
+      integrity,
+      tarball: {
+        filename: entry.filename,
+        size: bytes.byteLength,
+        sha256,
+      },
+    };
+  } catch (error) {
+    validationError = error;
+  }
+
+  let cleanupError;
+  try {
+    await cleanupDownload(downloadRoot);
+  } catch (error) {
+    cleanupError = error;
+  }
+  if (validationError && cleanupError) {
+    throw new AggregateError(
+      [validationError, cleanupError],
+      `${pkg.name}@${version}: registry readback failed and temporary download cleanup also failed; preserve ${downloadRoot}.`,
+    );
+  }
+  if (validationError) {
+    throw validationError;
+  }
+  if (cleanupError) {
+    throw new RegistryReadbackCleanupError({
+      packageName: pkg.name,
+      version,
+      registryReadback,
+      downloadRoot,
+      cause: cleanupError,
+    });
+  }
+  return registryReadback;
+}
+
+export class RegistryReadbackCleanupError extends Error {
+  constructor({
+    packageName,
+    version,
+    registryReadback,
+    downloadRoot,
+    cause,
+  }) {
+    super(
+      `${packageName}@${version}: registry publication was confirmed, but temporary download cleanup failed; preserve ${downloadRoot}.`,
+      { cause },
+    );
+    this.name = "RegistryReadbackCleanupError";
+    this.registryReadback = registryReadback;
+    this.downloadRoot = downloadRoot;
+  }
+}
+
+export async function removePublishedPackageReadbackDirectory(downloadRoot) {
+  await rm(downloadRoot, { recursive: true, force: true });
+}
+
+export function normalizeNpmPackReadback(value, packageName, version) {
+  let entries;
+  if (Array.isArray(value)) {
+    entries = value;
+  } else if (value && typeof value === "object") {
+    entries =
+      typeof value.filename === "string"
+        ? [value]
+        : Object.values(value).filter(
+            (entry) => entry && typeof entry === "object",
+          );
+  } else {
+    entries = [];
+  }
+  if (entries.length !== 1 || typeof entries[0].filename !== "string") {
+    throw new Error(
+      `${packageName}@${version}: npm pack readback must identify exactly one tarball.`,
+    );
+  }
+  const [entry] = entries;
+  if (entry.name !== undefined && entry.name !== packageName) {
+    throw new Error(
+      `${packageName}@${version}: npm pack readback returned package ${entry.name}.`,
+    );
+  }
+  if (entry.version !== undefined && entry.version !== version) {
+    throw new Error(
+      `${packageName}@${version}: npm pack readback returned version ${entry.version}.`,
+    );
+  }
+  return entry;
 }
 
 export const NPM_REGISTRY = "https://registry.npmjs.org/";

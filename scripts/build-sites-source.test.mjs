@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import {
   chmod,
+  cp,
+  mkdir,
   mkdtemp,
   readFile,
+  readdir,
+  rename,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,6 +23,7 @@ import {
   DEFAULT_SITE_ORIGIN,
   installZigLinker,
   readBoundedBody,
+  replaceSiteOutput,
   resolveXzReadableStream,
   resolveCargo,
   RUST_TOOLCHAIN,
@@ -26,6 +32,8 @@ import {
   RUSTUP_TARGET,
   rustBootstrapSupported,
   sha256,
+  SITE_OUTPUT_ENTRIES,
+  SITE_OUTPUT_LOCK,
   siteOrigin,
   SYSTEM_TAR,
   writeVerifiedBody,
@@ -33,6 +41,13 @@ import {
   ZIG_ARCHIVE_URL,
   ZIG_VERSION,
 } from "./build-sites-source.mjs";
+
+async function writeSiteOutput(root, marker) {
+  for (const name of SITE_OUTPUT_ENTRIES) {
+    await mkdir(join(root, name), { recursive: true });
+    await writeFile(join(root, name, "marker.txt"), `${marker}:${name}`);
+  }
+}
 
 function responseFor(bytes, options = {}) {
   const headers = new Headers();
@@ -605,4 +620,372 @@ test("Sites source build cleans the pinned toolchain after downstream failure", 
     /downstream build failed/,
   );
   assert.equal(cleanups, 1);
+});
+
+test("site output replacement preserves npm release and CI evidence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-output-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  const receipt = join(
+    destination,
+    "npm-packages",
+    "npm-publication-receipt.json",
+  );
+  const tarball = join(
+    destination,
+    "npm-packages",
+    "tarballs",
+    "ferrite-runtime.tgz",
+  );
+  const ciReceipt = join(destination, "ci", "results.tsv");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+    await mkdir(join(destination, "npm-packages", "tarballs"), {
+      recursive: true,
+    });
+    await mkdir(join(destination, "ci"), { recursive: true });
+    await writeFile(receipt, "immutable receipt");
+    await writeFile(tarball, "immutable tarball");
+    await writeFile(ciReceipt, "immutable CI evidence");
+
+    await replaceSiteOutput(source, destination);
+
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `new:${name}`,
+      );
+    }
+    assert.equal(await readFile(receipt, "utf8"), "immutable receipt");
+    assert.equal(await readFile(tarball, "utf8"), "immutable tarball");
+    assert.equal(await readFile(ciReceipt, "utf8"), "immutable CI evidence");
+    assert.deepEqual(
+      (await readdir(destination)).filter((name) => name.startsWith(".site-")),
+      [],
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement rolls back without touching release evidence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-rollback-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  const receipt = join(
+    destination,
+    "npm-packages",
+    "npm-publication-receipt.json",
+  );
+  const tarball = join(
+    destination,
+    "npm-packages",
+    "tarballs",
+    "ferrite-runtime.tgz",
+  );
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+    await mkdir(join(destination, "npm-packages", "tarballs"), {
+      recursive: true,
+    });
+    await writeFile(receipt, "immutable receipt");
+    await writeFile(tarball, "immutable tarball");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination, {
+        renameImpl: async (from, to) => {
+          if (
+            from.includes(".site-next-") &&
+            from.endsWith(`${join("", "server")}`)
+          ) {
+            throw new Error("injected server install failure");
+          }
+          await rename(from, to);
+        },
+      }),
+      /injected server install failure/,
+    );
+
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `old:${name}`,
+      );
+    }
+    assert.equal(await readFile(receipt, "utf8"), "immutable receipt");
+    assert.equal(await readFile(tarball, "utf8"), "immutable tarball");
+    assert.equal(
+      (await readdir(destination)).includes(SITE_OUTPUT_LOCK),
+      false,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement rejects unexpected source entries before mutation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-shape-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  const receipt = join(
+    destination,
+    "npm-packages",
+    "npm-publication-receipt.json",
+  );
+  try {
+    await writeSiteOutput(source, "new");
+    await mkdir(join(source, "npm-packages"), { recursive: true });
+    await mkdir(join(destination, "npm-packages"), { recursive: true });
+    await writeFile(receipt, "immutable receipt");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination),
+      /must contain only/,
+    );
+
+    assert.equal(await readFile(receipt, "utf8"), "immutable receipt");
+    assert.deepEqual(await readdir(destination), ["npm-packages"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement rejects a symlink destination without outside mutation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-symlink-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  const outside = join(directory, "outside");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(outside, "outside");
+    await symlink(outside, destination, "dir");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination),
+      /destination must be a non-symlink directory/,
+    );
+
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(outside, name, "marker.txt"), "utf8"),
+        `outside:${name}`,
+      );
+    }
+    assert.equal(
+      (await readdir(outside)).some((name) => name.startsWith(".site-")),
+      false,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement serializes concurrent transactions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-lock-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  let releaseCopy;
+  const copyGate = new Promise((resolve) => {
+    releaseCopy = resolve;
+  });
+  let firstCopyStarted;
+  const copyStarted = new Promise((resolve) => {
+    firstCopyStarted = resolve;
+  });
+  let held = false;
+  let firstFailure;
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+    const first = replaceSiteOutput(source, destination, {
+      cpImpl: async (...args) => {
+        if (!held) {
+          held = true;
+          firstCopyStarted();
+          await copyGate;
+        }
+        await cp(...args);
+      },
+    });
+    first.catch((error) => {
+      firstFailure = error;
+      firstCopyStarted();
+    });
+    await copyStarted;
+    if (firstFailure) throw firstFailure;
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination),
+      /transaction lock exists.*preserve and reconcile/,
+    );
+
+    releaseCopy();
+    await first;
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `new:${name}`,
+      );
+    }
+    assert.equal(
+      (await readdir(destination)).includes(SITE_OUTPUT_LOCK),
+      false,
+    );
+  } finally {
+    releaseCopy?.();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement cleans an allocated staging directory when backup allocation fails", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-allocate-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  let allocations = 0;
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination, {
+        mkdtempImpl: async (prefix) => {
+          allocations += 1;
+          if (allocations === 2) {
+            throw new Error("injected backup allocation failure");
+          }
+          return await mkdtemp(prefix);
+        },
+      }),
+      /injected backup allocation failure/,
+    );
+
+    assert.equal(
+      (await readdir(destination)).some((name) => name.startsWith(".site-")),
+      false,
+    );
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `old:${name}`,
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement retains lock and backup after incomplete rollback", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-rollback-lock-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination, {
+        renameImpl: async (from, to) => {
+          if (
+            from.includes(".site-next-") &&
+            from.endsWith("server")
+          ) {
+            throw new Error("injected install failure");
+          }
+          if (
+            from.includes(".site-backup-") &&
+            from.endsWith("client")
+          ) {
+            throw new Error("injected rollback failure");
+          }
+          await rename(from, to);
+        },
+      }),
+      /preserve .*site-build-lock.*remaining scratch/,
+    );
+
+    const names = await readdir(destination);
+    assert.ok(names.includes(SITE_OUTPUT_LOCK));
+    const backup = names.find((name) => name.startsWith(".site-backup-"));
+    assert.ok(backup);
+    assert.equal(
+      await readFile(join(destination, backup, "client", "marker.txt"), "utf8"),
+      "old:client",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("site output replacement retains the lock on scratch cleanup failure", async (context) => {
+  for (const failingPrefix of [".site-backup-", ".site-next-"]) {
+    await context.test(failingPrefix, async () => {
+      const directory = await mkdtemp(
+        join(tmpdir(), "ferrite-site-cleanup-lock-"),
+      );
+      const source = join(directory, "source");
+      const destination = join(directory, "dist");
+      try {
+        await writeSiteOutput(source, "new");
+        await writeSiteOutput(destination, "old");
+
+        await assert.rejects(
+          replaceSiteOutput(source, destination, {
+            rmImpl: async (path, options) => {
+              if (path.includes(failingPrefix)) {
+                throw new Error(`injected ${failingPrefix} cleanup failure`);
+              }
+              await rm(path, options);
+            },
+          }),
+          /preserve .*site-build-lock.*remaining scratch/,
+        );
+
+        const names = await readdir(destination);
+        assert.ok(names.includes(SITE_OUTPUT_LOCK));
+        assert.ok(names.some((name) => name.startsWith(failingPrefix)));
+        for (const name of SITE_OUTPUT_ENTRIES) {
+          assert.equal(
+            await readFile(join(destination, name, "marker.txt"), "utf8"),
+            `new:${name}`,
+          );
+        }
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("site output replacement reports lock removal failure without hiding installed output", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ferrite-site-unlock-"));
+  const source = join(directory, "source");
+  const destination = join(directory, "dist");
+  try {
+    await writeSiteOutput(source, "new");
+    await writeSiteOutput(destination, "old");
+
+    await assert.rejects(
+      replaceSiteOutput(source, destination, {
+        rmImpl: async (path, options) => {
+          if (path.endsWith(SITE_OUTPUT_LOCK)) {
+            throw new Error("injected lock removal failure");
+          }
+          await rm(path, options);
+        },
+      }),
+      /preserve .*site-build-lock.*remaining scratch/,
+    );
+
+    assert.ok((await readdir(destination)).includes(SITE_OUTPUT_LOCK));
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      assert.equal(
+        await readFile(join(destination, name, "marker.txt"), "utf8"),
+        `new:${name}`,
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

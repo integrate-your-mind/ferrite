@@ -6,6 +6,9 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
+  realpath,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -33,6 +36,12 @@ const typescript = join(root, "node_modules", "typescript", "bin", "tsc");
 const website = join(root, "website");
 const websiteDist = join(website, "dist");
 const outputDist = join(root, "dist");
+export const SITE_OUTPUT_ENTRIES = Object.freeze([
+  ".openai",
+  "client",
+  "server",
+]);
+export const SITE_OUTPUT_LOCK = ".site-build-lock";
 const rustupMaximumBytes = 32 * 1024 * 1024;
 const rustupInstallTimeoutMs = 5 * 60_000;
 const zigMaximumBytes = 60 * 1024 * 1024;
@@ -512,6 +521,180 @@ async function requireDirectory(path, label) {
   }
 }
 
+async function pathExists(path, lstatImpl = lstat) {
+  try {
+    await lstatImpl(path);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function ensureDestinationDirectory(
+  path,
+  { lstatImpl = lstat, mkdirImpl = mkdir, realpathImpl = realpath } = {},
+) {
+  let info;
+  try {
+    info = await lstatImpl(path);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    await mkdirImpl(path, { recursive: true });
+    info = await lstatImpl(path);
+  }
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error(
+      "site output destination must be a non-symlink directory",
+    );
+  }
+  return await realpathImpl(path);
+}
+
+export async function replaceSiteOutput(
+  sourceDist,
+  destinationDist,
+  options = {},
+) {
+  const cpImpl = options.cpImpl ?? cp;
+  const lstatImpl = options.lstatImpl ?? lstat;
+  const mkdirImpl = options.mkdirImpl ?? mkdir;
+  const mkdtempImpl = options.mkdtempImpl ?? mkdtemp;
+  const readdirImpl = options.readdirImpl ?? readdir;
+  const realpathImpl = options.realpathImpl ?? realpath;
+  const renameImpl = options.renameImpl ?? rename;
+  const rmImpl = options.rmImpl ?? rm;
+
+  const sourceInfo = await lstatImpl(sourceDist);
+  if (!sourceInfo.isDirectory() || sourceInfo.isSymbolicLink()) {
+    throw new Error("website dist must be a non-symlink directory");
+  }
+  const sourceEntries = await readdirImpl(sourceDist, { withFileTypes: true });
+  const sourceNames = sourceEntries.map(({ name }) => name).sort();
+  const expectedNames = [...SITE_OUTPUT_ENTRIES].sort();
+  if (
+    sourceNames.length !== expectedNames.length ||
+    sourceNames.some((name, index) => name !== expectedNames[index])
+  ) {
+    throw new Error(
+      `website dist must contain only ${SITE_OUTPUT_ENTRIES.join(", ")}`,
+    );
+  }
+  for (const entry of sourceEntries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error(
+        `website dist entry ${entry.name} must be a non-symlink directory`,
+      );
+    }
+  }
+
+  const destinationRoot = await ensureDestinationDirectory(destinationDist, {
+    lstatImpl,
+    mkdirImpl,
+    realpathImpl,
+  });
+  const lockPath = join(destinationRoot, SITE_OUTPUT_LOCK);
+  try {
+    await mkdirImpl(lockPath, { recursive: false, mode: 0o700 });
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new Error(
+        `site output transaction lock exists at ${lockPath}; preserve and reconcile it before retrying`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+
+  let stagingRoot;
+  let backupRoot;
+  const installed = [];
+  const backedUp = [];
+  let operationError;
+  const lifecycleErrors = [];
+  let preserveLock = false;
+  try {
+    stagingRoot = await mkdtempImpl(join(destinationRoot, ".site-next-"));
+    backupRoot = await mkdtempImpl(
+      join(destinationRoot, ".site-backup-"),
+    );
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      await cpImpl(join(sourceDist, name), join(stagingRoot, name), {
+        recursive: true,
+        errorOnExist: true,
+        force: false,
+      });
+    }
+    for (const name of SITE_OUTPUT_ENTRIES) {
+      const destination = join(destinationRoot, name);
+      if (await pathExists(destination, lstatImpl)) {
+        await renameImpl(destination, join(backupRoot, name));
+        backedUp.push(name);
+      }
+      await renameImpl(join(stagingRoot, name), destination);
+      installed.push(name);
+    }
+  } catch (error) {
+    operationError = error;
+    const rollbackErrors = [];
+    for (const name of [...installed].reverse()) {
+      try {
+        await rmImpl(join(destinationRoot, name), {
+          recursive: true,
+          force: true,
+        });
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    for (const name of [...backedUp].reverse()) {
+      try {
+        await renameImpl(
+          join(backupRoot, name),
+          join(destinationRoot, name),
+        );
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      preserveLock = true;
+      lifecycleErrors.push(...rollbackErrors);
+    }
+  }
+
+  if (!preserveLock) {
+    for (const scratch of [backupRoot, stagingRoot]) {
+      if (!scratch) continue;
+      try {
+        await rmImpl(scratch, { recursive: true, force: true });
+      } catch (cleanupError) {
+        preserveLock = true;
+        lifecycleErrors.push(cleanupError);
+      }
+    }
+  }
+
+  if (!preserveLock) {
+    try {
+      await rmImpl(lockPath, { recursive: true, force: true });
+    } catch (lockError) {
+      preserveLock = true;
+      lifecycleErrors.push(lockError);
+    }
+  }
+
+  if (operationError || lifecycleErrors.length > 0) {
+    if (lifecycleErrors.length === 0) throw operationError;
+    throw new AggregateError(
+      [...(operationError ? [operationError] : []), ...lifecycleErrors],
+      preserveLock
+        ? `site output transaction did not cleanly finish; preserve ${lockPath} and any remaining scratch`
+        : "site output transaction failed",
+    );
+  }
+}
+
 export async function buildSitesSource(options = {}) {
   const baseEnv = options.env ?? process.env;
   const origin = siteOrigin(options.origin ?? baseEnv.FERRITE_SITE_ORIGIN);
@@ -525,12 +708,7 @@ export async function buildSitesSource(options = {}) {
       await runImpl(step.command, step.args, env, step.timeoutMs);
     }
     await requireDirectory(websiteDist, "website dist");
-    await rm(outputDist, { recursive: true, force: true });
-    await cp(websiteDist, outputDist, {
-      recursive: true,
-      errorOnExist: true,
-      force: false,
-    });
+    await replaceSiteOutput(websiteDist, outputDist);
     await requireDirectory(outputDist, "root dist");
     return { origin, outputDist };
   } finally {
