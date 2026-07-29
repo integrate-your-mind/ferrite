@@ -5,9 +5,9 @@ pub use legacy::{AttributeValue, CoreError, Element, Node, Result, element, frag
 
 pub mod observability {
     use std::fmt;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+    use std::sync::{Arc, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde::Serialize;
@@ -21,6 +21,7 @@ pub mod observability {
     pub const MAX_BUILD_ROUTES: u64 = 1_000_000;
 
     static NEXT_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
+    static CORRELATION_ID_PREFIX: OnceLock<u64> = OnceLock::new();
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "snake_case")]
@@ -133,13 +134,15 @@ pub mod observability {
     impl CorrelationId {
         pub fn generate() -> Self {
             let sequence = NEXT_CORRELATION_ID.fetch_add(1, Ordering::Relaxed);
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let process = u128::from(std::process::id());
-            let mixed = now ^ (process << 64) ^ u128::from(sequence);
-            Self(format!("{mixed:032x}"))
+            let prefix = *CORRELATION_ID_PREFIX.get_or_init(|| {
+                let started = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let folded = (started as u64) ^ ((started >> 64) as u64);
+                folded ^ u64::from(std::process::id()).rotate_left(32)
+            });
+            Self(format!("{prefix:016x}{sequence:016x}"))
         }
 
         pub fn as_str(&self) -> &str {
@@ -428,6 +431,8 @@ pub mod observability {
 
     #[cfg(test)]
     mod tests {
+        use std::collections::HashSet;
+
         use super::*;
 
         fn completed_event(route_pattern: Option<&str>) -> Event {
@@ -478,6 +483,27 @@ pub mod observability {
             assert_eq!(first.as_str().len(), 32);
             assert!(first.as_str().bytes().all(|byte| byte.is_ascii_hexdigit()));
             assert_ne!(first, second);
+        }
+
+        #[test]
+        fn correlation_ids_remain_unique_across_concurrent_emitters() {
+            let workers = (0..8)
+                .map(|_| {
+                    std::thread::spawn(|| {
+                        (0..128)
+                            .map(|_| CorrelationId::generate().as_str().to_owned())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let ids = workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>();
+            let unique = ids.iter().collect::<HashSet<_>>();
+
+            assert_eq!(ids.len(), 1_024);
+            assert_eq!(unique.len(), ids.len());
         }
 
         #[test]

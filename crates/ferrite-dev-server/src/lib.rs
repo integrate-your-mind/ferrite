@@ -4157,15 +4157,6 @@ fn response_write_deadline_error() -> std::io::Error {
     )
 }
 
-fn is_response_write_deadline_error(error: &DevServerError) -> bool {
-    matches!(
-        error,
-        DevServerError::Io(error)
-            if error.kind() == std::io::ErrorKind::TimedOut
-                && error.to_string() == PRODUCTION_RESPONSE_WRITE_DEADLINE_MESSAGE
-    )
-}
-
 fn map_response_write_error(error: std::io::Error) -> std::io::Error {
     if matches!(
         error.kind(),
@@ -7952,6 +7943,74 @@ process.exit(17);
             assert!(!encoded.contains("private-id"));
             assert!(!encoded.contains("super-secret"));
         }
+    }
+
+    #[test]
+    fn structured_protocol_rejection_separates_error_response_from_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(8);
+        let mut project = production_project_for(&app);
+        project.observability_emitter = Some(emitter);
+
+        let response = production_http_request(
+            project,
+            b"POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nX-Secret: private-header-canary\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding:\r\nContent-Length: 0\r\n\r\n",
+        );
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert!(response_headers(&response).starts_with("HTTP/1.1 400 Bad Request"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].component, ObservabilityComponent::Server);
+        assert_eq!(events[0].outcome, Some(Outcome::Error));
+        assert_eq!(events[0].error_class, Some(ErrorClass::Rejected));
+        assert_eq!(events[0].failure_phase, Some(FailurePhase::Read));
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(events[1].component, ObservabilityComponent::Transport);
+        assert_eq!(events[1].outcome, Some(Outcome::Success));
+        assert_eq!(events[0].correlation_id, events[1].correlation_id);
+        for event in events {
+            let encoded = event.to_json_line().unwrap();
+            assert!(!encoded.contains("private-header-canary"));
+            assert!(!encoded.contains("transfer-encoding"));
+        }
+    }
+
+    #[test]
+    fn structured_request_timeout_is_correlated_and_server_cleans_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(8);
+        let mut project = production_project_for(&app);
+        project.config.request_read_timeout = Duration::from_millis(50);
+        project.observability_emitter = Some(emitter);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            serve_production_listener_once(listener, &project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].outcome, Some(Outcome::Timeout));
+        assert_eq!(events[0].error_class, Some(ErrorClass::Timeout));
+        assert_eq!(events[0].failure_phase, Some(FailurePhase::Read));
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(events[1].outcome, Some(Outcome::Success));
+        assert_eq!(events[0].correlation_id, events[1].correlation_id);
     }
 
     #[test]
