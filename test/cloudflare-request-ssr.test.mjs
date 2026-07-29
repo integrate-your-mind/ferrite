@@ -86,9 +86,15 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
       readFile(receiptPath),
     ]);
     const receipt = JSON.parse(receiptBytes.toString("utf8"));
+    const fallbackBody = "<!doctype html><p>prerender fallback</p>";
     const manifest = {
       format: { name: "ferrite-server", major: 1, minor: 0 },
       buildId: ASSET_BUILD_ID,
+      files: [{
+        path: "index.html",
+        size: Buffer.byteLength(fallbackBody),
+        sha256: createHash("sha256").update(fallbackBody).digest("hex"),
+      }],
       routes: [{
         path: "/",
         prerendered: { "/": "index.html" },
@@ -119,7 +125,7 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
             });
           }
           fallbackRequests.push(pathname);
-          return new Response("<!doctype html><p>prerender fallback</p>", {
+          return new Response(fallbackBody, {
             headers: { "Content-Type": "text/html; charset=utf-8" },
           });
         },
@@ -149,7 +155,7 @@ test("executes a Ferrite route module and Rust HTML renderer at request time thr
     const failed = await handler.fetch(new Request("https://worker.example.test/"), env);
     assert.equal(failed.status, 200);
     assert.equal(failed.headers.get("x-ferrite-render"), "static-fallback");
-    assert.equal(await failed.text(), "<!doctype html><p>prerender fallback</p>");
+    assert.equal(await failed.text(), fallbackBody);
     assert.deepEqual(fallbackRequests, ["/index.html"]);
   } finally {
     await rm(project, { recursive: true, force: true });
