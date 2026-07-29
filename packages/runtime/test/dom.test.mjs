@@ -236,6 +236,48 @@ test("React-compatible Capture event props run before target and bubble handlers
   ]);
 });
 
+test("React-compatible Capture props cover current two-phase DOM event names", () => {
+  const cases = [
+    ["onBeforeToggleCapture", "beforetoggle"],
+    ["onDragExitCapture", "dragexit"],
+    ["onFullscreenChangeCapture", "fullscreenchange"],
+    ["onFullscreenErrorCapture", "fullscreenerror"],
+    ["onScrollEndCapture", "scrollend"],
+    ["onTransitionCancelCapture", "transitioncancel"],
+    ["onTransitionRunCapture", "transitionrun"],
+    ["onTransitionStartCapture", "transitionstart"],
+  ];
+
+  for (const [captureProp, eventName] of cases) {
+    const { window, container } = createContainer();
+    const calls = [];
+    const bubbleProp = captureProp.slice(0, -"Capture".length);
+
+    mount(
+      createElement(
+        "div",
+        {
+          [captureProp]: () => calls.push("parent capture"),
+        },
+        createElement(
+          "button",
+          {
+            [bubbleProp]: () => calls.push("child bubble"),
+          },
+          "Target",
+        ),
+      ),
+      container,
+    );
+
+    container
+      .querySelector("button")
+      ?.dispatchEvent(new window.Event(eventName, { bubbles: true }));
+
+    assert.deepEqual(calls, ["parent capture", "child bubble"], captureProp);
+  }
+});
+
 test("event names that end in Capture remain native event names", () => {
   const { window, container } = createContainer();
   const calls = [];
@@ -256,6 +298,28 @@ test("event names that end in Capture remain native event names", () => {
   button?.dispatchEvent(new window.Event("gotpointercapture", { bubbles: true }));
 
   assert.deepEqual(calls, ["got pointer capture"]);
+});
+
+test("React event names without a capture prop remain native custom events", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+
+  mount(
+    createElement(
+      "button",
+      {
+        onMouseEnterCapture: () => calls.push("mouse enter capture"),
+      },
+      "Hover",
+    ),
+    container,
+  );
+
+  const button = container.querySelector("button");
+  button?.dispatchEvent(new window.Event("mouseenter", { bubbles: true }));
+  button?.dispatchEvent(new window.Event("mouseentercapture", { bubbles: true }));
+
+  assert.deepEqual(calls, ["mouse enter capture"]);
 });
 
 test("native custom event names ending in Capture remain backward compatible", () => {
@@ -325,6 +389,19 @@ test("native custom event names ending in Capture can opt into capture phase", (
     "child bubble",
     "parent bubble",
   ]);
+});
+
+test("custom Capture event props reject non-function handlers without mutating the tree", () => {
+  const { container } = createContainer();
+  const root = mount(createElement("button", { type: "button" }, "Upload"), container);
+  const button = container.querySelector("button");
+
+  assert.throws(
+    () => root.update(createElement("button", { onFileCapture: "not a function" }, "Invalid")),
+    /event prop "onFileCapture" must be a function/,
+  );
+  assert.equal(container.querySelector("button"), button);
+  assert.equal(container.innerHTML, '<button type="button">Upload</button>');
 });
 
 test("capture handlers are replaced and removed without changing the DOM node", () => {
