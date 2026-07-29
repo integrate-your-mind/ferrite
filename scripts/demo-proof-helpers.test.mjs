@@ -6,10 +6,38 @@ import test from "node:test";
 
 import {
   browserExecutableCandidates,
+  cargoTargetRoot,
   expectedArtifactFiles,
   launchVerifiedBrowser,
   listArtifactFiles,
 } from "./demo-proof-helpers.mjs";
+
+test("demo proof resolves default, relative, and absolute Cargo target roots", () => {
+  assert.equal(
+    cargoTargetRoot({
+      cwd: "/workspace",
+      env: {},
+      repoRoot: "/workspace/ferrite",
+    }),
+    "/workspace/ferrite/target",
+  );
+  assert.equal(
+    cargoTargetRoot({
+      cwd: "/workspace/ferrite",
+      env: { CARGO_TARGET_DIR: ".ferrite/isolated-target" },
+      repoRoot: "/workspace/ferrite",
+    }),
+    "/workspace/ferrite/.ferrite/isolated-target",
+  );
+  assert.equal(
+    cargoTargetRoot({
+      cwd: "/workspace/ferrite",
+      env: { CARGO_TARGET_DIR: "/tmp/ferrite-target" },
+      repoRoot: "/workspace/ferrite",
+    }),
+    "/tmp/ferrite-target",
+  );
+});
 
 test("configured browser path is exclusive and whitespace is trimmed", () => {
   assert.deepEqual(

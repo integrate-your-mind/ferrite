@@ -10,13 +10,18 @@ import { chromium } from "playwright-core";
 
 import {
   browserExecutableCandidates,
+  cargoTargetRoot,
   expectedArtifactFiles,
   launchVerifiedBrowser,
   listArtifactFiles,
 } from "./demo-proof-helpers.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const cli = join(repoRoot, "target", "debug", "ferrite");
+const cli = join(
+  cargoTargetRoot({ repoRoot }),
+  "debug",
+  process.platform === "win32" ? "ferrite.exe" : "ferrite",
+);
 const renderer = join(repoRoot, "packages", "runtime", "bin", "render-artifact.mjs");
 const browserSelection = browserExecutableCandidates({
   playwrightExecutablePath: chromium.executablePath(),

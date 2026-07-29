@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { access, readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 const systemBrowserCandidates = (platform, env) => {
   if (platform === "darwin") {
@@ -42,6 +42,18 @@ export function browserExecutableCandidates({
       .filter((candidate, index, all) => all.indexOf(candidate) === index),
     configured: false,
   };
+}
+
+export function cargoTargetRoot({
+  cwd = process.cwd(),
+  env = process.env,
+  repoRoot,
+} = {}) {
+  const configured = env.CARGO_TARGET_DIR;
+  if (!configured) {
+    return join(repoRoot, "target");
+  }
+  return isAbsolute(configured) ? configured : resolve(cwd, configured);
 }
 
 export async function launchVerifiedBrowser({
