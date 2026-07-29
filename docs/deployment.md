@@ -178,7 +178,7 @@ Use command arguments for the current runtime knobs:
 - `--once`: deterministic one-request mode for smoke tests; it does not synthesize request cookies, so it intentionally renders no replay nonce when session binding is enabled
 - `--request-path`: request target for `--once` smoke tests
 
-The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request/render/write limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and in-memory Prometheus-style counters, but not tracing sinks or external audit sinks.
+The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request/render/write limits, server-action CSRF cookie binding, process-local replay protection with optional session-cookie and route binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and in-memory Prometheus-style counters, but not tracing sinks or external audit sinks.
 
 If the response-write deadline expires before any bytes are sent, the connection closes with no response. If it expires after a header or body prefix is sent, the client receives a truncated response and the connection closes; Ferrite cannot safely replace an in-progress HTTP response with a new error document. The concurrent server emits a generic response-write deadline message to stderr. Overload `503` responses use the smaller of the configured deadline and 100 ms so rejected sockets do not hold the accept loop for the normal response budget.
 
