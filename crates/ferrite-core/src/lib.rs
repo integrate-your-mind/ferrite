@@ -267,8 +267,18 @@ mod tests {
     #[test]
     fn enforces_output_limit_during_escaping_across_multiple_nodes() {
         let tree = fragment(vec![
-            element("p", [], vec![text("<&>")]).unwrap(),
-            element("span", [], vec![text("x")]).unwrap(),
+            element(
+                "p",
+                std::iter::empty::<(&str, AttributeValue)>(),
+                vec![text("<&>")],
+            )
+            .unwrap(),
+            element(
+                "span",
+                std::iter::empty::<(&str, AttributeValue)>(),
+                vec![text("x")],
+            )
+            .unwrap(),
         ]);
         assert_eq!(
             render_to_html_with_limit(&tree, 34).unwrap(),

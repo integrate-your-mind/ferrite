@@ -187,7 +187,7 @@ test("falls back only to the declared static route on render failure, deadline, 
   });
   const timedOut = await deadlineWithoutFallback.fetch(
     new Request("https://example.test/docs"),
-    {},
+    assets([], new Response("missing", { status: 404 })),
   );
   assert.equal(timedOut.status, 504);
   assert.equal(await timedOut.text(), "Gateway timeout");
@@ -491,7 +491,9 @@ test("rejects routes outside the initial static, action-free Worker compatibilit
     }),
     /server actions/,
   );
-  const withoutIdentity = structuredClone(base);
+  const withoutIdentity = {
+    module: { ...base.module },
+  };
   delete withoutIdentity.module.cloudflare;
   assert.throws(
     () => createCloudflareSsrHandler({
