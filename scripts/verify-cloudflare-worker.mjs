@@ -657,6 +657,18 @@ async function createFixture(root) {
   const manifest = {
     format: { name: "ferrite-server", major: 1, minor: 0 },
     buildId: assetBuildId,
+    files: [
+      ...pages.map(({ fallback, fallbackBody }) => ({
+        path: fallback,
+        size: Buffer.byteLength(fallbackBody),
+        sha256: createHash("sha256").update(fallbackBody).digest("hex"),
+      })),
+      {
+        path: "asset.txt",
+        size: Buffer.byteLength("Ferrite static asset\n"),
+        sha256: createHash("sha256").update("Ferrite static asset\n").digest("hex"),
+      },
+    ],
     routes: pages.map(({ path, fallback }) => {
       const receipt = routeReceipts.find((candidate) => candidate.path === path);
       assert.ok(receipt);

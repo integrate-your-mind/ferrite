@@ -56,8 +56,9 @@ the build fails closed.
 Before request-time rendering, the adapter fetches the deployed
 `/ferrite-server.json` through `ASSETS`, hashes its exact bytes against the
 identity embedded in the Worker entry, and requires the final asset identity,
-per-route source/metadata/module receipt fields, and exact action-free route-to-prerender
-mapping. The local verifier generates that manifest from validated receipts.
+per-route source/metadata/module receipt fields, exact action-free route-to-prerender
+mapping, and the fallback file's declared size and SHA-256. The local verifier
+generates that manifest from validated receipts and the exact fallback bytes.
 This prevents a stale or independently replaced asset manifest from silently
 authorizing request rendering. An attacker authorized to replace both Worker
 code and assets remains outside this unsigned local-spike threat model.
@@ -136,7 +137,8 @@ The build uses an isolate-oriented ESM target and fails if application code
 imports a Node built-in or resolves transitive source outside the project and
 the explicitly verified `@ferrite/runtime` and `@ferrite/protocol` receipt roots.
 The only external allowed by this first profile is `node:async_hooks` from
-Ferrite's own server runtime.
+the exact canonical `dist/server.js` inside the verified Ferrite runtime package;
+project paths that resemble a runtime source or install path are still rejected.
 `PROFILE=release pnpm --filter @ferrite/protocol-wasm build` builds the
 release-profile WASM used for bundle-size and production proof.
 
@@ -198,10 +200,13 @@ Official constraints and configuration references:
 - An aborted request is rethrown as `AbortError`; it must not start fallback work.
 - Fallback requests strip range and conditional headers and accept only a full,
   bounded `200` `text/html` document. The adapter buffers the complete body
-  before returning a successful response. A missing, throwing, stalled,
-  truncated, oversized, conditional, wrong-media-type, or non-success fallback
-  produces a generic no-store `500` or `504` without exposing the route error
-  or committing partial HTML.
+  before returning a successful response, then matches its byte length and
+  SHA-256 against the exact file record in the verified asset manifest. `HEAD`
+  fallback requests still perform that verified `GET` internally before
+  returning a bodyless response. A missing, throwing, stalled, truncated,
+  oversized, replaced, conditional, wrong-media-type, or non-success fallback
+  produces a generic no-store `500` or `504` without exposing the route error or
+  committing partial HTML.
 - `shouldRender` is the rollback gate. Returning `false` bypasses request rendering and serves the declared prerender.
 - Unknown paths and declared static assets remain owned by `env.ASSETS`.
 

@@ -9,6 +9,16 @@ const METADATA_BUILD_ID = `sha256:${"e".repeat(64)}`;
 const MODULE_BUILD_ID = `sha256:${"b".repeat(64)}`;
 const MODULE_SHA256 = "c".repeat(64);
 const RECEIPT_SHA256 = "d".repeat(64);
+const DEFAULT_FALLBACK_BODY = "static docs";
+
+function fileRecord(path, body) {
+  const bytes = Buffer.from(body);
+  return {
+    path,
+    size: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
 
 function routeModule(render, {
   path = "/docs",
@@ -52,6 +62,7 @@ function routeModule(render, {
 
 function manifestBytes({
   buildId = BUILD_ID,
+  files = [fileRecord("docs/index.html", DEFAULT_FALLBACK_BODY)],
   routes = [{
     path: "/docs",
     prerendered: { "/docs": "docs/index.html" },
@@ -71,6 +82,7 @@ function manifestBytes({
   return Buffer.from(JSON.stringify({
     format: { name: "ferrite-server", major: 1, minor: 0 },
     buildId,
+    files,
     routes,
   }));
 }
@@ -108,13 +120,15 @@ function textRenderer() {
   };
 }
 
-function assets(seen, response = new Response("static docs", {
+function assets(seen, response = new Response(DEFAULT_FALLBACK_BODY, {
   status: 200,
   headers: { "Content-Type": "text/html; charset=utf-8" },
-}), buildId = BUILD_ID) {
-  const bytes = buildId === BUILD_ID
-    ? DEFAULT_MANIFEST_BYTES
-    : manifestBytes({ buildId });
+}), buildId = BUILD_ID, manifestOverride) {
+  const bytes = manifestOverride ?? (
+    buildId === BUILD_ID
+      ? DEFAULT_MANIFEST_BYTES
+      : manifestBytes({ buildId })
+  );
   return {
     ASSETS: {
       async fetch(request) {
@@ -209,6 +223,10 @@ test("falls back only to the declared static route on render failure, deadline, 
 
   for (const scenario of scenarios) {
     const seen = [];
+    const fallbackBody = scenario.fallbackBody ?? DEFAULT_FALLBACK_BODY;
+    const bytes = manifestBytes({
+      files: [fileRecord("docs/index.html", fallbackBody)],
+    });
     const handler = createCloudflareSsrHandler({
       routes: [{
         module: routeModule(scenario.render),
@@ -217,16 +235,16 @@ test("falls back only to the declared static route on render failure, deadline, 
       responseDeadlineMs: scenario.responseDeadlineMs,
       maxPacketBytes: scenario.maxPacketBytes,
       maxHtmlBytes: scenario.maxHtmlBytes,
-    });
+    }, bytes);
     const response = await handler.fetch(
       new Request("https://example.test/docs?private=1"),
-      assets(seen, new Response(scenario.fallbackBody ?? "static docs", {
+      assets(seen, new Response(fallbackBody, {
         status: 200,
         headers: { "Content-Type": "text/html; charset=utf-8" },
-      })),
+      }), BUILD_ID, bytes),
     );
     assert.equal(response.status, 200, scenario.name);
-    assert.equal(await response.text(), scenario.fallbackBody ?? "static docs", scenario.name);
+    assert.equal(await response.text(), fallbackBody, scenario.name);
     assert.equal(response.headers.get("x-ferrite-render"), "static-fallback", scenario.name);
     assert.deepEqual(seen, [{ method: "GET", pathname: "/docs/index.html" }], scenario.name);
   }
@@ -434,6 +452,14 @@ test("fails closed when route code and static assets do not share one build iden
       JSON.parse(DEFAULT_MANIFEST_BYTES.toString("utf8")).routes[0],
     ],
   });
+  const fallbackFile = fileRecord("docs/index.html", DEFAULT_FALLBACK_BODY);
+  const missingFallbackFile = manifestBytes({ files: [] });
+  const duplicateFallbackFile = manifestBytes({
+    files: [fallbackFile, fallbackFile],
+  });
+  const malformedFallbackFile = manifestBytes({
+    files: [{ ...fallbackFile, size: -1 }],
+  });
   const cases = [
     {
       handler: createHandler(),
@@ -460,6 +486,18 @@ test("fails closed when route code and static assets do not share one build iden
       env: manifestEnvironment(duplicateRoute),
     },
     {
+      handler: createHandler(missingFallbackFile),
+      env: manifestEnvironment(missingFallbackFile),
+    },
+    {
+      handler: createHandler(duplicateFallbackFile),
+      env: manifestEnvironment(duplicateFallbackFile),
+    },
+    {
+      handler: createHandler(malformedFallbackFile),
+      env: manifestEnvironment(malformedFallbackFile),
+    },
+    {
       handler: createHandler(),
       env: {
       ASSETS: {
@@ -479,6 +517,42 @@ test("fails closed when route code and static assets do not share one build iden
     assert.equal(await response.text(), "Internal server error");
   }
   assert.equal(renders, 0);
+});
+
+test("fails closed when fallback bytes differ from the pinned manifest file identity", async () => {
+  const handler = createCloudflareSsrHandler({
+    routes: [{
+      module: routeModule(() => {
+        throw new Error("render failed");
+      }),
+    }],
+    renderer: textRenderer(),
+  });
+  for (const method of ["GET", "HEAD"]) {
+    const seen = [];
+    const response = await handler.fetch(
+      new Request("https://example.test/docs", { method }),
+      assets(seen, new Response("tampered fallback", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      })),
+    );
+
+    assert.equal(response.status, 500);
+    assert.equal(await response.text(), method === "HEAD" ? "" : "Internal server error");
+    assert.equal(response.headers.get("x-ferrite-render"), null);
+    assert.deepEqual(seen, [{ method: "GET", pathname: "/docs/index.html" }]);
+  }
+
+  const seen = [];
+  const valid = await handler.fetch(
+    new Request("https://example.test/docs", { method: "HEAD" }),
+    assets(seen),
+  );
+  assert.equal(valid.status, 200);
+  assert.equal(await valid.text(), "");
+  assert.equal(valid.headers.get("x-ferrite-render"), "static-fallback");
+  assert.deepEqual(seen, [{ method: "GET", pathname: "/docs/index.html" }]);
 });
 
 test("bounds manifest hashing before rollback can receive a fresh deadline", async () => {

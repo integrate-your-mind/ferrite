@@ -45,7 +45,6 @@ export function browserExecutableCandidates({
 }
 
 export function cargoTargetRoot({
-  cwd = process.cwd(),
   env = process.env,
   repoRoot,
 } = {}) {
@@ -53,7 +52,7 @@ export function cargoTargetRoot({
   if (!configured) {
     return join(repoRoot, "target");
   }
-  return isAbsolute(configured) ? configured : resolve(cwd, configured);
+  return isAbsolute(configured) ? configured : resolve(repoRoot, configured);
 }
 
 export async function launchVerifiedBrowser({

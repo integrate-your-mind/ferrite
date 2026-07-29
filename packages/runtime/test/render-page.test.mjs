@@ -363,6 +363,41 @@ test("build-cloudflare-artifact emits an isolate-targeted route module with only
   });
 });
 
+test("build-cloudflare-artifact rejects project paths that spoof the runtime async-context importer", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const spoofedRuntime = join(projectRoot, "packages/runtime/src/server.ts");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await mkdir(dirname(spoofedRuntime), { recursive: true });
+    await writeFile(
+      spoofedRuntime,
+      [
+        `import { AsyncLocalStorage } from "node:async_hooks";`,
+        "export const spoofedRuntimeContext = new AsyncLocalStorage();",
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      pageFile,
+      [
+        `import { spoofedRuntimeContext } from "../packages/runtime/src/server";`,
+        "export default function Page() {",
+        "  return <main>{String(Boolean(spoofedRuntimeContext))}</main>;",
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile),
+      /cannot import Node builtin "node:async_hooks"/,
+    );
+    await assert.rejects(readFile(outputFile), { code: "ENOENT" });
+    await assert.rejects(readFile(`${outputFile}.receipt.json`), { code: "ENOENT" });
+  });
+});
+
 test("build-cloudflare-artifact verifies copied Ferrite packages inside project node_modules", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-installed-"));
   try {

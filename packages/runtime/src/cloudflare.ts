@@ -108,6 +108,12 @@ type PreparedRoute = CloudflareSsrRoute & {
   props: Record<string, unknown>;
 };
 
+type CloudflareAssetFileIdentity = {
+  path: string;
+  size: number;
+  sha256: string;
+};
+
 class ResponseDeadlineError extends Error {
   constructor() {
     super("Ferrite Cloudflare request-time response exceeded its deadline.");
@@ -162,8 +168,9 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
       }
       throwIfAborted(request.signal);
       const deadline = monotonicNow() + responseDeadlineMs;
+      let fallbackFile: CloudflareAssetFileIdentity;
       try {
-        await verifyAssetsBuildIdentity(
+        const fallbackFiles = await verifyAssetsBuildIdentity(
           request,
           env,
           prepared.assetBuildId,
@@ -172,6 +179,13 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
           request.signal,
           deadline,
         );
+        const verifiedFallback = fallbackFiles.get(route.fallbackPath);
+        if (!verifiedFallback) {
+          throw new TypeError(
+            `Ferrite Cloudflare asset manifest does not identify fallback "${route.fallbackPath}".`,
+          );
+        }
+        fallbackFile = verifiedFallback;
       } catch (error) {
         if (request.signal.aborted) {
           throw abortError();
@@ -192,6 +206,7 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
           request,
           env,
           route.fallbackPath,
+          fallbackFile,
           500,
           responseDeadlineMs,
           maxHtmlBytes,
@@ -246,6 +261,7 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
           request,
           env,
           route.fallbackPath,
+          fallbackFile,
           status,
           responseDeadlineMs,
           maxHtmlBytes,
@@ -425,7 +441,7 @@ async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
   expectedRoutes: Iterable<PreparedRoute>,
   signal: AbortSignal,
   deadline: number,
-): Promise<void> {
+): Promise<Map<string, CloudflareAssetFileIdentity>> {
   const binding = env?.ASSETS;
   if (!binding || typeof binding.fetch !== "function") {
     throw new TypeError("Ferrite Cloudflare SSR requires an ASSETS binding.");
@@ -482,9 +498,33 @@ async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
     !("buildId" in manifest) ||
     manifest.buildId !== expectedAssetBuildId ||
     !("routes" in manifest) ||
-    !Array.isArray(manifest.routes)
+    !Array.isArray(manifest.routes) ||
+    !("files" in manifest) ||
+    !Array.isArray(manifest.files)
   ) {
     throw new TypeError("Ferrite Cloudflare asset manifest does not match the route build identity.");
+  }
+  const manifestFiles = new Map<string, CloudflareAssetFileIdentity>();
+  for (const candidate of manifest.files) {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.path !== "string" ||
+      !isCanonicalManifestFilePath(candidate.path) ||
+      !Number.isSafeInteger(candidate.size) ||
+      (candidate.size as number) < 0 ||
+      typeof candidate.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(candidate.sha256) ||
+      manifestFiles.has(candidate.path)
+    ) {
+      throw new TypeError(
+        "Ferrite Cloudflare asset manifest contains invalid or duplicate file identities.",
+      );
+    }
+    manifestFiles.set(candidate.path, {
+      path: candidate.path,
+      size: candidate.size as number,
+      sha256: candidate.sha256 as string,
+    });
   }
   const manifestPaths = new Set<string>();
   for (const candidate of manifest.routes) {
@@ -497,6 +537,7 @@ async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
     }
     manifestPaths.add(candidate.path);
   }
+  const fallbackFiles = new Map<string, CloudflareAssetFileIdentity>();
   for (const expected of expectedRoutes) {
     const matches = manifest.routes.filter((candidate) =>
       isRecord(candidate) &&
@@ -515,10 +556,12 @@ async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
     const cloudflare = isRecord(route?.cloudflare)
       ? route.cloudflare
       : undefined;
+    const fallbackFile = manifestFiles.get(expected.fallbackPath.slice(1));
     if (
       !route ||
       !prerendered ||
       prerendered[expected.path] !== expected.fallbackPath.slice(1) ||
+      !fallbackFile ||
       !Array.isArray(observedActions) ||
       observedActions.length !== 0 ||
       !cloudflare ||
@@ -537,7 +580,9 @@ async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
         `Ferrite Cloudflare asset manifest does not bind route "${expected.path}" to its action-free fallback.`,
       );
     }
+    fallbackFiles.set(expected.fallbackPath, fallbackFile);
   }
+  return fallbackFiles;
 }
 
 async function sha256BuildId(bytes: Uint8Array): Promise<string> {
@@ -549,6 +594,21 @@ async function sha256BuildId(bytes: Uint8Array): Promise<string> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isCanonicalManifestFilePath(path: string): boolean {
+  return (
+    path.length > 0 &&
+    !path.startsWith("/") &&
+    !path.endsWith("/") &&
+    !path.includes("//") &&
+    !path.includes("\\") &&
+    !path.includes("\0") &&
+    !path.includes("%") &&
+    !path.includes("?") &&
+    !path.includes("#") &&
+    path.split("/").every((segment) => segment !== "." && segment !== "..")
+  );
 }
 
 async function readBoundedResponseBody(
@@ -709,6 +769,7 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
   request: Request,
   env: Env,
   fallbackPath: string,
+  fallbackFile: CloudflareAssetFileIdentity,
   failureStatus: number,
   responseDeadlineMs: number,
   maxHtmlBytes: number,
@@ -743,7 +804,7 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
     const response = await withinRequestBudget(
       binding.fetch(
         new Request(url.toString(), {
-          method: request.method,
+          method: "GET",
           headers,
           signal: request.signal,
         }),
@@ -764,17 +825,28 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
         request.method === "HEAD",
       );
     }
-    const body = request.method === "HEAD"
-      ? null
-      : await readBoundedResponseBody(
-          response,
-          maxHtmlBytes,
-          "fallback HTML",
-          request.signal,
-          deadline,
-        );
+    const body = await readBoundedResponseBody(
+      response,
+      maxHtmlBytes,
+      "fallback HTML",
+      request.signal,
+      deadline,
+    );
+    const observedSha256 = await withinRequestBudget(
+      sha256BuildId(body),
+      request.signal,
+      deadline,
+    );
+    if (
+      body.byteLength !== fallbackFile.size ||
+      observedSha256 !== `sha256:${fallbackFile.sha256}`
+    ) {
+      throw new TypeError(
+        `Ferrite Cloudflare fallback "${fallbackFile.path}" does not match its asset manifest identity.`,
+      );
+    }
     return new Response(
-      body,
+      request.method === "HEAD" ? null : body,
       {
         status: response.status,
         statusText: response.statusText,

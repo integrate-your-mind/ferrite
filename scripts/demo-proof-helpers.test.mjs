@@ -24,7 +24,7 @@ test("demo proof resolves default, relative, and absolute Cargo target roots", (
   );
   assert.equal(
     cargoTargetRoot({
-      cwd: "/workspace/ferrite",
+      cwd: "/external/launcher",
       env: { CARGO_TARGET_DIR: ".ferrite/isolated-target" },
       repoRoot: "/workspace/ferrite",
     }),

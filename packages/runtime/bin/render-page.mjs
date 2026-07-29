@@ -796,6 +796,9 @@ async function bundleServerArtifact({
   inputSnapshot,
 }) {
   const cloudflare = targetRuntime === "cloudflare";
+  const runtimeServerImporter = cloudflare
+    ? await cloudflareRuntimeServerImporter()
+    : undefined;
   const result = await build({
     entryPoints: [entryFile],
     outfile: outputFile,
@@ -818,7 +821,7 @@ async function bundleServerArtifact({
       clientReferenceProxyPlugin({ projectRoot, excludedFiles, inputSnapshot }),
       ...(cloudflare
         ? [
-            cloudflareBuiltinGuardPlugin(),
+            cloudflareBuiltinGuardPlugin({ runtimeServerImporter }),
             cloudflareInputSnapshotPlugin({
               inputSnapshot,
               projectRoot,
@@ -848,20 +851,20 @@ async function bundleServerArtifact({
   return result;
 }
 
-function cloudflareBuiltinGuardPlugin() {
+function cloudflareBuiltinGuardPlugin({ runtimeServerImporter }) {
   return {
     name: "ferrite-cloudflare-builtin-guard",
     setup(build) {
-      build.onResolve({ filter: /.*/ }, (args) => {
+      build.onResolve({ filter: /.*/ }, async (args) => {
         if (!isBuiltin(args.path)) {
           return undefined;
         }
-        const importer = args.importer.replaceAll("\\", "/");
+        const importer = args.importer
+          ? await realSourcePath(args.importer)
+          : "";
         const runtimeAsyncContext =
           args.path === "node:async_hooks" &&
-          /(?:^|\/)(?:packages\/runtime|node_modules\/@ferrite\/runtime)\/(?:src|dist)\/server\.(?:ts|js)$/.test(
-            importer,
-          );
+          importer === runtimeServerImporter;
         if (runtimeAsyncContext) {
           return { path: args.path, external: true };
         }
@@ -875,6 +878,25 @@ function cloudflareBuiltinGuardPlugin() {
       });
     },
   };
+}
+
+async function cloudflareRuntimeServerImporter() {
+  const packageRoots = await cloudflareReceiptPackageRoots();
+  const runtimePackage = packageRoots.find(({ name }) => name === "@ferrite/runtime");
+  if (!runtimePackage) {
+    throw new TypeError(
+      'Ferrite Cloudflare artifact builder could not verify the "@ferrite/runtime" package root.',
+    );
+  }
+  const importer = await realSourcePath(join(runtimePackage.root, "dist/server.js"));
+  try {
+    await access(importer);
+  } catch {
+    throw new TypeError(
+      `Ferrite Cloudflare artifact builder could not verify runtime server module "${importer}".`,
+    );
+  }
+  return importer;
 }
 
 function cloudflareInputSnapshotPlugin({ inputSnapshot, projectRoot }) {
