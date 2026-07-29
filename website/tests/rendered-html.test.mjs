@@ -22,14 +22,14 @@ test("route inventory and comparison series remain source-backed", async () => {
   for (const renderingMode of [/server-side rendering/i, /client-side rendering/i, /static site generation/i]) assert.match(home, renderingMode);
   for (const renderingMode of [/request-time server rendering/i, /browser mounting and hydration/i, /prerendered static delivery/i]) assert.match(architecture, renderingMode);
   assert.match(deployment, /does not execute Ferrite's native listener or request-time renderer inside a Worker/i);
-  assert.match(readme, /dedicated fetch-based adapter/i);
+  assert.match(readme, /current fetch-based adapter only serves static output/i);
   for (const content of [home, architecture, deployment, readme]) assert.doesNotMatch(content, /plain Worker adapter/i);
 });
 
 test("deployment adapter preserves hosting identity and hardens responses", async () => {
   const adapter = await source("deploy-adapter.mjs"); const hosting = JSON.parse(await source(".openai/hosting.json"));
   assert.equal(hosting.project_id, "appgprj_6a5b984c7d4481919ec1cf6bbcbd55c8");
-  for (const required of ["sourceBuildId", "staging", "rollback", "size mismatch", "SHA-256 mismatch", "symlink/reparse", "404", "Cache-Control", "X-Content-Type-Options", "Content-Security-Policy", "GENERATED_SERVER_ENTRY", "FERRITE_SITES_SERVE"]) assert.match(adapter, new RegExp(required.replace(/[/.]/g, "\\$&")));
+  for (const required of ["sourceBuildId", "staging", "rollback", "size mismatch", "SHA-256 mismatch", "symlink/reparse", "404", "Cache-Control", "X-Content-Type-Options", "Content-Security-Policy", "generatedWorkerEntry", "env.ASSETS.fetch", "FERRITE_SITES_SERVE"]) assert.match(adapter, new RegExp(required.replace(/[/.]/g, "\\$&")));
   assert.match(adapter, /join\(dist, "server", "index\.js"\)/);
   assert.match(adapter, /prerendered/); assert.match(adapter, /manifest\.files/); assert.match(adapter, /FERRITE_SITE_ORIGIN/); assert.match(adapter, /renderSitemap/); assert.match(adapter, /renderRobots/); assert.doesNotMatch(adapter, /home-page fallback|routes\.has\("\/"\)/i);
 });

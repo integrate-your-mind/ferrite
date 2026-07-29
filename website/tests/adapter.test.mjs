@@ -165,6 +165,103 @@ test("packages verified prerendered routes/assets and serves deep links without 
   }
 });
 
+test("generated Worker serves only declared static routes and assets through the ASSETS binding", async () => {
+  const fixture = await mkdtemp(join(tmpdir(), "ferrite-worker-adapter-fixture-"));
+  try {
+    await writeFixture(join(fixture, "artifact"));
+    const result = await packageArtifact(join(fixture, "artifact"), join(fixture, "dist"), {
+      siteOrigin: "https://worker.example.test",
+    });
+    await assert.rejects(readFile(join(result.dist, "server", "adapter.mjs")));
+    const entry = await readFile(result.server, "utf8");
+    const module = await import(`data:text/javascript;base64,${Buffer.from(entry).toString("base64")}`);
+    const seen = [];
+    const env = {
+      ASSETS: {
+        fetch: async (assetRequest) => {
+          seen.push({ method: assetRequest.method, url: assetRequest.url });
+          if (new URL(assetRequest.url).pathname === "/blob.bin") return new Response("missing", { status: 404 });
+          if (assetRequest.headers.get("x-trigger-throw") === "1") throw new Error("asset binding failed");
+          if (assetRequest.headers.has("if-none-match")) return new Response(null, { status: 304, headers: { ETag: "\"fixture\"" } });
+          if (assetRequest.headers.has("if-match")) return new Response("precondition failed", { status: 412 });
+          if (assetRequest.headers.get("range") === "bytes=999-") return new Response("range not satisfiable", { status: 416 });
+          if (assetRequest.headers.has("range")) return new Response("partial", { status: 206, headers: { "Content-Range": "bytes 0-6/10" } });
+          return new Response(assetRequest.method === "HEAD" ? null : "asset body", {
+            status: 200,
+            headers: { "Content-Type": "text/html; charset=utf-8" },
+          });
+        },
+      },
+    };
+
+    const docs = await module.default.fetch(new Request("https://worker.example.test/docs?ignored=1"), env);
+    assert.equal(docs.status, 200);
+    assert.equal(await docs.text(), "asset body");
+    assert.equal(seen.at(-1).url, "https://worker.example.test/docs/index.html");
+    assert.equal(docs.headers.get("cache-control"), "no-cache");
+    assert.equal(docs.headers.get("x-content-type-options"), "nosniff");
+
+    const asset = await module.default.fetch(new Request("https://worker.example.test/assets/app.0123456789.js"), env);
+    assert.equal(asset.status, 200);
+    assert.equal(asset.headers.get("cache-control"), "public, max-age=31536000, immutable");
+
+    const head = await module.default.fetch(new Request("https://worker.example.test/docs", { method: "HEAD" }), env);
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), "");
+    assert.equal(seen.at(-1).method, "HEAD");
+
+    const partial = await module.default.fetch(new Request("https://worker.example.test/assets/app.0123456789.js", {
+      headers: { Range: "bytes=0-6" },
+    }), env);
+    assert.equal(partial.status, 206);
+    assert.equal(await partial.text(), "partial");
+    assert.equal(partial.headers.get("content-range"), "bytes 0-6/10");
+    assert.equal(partial.headers.get("cache-control"), "public, max-age=31536000, immutable");
+
+    const notModified = await module.default.fetch(new Request("https://worker.example.test/assets/app.0123456789.js", {
+      headers: { "If-None-Match": "\"fixture\"" },
+    }), env);
+    assert.equal(notModified.status, 304);
+    assert.equal(await notModified.text(), "");
+    assert.equal(notModified.headers.get("etag"), "\"fixture\"");
+
+    for (const [headers, expectedStatus, expectedBody] of [
+      [{ "If-Match": "\"other\"" }, 412, "precondition failed"],
+      [{ Range: "bytes=999-" }, 416, "range not satisfiable"],
+    ]) {
+      const response = await module.default.fetch(new Request("https://worker.example.test/assets/app.0123456789.js", { headers }), env);
+      assert.equal(response.status, expectedStatus);
+      assert.equal(await response.text(), expectedBody);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    }
+
+    const beforeFailures = seen.length;
+    const post = await module.default.fetch(new Request("https://worker.example.test/docs", { method: "POST" }), env);
+    assert.equal(post.status, 405);
+    assert.equal(post.headers.get("allow"), "GET, HEAD");
+    assert.equal(await post.text(), "Method not allowed");
+    assert.equal((await module.default.fetch(new Request("https://worker.example.test/missing"), env)).status, 404);
+    assert.equal((await module.default.fetch(new Request("https://worker.example.test/%E0%A4%A"), env)).status, 400);
+    assert.equal((await module.default.fetch(new Request("https://worker.example.test/%252e%252e/secret"), env)).status, 400);
+    assert.equal((await module.default.fetch(new Request("https://worker.example.test/docs%5csecret"), env)).status, 400);
+    assert.equal((await module.default.fetch(new Request("https://worker.example.test/docs%00secret"), env)).status, 400);
+    assert.equal(seen.length, beforeFailures);
+
+    const missingDeclaredAsset = await module.default.fetch(new Request("https://worker.example.test/blob.bin"), env);
+    assert.equal(missingDeclaredAsset.status, 500);
+    assert.equal(await missingDeclaredAsset.text(), "Internal server error");
+    const bindingFailure = await module.default.fetch(new Request("https://worker.example.test/docs", {
+      headers: { "X-Trigger-Throw": "1" },
+    }), env);
+    assert.equal(bindingFailure.status, 500);
+    assert.equal(await bindingFailure.text(), "Internal server error");
+    assert.equal((await module.default.fetch(new Request("https://worker.example.test/docs"), {})).status, 500);
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
 test("packages validated site public files when the Ferrite artifact does not enumerate them", async () => {
   const fixture = await mkdtemp(join(tmpdir(), "ferrite-public-files-fixture-"));
   try {

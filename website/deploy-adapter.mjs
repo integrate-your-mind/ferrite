@@ -541,7 +541,7 @@ async function verifyStagedOutput(staging, manifest, fsApi, serverFiles, expecte
   const actualClientPaths = await collectArtifactPaths(client, clientRoot.canonical, fsApi);
   if (actualClientPaths.some((path) => !expectedClientPaths.has(path)) || [...expectedClientPaths].some((path) => !actualClientPaths.includes(path))) invalid("staged client output is incomplete or contains undeclared files");
   const actualServerPaths = await collectArtifactPaths(server, serverRoot.canonical, fsApi);
-  if (actualServerPaths.sort().join("\n") !== ["adapter.mjs", "index.js", "source-build.json"].join("\n")) invalid("staged server output is incomplete or contains undeclared files");
+  if (actualServerPaths.sort().join("\n") !== ["index.js", "source-build.json"].join("\n")) invalid("staged server output is incomplete or contains undeclared files");
   const actualOpenaiPaths = await collectArtifactPaths(openai, openaiRoot.canonical, fsApi);
   if (actualOpenaiPaths.length !== 1 || actualOpenaiPaths[0] !== "hosting.json") invalid("staged hosting output is incomplete or contains undeclared files");
   const manifestBytes = Buffer.from(await fsApi.readFile(join(client, MANIFEST_NAME)));
@@ -556,7 +556,7 @@ async function verifyStagedOutput(staging, manifest, fsApi, serverFiles, expecte
     const expected = expectedClientBytes.get(relative);
     if (expected && !expected.equals(bytes)) invalid(`staged output bytes differ from the verified source for \`${relative}\``);
   }
-  for (const required of ["adapter.mjs", "index.js", "source-build.json"]) await regularFile(server, serverRoot.canonical, required, fsApi);
+  for (const required of ["index.js", "source-build.json"]) await regularFile(server, serverRoot.canonical, required, fsApi);
   await regularFile(staging, stagingRoot.canonical, ".openai/hosting.json", fsApi);
   return true;
 }
@@ -601,11 +601,110 @@ export async function atomicReplaceDirectory(staging, dist, fsApi = FS) {
   return { destination, backupPath: null };
 }
 
-const GENERATED_SERVER_ENTRY = `import { createSiteServer } from "./adapter.mjs";
-const server = createSiteServer(new URL("../", import.meta.url));
-export { server };
-export default server;
+function generatedWorkerEntry(manifest, clientFiles) {
+  const routes = {};
+  for (const route of manifest.routes) {
+    for (const [pathname, file] of Object.entries(route.prerendered ?? {})) routes[pathname] = file;
+  }
+  return `const ROUTES = Object.freeze(${JSON.stringify(routes, null, 2)});
+const FILES = new Set(${JSON.stringify([...clientFiles].sort(), null, 2)});
+const SECURITY_HEADERS = Object.freeze(${JSON.stringify(SECURITY_HEADERS, null, 2)});
+
+function responseHeaders(cacheControl, source) {
+  const headers = new Headers(source);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
+  headers.set("Cache-Control", cacheControl);
+  return headers;
+}
+
+function errorResponse(status, message, extraHeaders = {}) {
+  const headers = responseHeaders("no-store", {
+    "Content-Type": "text/plain; charset=utf-8",
+    ...extraHeaders,
+  });
+  return new Response(message, { status, headers });
+}
+
+function cacheControl(pathname) {
+  return /\\.[a-f0-9]{8,}\\.[a-z0-9]+$/i.test(pathname)
+    ? "public, max-age=31536000, immutable"
+    : "no-cache";
+}
+
+function requestFile(request) {
+  let pathname;
+  try {
+    const encodedPathname = new URL(request.url).pathname;
+    if (
+      /%(?:25)*(?:00|2f|5c)/i.test(encodedPathname) ||
+      /(?:^|\\/)(?:%(?:25)*2e){1,2}(?:\\/|$)/i.test(encodedPathname)
+    ) {
+      return { error: errorResponse(400, "Bad request") };
+    }
+    pathname = decodeURIComponent(encodedPathname);
+  } catch {
+    return { error: errorResponse(400, "Bad request") };
+  }
+  if (
+    !pathname.startsWith("/") ||
+    pathname.includes("\\\\") ||
+    pathname.includes("\\0") ||
+    pathname.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    return { error: errorResponse(400, "Bad request") };
+  }
+  const normalized = pathname.length > 1 ? pathname.replace(/\\/+$/, "") : "/";
+  const candidates = [];
+  const prerendered = ROUTES[normalized];
+  if (prerendered && FILES.has(prerendered)) candidates.push(prerendered);
+  const relative = normalized === "/" ? "index.html" : normalized.slice(1);
+  if (FILES.has(relative)) candidates.push(relative);
+  const basename = relative.slice(relative.lastIndexOf("/") + 1);
+  if (!basename.includes(".") && FILES.has(\`\${relative}/index.html\`)) candidates.push(\`\${relative}/index.html\`);
+  return { file: candidates[0] ?? null };
+}
+
+export default {
+  async fetch(request, env) {
+    const method = request.method || "GET";
+    if (method !== "GET" && method !== "HEAD") {
+      return errorResponse(405, "Method not allowed", { Allow: "GET, HEAD" });
+    }
+    const resolved = requestFile(request);
+    if (resolved.error) return resolved.error;
+    if (!resolved.file) return errorResponse(404, "Not found");
+    if (!env || !env.ASSETS || typeof env.ASSETS.fetch !== "function") {
+      return errorResponse(500, "Internal server error");
+    }
+    const assetUrl = new URL(request.url);
+    assetUrl.pathname = \`/\${resolved.file}\`;
+    assetUrl.search = "";
+    assetUrl.hash = "";
+    let asset;
+    try {
+      asset = await env.ASSETS.fetch(new Request(assetUrl.toString(), {
+        method,
+        headers: request.headers,
+      }));
+    } catch {
+      return errorResponse(500, "Internal server error");
+    }
+    if (![200, 206, 304, 412, 416].includes(asset.status)) {
+      return errorResponse(500, "Internal server error");
+    }
+    const cache = asset.status === 412 || asset.status === 416
+      ? "no-store"
+      : cacheControl(resolved.file);
+    const headers = responseHeaders(cache, asset.headers);
+    return new Response(method === "HEAD" || asset.status === 304 ? null : asset.body, {
+      status: asset.status,
+      statusText: asset.statusText,
+      headers,
+    });
+  },
+};
 `;
+}
 
 export async function packageArtifact(
   artifactDirectory = join(root, ".ferrite", "build"),
@@ -630,6 +729,7 @@ export async function packageArtifact(
   const serverFiles = new Set(artifactResult.manifest.routes.map((route) => route.serverModule));
   const clientBytes = new Map(artifactResult.bytesByPath);
   for (const [relative, bytes] of publicBytes) clientBytes.set(relative, bytes);
+  const clientFiles = new Set([...clientBytes.keys()].filter((relative) => !serverFiles.has(relative)));
   try {
     const client = join(staging, "client");
     const server = join(staging, "server");
@@ -638,8 +738,7 @@ export async function packageArtifact(
       await writeBytes(join(client, relative), bytes, fsApi);
     }
     await writeBytes(join(client, MANIFEST_NAME), Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`), fsApi);
-    await writeBytes(join(server, "adapter.mjs"), Buffer.from(await readFile(new URL("./deploy-adapter.mjs", import.meta.url))), fsApi);
-    await writeBytes(join(server, "index.js"), Buffer.from(GENERATED_SERVER_ENTRY), fsApi);
+    await writeBytes(join(server, "index.js"), Buffer.from(generatedWorkerEntry(manifest, clientFiles)), fsApi);
     await writeBytes(join(server, "source-build.json"), Buffer.from(`${JSON.stringify({ sourceBuildId: artifactResult.manifest.buildId, outputBuildId: manifest.buildId, siteOrigin: origin }, null, 2)}\n`), fsApi);
     const projectRoot = await canonicalRoot(root, fsApi);
     const hostingSource = await regularFile(root, projectRoot.canonical, ".openai/hosting.json", fsApi);

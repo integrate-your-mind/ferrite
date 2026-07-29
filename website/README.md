@@ -64,7 +64,7 @@ After a Ferrite artifact exists, `pnpm run package:sites` invokes
 `_ferrite/static` bundle, and public asset (while keeping server modules out of
 the public tree) into the Sites shape:
 
-- `dist/server/index.js` — generated Node-compatible immutable-output adapter entry
+- `dist/server/index.js` — generated Cloudflare Worker entry for the verified static assets binding
 - `dist/client` — browser bundles and public assets
 - `dist/.openai/hosting.json` — unchanged project ID from `.openai/hosting.json`
 
@@ -72,12 +72,13 @@ It verifies the source manifest and every declared file (type, symlink/reparse
 status, size, and SHA-256), stages and verifies a complete output, then swaps
 the Sites directory transactionally with rollback. It serves generated deep
 links, returns a real 404 for unknown paths, and adds conservative
-cache/security headers with no request-body or query logging. The plain adapter
+cache/security headers with no request-body or query logging. The static Worker adapter
 only serves immutable output; it does not compile Ferrite source.
 
 The Cloudflare-hosted project site uses the verified prerendered HTML and browser
 assets. It does not run Ferrite's native HTTP listener or request-time SSR inside
-a Worker. A future request-time edge mode needs a dedicated fetch-based adapter.
+a Worker. A future request-time edge mode needs an isolate-compatible Ferrite
+renderer; the current fetch-based adapter only serves static output.
 
 The generated `sourceBuildId` is the verified Ferrite artifact-content identity,
 not a Git commit or tree identity. Exact-source claims must also cite an external
