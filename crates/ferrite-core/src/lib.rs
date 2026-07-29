@@ -508,13 +508,14 @@ pub mod observability {
 
         #[test]
         fn route_patterns_are_control_free_bounded_and_events_fit_the_ceiling() {
-            let input = format!("/{}\\nsecret-query-token", "\"".repeat(600));
+            let input = format!("/\n{}secret-query-token", "\"".repeat(600));
             let event = completed_event(Some(&input));
             let line = event.to_json_line().unwrap();
             let route = event.http.as_ref().unwrap().route_pattern.as_str();
 
             assert!(route.len() <= MAX_ROUTE_PATTERN_BYTES);
             assert!(!route.chars().any(char::is_control));
+            assert!(route.contains('?'));
             assert!(!line.contains("secret-query-token"));
             assert!(line.len() <= MAX_EVENT_BYTES);
         }

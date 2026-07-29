@@ -62,9 +62,11 @@ The fixed fields are:
 Start events omit terminal outcome fields. Successful completion events omit
 error fields. Durations are capped at 24 hours, build route counts at one
 million, route patterns at 256 UTF-8 bytes, and each serialized event at 1 KiB.
-For correlated server events, `duration_ms` is elapsed time since Ferrite began
-handling the request, not a component-local span duration. Sequence numbers
-describe ordering only; they do not turn these records into tracing spans.
+For socket-backed events, every correlated terminal `duration_ms` uses one
+origin captured immediately before Ferrite begins reading the request. Direct
+Rust handler calls capture the origin immediately before handler execution.
+Durations are not component-local span durations. Sequence numbers describe
+ordering only; they do not turn these records into tracing spans.
 
 ## Correlation Boundaries
 
@@ -77,6 +79,13 @@ events:
 2. sequence `1`: matching render or navigation operation completed
 3. sequence `2`: application response completed
 4. sequence `3`: the local socket write completed or failed
+
+The application chooses the bounded response mode once and reuses it for
+correlated render/navigation, server, and transport completion events. The
+start event uses `other` because no response exists yet. Server-action
+execution currently emits server and transport records rather than a separate
+action-renderer span; renderer failures use the `render` failure phase and a
+trusted route pattern when routing succeeded.
 
 Protocol rejections and unsupported methods can begin after request parsing has
 already failed, so they may emit only terminal server and transport events.
@@ -109,6 +118,12 @@ rather than a raw request value.
 This contract applies only to structured events. Other command diagnostics can
 still include source paths or user-facing child-process errors. It is not a
 claim that the entire process stderr stream is redacted.
+
+Without `--event-log`, Ferrite preserves its legacy per-request render, bundle,
+and response-write timeout diagnostics. Enabling the structured stream
+suppresses those raw request/error diagnostics and emits only their bounded
+classification records, preventing them from contaminating the structured
+collector path.
 
 The older `--access-log` and `--action-log` flags remain compatibility
 interfaces. They retain raw request paths, submitted action identifiers and

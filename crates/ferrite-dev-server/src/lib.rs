@@ -1366,6 +1366,35 @@ impl ProductionProject {
         self
     }
 
+    fn legacy_diagnostics_enabled(&self) -> bool {
+        self.observability_emitter.is_none()
+    }
+
+    fn legacy_request_failure_diagnostic(
+        &self,
+        kind: &str,
+        path: &str,
+        route_pattern: &str,
+        error: &dyn std::fmt::Display,
+    ) -> Option<String> {
+        if self.legacy_diagnostics_enabled() {
+            let error = error.to_string();
+            Some(format!(
+                "Ferrite production {kind} failed: path={path:?} pattern={route_pattern:?} error={error:?}"
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn legacy_response_write_deadline_diagnostic(
+        &self,
+        error: &DevServerError,
+    ) -> Option<&'static str> {
+        (self.legacy_diagnostics_enabled() && is_response_write_deadline_error(error))
+            .then_some("Ferrite production response write deadline exceeded")
+    }
+
     pub fn config(&self) -> &ProductionServerConfig {
         &self.config
     }
@@ -1377,43 +1406,56 @@ impl ProductionProject {
 
     pub fn handle_get(&self, raw_path: &str) -> Result<DevResponse> {
         self.handle_get_with_context(raw_path, self.direct_request_context())
+            .map(|handled| handled.response)
     }
 
     fn handle_get_with_context(
         &self,
         raw_path: &str,
         request_context: ProductionRequestContext,
-    ) -> Result<DevResponse> {
-        let started = Instant::now();
+    ) -> Result<HandledProductionResponse> {
+        let observability_started = request_context.started_at;
+        let handler_started = Instant::now();
         self.emit_request_started("GET", &request_context);
         if !raw_path.starts_with('/') {
             let error = DevServerError::InvalidRequestPath(raw_path.to_owned());
-            self.emit_request_error("GET", &request_context, &error, started.elapsed());
+            self.emit_request_error(
+                "GET",
+                &request_context,
+                &error,
+                observability_started.elapsed(),
+            );
             return Err(error);
         }
 
         let response = match self.handle_get_inner(raw_path) {
             Ok(response) => response,
             Err(error) => {
-                self.emit_request_error("GET", &request_context, &error, started.elapsed());
+                self.emit_request_error(
+                    "GET",
+                    &request_context,
+                    &error,
+                    observability_started.elapsed(),
+                );
                 return Err(error);
             }
         };
+        let response_mode = self.observability_response_mode_for_get(raw_path, &response);
+        let handled = HandledProductionResponse::new(response, response_mode);
         self.observe_request(
             "GET",
             raw_path,
-            &response,
-            started.elapsed(),
+            &handled.response,
+            handler_started.elapsed(),
             request_context.clone(),
         );
         self.emit_request_completed(
             "GET",
             &request_context,
-            &response,
-            self.observability_response_mode_for_get(raw_path, &response),
-            started.elapsed(),
+            &handled,
+            observability_started.elapsed(),
         );
-        Ok(response)
+        Ok(handled)
     }
 
     pub fn handle_post(
@@ -1423,6 +1465,7 @@ impl ProductionProject {
         body: &[u8],
     ) -> Result<DevResponse> {
         self.handle_post_with_context(raw_path, headers, body, self.direct_request_context())
+            .map(|handled| handled.response)
     }
 
     fn handle_post_with_context(
@@ -1431,37 +1474,47 @@ impl ProductionProject {
         headers: &HttpHeaders,
         body: &[u8],
         request_context: ProductionRequestContext,
-    ) -> Result<DevResponse> {
-        let started = Instant::now();
+    ) -> Result<HandledProductionResponse> {
+        let observability_started = request_context.started_at;
+        let handler_started = Instant::now();
         self.emit_request_started("POST", &request_context);
         if !raw_path.starts_with('/') {
             let error = DevServerError::InvalidRequestPath(raw_path.to_owned());
-            self.emit_request_error("POST", &request_context, &error, started.elapsed());
+            self.emit_request_error(
+                "POST",
+                &request_context,
+                &error,
+                observability_started.elapsed(),
+            );
             return Err(error);
         }
 
-        let response = match self.handle_post_inner(raw_path, headers, body, &request_context) {
-            Ok(response) => response,
+        let handled = match self.handle_post_inner(raw_path, headers, body, &request_context) {
+            Ok(handled) => handled,
             Err(error) => {
-                self.emit_request_error("POST", &request_context, &error, started.elapsed());
+                self.emit_request_error(
+                    "POST",
+                    &request_context,
+                    &error,
+                    observability_started.elapsed(),
+                );
                 return Err(error);
             }
         };
         self.observe_request(
             "POST",
             raw_path,
-            &response,
-            started.elapsed(),
+            &handled.response,
+            handler_started.elapsed(),
             request_context.clone(),
         );
         self.emit_request_completed(
             "POST",
             &request_context,
-            &response,
-            ObservabilityResponseMode::Action,
-            started.elapsed(),
+            &handled,
+            observability_started.elapsed(),
         );
-        Ok(response)
+        Ok(handled)
     }
 
     fn handle_get_inner(&self, raw_path: &str) -> Result<DevResponse> {
@@ -1499,15 +1552,20 @@ impl ProductionProject {
         headers: &HttpHeaders,
         body: &[u8],
         request_context: &ProductionRequestContext,
-    ) -> Result<DevResponse> {
+    ) -> Result<HandledProductionResponse> {
         self.ensure_ready()?;
         let path = strip_query(raw_path);
         if path != SERVER_ACTION_PATH {
-            return Ok(DevResponse::method_not_allowed().with_cache_control("no-store"));
+            let response = DevResponse::method_not_allowed().with_cache_control("no-store");
+            let response_mode = self.observability_response_mode_for_post(raw_path, &response);
+            return Ok(HandledProductionResponse::new(response, response_mode));
         }
 
         self.action_response(headers, body, request_context)
-            .map(|response| response.with_cache_control("no-store"))
+            .map(|mut handled| {
+                handled.response = handled.response.with_cache_control("no-store");
+                handled
+            })
     }
 
     fn observe_request(
@@ -1542,10 +1600,12 @@ impl ProductionProject {
         headers: &HttpHeaders,
         peer_ip: Option<IpAddr>,
         correlation_id: Option<CorrelationId>,
+        started_at: Instant,
     ) -> ProductionRequestContext {
         ProductionRequestContext {
             client_ip: production_client_ip(headers, peer_ip, &self.config),
             correlation_id,
+            started_at,
         }
     }
 
@@ -1556,6 +1616,7 @@ impl ProductionProject {
                 .observability_emitter
                 .as_ref()
                 .map(|_| CorrelationId::generate()),
+            started_at: Instant::now(),
         }
     }
 
@@ -1601,12 +1662,23 @@ impl ProductionProject {
             .unwrap_or_else(|_| response_mode_from_content_type(response))
     }
 
+    fn observability_response_mode_for_post(
+        &self,
+        raw_path: &str,
+        response: &DevResponse,
+    ) -> ObservabilityResponseMode {
+        if strip_query(raw_path) == SERVER_ACTION_PATH {
+            ObservabilityResponseMode::Action
+        } else {
+            response_mode_from_content_type(response)
+        }
+    }
+
     fn emit_request_completed(
         &self,
         method: &str,
         request_context: &ProductionRequestContext,
-        response: &DevResponse,
-        response_mode: ObservabilityResponseMode,
+        handled: &HandledProductionResponse,
         elapsed: Duration,
     ) {
         let (Some(emitter), Some(correlation_id)) = (
@@ -1615,12 +1687,15 @@ impl ProductionProject {
         ) else {
             return;
         };
-        let (outcome, error_class, failure_phase) = classify_response_observability(response);
+        let response = &handled.response;
+        let response_mode = handled.response_mode;
+        let (outcome, error_class, failure_phase) =
+            classify_response_observability(response, handled.observability_route_pattern());
         let http = || {
             HttpFields::new(
                 MethodClass::from_method(method),
                 Some(response.status),
-                response.route_pattern_header.as_deref(),
+                handled.observability_route_pattern(),
                 response_mode,
             )
         };
@@ -1640,7 +1715,7 @@ impl ProductionProject {
             )),
             _ => None,
         };
-        if response.route_pattern_header.is_some() {
+        if handled.observability_route_pattern().is_some() {
             if let Some((component, operation)) = render_operation {
                 let _ = emitter.emit(
                     Event::completed(
@@ -1917,12 +1992,40 @@ impl ProductionProject {
         renderer
     }
 
+    fn render_failure_response(
+        &self,
+        path: &str,
+        match_result: &RouteMatch,
+        error: &PageRenderError,
+    ) -> DevResponse {
+        if let Some(diagnostic) =
+            self.legacy_request_failure_diagnostic("render", path, &match_result.route.path, error)
+        {
+            eprintln!("{diagnostic}");
+        }
+        build_production_render_error_response(path, match_result, error)
+    }
+
+    fn bundle_failure_response(
+        &self,
+        path: &str,
+        match_result: &RouteMatch,
+        error: &ClientBundleError,
+    ) -> DevResponse {
+        if let Some(diagnostic) =
+            self.legacy_request_failure_diagnostic("bundle", path, &match_result.route.path, error)
+        {
+            eprintln!("{diagnostic}");
+        }
+        build_production_bundle_error_response(path, match_result, error)
+    }
+
     fn action_response(
         &self,
         headers: &HttpHeaders,
         body: &[u8],
         request_context: &ProductionRequestContext,
-    ) -> Result<DevResponse> {
+    ) -> Result<HandledProductionResponse> {
         let started = Instant::now();
         let mut replay_nonces = self.replay_nonces.as_ref().map(|replay_nonces| {
             replay_nonces
@@ -1948,7 +2051,10 @@ impl ProductionProject {
                     started.elapsed(),
                     request_context,
                 );
-                return Ok(response);
+                return Ok(HandledProductionResponse::new(
+                    response,
+                    ObservabilityResponseMode::Action,
+                ));
             }
         };
         drop(replay_nonces);
@@ -1967,7 +2073,10 @@ impl ProductionProject {
                 started.elapsed(),
                 request_context,
             );
-            return Ok(response);
+            return Ok(HandledProductionResponse::new(
+                response,
+                ObservabilityResponseMode::Action,
+            ));
         };
         let module_source = snapshot
             .server_module_sources
@@ -1990,11 +2099,7 @@ impl ProductionProject {
                     request.id, route_path
                 )))
             }
-            Err(error) => Ok(production_render_error_response(
-                &route_path,
-                &match_result,
-                &error,
-            )),
+            Err(error) => Ok(self.render_failure_response(&route_path, &match_result, &error)),
         }?;
         self.observe_action(
             Some(action_id),
@@ -2004,7 +2109,12 @@ impl ProductionProject {
             started.elapsed(),
             request_context,
         );
-        Ok(response)
+        let handled = HandledProductionResponse::new(response, ObservabilityResponseMode::Action);
+        if self.observability_emitter.is_some() && handled.observability_route_pattern().is_none() {
+            Ok(handled.with_observability_route_pattern(match_result.route.path.clone()))
+        } else {
+            Ok(handled)
+        }
     }
 
     fn artifact_route_stream_response(
@@ -2029,7 +2139,7 @@ impl ProductionProject {
                 ) {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        return production_render_error_response(path, match_result, &error);
+                        return self.render_failure_response(path, match_result, &error);
                     }
                 };
                 match renderer.render_document_to_stream_parts_with_conventions(
@@ -2057,7 +2167,7 @@ impl ProductionProject {
                         parts.chunks.into_iter().map(|chunk| chunk.html).collect(),
                     )
                     .with_modulepreload_links(client_bundle_scripts(client_bundle)),
-                    Err(error) => production_render_error_response(path, match_result, &error),
+                    Err(error) => self.render_failure_response(path, match_result, &error),
                 }
             }
             None => match renderer.render_page_to_stream_parts_with_conventions(
@@ -2085,9 +2195,9 @@ impl ProductionProject {
                         )
                         .with_modulepreload_links(client_bundle_scripts(client_bundle))
                     }
-                    Err(error) => production_render_error_response(path, match_result, &error),
+                    Err(error) => self.render_failure_response(path, match_result, &error),
                 },
-                Err(error) => production_render_error_response(path, match_result, &error),
+                Err(error) => self.render_failure_response(path, match_result, &error),
             },
         }
     }
@@ -2114,7 +2224,7 @@ impl ProductionProject {
                 ) {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        return production_render_error_response(path, match_result, &error);
+                        return self.render_failure_response(path, match_result, &error);
                     }
                 };
                 match renderer.render_document_to_server_payload_json_with_conventions(
@@ -2138,7 +2248,7 @@ impl ProductionProject {
                     conventions,
                 ) {
                     Ok(payload) => server_payload_response(payload, options.kind),
-                    Err(error) => production_render_error_response(path, match_result, &error),
+                    Err(error) => self.render_failure_response(path, match_result, &error),
                 }
             }
             None => match renderer.render_page_to_server_payload_json_with_conventions(
@@ -2148,7 +2258,7 @@ impl ProductionProject {
                 conventions,
             ) {
                 Ok(payload) => server_payload_response(payload, options.kind),
-                Err(error) => production_render_error_response(path, match_result, &error),
+                Err(error) => self.render_failure_response(path, match_result, &error),
             },
         }
     }
@@ -2180,7 +2290,7 @@ impl ProductionProject {
                             {
                                 Ok(action_bootstrap) => action_bootstrap,
                                 Err(error) => {
-                                    return production_render_error_response(
+                                    return self.render_failure_response(
                                         path,
                                         match_result,
                                         &error,
@@ -2232,15 +2342,13 @@ impl ProductionProject {
                                 )
                                 .with_modulepreload_links(client_bundle_scripts(&client_bundle)),
                                 Err(error) => {
-                                    production_render_error_response(path, match_result, &error)
+                                    self.render_failure_response(path, match_result, &error)
                                 }
                             },
-                            Err(error) => {
-                                production_bundle_error_response(path, match_result, &error)
-                            }
+                            Err(error) => self.bundle_failure_response(path, match_result, &error),
                         }
                     }
-                    Err(error) => production_render_error_response(path, match_result, &error),
+                    Err(error) => self.render_failure_response(path, match_result, &error),
                 }
             }
             None => match renderer.render_page_to_stream_parts_with_conventions(
@@ -2265,7 +2373,7 @@ impl ProductionProject {
                             {
                                 Ok(action_bootstrap) => action_bootstrap,
                                 Err(error) => {
-                                    return production_render_error_response(
+                                    return self.render_failure_response(
                                         path,
                                         match_result,
                                         &error,
@@ -2301,14 +2409,12 @@ impl ProductionProject {
                                 )
                                 .with_modulepreload_links(client_bundle_scripts(&client_bundle))
                             }
-                            Err(error) => {
-                                production_bundle_error_response(path, match_result, &error)
-                            }
+                            Err(error) => self.bundle_failure_response(path, match_result, &error),
                         }
                     }
-                    Err(error) => production_render_error_response(path, match_result, &error),
+                    Err(error) => self.render_failure_response(path, match_result, &error),
                 },
-                Err(error) => production_render_error_response(path, match_result, &error),
+                Err(error) => self.render_failure_response(path, match_result, &error),
             },
         }
     }
@@ -2340,7 +2446,7 @@ impl ProductionProject {
                             {
                                 Ok(action_bootstrap) => action_bootstrap,
                                 Err(error) => {
-                                    return production_render_error_response(
+                                    return self.render_failure_response(
                                         path,
                                         match_result,
                                         &error,
@@ -2390,15 +2496,13 @@ impl ProductionProject {
                                 ) {
                                 Ok(payload) => server_payload_response(payload, options.kind),
                                 Err(error) => {
-                                    production_render_error_response(path, match_result, &error)
+                                    self.render_failure_response(path, match_result, &error)
                                 }
                             },
-                            Err(error) => {
-                                production_bundle_error_response(path, match_result, &error)
-                            }
+                            Err(error) => self.bundle_failure_response(path, match_result, &error),
                         }
                     }
-                    Err(error) => production_render_error_response(path, match_result, &error),
+                    Err(error) => self.render_failure_response(path, match_result, &error),
                 }
             }
             None => match renderer.render_page_to_server_payload_json_with_conventions(
@@ -2408,16 +2512,45 @@ impl ProductionProject {
                 conventions,
             ) {
                 Ok(payload) => server_payload_response(payload, options.kind),
-                Err(error) => production_render_error_response(path, match_result, &error),
+                Err(error) => self.render_failure_response(path, match_result, &error),
             },
         }
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProductionRequestContext {
     client_ip: Option<String>,
     correlation_id: Option<CorrelationId>,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HandledProductionResponse {
+    response: DevResponse,
+    response_mode: ObservabilityResponseMode,
+    observability_route_pattern_override: Option<String>,
+}
+
+impl HandledProductionResponse {
+    fn new(response: DevResponse, response_mode: ObservabilityResponseMode) -> Self {
+        Self {
+            response,
+            response_mode,
+            observability_route_pattern_override: None,
+        }
+    }
+
+    fn with_observability_route_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.observability_route_pattern_override = Some(pattern.into());
+        self
+    }
+
+    fn observability_route_pattern(&self) -> Option<&str> {
+        self.observability_route_pattern_override
+            .as_deref()
+            .or(self.response.route_pattern_header.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2737,7 +2870,13 @@ impl ProductionWorkerPool {
                         break;
                     };
                     let _in_flight_guard = ProductionInFlightGuard(Arc::clone(&in_flight));
-                    let _ = handle_production_stream_concurrent(&mut stream, &project);
+                    if let Err(error) = handle_production_stream_concurrent(&mut stream, &project) {
+                        if let Some(diagnostic) =
+                            project.legacy_response_write_deadline_diagnostic(&error)
+                        {
+                            eprintln!("{diagnostic}");
+                        }
+                    }
                 }
             }));
         }
@@ -3326,13 +3465,15 @@ fn handle_production_stream(stream: &mut TcpStream, project: &ProductionProject)
         response_write_timeout,
         max_request_bytes,
         project.observability_emitter.as_ref(),
-        |request, correlation_id| match request.method.as_str() {
+        |request, correlation_id, started_at| match request.method.as_str() {
             "GET" => {
-                let context = project.request_context(&request.headers, peer_ip, correlation_id);
+                let context =
+                    project.request_context(&request.headers, peer_ip, correlation_id, started_at);
                 project.handle_get_with_context(&request.path, context)
             }
             "POST" => {
-                let context = project.request_context(&request.headers, peer_ip, correlation_id);
+                let context =
+                    project.request_context(&request.headers, peer_ip, correlation_id, started_at);
                 project.handle_post_with_context(
                     &request.path,
                     &request.headers,
@@ -3340,7 +3481,10 @@ fn handle_production_stream(stream: &mut TcpStream, project: &ProductionProject)
                     context,
                 )
             }
-            _ => Ok(DevResponse::method_not_allowed().with_cache_control("no-store")),
+            _ => Ok(HandledProductionResponse::new(
+                DevResponse::method_not_allowed().with_cache_control("no-store"),
+                ObservabilityResponseMode::Other,
+            )),
         },
     )
 }
@@ -3359,13 +3503,15 @@ fn handle_production_stream_concurrent(
         response_write_timeout,
         max_request_bytes,
         project.observability_emitter.as_ref(),
-        |request, correlation_id| match request.method.as_str() {
+        |request, correlation_id, started_at| match request.method.as_str() {
             "GET" => {
-                let context = project.request_context(&request.headers, peer_ip, correlation_id);
+                let context =
+                    project.request_context(&request.headers, peer_ip, correlation_id, started_at);
                 project.handle_get_with_context(&request.path, context)
             }
             "POST" => {
-                let context = project.request_context(&request.headers, peer_ip, correlation_id);
+                let context =
+                    project.request_context(&request.headers, peer_ip, correlation_id, started_at);
                 project.handle_post_with_context(
                     &request.path,
                     &request.headers,
@@ -3373,7 +3519,10 @@ fn handle_production_stream_concurrent(
                     context,
                 )
             }
-            _ => Ok(DevResponse::method_not_allowed().with_cache_control("no-store")),
+            _ => Ok(HandledProductionResponse::new(
+                DevResponse::method_not_allowed().with_cache_control("no-store"),
+                ObservabilityResponseMode::Other,
+            )),
         },
     )
 }
@@ -3395,7 +3544,12 @@ where
         response_write_timeout,
         max_request_bytes,
         None,
-        |request, _correlation_id| handle_request(request),
+        |request, _correlation_id, _started_at| {
+            handle_request(request).map(|response| {
+                let response_mode = response_mode_from_content_type(&response);
+                HandledProductionResponse::new(response, response_mode)
+            })
+        },
     )
 }
 
@@ -3408,7 +3562,11 @@ fn handle_production_stream_with_observability<F>(
     mut handle_request: F,
 ) -> Result<()>
 where
-    F: FnMut(&ParsedHttpRequest, Option<CorrelationId>) -> Result<DevResponse>,
+    F: FnMut(
+        &ParsedHttpRequest,
+        Option<CorrelationId>,
+        Instant,
+    ) -> Result<HandledProductionResponse>,
 {
     let correlation_id = emitter.map(|_| CorrelationId::generate());
     let started = Instant::now();
@@ -3439,16 +3597,17 @@ where
         Ok(RequestReadResult::Request(request)) => request,
         Ok(RequestReadResult::Response(response)) => {
             let response = response.with_cache_control("no-store");
+            let response_mode = response_mode_from_content_type(&response);
             if let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id.as_ref()) {
                 let (outcome, error_class, failure_phase) =
-                    classify_response_observability(&response);
+                    classify_response_observability(&response, None);
                 emit_server_terminal_event(
                     emitter,
                     correlation_id,
                     MethodClass::Other,
                     Some(response.status),
                     None,
-                    response_mode_from_content_type(&response),
+                    response_mode,
                     outcome,
                     error_class,
                     failure_phase,
@@ -3468,6 +3627,8 @@ where
                 correlation_id.as_ref(),
                 MethodClass::Other,
                 &response,
+                response_mode,
+                None,
                 started.elapsed(),
                 write_result.as_ref().err(),
             );
@@ -3488,17 +3649,25 @@ where
         gzip: request.accepts_gzip(),
         deadline: Some(response_write_timeout),
     };
-    let response = handle_request(&request, correlation_id.clone())?;
+    let HandledProductionResponse {
+        response,
+        response_mode,
+        observability_route_pattern_override,
+    } = handle_request(&request, correlation_id.clone(), started)?;
+    let observability_route_pattern = observability_route_pattern_override
+        .as_deref()
+        .or(response.route_pattern_header.as_deref());
     if !matches!(request.method.as_str(), "GET" | "POST") {
         if let (Some(emitter), Some(correlation_id)) = (emitter, correlation_id.as_ref()) {
-            let (outcome, error_class, failure_phase) = classify_response_observability(&response);
+            let (outcome, error_class, failure_phase) =
+                classify_response_observability(&response, observability_route_pattern.as_deref());
             emit_server_terminal_event(
                 emitter,
                 correlation_id,
                 MethodClass::from_method(&request.method),
                 Some(response.status),
-                response.route_pattern_header.as_deref(),
-                response_mode_from_content_type(&response),
+                observability_route_pattern.as_deref(),
+                response_mode,
                 outcome,
                 error_class,
                 failure_phase,
@@ -3513,6 +3682,8 @@ where
         correlation_id.as_ref(),
         MethodClass::from_method(&request.method),
         &response,
+        response_mode,
+        observability_route_pattern.as_deref(),
         started.elapsed(),
         write_result.as_ref().err(),
     );
@@ -3557,6 +3728,8 @@ fn emit_transport_terminal_event(
     correlation_id: Option<&CorrelationId>,
     method: MethodClass,
     response: &DevResponse,
+    response_mode: ObservabilityResponseMode,
+    observability_route_pattern: Option<&str>,
     elapsed: Duration,
     write_error: Option<&DevServerError>,
 ) {
@@ -3589,8 +3762,8 @@ fn emit_transport_terminal_event(
         .with_http(HttpFields::new(
             method,
             Some(response.status),
-            response.route_pattern_header.as_deref(),
-            response_mode_from_content_type(response),
+            observability_route_pattern,
+            response_mode,
         )),
     );
 }
@@ -5546,7 +5719,7 @@ fn push_meta_property(tags: &mut Vec<String>, property: &str, content: Option<&s
     }
 }
 
-fn production_render_error_response(
+fn build_production_render_error_response(
     path: &str,
     match_result: &RouteMatch,
     error: &PageRenderError,
@@ -5583,7 +5756,7 @@ fn render_production_render_error(status: u16, path: &str, match_result: &RouteM
     )
 }
 
-fn production_bundle_error_response(
+fn build_production_bundle_error_response(
     path: &str,
     match_result: &RouteMatch,
     error: &ClientBundleError,
@@ -5598,10 +5771,9 @@ fn production_bundle_error_response(
 
 fn classify_response_observability(
     response: &DevResponse,
+    observability_route_pattern: Option<&str>,
 ) -> (Outcome, Option<ErrorClass>, Option<FailurePhase>) {
-    let response_phase = response
-        .route_pattern_header
-        .as_ref()
+    let response_phase = observability_route_pattern
         .map(|_| FailurePhase::Render)
         .unwrap_or(FailurePhase::Read);
     match response.status {
@@ -5696,6 +5868,15 @@ fn classify_observability_io_error(error: &std::io::Error) -> (Outcome, ErrorCla
         }
         _ => (Outcome::Error, ErrorClass::Io),
     }
+}
+
+fn is_response_write_deadline_error(error: &DevServerError) -> bool {
+    matches!(
+        error,
+        DevServerError::Io(error)
+            if error.kind() == std::io::ErrorKind::TimedOut
+                && error.to_string() == PRODUCTION_RESPONSE_WRITE_DEADLINE_MESSAGE
+    )
 }
 
 fn render_production_bundle_error(status: u16, path: &str, match_result: &RouteMatch) -> String {
@@ -7897,6 +8078,12 @@ process.exit(1);
             events[3].http.as_ref().unwrap().route_pattern.as_str(),
             "/posts/:id"
         );
+        assert!(
+            events[1..]
+                .iter()
+                .all(|event| event.http.as_ref().unwrap().response_mode
+                    == ObservabilityResponseMode::Document)
+        );
         for event in events {
             let encoded = event.to_json_line().unwrap();
             assert!(!encoded.contains("private-id"));
@@ -7905,6 +8092,172 @@ process.exit(1);
             assert!(!encoded.contains("client_ip"));
             assert!(!encoded.contains("\"path\""));
         }
+    }
+
+    #[test]
+    fn structured_navigation_modes_match_the_correlated_direct_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(8);
+        let mut project = production_project_for(&app);
+        project.observability_emitter = Some(emitter);
+
+        let json_response = project
+            .handle_get(&format!(
+                "/?{SERVER_PAYLOAD_QUERY_NAME}={SERVER_PAYLOAD_QUERY_VALUE}"
+            ))
+            .unwrap();
+        let stream_response = project
+            .handle_get(&format!(
+                "/?{SERVER_PAYLOAD_QUERY_NAME}={SERVER_PAYLOAD_STREAM_QUERY_VALUE}"
+            ))
+            .unwrap();
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(json_response.status, 200);
+        assert_eq!(stream_response.status, 200);
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.sequence > 0)
+                .map(|event| event.http.as_ref().unwrap().response_mode)
+                .collect::<Vec<_>>(),
+            vec![
+                ObservabilityResponseMode::PayloadJson,
+                ObservabilityResponseMode::PayloadJson,
+                ObservabilityResponseMode::PayloadStream,
+                ObservabilityResponseMode::PayloadStream,
+            ]
+        );
+        assert_eq!(events[0].correlation_id, events[1].correlation_id);
+        assert_eq!(events[1].correlation_id, events[2].correlation_id);
+        assert_eq!(events[3].correlation_id, events[4].correlation_id);
+        assert_eq!(events[4].correlation_id, events[5].correlation_id);
+        assert_ne!(events[0].correlation_id, events[3].correlation_id);
+        assert_eq!(events[1].component, ObservabilityComponent::Navigation);
+        assert_eq!(
+            events[1].operation,
+            ObservabilityOperation::RenderNavigation
+        );
+        assert_eq!(events[4].component, ObservabilityComponent::Navigation);
+        assert_eq!(events[4].operation, ObservabilityOperation::RenderStream);
+    }
+
+    #[test]
+    fn structured_response_modes_survive_asset_and_odd_post_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let mut asset_project = production_project_for(&app);
+        let html = asset_project.handle_get("/").unwrap().body_text();
+        let script = static_script_src(&html);
+        let (asset_emitter, asset_receiver) = ferrite_core::observability::bounded_channel(8);
+        asset_project.observability_emitter = Some(asset_emitter);
+
+        let asset_response = production_http_request(
+            asset_project,
+            format!("GET {script} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+        );
+        let asset_events = asset_receiver.try_iter().collect::<Vec<_>>();
+
+        assert!(response_headers(&asset_response).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(asset_events.len(), 3);
+        assert!(
+            asset_events[1..]
+                .iter()
+                .all(|event| event.http.as_ref().unwrap().response_mode
+                    == ObservabilityResponseMode::Asset)
+        );
+
+        let odd_app = temp.path().join("odd-app");
+        write(
+            &odd_app.join("page.tsx"),
+            "export default function Page() {}",
+        );
+        let (odd_emitter, odd_receiver) = ferrite_core::observability::bounded_channel(8);
+        let mut odd_project = production_project_for(&odd_app);
+        odd_project.observability_emitter = Some(odd_emitter);
+        let odd_response = production_http_request(
+            odd_project,
+            b"POST /not-an-action HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        let odd_events = odd_receiver.try_iter().collect::<Vec<_>>();
+
+        assert!(response_headers(&odd_response).starts_with("HTTP/1.1 405 Method Not Allowed"));
+        assert_eq!(odd_events.len(), 3);
+        assert!(
+            odd_events[1..]
+                .iter()
+                .all(|event| event.http.as_ref().unwrap().response_mode
+                    == ObservabilityResponseMode::Other)
+        );
+    }
+
+    #[test]
+    fn structured_socket_durations_share_the_pre_read_request_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(8);
+        let mut project = production_project_for(&app);
+        let observed_requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&observed_requests);
+        project.config.request_observer = Some(ProductionRequestObserver::new(move |event| {
+            captured_requests.lock().unwrap().push(event);
+        }));
+        project.config.metrics_path = Some("/metrics".to_owned());
+        project.config.request_read_timeout = Duration::from_secs(1);
+        project.observability_emitter = Some(emitter);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut accepted, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            handle_production_stream(&mut accepted, &project).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n")
+            .unwrap();
+        thread::sleep(Duration::from_millis(250));
+        stream.write_all(b"\r\n").unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        server.join().unwrap();
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        let observed_requests = observed_requests.lock().unwrap();
+
+        assert!(response_headers(&response).starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(observed_requests.len(), 1);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(events[2].sequence, 3);
+        assert!(
+            events[1..]
+                .iter()
+                .all(|event| event.duration_ms.unwrap() >= 200)
+        );
+        assert!(
+            events[1..]
+                .iter()
+                .all(|event| event.http.as_ref().unwrap().response_mode
+                    == ObservabilityResponseMode::Metrics)
+        );
+        let legacy_elapsed_ms =
+            u64::try_from(observed_requests[0].elapsed.as_millis()).unwrap_or(u64::MAX);
+        assert!(
+            events[1]
+                .duration_ms
+                .unwrap()
+                .saturating_sub(legacy_elapsed_ms)
+                >= 200
+        );
     }
 
     #[test]
@@ -8030,6 +8383,8 @@ process.exit(17);
             Some(&correlation_id),
             MethodClass::Get,
             &response,
+            ObservabilityResponseMode::Other,
+            Some("/posts/:id"),
             Duration::from_millis(5),
             Some(&disconnected),
         );
@@ -8038,6 +8393,8 @@ process.exit(17);
             Some(&correlation_id),
             MethodClass::Get,
             &response,
+            ObservabilityResponseMode::Other,
+            Some("/posts/:id"),
             Duration::from_millis(7),
             Some(&timed_out),
         );
@@ -8064,6 +8421,43 @@ process.exit(17);
         let project = production_project_for(&app);
 
         assert!(project.observability_emitter.is_none());
+        assert!(project.legacy_diagnostics_enabled());
+        let legacy = project
+            .legacy_request_failure_diagnostic(
+                "render",
+                "/private-id",
+                "/posts/:id",
+                "private renderer detail",
+            )
+            .expect("default mode preserves the legacy diagnostic");
+        assert!(legacy.contains("private-id"));
+        assert!(legacy.contains("/posts/:id"));
+        assert!(legacy.contains("private renderer detail"));
+        let deadline_error = DevServerError::Io(response_write_deadline_error());
+        assert!(
+            project
+                .legacy_response_write_deadline_diagnostic(&deadline_error)
+                .is_some()
+        );
+
+        let (emitter, _receiver) = ferrite_core::observability::bounded_channel(1);
+        let project = project.with_observability_emitter(emitter);
+        assert!(!project.legacy_diagnostics_enabled());
+        assert!(
+            project
+                .legacy_request_failure_diagnostic(
+                    "render",
+                    "/private-id",
+                    "/posts/:id",
+                    "private renderer detail",
+                )
+                .is_none()
+        );
+        assert!(
+            project
+                .legacy_response_write_deadline_diagnostic(&deadline_error)
+                .is_none()
+        );
     }
 
     #[test]
@@ -8074,7 +8468,8 @@ process.exit(17);
             &app.join("posts/[id]/page.tsx"),
             "export default function Page() {}",
         );
-        let project = action_production_project_for(
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(8);
+        let mut project = action_production_project_for(
             &app,
             r#"
 if (process.argv[2] === "--server-action") {
@@ -8084,6 +8479,7 @@ if (process.argv[2] === "--server-action") {
 process.exit(2);
 "#,
         );
+        project.observability_emitter = Some(emitter);
         let body = action_form_body("/posts/abc");
         let request = format!(
             "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
@@ -8094,10 +8490,38 @@ process.exit(2);
         let response = production_http_request(project, request.as_bytes());
         let headers = response_headers(&response);
         let body = String::from_utf8_lossy(response_body(&response));
+        let events = receiver.try_iter().collect::<Vec<_>>();
 
         assert!(headers.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(!headers.contains("X-Ferrite-Route-Pattern"));
         assert!(body.contains("Ferrite could not render this route."));
         assert!(!body.contains("private action failure detail"));
+        assert_eq!(events.len(), 3);
+        let server = &events[1];
+        let transport = &events[2];
+        assert_eq!(server.sequence, 2);
+        assert_eq!(server.error_class, Some(ErrorClass::Internal));
+        assert_eq!(server.failure_phase, Some(FailurePhase::Render));
+        assert_eq!(
+            server.http.as_ref().unwrap().route_pattern.as_str(),
+            "/posts/:id"
+        );
+        assert_eq!(
+            server.http.as_ref().unwrap().response_mode,
+            ObservabilityResponseMode::Action
+        );
+        assert_eq!(
+            transport.http.as_ref().unwrap().response_mode,
+            ObservabilityResponseMode::Action
+        );
+        for event in events {
+            assert!(
+                !event
+                    .to_json_line()
+                    .unwrap()
+                    .contains("private action failure detail")
+            );
+        }
     }
 
     #[test]
