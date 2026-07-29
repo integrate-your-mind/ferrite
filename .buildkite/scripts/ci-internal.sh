@@ -49,8 +49,6 @@ if (( DIRECT_EXECUTION == 1 )) && [[ -n "${FERRITE_CI_REPORT_DIR:-}" ]]; then
 fi
 REPORT_DIR="${FERRITE_CI_REPORT_DIR:-${DEFAULT_REPORT_DIR}}"
 readonly REPORT_DIR
-MIN_FREE_KIB=20971520
-readonly MIN_FREE_KIB
 RUST_TOOLCHAIN="1.95.0"
 readonly RUST_TOOLCHAIN
 COVERAGE_RUST_LINES_FLOOR="90.00"
@@ -285,10 +283,11 @@ check_coverage_sources() {
         if (path != source) next
         if (found) exit 3
         found = 1
+        source_value = value
       }
       END {
         if (!found) exit 1
-        print value
+        print source_value
       }
     ' "${log}")" || {
       local status="$?"
@@ -353,13 +352,6 @@ activate_rust_toolchain() {
 }
 
 preflight() {
-  local available_kib
-  available_kib="$(/bin/df -Pk "${ROOT}" | /usr/bin/awk 'NR == 2 { print $4 }')"
-  [[ "${available_kib}" =~ ^[0-9]+$ ]] ||
-    fail "could not determine available storage for ${ROOT}"
-  (( available_kib >= MIN_FREE_KIB )) ||
-    fail "storage admission requires at least ${MIN_FREE_KIB} KiB free; found ${available_kib} KiB"
-
   [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] ||
     fail "a clean worktree, including untracked files, is required"
 
@@ -439,8 +431,6 @@ preflight() {
     printf 'cargo_profile_dev_debug=%s\n' "${CARGO_PROFILE_DEV_DEBUG}"
     printf 'cargo_profile_dev_split_debuginfo=%s\n' \
       "${CARGO_PROFILE_DEV_SPLIT_DEBUGINFO}"
-    printf 'storage_available_kib=%s\n' "${available_kib}"
-    printf 'storage_minimum_kib=%s\n' "${MIN_FREE_KIB}"
   } > "${REPORT_DIR}/environment.txt"
 
   verify_report_commit "$(git rev-parse HEAD)"

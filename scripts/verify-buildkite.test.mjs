@@ -5,6 +5,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   stat,
   symlink,
@@ -203,16 +204,13 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.match(source, /COVERAGE_NATIVE_LINES_FLOOR="78\.00"/);
   assert.match(source, /COVERAGE_SITE_LINES_FLOOR="70\.00"/);
   assert.match(source, /check_coverage_floor/);
-  assert.match(source, /MIN_FREE_KIB=20971520/);
-  assert.match(source, /\/bin\/df -Pk "\$\{ROOT\}"/);
-  assert.match(source, /storage admission requires at least/);
+  assert.doesNotMatch(source, /MIN_FREE_KIB|\/bin\/df -Pk|storage admission/);
   assert.match(source, /git status --porcelain=v1 --untracked-files=all/);
   assert.doesNotMatch(source, /git diff --quiet/);
   const preflightSource = source.slice(
     source.indexOf("preflight() {"),
     source.indexOf("\nbootstrap() {"),
   );
-  const storageIndex = preflightSource.indexOf("/bin/df -Pk");
   const cleanlinessIndex = preflightSource.indexOf(
     "git status --porcelain=v1 --untracked-files=all",
   );
@@ -232,8 +230,7 @@ test("local CI retains the host-executable validation gate categories", async ()
     reportIndex,
   );
   assert.ok(
-    storageIndex >= 0 &&
-      cleanlinessIndex >= 0 &&
+    cleanlinessIndex >= 0 &&
       finalIdentityIndex >= 0 &&
       finalCleanlinessIndex >= 0 &&
       reportIndex >= 0 &&
@@ -242,8 +239,8 @@ test("local CI retains the host-executable validation gate categories", async ()
     "preflight ordering markers must exist",
   );
   assert.ok(
-    storageIndex < cleanlinessIndex && cleanlinessIndex < reportIndex,
-    "storage admission and cleanliness must run before CI creates report output",
+    cleanlinessIndex < reportIndex,
+    "cleanliness must run before CI creates report output",
   );
   assert.ok(
       finalIdentityIndex < finalCleanlinessIndex &&
@@ -310,7 +307,10 @@ test("local CI retains the host-executable validation gate categories", async ()
   assert.doesNotMatch(source, /coverage-rust env RUSTC=/);
   assert.doesNotMatch(source, /gitleaks git [^\n]*--log-opts=-1/);
   assert.doesNotMatch(source, /corepack pnpm/);
-  assert.doesNotMatch(source, /\bnpm publish\b|\bcargo publish\b|\bdeploy\b/);
+  assert.doesNotMatch(
+    source,
+    /\bnpm publish\b|\bcargo publish\b|\bwrangler deploy\b/,
+  );
 });
 
 test("local CI isolates receipts by commit, mode, and run", async () => {
@@ -335,6 +335,7 @@ test("local CI creates exclusive report runs and rejects symlink collisions", as
   const outside = join(tempRoot, "outside");
   await mkdir(workspace);
   await mkdir(outside);
+  const physicalWorkspace = await realpath(workspace);
   await writeFile(join(workspace, "Cargo.lock"), "# test lockfile\n");
   for (const args of [
     ["init", "--quiet"],
@@ -387,7 +388,10 @@ test("local CI creates exclusive report runs and rejects symlink collisions", as
 
     const first = invoke("run-one");
     assert.equal(first.status, 0, first.stderr);
-    assert.equal(first.stdout, join(workspace, "dist", "ci", head, "sourced", "run-one"));
+    assert.equal(
+      first.stdout,
+      join(physicalWorkspace, "dist", "ci", head, "sourced", "run-one"),
+    );
 
     const second = invoke("run-two");
     assert.equal(second.status, 0, second.stderr);

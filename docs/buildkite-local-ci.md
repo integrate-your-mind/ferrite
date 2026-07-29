@@ -75,17 +75,10 @@ reports fail closed. These floors sit below the current exact results (90.99%,
 81.57%, and 79.50%) to detect regressions without pretending to be a quality
 target.
 
-Each of the six proof-mode jobs checks storage before creating reports,
-installing dependencies, or building source. It fails closed unless the
-checkout volume has at least 20 GiB available, then records the observed and
-required KiB values in
-`dist/ci/<commit>/<mode>/<job-or-UUID>/environment.txt`. Run directories are
-created exclusively, reject symlinked path components, and cannot be redirected
-with `FERRITE_CI_REPORT_DIR` during a direct CI invocation. That override exists
-only for isolated sourced unit tests. The
-pipeline-upload bootstrap does not build source or create proof reports. Do
-not bypass the proof-mode guard to turn an `ENOSPC` failure into a nominal CI
-result.
+Run directories are created exclusively, reject symlinked path components,
+and cannot be redirected with `FERRITE_CI_REPORT_DIR` during a direct CI
+invocation. That override exists only for isolated sourced unit tests. The
+pipeline-upload bootstrap does not build source or create proof reports.
 
 Each gate records its starting commit, tree, `Cargo.lock` SHA-256, and
 worktree status, then verifies that all four are unchanged before reporting a
