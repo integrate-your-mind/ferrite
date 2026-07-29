@@ -203,6 +203,7 @@ test("falls back only to the declared static route on render failure, deadline, 
         root: [0, "larger than four bytes"],
       }),
       maxHtmlBytes: 4,
+      fallbackBody: "tiny",
     },
   ];
 
@@ -219,10 +220,13 @@ test("falls back only to the declared static route on render failure, deadline, 
     });
     const response = await handler.fetch(
       new Request("https://example.test/docs?private=1"),
-      assets(seen),
+      assets(seen, new Response(scenario.fallbackBody ?? "static docs", {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      })),
     );
     assert.equal(response.status, 200, scenario.name);
-    assert.equal(await response.text(), "static docs", scenario.name);
+    assert.equal(await response.text(), scenario.fallbackBody ?? "static docs", scenario.name);
     assert.equal(response.headers.get("x-ferrite-render"), "static-fallback", scenario.name);
     assert.deepEqual(seen, [{ method: "GET", pathname: "/docs/index.html" }], scenario.name);
   }

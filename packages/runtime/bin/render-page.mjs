@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import {
   access,
@@ -10,7 +10,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { isBuiltin } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { build, version as esbuildVersion } from "esbuild";
@@ -19,6 +19,11 @@ const CLIENT_ORIGINAL_SUFFIX = "?ferrite-client-original";
 const SHA256_BUILD_ID = /^sha256:[a-f0-9]{64}$/;
 const ZERO_SHA256_BUILD_ID = `sha256:${"0".repeat(64)}`;
 const CLOUDFLARE_ROUTE_RECEIPT_FORMAT = "ferrite-cloudflare-route-receipt";
+const CLOUDFLARE_RECEIPT_PACKAGES = Object.freeze([
+  { name: "@ferrite/runtime", allowedPrefix: "dist/" },
+  { name: "@ferrite/protocol", allowedPrefix: "dist/" },
+]);
+const requireFromRuntime = createRequire(import.meta.url);
 
 const args = process.argv.slice(2);
 const prebuiltArtifact = args[0] === "--prebuilt";
@@ -555,6 +560,9 @@ async function buildCloudflareServerArtifact({
       target: "es2022",
       conditions: ["workerd", "worker", "browser", "import", "default"],
       mainFields: ["module", "main"],
+      minifyIdentifiers: false,
+      minifySyntax: true,
+      minifyWhitespace: true,
     },
     inputs: final.inputs,
     canonicalModule,
@@ -799,8 +807,11 @@ async function bundleServerArtifact({
       ? {
           conditions: ["workerd", "worker", "browser", "import", "default"],
           mainFields: ["module", "main"],
+          minifyIdentifiers: false,
+          minifySyntax: true,
+          minifyWhitespace: true,
         }
-      : {}),
+      : { minify: true }),
     jsx: "automatic",
     jsxImportSource: "@ferrite/runtime",
     plugins: [
@@ -819,7 +830,6 @@ async function bundleServerArtifact({
       ".css": "empty",
     },
     legalComments: "none",
-    minify: true,
     metafile: true,
     logLevel: "silent",
   });
@@ -975,10 +985,10 @@ function recordCloudflareInput(inputSnapshot, file, contents) {
 }
 
 async function serializeCloudflareInputSnapshot(inputSnapshot, projectRoot, entryFile) {
-  const [canonicalProjectRoot, canonicalEntry, canonicalRuntimeRoot] = await Promise.all([
+  const [canonicalProjectRoot, canonicalEntry, ferritePackageRoots] = await Promise.all([
     realSourcePath(projectRoot),
     realSourcePath(entryFile),
-    realSourcePath(resolve(dirname(fileURLToPath(import.meta.url)), "..")),
+    cloudflareReceiptPackageRoots(),
   ]);
   const records = [];
   for (const [file, contents] of inputSnapshot) {
@@ -987,19 +997,36 @@ async function serializeCloudflareInputSnapshot(inputSnapshot, projectRoot, entr
       continue;
     }
     let path;
-    if (isPathInside(canonicalProjectRoot, canonicalFile)) {
+    const ferritePackage = ferritePackageRoots.find(({ root }) =>
+      isPathInside(root, canonicalFile)
+    );
+    if (ferritePackage) {
+      const packageRelative = portableRelativePath(ferritePackage.root, canonicalFile);
+      if (
+        !packageRelative.startsWith(ferritePackage.allowedPrefix) ||
+        !isCanonicalReceiptRelativePath(packageRelative)
+      ) {
+        throw new TypeError(
+          `Ferrite Cloudflare route imported unsupported ${ferritePackage.name} input "${packageRelative || "<package-root>"}".`,
+        );
+      }
+      path = `${ferritePackage.name}/${packageRelative}`;
+    } else if (isPathInside(canonicalProjectRoot, canonicalFile)) {
       const projectRelative = portableRelativePath(canonicalProjectRoot, canonicalFile);
+      if (!isCanonicalReceiptRelativePath(projectRelative)) {
+        throw new TypeError(
+          `Ferrite Cloudflare route imported non-canonical project input "${projectRelative}".`,
+        );
+      }
       if (hasGeneratedSourceSegment(projectRelative)) {
         throw new TypeError(
           `Ferrite Cloudflare route imported excluded generated source "${projectRelative}".`,
         );
       }
       path = `project/${projectRelative}`;
-    } else if (isPathInside(canonicalRuntimeRoot, canonicalFile)) {
-      path = `@ferrite/runtime/${portableRelativePath(canonicalRuntimeRoot, canonicalFile)}`;
     } else {
       throw new TypeError(
-        `Ferrite Cloudflare route imported source outside the project and runtime roots: "${canonicalFile}".`,
+        `Ferrite Cloudflare route imported source outside the project and Ferrite package roots: "${canonicalFile}".`,
       );
     }
     records.push({
@@ -1023,6 +1050,48 @@ async function serializeCloudflareInputSnapshot(inputSnapshot, projectRoot, entr
   return records;
 }
 
+async function cloudflareReceiptPackageRoots() {
+  const roots = await Promise.all(CLOUDFLARE_RECEIPT_PACKAGES.map((descriptor) =>
+    verifiedPackageRoot(
+      descriptor,
+      descriptor.name === "@ferrite/runtime"
+        ? fileURLToPath(import.meta.url)
+        : requireFromRuntime.resolve(descriptor.name),
+    )
+  ));
+  const seen = new Set();
+  for (const { name, root } of roots) {
+    if (seen.has(root)) {
+      throw new TypeError(
+        `Ferrite Cloudflare receipt packages resolve to the same canonical root: "${root}" (${name}).`,
+      );
+    }
+    seen.add(root);
+  }
+  return roots.sort((left, right) =>
+    right.root.length - left.root.length ||
+    Buffer.from(left.name).compare(Buffer.from(right.name))
+  );
+}
+
+async function verifiedPackageRoot(descriptor, entryFile) {
+  const root = await realSourcePath(await findNearestPackageRoot(entryFile));
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+  } catch (error) {
+    throw new TypeError(
+      `Ferrite Cloudflare receipt root for "${descriptor.name}" has an unreadable package manifest: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (manifest?.name !== descriptor.name) {
+    throw new TypeError(
+      `Ferrite Cloudflare receipt root for "${descriptor.name}" resolved to package "${String(manifest?.name ?? "<missing>")}".`,
+    );
+  }
+  return { ...descriptor, root };
+}
+
 function assertSameCloudflareInputs(expected, actual) {
   if (JSON.stringify(expected) !== JSON.stringify(actual)) {
     throw new TypeError(
@@ -1038,6 +1107,39 @@ function isPathInside(root, candidate) {
 
 function portableRelativePath(root, candidate) {
   return relative(root, candidate).split(sep).join("/");
+}
+
+function isCanonicalReceiptRelativePath(path) {
+  return (
+    path.length > 0 &&
+    !path.startsWith("/") &&
+    !path.includes("\\") &&
+    path.split("/").every((segment) =>
+      segment.length > 0 && segment !== "." && segment !== ".."
+    )
+  );
+}
+
+function isCloudflareReceiptInputPath(path) {
+  const projectPrefix = "project/";
+  if (path.startsWith(projectPrefix)) {
+    const projectRelative = path.slice(projectPrefix.length);
+    return (
+      isCanonicalReceiptRelativePath(projectRelative) &&
+      !hasGeneratedSourceSegment(projectRelative)
+    );
+  }
+  return CLOUDFLARE_RECEIPT_PACKAGES.some(({ name, allowedPrefix }) => {
+    const packagePrefix = `${name}/`;
+    if (!path.startsWith(packagePrefix)) {
+      return false;
+    }
+    const packageRelative = path.slice(packagePrefix.length);
+    return (
+      packageRelative.startsWith(allowedPrefix) &&
+      isCanonicalReceiptRelativePath(packageRelative)
+    );
+  });
 }
 
 function portablePath(file, projectRoot) {
@@ -1364,6 +1466,9 @@ async function verifyCloudflareArtifactReceipt(buildArgs) {
       JSON.stringify(["workerd", "worker", "browser", "import", "default"]) ||
     JSON.stringify(receipt.compiler?.mainFields) !==
       JSON.stringify(["module", "main"]) ||
+    receipt.compiler?.minifyIdentifiers !== false ||
+    receipt.compiler?.minifySyntax !== true ||
+    receipt.compiler?.minifyWhitespace !== true ||
     !Array.isArray(receipt.inputs)
   ) {
     throw new TypeError("Ferrite Cloudflare route receipt has an invalid schema.");
@@ -1375,8 +1480,7 @@ async function verifyCloudflareArtifactReceipt(buildArgs) {
       typeof input !== "object" ||
       Array.isArray(input) ||
       typeof input.path !== "string" ||
-      (!input.path.startsWith("project/") &&
-        !input.path.startsWith("@ferrite/runtime/")) ||
+      !isCloudflareReceiptInputPath(input.path) ||
       !Number.isSafeInteger(input.bytes) ||
       input.bytes < 0 ||
       !/^[a-f0-9]{64}$/.test(input.sha256 ?? "") ||

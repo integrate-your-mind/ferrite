@@ -32,12 +32,20 @@ It rejects dynamic/catch-all route patterns, server actions, reserved payload-st
 The current Ferrite stream API resolves every deferred Suspense chunk before it returns a packet. The Worker adapter therefore does not claim progressive SSR streaming. A deadline or aborted request abandons the response path, but JavaScript cannot forcibly cancel an arbitrary user promise that ignores `AbortSignal`.
 
 The experimental generator derives each route's source identity from the exact
-transitive project and Ferrite runtime bytes consumed by esbuild. It rejects
-imports outside those receipt roots, rechecks every input after each build
-pass, derives a canonical module identity with one fixed-width sentinel, and
-writes `<route>.receipt.json` with the final module size and SHA-256. A
+transitive project, `@ferrite/runtime`, and `@ferrite/protocol` bytes consumed by
+esbuild. It verifies those Ferrite package names before trusting only their
+published `dist/` trees, rejects imports outside those receipt roots, rechecks
+every input after each build pass, derives a canonical module identity with one
+fixed-width sentinel, and writes `<route>.receipt.json` with the final module
+size and SHA-256. A
 caller-supplied `sourceBuildId` is only an assertion and is rejected when stale;
 it never selects the identity.
+
+Cloudflare artifacts retain esbuild's syntax and whitespace minification but
+disable identifier renaming. Esbuild's identifier names depend on character
+frequency, so renaming could otherwise change unrelated bundle bytes when the
+fixed-width module identity is substituted. The receipt records and verifies
+all three minification settings.
 
 The artifact also embeds a metadata identity derived from the route path,
 fallback path, asset identity, source identity, schema version, and observed
@@ -126,8 +134,9 @@ node packages/runtime/bin/render-page.mjs \
 
 The build uses an isolate-oriented ESM target and fails if application code
 imports a Node built-in or resolves transitive source outside the project and
-Ferrite runtime receipt roots. The only external allowed by this first profile
-is `node:async_hooks` from Ferrite's own server runtime.
+the explicitly verified `@ferrite/runtime` and `@ferrite/protocol` receipt roots.
+The only external allowed by this first profile is `node:async_hooks` from
+Ferrite's own server runtime.
 `PROFILE=release pnpm --filter @ferrite/protocol-wasm build` builds the
 release-profile WASM used for bundle-size and production proof.
 

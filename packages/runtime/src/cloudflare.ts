@@ -557,7 +557,7 @@ async function readBoundedResponseBody(
   label: string,
   signal: AbortSignal,
   deadline: number,
-): Promise<Uint8Array> {
+): Promise<Uint8Array<ArrayBuffer>> {
   const declaredSize = response.headers.get("content-length");
   if (
     declaredSize !== null &&
