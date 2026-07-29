@@ -71,14 +71,20 @@ worktree checks.
 is 90.00%, runtime JavaScript is 80.00%, and native JavaScript is 78.00%.
 Rust parsing requires a `TOTAL` lines percentage; Node parsing requires a
 well-formed `# all files | ...` summary. Empty, malformed, or under-floor
-reports fail closed. These floors sit below the current exact results (90.99%,
-81.57%, and 79.50%) to detect regressions without pretending to be a quality
+reports fail closed. These floors sit below the current exact results (90.94%,
+81.72%, and 83.23%) to detect regressions without pretending to be a quality
 target.
 
 Run directories are created exclusively, reject symlinked path components,
 and cannot be redirected with `FERRITE_CI_REPORT_DIR` during a direct CI
 invocation. That override exists only for isolated sourced unit tests. The
 pipeline-upload bootstrap does not build source or create proof reports.
+Buildkite reports that externally configured bootstrap as a script job, but
+its step key is provider/settings metadata rather than a repository-owned key.
+The release verifier identifies it by the exact
+`./.buildkite/scripts/upload-pipeline.mjs` command. It requires exactly that
+bootstrap plus the six keyed repository jobs, rejects every other current job
+or job type, and ignores only explicitly superseded retries.
 
 Each gate records its starting commit, tree, `Cargo.lock` SHA-256, and
 worktree status, then verifies that all four are unchanged before reporting a
