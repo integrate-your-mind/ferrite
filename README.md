@@ -52,13 +52,13 @@ Ferrite currently provides a buildable framework foundation with:
 - server-first routes with whole-route hydration and imported client-component islands;
 - a browser DOM runtime with mounting, hydration, events, state, effects, refs, memo helpers, transitions, error boundaries, and keyed reconciliation;
 - bounded payload navigation, prefetching, stream-frame handling, history restoration, stale-navigation ownership, and managed document-head updates;
-- explicit form-based server actions with origin checks and optional CSRF, replay, proxy, logging, and metrics controls;
+- explicit form-based server actions with origin checks and optional CSRF, process-local replay, application-session/route binding, proxy, logging, and metrics controls;
 - deterministic production artifacts with declared files, sizes, SHA-256 records, route metadata, browser bundles, prerenders, and action metadata;
 - an artifact-only production server with bounded requests, worker admission, timeouts, overload rejection, cleanup, signal-driven drain, and generic public errors;
 - native Node SSR bindings with checksum verification and fail-closed macOS copy signing, plus a browser-consumable WASM protocol validator;
 - real example applications, a source-backed project website, and local package, browser, nginx, container, failure-path, and recovery proof.
 
-Ferrite is not a drop-in React or Next.js replacement. It does not yet provide a stable registry install path, full React Server Components, automatic `"use server"` discovery, distributed replay state, general auth middleware, file uploads, complete tracing, broad platform proof, or a supported public HTTP edge.
+Ferrite is not a drop-in React or Next.js replacement. It does not yet provide a stable registry install path, full React Server Components, automatic `"use server"` discovery, distributed replay state, general auth middleware, file uploads, complete tracing, broad platform proof, or a supported public HTTP edge. Its optional session-cookie replay binding verifies only continuity with an app-owned cookie; it does not authenticate that cookie or coordinate nonce use across processes.
 
 ## Requirements
 
@@ -193,6 +193,12 @@ Production deployments should put Ferrite behind a mature edge such as nginx, En
 - [Deployment guide](docs/deployment.md)
 - [Architecture](docs/architecture.md)
 - [Production-readiness review](docs/production-readiness-review-2026-07-10.md)
+
+Server actions can opt into process-local replay nonces bound to one app-owned
+session cookie value and exact route. This does not authenticate the cookie,
+authorize an action, or coordinate replay state across processes. See the
+[deployment security notes](docs/deployment.md#security-notes) for retry,
+rotation, cookie, and sticky-process requirements.
 
 ## Proof and limits
 

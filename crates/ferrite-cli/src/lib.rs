@@ -280,6 +280,12 @@ struct ServeArgs {
 
     #[arg(
         long,
+        help = "Application session cookie used to bind replay nonces to one session and route; requires --server-action-replay-ttl-ms"
+    )]
+    server_action_session_cookie_name: Option<String>,
+
+    #[arg(
+        long,
         help = "Trusted public HTTP(S) origin for server-action POSTs behind a reverse proxy; requires matching X-Forwarded-Proto and X-Forwarded-Host"
     )]
     trusted_proxy_public_origin: Option<String>,
@@ -609,6 +615,11 @@ fn run_cli(cli: Cli) -> Result<()> {
                 args.server_action_replay_ttl_ms,
                 server_action_csrf_token.as_deref(),
             )?;
+            let server_action_session_cookie_name = resolve_server_action_session_cookie_name(
+                args.server_action_session_cookie_name.as_deref(),
+                server_action_replay_ttl.is_some(),
+                server_action_csrf_cookie_name.as_deref(),
+            )?;
             let trusted_proxy =
                 resolve_trusted_proxy_public_origin(args.trusted_proxy_public_origin.as_deref())?;
             let trusted_proxy_client_ip_hops = resolve_trusted_proxy_client_ip_hops(
@@ -634,6 +645,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             }
             if let Some(ttl) = server_action_replay_ttl {
                 config = config.with_server_action_replay_ttl(ttl);
+            }
+            if let Some(cookie_name) = server_action_session_cookie_name {
+                config = config.with_server_action_session_cookie_name(cookie_name);
             }
             if let Some(trusted_proxy) = trusted_proxy {
                 config = config.with_trusted_proxy(trusted_proxy);
@@ -1081,6 +1095,33 @@ fn resolve_server_action_replay_ttl(
         ));
     }
     Ok(Some(Duration::from_millis(ttl_ms)))
+}
+
+fn resolve_server_action_session_cookie_name(
+    cookie_name: Option<&str>,
+    replay_protection_enabled: bool,
+    csrf_cookie_name: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(cookie_name) = cookie_name else {
+        return Ok(None);
+    };
+    if !replay_protection_enabled {
+        return Err(CliError::Config(
+            "--server-action-session-cookie-name requires --server-action-replay-ttl-ms".to_owned(),
+        ));
+    }
+    if !is_valid_cookie_name(cookie_name) {
+        return Err(CliError::Config(
+            "--server-action-session-cookie-name must be a non-empty RFC6265 cookie name"
+                .to_owned(),
+        ));
+    }
+    if csrf_cookie_name == Some(cookie_name) {
+        return Err(CliError::Config(
+            "--server-action-session-cookie-name must identify an application session cookie, not --server-action-csrf-cookie-name".to_owned(),
+        ));
+    }
+    Ok(Some(cookie_name.to_owned()))
 }
 
 fn is_valid_cookie_name(name: &str) -> bool {
@@ -1682,6 +1723,26 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_server_action_session_cookie_name_flag() {
+        let cli = Cli::try_parse_from([
+            "ferrite",
+            "serve",
+            "--server-action-session-cookie-name",
+            "app_session",
+            "--once",
+        ])
+        .unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(
+            args.server_action_session_cookie_name.as_deref(),
+            Some("app_session")
+        );
+    }
+
+    #[test]
     fn serve_accepts_trusted_proxy_public_origin_flag() {
         let cli = Cli::try_parse_from([
             "ferrite",
@@ -1871,6 +1932,43 @@ mod tests {
         );
         assert_eq!(
             resolve_server_action_replay_ttl(None, Some("token-123")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn server_action_session_cookie_name_requires_replay_protection_and_valid_name() {
+        let missing_replay =
+            resolve_server_action_session_cookie_name(Some("app_session"), false, None)
+                .unwrap_err();
+        assert!(matches!(missing_replay, CliError::Config(_)));
+        assert_eq!(missing_replay.exit_code(), 2);
+        assert!(
+            missing_replay
+                .to_string()
+                .contains("--server-action-replay-ttl-ms")
+        );
+
+        let bad_name =
+            resolve_server_action_session_cookie_name(Some("bad name"), true, None).unwrap_err();
+        assert!(matches!(bad_name, CliError::Config(_)));
+        assert_eq!(bad_name.exit_code(), 2);
+
+        let csrf_cookie_reuse = resolve_server_action_session_cookie_name(
+            Some("ferrite_action_csrf"),
+            true,
+            Some("ferrite_action_csrf"),
+        )
+        .unwrap_err();
+        assert!(matches!(csrf_cookie_reuse, CliError::Config(_)));
+        assert_eq!(csrf_cookie_reuse.exit_code(), 2);
+
+        assert_eq!(
+            resolve_server_action_session_cookie_name(Some("app_session"), true, None).unwrap(),
+            Some("app_session".to_owned())
+        );
+        assert_eq!(
+            resolve_server_action_session_cookie_name(None, true, None).unwrap(),
             None
         );
     }

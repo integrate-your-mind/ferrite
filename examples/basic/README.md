@@ -57,9 +57,14 @@ line-delimited stream frames are available through the CLI's documented
 
 ## Known limitations
 
-- Server actions are explicit form POSTs only. Automatic `"use server"`
-  discovery, client event invocation, session-bound CSRF rotation, and
-  distributed replay coordination are not implemented.
+- Server actions are explicit form POSTs only. The production adapter can bind
+  a process-local replay nonce to an app-owned session cookie and route, but
+  the binding is not action-specific authorization and this example does not
+  establish an authenticated session. Accepted nonces stay spent after an
+  action failure or timeout, so retries require a freshly rendered form.
+  Automatic `"use server"` discovery, client event invocation, first-class auth,
+  session-bound CSRF token issuance, and distributed replay coordination are
+  not implemented.
 - Client navigation, prefetch, hydration, and stream-frame behavior require
   the browser runtime and its generated assets; a one-shot CLI render does not
   prove physical browser behavior.

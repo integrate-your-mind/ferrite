@@ -96,7 +96,7 @@ Disallowed alpha claims until proven:
 
 5. Server-action security gaps
 - Explicit form transport only, not automatic `"use server"` discovery.
-- CSRF is opt-in and static-token based with optional SameSite/HttpOnly/Secure double-submit cookie binding and optional single-process one-time replay nonces; there is still no session-bound token rotation, multi-process replay coordination, or first-class auth middleware integration.
+- CSRF is opt-in and static-token based with optional SameSite/HttpOnly/Secure double-submit cookie binding. Single-process one-time replay nonces can be bound to an app-owned session-cookie fingerprint and exact route, but there is still no session-bound CSRF token issuance/rotation, multi-process replay coordination, or first-class auth middleware integration.
 - Trusted-proxy public-origin checks and explicit forwarded client-IP access-log policy now exist. The pinned-nginx candidate-image harness proves the local topology; hosted ingress/CDN topology is not finalized.
 - File uploads (`multipart` file parts) are intentionally rejected.
 
@@ -116,7 +116,7 @@ Disallowed alpha claims until proven:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
   - publish restart/rollback runbook, CLI request/action log schemas, and metrics/tracing integration plan.
 - Day 6–7: security backlog pass:
-  - session-bound token or equivalent CSRF design beyond the current double-submit cookie binding,
+  - session-bound CSRF token issuance beyond the current global double-submit token and app-session replay binding,
   - explicit replay and token rotation plan,
   - trusted-proxy deployment test matrix, including forwarded proto/host and forwarded client-IP policy.
 
@@ -155,7 +155,7 @@ These are hypotheses to validate via 4–8 design-partner conversions and churn-
 
 - **R2: Server-action security incident before auth hardening**
   Impact: trust loss and legal exposure in authenticated workloads.
-  Mitigation: keep private beta scope to unauthenticated/internal workflows until session-bound CSRF, replay behavior in the chosen topology, and proxy trust are proven.
+  Mitigation: keep private beta scope to unauthenticated/internal workflows until authenticated session validation, session-bound CSRF issuance, replay behavior in the chosen topology, and proxy trust are proven.
 
 - **R3: Hosting mismatch/performance regressions in production topologies**
   Impact: deployment failure and unreliable latency claims.
@@ -183,7 +183,7 @@ Launch here means paid beta availability to external teams under explicit usage 
   - One documented and reproducible deployment stack (proxy + process manager or container + health/smoke checks) run in staging.
   - Rollback drill captured with artifact/version lock record.
 - Server-action security proof:
-  - Session-bound CSRF token strategy implemented (or explicit alternate beyond static double-submit cookie binding) and tested for rotation plus replay in the chosen process topology.
+  - Authenticated session and session-bound CSRF token strategy implemented (or explicit reviewed alternate beyond the static double-submit token and process-local replay binding) and tested for rotation plus replay in the chosen process topology.
   - Trusted-proxy public-origin checks and forwarded client-IP access-log policy exercised behind the chosen staging proxy with forwarded-header sanitization.
 - Operational proof:
   - CLI request access-log and server-action audit-log output captured in staging and integrated with the chosen log collector.
