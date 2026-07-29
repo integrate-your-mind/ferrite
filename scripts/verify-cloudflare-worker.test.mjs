@@ -20,11 +20,31 @@ import {
   assertSupportedIndexFlag,
   gitBlobObjectId,
   inventoryFiles,
+  isExpectedRequestedTermination,
   removeWranglerDryRunReadme,
   runCapture,
   startTrackedSourceMonitor,
   trackedSourceSnapshot,
 } from "./verify-cloudflare-worker.mjs";
+
+test("Cloudflare proof accepts exit 143 only after requested SIGTERM", () => {
+  assert.equal(
+    isExpectedRequestedTermination({ code: 143, signal: null }, true),
+    true,
+  );
+  assert.equal(
+    isExpectedRequestedTermination({ code: 143, signal: null }, false),
+    false,
+  );
+  assert.equal(
+    isExpectedRequestedTermination({ code: null, signal: "SIGTERM" }, true),
+    true,
+  );
+  assert.equal(
+    isExpectedRequestedTermination({ code: 1, signal: null }, true),
+    false,
+  );
+});
 
 test("Cloudflare proof excludes only validated Wrangler dry-run metadata", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-wrangler-metadata-"));

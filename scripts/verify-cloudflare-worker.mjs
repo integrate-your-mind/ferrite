@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { watch } from "node:fs";
+import { realpathSync, watch } from "node:fs";
+import { createRequire } from "node:module";
 import {
   access,
   copyFile,
@@ -24,12 +25,20 @@ import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const requireFromWrangler = createRequire(
+  realpathSync(join(workspaceRoot, "node_modules/wrangler/package.json")),
+);
 const pnpm = platform === "win32" ? "pnpm.cmd" : "pnpm";
 const wrangler = join(
   workspaceRoot,
   "node_modules",
   ".bin",
   platform === "win32" ? "wrangler.cmd" : "wrangler",
+);
+const workerd = join(
+  dirname(requireFromWrangler.resolve("workerd/package.json")),
+  "bin",
+  platform === "win32" ? "workerd.exe" : "workerd",
 );
 const renderPage = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const compatibilityDate = "2026-07-29";
@@ -1126,17 +1135,7 @@ async function reserveLoopbackPort() {
 async function toolVersions() {
   const [wranglerVersion, workerdVersion] = await Promise.all([
     runCapture(wrangler, ["--version"], { cwd: workspaceRoot, timeoutMs: 10_000 }),
-    runCapture(
-      process.execPath,
-      [
-        join(
-          workspaceRoot,
-          "node_modules/.pnpm/workerd@1.20260722.1/node_modules/workerd/bin/workerd",
-        ),
-        "--version",
-      ],
-      { cwd: workspaceRoot, timeoutMs: 10_000 },
-    ),
+    runCapture(workerd, ["--version"], { cwd: workspaceRoot, timeoutMs: 10_000 }),
   ]);
   return {
     wrangler: wranglerVersion.stdout.trim(),
@@ -1815,7 +1814,8 @@ async function stopChild(child) {
     /(?:^|[/\s])workerd(?:\s|$)/.test(command)
   );
 
-  if (child.exitCode === null && child.signalCode === null) {
+  const terminationRequested = child.exitCode === null && child.signalCode === null;
+  if (terminationRequested) {
     child.kill("SIGTERM");
   }
   let terminalError;
@@ -1838,7 +1838,7 @@ async function stopChild(child) {
     terminalError = new Error(
       `Wrangler failed to start: ${terminal.error.message}\n${child.logs.stdout}\n${child.logs.stderr}`,
     );
-  } else if (terminal.code !== 0 && terminal.signal !== "SIGTERM") {
+  } else if (!isExpectedRequestedTermination(terminal, terminationRequested)) {
     terminalError = new Error(
       `Wrangler exited by ${terminal.signal ?? terminal.code}.\n${child.logs.stdout}\n${child.logs.stderr}`,
     );
@@ -1871,6 +1871,12 @@ async function stopChild(child) {
     forcedWranglerKill: wranglerForced,
     forcedDescendantKill: forced,
   };
+}
+
+export function isExpectedRequestedTermination(terminal, terminationRequested) {
+  return terminal.code === 0 ||
+    terminal.signal === "SIGTERM" ||
+    (terminationRequested && terminal.signal === null && terminal.code === 143);
 }
 
 async function descendantProcesses(rootPid) {
