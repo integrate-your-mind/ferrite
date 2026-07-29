@@ -1409,37 +1409,57 @@ export async function startTrackedSourceMonitor(
   const changes = [];
   const watchers = [];
   try {
-    for (const directory of directories) {
-      const absoluteDirectory = resolve(root, directory);
+    for (const path of trackedEntries) {
       const watcher = watch(
-        absoluteDirectory,
+        resolve(root, path),
         { persistent: false },
-        (eventType, filename) => {
+        (eventType) => {
           if (changes.length >= 32) {
             return;
           }
-          if (filename === null) {
-            changes.push(`${eventType}:<unknown>:${directory}`);
-            return;
-          }
-          const path = relative(
-            root,
-            resolve(absoluteDirectory, filename.toString()),
-          ).replaceAll("\\", "/");
-          const allowedWrite = allowedWrites.some(
-            (prefix) => path === prefix || path.startsWith(`${prefix}/`),
-          );
-          if (trackedEntries.has(path) || (rejectUnexpectedPaths && !allowedWrite)) {
-            changes.push(`${eventType}:${path}`);
-          }
+          changes.push(`${eventType}:${path}`);
         },
       );
       watcher.on("error", (error) => {
         if (changes.length < 32) {
-          changes.push(`watch-error:${directory}:${error.message}`);
+          changes.push(`watch-error:${path}:${error.message}`);
         }
       });
       watchers.push(watcher);
+    }
+    if (rejectUnexpectedPaths) {
+      for (const directory of directories) {
+        const absoluteDirectory = resolve(root, directory);
+        const watcher = watch(
+          absoluteDirectory,
+          { persistent: false },
+          (eventType, filename) => {
+            if (changes.length >= 32) {
+              return;
+            }
+            if (filename === null) {
+              changes.push(`${eventType}:<unknown>:${directory}`);
+              return;
+            }
+            const path = relative(
+              root,
+              resolve(absoluteDirectory, filename.toString()),
+            ).replaceAll("\\", "/");
+            const allowedWrite = allowedWrites.some(
+              (prefix) => path === prefix || path.startsWith(`${prefix}/`),
+            );
+            if (!allowedWrite && !trackedEntries.has(path)) {
+              changes.push(`${eventType}:${path}`);
+            }
+          },
+        );
+        watcher.on("error", (error) => {
+          if (changes.length < 32) {
+            changes.push(`watch-error:${directory}:${error.message}`);
+          }
+        });
+        watchers.push(watcher);
+      }
     }
   } catch (error) {
     for (const watcher of watchers) {
@@ -1450,7 +1470,9 @@ export async function startTrackedSourceMonitor(
 
   return {
     async assertUnchanged() {
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+      await new Promise((resolveDelay) =>
+        setTimeout(resolveDelay, platform === "darwin" ? 1_000 : 50)
+      );
       assert.deepEqual(
         changes,
         [],
