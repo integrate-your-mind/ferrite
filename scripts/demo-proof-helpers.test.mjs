@@ -10,6 +10,7 @@ import {
   expectedArtifactFiles,
   launchVerifiedBrowser,
   listArtifactFiles,
+  withVerifiedBrowser,
 } from "./demo-proof-helpers.mjs";
 
 test("demo proof resolves default, relative, and absolute Cargo target roots", () => {
@@ -111,6 +112,60 @@ test("configured browser failure does not silently select another binary", async
     /FERRITE_BROWSER_EXECUTABLE did not identify a launchable Chromium browser/,
   );
   assert.deepEqual(launches, ["/configured/chromium"]);
+});
+
+test("demo proof shares one verified browser and closes it once", async () => {
+  let launches = 0;
+  let closes = 0;
+  const result = await withVerifiedBrowser(
+    {
+      chromium: {
+        launch: async () => {
+          launches += 1;
+          return {
+            close: async () => { closes += 1; },
+            version: () => "150.0.0.0",
+          };
+        },
+      },
+      candidates: ["/system/chromium"],
+      platform: "linux",
+      statFile: async () => ({ isFile: () => true }),
+      accessFile: async () => {},
+    },
+    async (proof) => [proof.version, proof.version],
+  );
+
+  assert.deepEqual(result, ["150.0.0.0", "150.0.0.0"]);
+  assert.equal(launches, 1);
+  assert.equal(closes, 1);
+});
+
+test("demo proof reports both operation and shared browser cleanup failures", async () => {
+  const operationFailure = new Error("demo assertion failed");
+  const cleanupFailure = new Error("browser close failed");
+  await assert.rejects(
+    withVerifiedBrowser(
+      {
+        chromium: {
+          launch: async () => ({
+            close: async () => { throw cleanupFailure; },
+            version: () => "150.0.0.0",
+          }),
+        },
+        candidates: ["/system/chromium"],
+        platform: "linux",
+        statFile: async () => ({ isFile: () => true }),
+        accessFile: async () => {},
+      },
+      async () => { throw operationFailure; },
+    ),
+    (error) => {
+      assert.equal(error.message, "demo browser proof and shared browser cleanup failed");
+      assert.deepEqual(error.errors, [operationFailure, cleanupFailure]);
+      return true;
+    },
+  );
 });
 
 test("artifact file inventory is sorted and includes only regular files", async () => {

@@ -12,8 +12,8 @@ import {
   browserExecutableCandidates,
   cargoTargetRoot,
   expectedArtifactFiles,
-  launchVerifiedBrowser,
   listArtifactFiles,
+  withVerifiedBrowser,
 } from "./demo-proof-helpers.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -382,20 +382,16 @@ async function verifyUndeclaredFileIgnored(example, manifest) {
   }
 }
 
-async function verifyBrowser(example, manifest) {
+async function verifyBrowser(example, manifest, browserProof) {
   const port = await reservePort();
   const server = startServer(example, manifest.artifact, port);
-  let browser;
-  let browserProof;
   let page;
   let proofError;
   try {
-    browserProof = await launchVerifiedBrowser({ chromium, ...browserSelection });
-    browser = browserProof.browser;
     const pageErrors = [];
     const failedRequests = [];
     const badResponses = [];
-    page = await browser.newPage();
+    page = await browserProof.browser.newPage();
     await page.setViewportSize({ width: 390, height: 844 });
     page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("requestfailed", (request) => failedRequests.push(`${request.method()} ${request.url()} ${request.failure()?.errorText ?? "failed"}`));
@@ -437,7 +433,6 @@ async function verifyBrowser(example, manifest) {
   const cleanupErrors = [];
   for (const [label, cleanup] of [
     ["page close", () => page?.close()],
-    ["browser close", () => browser?.close()],
     ["server stop", () => stopServer(server)],
   ]) {
     try {
@@ -473,16 +468,18 @@ async function main() {
     console.log(JSON.stringify({ ok: true, mode, demos: available }, null, 2));
     return;
   }
-  for (const { example, manifest } of available) {
-    await verifyHttp(example, manifest);
-    await verifyTamper(example, manifest);
-    await verifyUndeclaredFileIgnored(example, manifest);
-    const browser = await verifyBrowser(example, manifest);
-    const deepRouteCount = example.paths.length - 1;
-    console.log(
-      `${example.name}: build ${manifest.buildId}; ${manifest.files} verified files; HTTP normal/query/${deepRouteCount} deep/404, browser ${browser.version}, undeclared-file 404, and tamper fail-closed passed`,
-    );
-  }
+  await withVerifiedBrowser({ chromium, ...browserSelection }, async (browserProof) => {
+    for (const { example, manifest } of available) {
+      await verifyHttp(example, manifest);
+      await verifyTamper(example, manifest);
+      await verifyUndeclaredFileIgnored(example, manifest);
+      await verifyBrowser(example, manifest, browserProof);
+      const deepRouteCount = example.paths.length - 1;
+      console.log(
+        `${example.name}: build ${manifest.buildId}; ${manifest.files} verified files; HTTP normal/query/${deepRouteCount} deep/404, browser ${browserProof.version}, undeclared-file 404, and tamper fail-closed passed`,
+      );
+    }
+  });
 }
 
 let mainError;

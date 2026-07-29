@@ -96,6 +96,32 @@ export async function launchVerifiedBrowser({
   throw new AggregateError(failures, guidance);
 }
 
+export async function withVerifiedBrowser(launchOptions, operation) {
+  const browserProof = await launchVerifiedBrowser(launchOptions);
+  let result;
+  let operationError;
+  try {
+    result = await operation(browserProof);
+  } catch (error) {
+    operationError = error;
+  }
+
+  try {
+    await browserProof.browser.close();
+  } catch (error) {
+    if (operationError) {
+      throw new AggregateError(
+        [operationError, error],
+        "demo browser proof and shared browser cleanup failed",
+      );
+    }
+    throw error;
+  }
+
+  if (operationError) throw operationError;
+  return result;
+}
+
 export async function listArtifactFiles(root, relativeRoot = "") {
   const directory = relativeRoot ? join(root, ...relativeRoot.split("/")) : root;
   const entries = await readdir(directory, { withFileTypes: true });
