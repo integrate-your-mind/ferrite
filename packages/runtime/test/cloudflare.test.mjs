@@ -524,6 +524,82 @@ test("sanitizes full-document rollback requests and rejects partial fallback HTM
   }]);
 });
 
+test("buffers fallback HTML and fails closed on stream errors, stalls, and invalid lengths", async () => {
+  const fallbackEnvironment = (makeResponse) => ({
+    ASSETS: {
+      async fetch(request) {
+        if (new URL(request.url).pathname === "/ferrite-server.json") {
+          return new Response(DEFAULT_MANIFEST_BYTES);
+        }
+        return makeResponse();
+      },
+    },
+  });
+  const handler = (options = {}) => createCloudflareSsrHandler({
+    routes: [{
+      module: routeModule(() => {
+        throw new Error("render failed");
+      }),
+    }],
+    renderer: textRenderer(),
+    ...options,
+  });
+
+  const errored = await handler().fetch(
+    new Request("https://example.test/docs"),
+    fallbackEnvironment(() => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("<!doctype html>"));
+        controller.error(new Error("stream failed"));
+      },
+    }), {
+      headers: { "Content-Type": "text/html" },
+    })),
+  );
+  assert.equal(errored.status, 500);
+  assert.equal(await errored.text(), "Internal server error");
+
+  let stalledCanceled = false;
+  const stalled = await handler({ responseDeadlineMs: 10 }).fetch(
+    new Request("https://example.test/docs"),
+    fallbackEnvironment(() => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("<!doctype html>"));
+      },
+      cancel() {
+        stalledCanceled = true;
+        return new Promise(() => {});
+      },
+    }), {
+      headers: { "Content-Type": "text/html" },
+    })),
+  );
+  assert.equal(stalled.status, 504);
+  assert.equal(await stalled.text(), "Gateway timeout");
+  assert.equal(stalledCanceled, true);
+
+  const oversized = await handler({ maxHtmlBytes: 4 }).fetch(
+    new Request("https://example.test/docs"),
+    fallbackEnvironment(() => new Response("<!doctype html>", {
+      headers: { "Content-Type": "text/html" },
+    })),
+  );
+  assert.equal(oversized.status, 500);
+  assert.equal(await oversized.text(), "Internal server error");
+
+  const truncated = await handler().fetch(
+    new Request("https://example.test/docs"),
+    fallbackEnvironment(() => new Response("short", {
+      headers: {
+        "Content-Length": "10",
+        "Content-Type": "text/html",
+      },
+    })),
+  );
+  assert.equal(truncated.status, 500);
+  assert.equal(await truncated.text(), "Internal server error");
+});
+
 test("fails closed for malformed, unsupported, aborted, and unavailable fallback paths", async () => {
   let renders = 0;
   const seen = [];

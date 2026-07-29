@@ -163,14 +163,12 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
       throwIfAborted(request.signal);
       const deadline = monotonicNow() + responseDeadlineMs;
       try {
-        await withinRequestBudget(
-          verifyAssetsBuildIdentity(
-            request,
-            env,
-            prepared.assetBuildId,
-            options.assetManifestSha256,
-            routes.values(),
-          ),
+        await verifyAssetsBuildIdentity(
+          request,
+          env,
+          prepared.assetBuildId,
+          options.assetManifestSha256,
+          routes.values(),
           request.signal,
           deadline,
         );
@@ -190,7 +188,14 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
         useSsr = false;
       }
       if (!useSsr) {
-        return fetchFallback(request, env, route.fallbackPath, 500, responseDeadlineMs);
+        return fetchFallback(
+          request,
+          env,
+          route.fallbackPath,
+          500,
+          responseDeadlineMs,
+          maxHtmlBytes,
+        );
       }
 
       try {
@@ -237,7 +242,14 @@ export function createCloudflareSsrHandler<Env extends CloudflareSsrEnv = Cloudf
           throw abortError();
         }
         const status = error instanceof ResponseDeadlineError ? 504 : 500;
-        return fetchFallback(request, env, route.fallbackPath, status, responseDeadlineMs);
+        return fetchFallback(
+          request,
+          env,
+          route.fallbackPath,
+          status,
+          responseDeadlineMs,
+          maxHtmlBytes,
+        );
       }
     },
   };
@@ -411,6 +423,8 @@ async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
   expectedAssetBuildId: string,
   expectedManifestSha256: string,
   expectedRoutes: Iterable<PreparedRoute>,
+  signal: AbortSignal,
+  deadline: number,
 ): Promise<void> {
   const binding = env?.ASSETS;
   if (!binding || typeof binding.fetch !== "function") {
@@ -420,23 +434,25 @@ async function verifyAssetsBuildIdentity<Env extends CloudflareSsrEnv>(
   manifestUrl.pathname = "/ferrite-server.json";
   manifestUrl.search = "";
   manifestUrl.hash = "";
-  const response = await binding.fetch(new Request(manifestUrl, {
-    method: "GET",
-    headers: { Accept: "application/json" },
-    signal: request.signal,
-  }));
+  const response = await withinRequestBudget(
+    binding.fetch(new Request(manifestUrl, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal,
+    })),
+    signal,
+    deadline,
+  );
   if (response.status !== 200) {
     throw new TypeError("Ferrite Cloudflare asset manifest is unavailable.");
   }
-  const declaredSize = response.headers.get("content-length");
-  if (
-    declaredSize !== null &&
-    (!/^(?:0|[1-9][0-9]*)$/.test(declaredSize) ||
-      Number(declaredSize) > MAX_ASSET_MANIFEST_BYTES)
-  ) {
-    throw new TypeError("Ferrite Cloudflare asset manifest exceeds its byte limit.");
-  }
-  const bytes = await readBoundedResponseBody(response, MAX_ASSET_MANIFEST_BYTES);
+  const bytes = await readBoundedResponseBody(
+    response,
+    MAX_ASSET_MANIFEST_BYTES,
+    "asset manifest",
+    signal,
+    deadline,
+  );
   if (await sha256BuildId(bytes) !== expectedManifestSha256) {
     throw new TypeError("Ferrite Cloudflare asset manifest bytes do not match the Worker build.");
   }
@@ -530,8 +546,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-async function readBoundedResponseBody(response: Response, maxBytes: number): Promise<Uint8Array> {
+async function readBoundedResponseBody(
+  response: Response,
+  maxBytes: number,
+  label: string,
+  signal: AbortSignal,
+  deadline: number,
+): Promise<Uint8Array> {
+  const declaredSize = response.headers.get("content-length");
+  if (
+    declaredSize !== null &&
+    (!/^(?:0|[1-9][0-9]*)$/.test(declaredSize) ||
+      Number(declaredSize) > maxBytes)
+  ) {
+    throw new TypeError(`Ferrite Cloudflare ${label} exceeds its byte limit.`);
+  }
   if (!response.body) {
+    if (declaredSize !== null && Number(declaredSize) !== 0) {
+      throw new TypeError(`Ferrite Cloudflare ${label} ended before its declared length.`);
+    }
     return new Uint8Array();
   }
   const reader = response.body.getReader();
@@ -539,23 +572,35 @@ async function readBoundedResponseBody(response: Response, maxBytes: number): Pr
   let total = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await withinRequestBudget(
+        reader.read(),
+        signal,
+        deadline,
+      );
       if (done) {
         break;
       }
       total += value.byteLength;
       if (total > maxBytes) {
-        try {
-          await reader.cancel("Ferrite Cloudflare asset manifest exceeds its byte limit.");
-        } catch {
-          // The size violation remains authoritative when the binding cannot cancel.
-        }
-        throw new TypeError("Ferrite Cloudflare asset manifest exceeds its byte limit.");
+        throw new TypeError(`Ferrite Cloudflare ${label} exceeds its byte limit.`);
       }
       chunks.push(value);
     }
+  } catch (error) {
+    cancelResponseReader(
+      reader,
+      `Ferrite Cloudflare ${label} could not be read completely.`,
+    );
+    throw error;
   } finally {
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {
+      // A non-cooperative source may retain the pending read after cancellation.
+    }
+  }
+  if (declaredSize !== null && total !== Number(declaredSize)) {
+    throw new TypeError(`Ferrite Cloudflare ${label} ended before its declared length.`);
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -564,6 +609,19 @@ async function readBoundedResponseBody(response: Response, maxBytes: number): Pr
     offset += chunk.byteLength;
   }
   return bytes;
+}
+
+function cancelResponseReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reason: string,
+): void {
+  try {
+    void reader.cancel(reason).catch(() => {
+      // The original stream, abort, or deadline failure remains authoritative.
+    });
+  } catch {
+    // The original stream, abort, or deadline failure remains authoritative.
+  }
 }
 
 function containsServerAction(node: CompactNode): boolean {
@@ -648,6 +706,7 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
   fallbackPath: string,
   failureStatus: number,
   responseDeadlineMs: number,
+  maxHtmlBytes: number,
 ): Promise<Response> {
   throwIfAborted(request.signal);
   const binding = env?.ASSETS;
@@ -664,6 +723,7 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
   url.search = "";
   url.hash = "";
   try {
+    const deadline = monotonicNow() + responseDeadlineMs;
     const headers = new Headers(request.headers);
     for (const name of [
       "if-match",
@@ -684,7 +744,7 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
         }),
       ),
       request.signal,
-      monotonicNow() + responseDeadlineMs,
+      deadline,
     );
     const mediaType = response.headers
       .get("content-type")
@@ -699,8 +759,17 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
         request.method === "HEAD",
       );
     }
+    const body = request.method === "HEAD"
+      ? null
+      : await readBoundedResponseBody(
+          response,
+          maxHtmlBytes,
+          "fallback HTML",
+          request.signal,
+          deadline,
+        );
     return new Response(
-      request.method === "HEAD" ? null : response.body,
+      body,
       {
         status: response.status,
         statusText: response.statusText,

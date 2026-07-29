@@ -68,16 +68,21 @@ isolated deterministic fixture, generates four edge route artifacts, and runs
 `wrangler deploy --dry-run`. It then revalidates every receipt against the
 post-bundle route artifact, requires each artifact and metadata/module identity
 in Wrangler's metafile and emitted modules, and starts
-`wrangler dev --local --no-bundle` from that exact inventoried output. It then
-observes two distinct request-time renders in the same isolate and checks:
+`wrangler dev --local --no-bundle` from a regular, realpath-contained entry
+whose bytes match that exact inventory. It then observes two distinct
+request-time renders in the same isolate, re-inventories the Worker, assets, and
+route bindings after runtime execution, and checks:
 
 - exact deep-route refresh plus `HEAD`
 - static-asset passthrough and missing assets
 - route-exception, response-deadline, and rendered-server-action fallback
 - unsupported methods, representations, and payload streaming
 - encoded traversal and separator rejection
-- Git HEAD/tree/cleanliness, route receipts, manifest/config/lockfile identities,
-  bounded emitted bundle/WASM identities, and descendant cleanup
+- clean and unchanged Git HEAD/tree/branch plus a tracked-input digest at proof
+  start and after cleanup; a live monitor also rejects transient tracked-source
+  writes during the proof
+- route receipts, manifest/config/lockfile identities, bounded emitted
+  bundle/WASM identities, and command process-group cleanup
 
 A passing receipt proves that fixture in the pinned local workerd version. It
 does not prove a Cloudflare deployment, production traffic, cross-platform
@@ -175,10 +180,12 @@ Official constraints and configuration references:
 - A malformed request, unsupported method, unsupported `Accept`, or payload-stream request never invokes the route or asset binding.
 - A route exception, action control, invalid/oversized packet, invalid/oversized HTML, or deadline failure may fetch only that route's declared fallback path.
 - An aborted request is rethrown as `AbortError`; it must not start fallback work.
-- Fallback requests strip range and conditional headers and accept only a full
-  `200` `text/html` document. A missing, throwing, partial, conditional,
-  wrong-media-type, or non-success fallback produces a generic no-store `500`
-  or `504` without exposing the route error.
+- Fallback requests strip range and conditional headers and accept only a full,
+  bounded `200` `text/html` document. The adapter buffers the complete body
+  before returning a successful response. A missing, throwing, stalled,
+  truncated, oversized, conditional, wrong-media-type, or non-success fallback
+  produces a generic no-store `500` or `504` without exposing the route error
+  or committing partial HTML.
 - `shouldRender` is the rollback gate. Returning `false` bypasses request rendering and serves the declared prerender.
 - Unknown paths and declared static assets remain owned by `env.ASSETS`.
 

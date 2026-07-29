@@ -2,13 +2,17 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { watch } from "node:fs";
 import {
   access,
   copyFile,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
+  readlink,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -31,20 +35,50 @@ const renderPage = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const compatibilityDate = "2026-07-29";
 const commandTimeoutMs = 120_000;
 
-const receipt = await verifyCloudflareWorker();
-process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const receipt = await verifyCloudflareWorker();
+  process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
+}
 
 async function verifyCloudflareWorker() {
-  await buildPrerequisites();
+  const trackedPaths = await trackedSourcePaths();
+  const sourceMonitor = startTrackedSourceMonitor(trackedPaths);
+  let sourceStart;
+  try {
+    sourceStart = {
+      ...await sourceState(),
+      ...await trackedSourceSnapshot(trackedPaths),
+    };
+    assertCleanSourceState(sourceStart, "before the proof");
+    await sourceMonitor.assertUnchanged();
+  } catch (error) {
+    sourceMonitor.close();
+    throw error;
+  }
+  const proofInputSha256 = digestIdentity({
+    format: "ferrite-cloudflare-workerd-proof-input",
+    version: 1,
+    command: ["node", "scripts/verify-cloudflare-worker.mjs"],
+    compatibilityDate,
+    source: {
+      head: sourceStart.head,
+      tree: sourceStart.tree,
+      branch: sourceStart.branch,
+      trackedInputSha256: sourceStart.trackedInputSha256,
+    },
+  });
 
-  const fixtureRoot = await makeFixtureRoot();
+  let fixtureRoot;
   let dev;
   let result;
   let processCleanup;
   let fixtureRemoved = false;
+  let sourceEnd;
   let primaryError;
   const cleanupErrors = [];
   try {
+    await buildPrerequisites();
+    fixtureRoot = await makeFixtureRoot();
     const fixture = await createFixture(fixtureRoot);
     const bundleMetafile = join(fixture.bundle, "bundle-meta.json");
     const dryRun = await runCapture(
@@ -78,6 +112,7 @@ async function verifyCloudflareWorker() {
       fixture,
       bundleMetafile,
       fixtureRoot,
+      bundle,
     );
 
     const port = await reserveLoopbackPort();
@@ -88,12 +123,31 @@ async function verifyCloudflareWorker() {
     dev.processTree = await observeOwnedProcessTree(dev.pid);
 
     const scenarios = await verifyScenarios(origin);
+    const [bundleAfter, staticAssetsAfter, routeBundleBindingsAfter] = await Promise.all([
+      inventoryFiles(fixture.bundle),
+      inventoryFiles(fixture.assets),
+      verifyBundledRouteArtifacts(fixture, bundleMetafile, fixtureRoot, bundle),
+    ]);
+    assert.deepEqual(
+      bundleAfter,
+      bundle,
+      "The exact Worker bundle changed while workerd was executing it.",
+    );
+    assert.deepEqual(
+      staticAssetsAfter,
+      staticAssets,
+      "The static asset snapshot changed while workerd was executing it.",
+    );
+    assert.deepEqual(
+      routeBundleBindingsAfter,
+      routeBundleBindings,
+      "The route artifact bindings changed while workerd was executing them.",
+    );
     const wasm = await fileIdentity(
       join(workspaceRoot, "packages/protocol-wasm/dist/ferrite_protocol_wasm.wasm"),
     );
-    const [versions, source, buildConfig, runtimeConfigIdentity, lockfile] = await Promise.all([
+    const [versions, buildConfig, runtimeConfigIdentity, lockfile] = await Promise.all([
       toolVersions(),
-      sourceState(),
       fileIdentity(fixture.config),
       fileIdentity(runtimeConfig),
       fileIdentity(join(workspaceRoot, "pnpm-lock.yaml")),
@@ -103,7 +157,10 @@ async function verifyCloudflareWorker() {
       status: "passed",
       runtime: "wrangler dev --local --no-bundle (workerd)",
       compatibilityDate,
-      source,
+      source: {
+        ...sourceStart,
+        proofInputSha256,
+      },
       sourceBuildIds: fixture.routeReceipts.map(({ path, sourceBuildId }) => ({
         path,
         sourceBuildId,
@@ -124,6 +181,7 @@ async function verifyCloudflareWorker() {
         bytes: bundle.bytes,
         gzipBytes: bundle.gzipBytes,
         routeBindings: routeBundleBindings,
+        stableThroughRuntime: true,
         dryRunSummary: boundedLog(`${dryRun.stdout}\n${dryRun.stderr}`),
       },
       scenarios,
@@ -144,14 +202,28 @@ async function verifyCloudflareWorker() {
         cleanupErrors.push(error);
       }
     }
-    try {
-      await rm(fixtureRoot, { recursive: true, force: true });
-      fixtureRemoved = !(await pathExists(fixtureRoot));
-      if (!fixtureRemoved) {
-        throw new Error(`Cloudflare Worker proof fixture still exists at ${fixtureRoot}.`);
+    if (fixtureRoot) {
+      try {
+        await rm(fixtureRoot, { recursive: true, force: true });
+        fixtureRemoved = !(await pathExists(fixtureRoot));
+        if (!fixtureRemoved) {
+          throw new Error(`Cloudflare Worker proof fixture still exists at ${fixtureRoot}.`);
+        }
+      } catch (error) {
+        cleanupErrors.push(error);
       }
+    }
+    try {
+      sourceEnd = {
+        ...await sourceState(),
+        ...await trackedSourceSnapshot(trackedPaths),
+      };
+      assertSameSourceState(sourceStart, sourceEnd);
+      await sourceMonitor.assertUnchanged();
     } catch (error) {
       cleanupErrors.push(error);
+    } finally {
+      sourceMonitor.close();
     }
   }
 
@@ -176,6 +248,7 @@ async function verifyCloudflareWorker() {
     ...processCleanup,
     fixtureRemoved,
   };
+  result.source.end = sourceEnd;
   return result;
 }
 
@@ -485,6 +558,14 @@ async function verifyBundledRouteArtifacts(
     emittedModuleBytes.byteLength > 0,
     "Wrangler dry-run must emit at least one JavaScript Worker module.",
   );
+  assert.equal(
+    allBufferOffsets(
+      emittedModuleBytes,
+      Buffer.from(fixture.assetManifestSha256),
+    ).length,
+    1,
+    "Wrangler output must contain exactly one pinned asset-manifest identity.",
+  );
 
   const bindings = [];
   for (const routeArtifact of fixture.routeArtifacts) {
@@ -548,7 +629,7 @@ async function verifyBundledRouteArtifacts(
   return bindings;
 }
 
-async function writeExactBundleConfig(fixture, metafilePath, fixtureRoot) {
+async function writeExactBundleConfig(fixture, metafilePath, fixtureRoot, bundle) {
   const metafile = JSON.parse(await readFile(metafilePath, "utf8"));
   const entryOutputs = Object.entries(metafile.outputs ?? {})
     .filter(([, output]) => typeof output?.entryPoint === "string")
@@ -558,13 +639,11 @@ async function writeExactBundleConfig(fixture, metafilePath, fixtureRoot) {
     1,
     `Wrangler dry-run must emit exactly one entry module; found ${entryOutputs.length}.`,
   );
-  const entry = entryOutputs[0];
-  const bundleRelative = relative(fixture.bundle, entry);
-  assert.ok(
-    bundleRelative !== "" &&
-      !bundleRelative.startsWith("..") &&
-      !isAbsolute(bundleRelative),
-    "Wrangler dry-run entry module must be inside the inventoried bundle.",
+  const entry = await assertInventoriedRegularFile(
+    fixture.bundle,
+    entryOutputs[0],
+    bundle,
+    "Wrangler dry-run entry module",
   );
   const config = join(fixtureRoot, "wrangler-exact-bundle.jsonc");
   await writeFile(
@@ -591,6 +670,54 @@ async function writeExactBundleConfig(fixture, metafilePath, fixtureRoot) {
     }, null, 2)}\n`,
   );
   return config;
+}
+
+export async function assertInventoriedRegularFile(
+  root,
+  candidate,
+  inventory,
+  label = "proof file",
+) {
+  const lexicalRoot = resolve(root);
+  const lexicalCandidate = resolve(candidate);
+  const lexicalRelative = relative(lexicalRoot, lexicalCandidate);
+  if (
+    lexicalRelative === "" ||
+    lexicalRelative.startsWith("..") ||
+    isAbsolute(lexicalRelative)
+  ) {
+    throw new Error(`${label} must be inside the inventoried bundle.`);
+  }
+  const [canonicalRoot, candidateStat] = await Promise.all([
+    realpath(lexicalRoot),
+    lstat(lexicalCandidate),
+  ]);
+  if (!candidateStat.isFile() || candidateStat.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular, non-symlink file.`);
+  }
+  const canonicalCandidate = await realpath(lexicalCandidate);
+  if (canonicalCandidate !== resolve(canonicalRoot, lexicalRelative)) {
+    throw new Error(`${label} must not traverse an intermediate symlink.`);
+  }
+  const candidateRelative = relative(canonicalRoot, canonicalCandidate);
+  if (
+    candidateRelative === "" ||
+    candidateRelative.startsWith("..") ||
+    isAbsolute(candidateRelative)
+  ) {
+    throw new Error(`${label} must resolve inside the inventoried bundle.`);
+  }
+  const inventoryPath = candidateRelative.replaceAll("\\", "/");
+  const record = inventory.files.find(({ path }) => path === inventoryPath);
+  if (!record) {
+    throw new Error(`${label} is missing from the exact bundle inventory.`);
+  }
+  assert.deepEqual(
+    await fileIdentity(canonicalCandidate),
+    { bytes: record.bytes, sha256: record.sha256 },
+    `${label} changed after the exact bundle inventory was captured.`,
+  );
+  return canonicalCandidate;
 }
 
 function launchDev(config, persist, port, inspectorPort) {
@@ -790,7 +917,7 @@ async function sourceState() {
       cwd: workspaceRoot,
       timeoutMs: 10_000,
     }),
-    runCapture("git", ["status", "--porcelain=v1", "--untracked-files=normal"], {
+    runCapture("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
       cwd: workspaceRoot,
       timeoutMs: 10_000,
     }),
@@ -804,7 +931,159 @@ async function sourceState() {
   };
 }
 
-async function inventoryFiles(root) {
+async function trackedSourcePaths() {
+  const { stdout } = await runCapture(
+    "git",
+    ["ls-files", "-z"],
+    {
+      cwd: workspaceRoot,
+      maxOutputBytes: 8 * 1024 * 1024,
+      timeoutMs: 10_000,
+    },
+  );
+  const paths = stdout
+    .split("\0")
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right));
+  assert.ok(paths.length > 0, "Ferrite proof found no tracked source files.");
+  for (const path of paths) {
+    if (isAbsolute(path) || path === ".." || path.startsWith("../")) {
+      throw new Error(`Ferrite proof received an invalid tracked path "${path}".`);
+    }
+  }
+  return paths;
+}
+
+export async function trackedSourceSnapshot(paths, root = workspaceRoot) {
+  const records = [];
+  for (const path of paths) {
+    const absolute = resolve(root, path);
+    const stat = await lstat(absolute);
+    if (stat.isSymbolicLink()) {
+      const target = await readlink(absolute);
+      records.push({
+        path,
+        mode: "120000",
+        bytes: Buffer.byteLength(target),
+        sha256: createHash("sha256").update(target).digest("hex"),
+      });
+      continue;
+    }
+    if (!stat.isFile()) {
+      throw new Error(`Ferrite tracked input "${path}" is not a regular file or symlink.`);
+    }
+    const contents = await readFile(absolute);
+    records.push({
+      path,
+      mode: stat.mode & 0o111 ? "100755" : "100644",
+      bytes: contents.byteLength,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    });
+  }
+  return {
+    trackedFileCount: records.length,
+    trackedInputSha256: digestIdentity({
+      format: "ferrite-tracked-source-snapshot",
+      version: 1,
+      records,
+    }),
+  };
+}
+
+export function startTrackedSourceMonitor(paths, root = workspaceRoot) {
+  const trackedEntries = new Set(paths);
+  const directories = new Set();
+  for (const path of paths) {
+    directories.add(dirname(path));
+  }
+
+  const changes = [];
+  const watchers = [];
+  try {
+    for (const directory of directories) {
+      const absoluteDirectory = resolve(root, directory);
+      const watcher = watch(
+        absoluteDirectory,
+        { persistent: false },
+        (eventType, filename) => {
+          if (changes.length >= 32) {
+            return;
+          }
+          if (filename === null) {
+            changes.push(`${eventType}:<unknown>:${directory}`);
+            return;
+          }
+          const path = relative(
+            root,
+            resolve(absoluteDirectory, filename.toString()),
+          ).replaceAll("\\", "/");
+          if (trackedEntries.has(path)) {
+            changes.push(`${eventType}:${path}`);
+          }
+        },
+      );
+      watcher.on("error", (error) => {
+        if (changes.length < 32) {
+          changes.push(`watch-error:${directory}:${error.message}`);
+        }
+      });
+      watchers.push(watcher);
+    }
+  } catch (error) {
+    for (const watcher of watchers) {
+      watcher.close();
+    }
+    throw error;
+  }
+
+  return {
+    async assertUnchanged() {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+      assert.deepEqual(
+        changes,
+        [],
+        `Ferrite tracked source changed during the Worker proof: ${changes.join(", ")}.`,
+      );
+    },
+    close() {
+      for (const watcher of watchers) {
+        watcher.close();
+      }
+    },
+  };
+}
+
+export function assertCleanSourceState(source, context) {
+  assert.equal(
+    source.clean,
+    true,
+    `Ferrite Cloudflare Worker proof requires a clean source tree ${context}; found ${source.residue ?? "unknown residue"}.`,
+  );
+}
+
+export function assertSameSourceState(expected, actual) {
+  assertCleanSourceState(actual, "after cleanup");
+  assert.deepEqual(
+    {
+      head: actual.head,
+      tree: actual.tree,
+      branch: actual.branch,
+      trackedFileCount: actual.trackedFileCount,
+      trackedInputSha256: actual.trackedInputSha256,
+    },
+    {
+      head: expected.head,
+      tree: expected.tree,
+      branch: expected.branch,
+      trackedFileCount: expected.trackedFileCount,
+      trackedInputSha256: expected.trackedInputSha256,
+    },
+    "Ferrite source HEAD, tree, branch, or tracked-input identity changed during the Worker proof.",
+  );
+}
+
+export async function inventoryFiles(root) {
+  const canonicalRoot = await realpath(root);
   const files = [];
   let bytes = 0;
   let gzipBytes = 0;
@@ -817,20 +1096,22 @@ async function inventoryFiles(root) {
         continue;
       }
       if (!entry.isFile()) {
-        continue;
+        throw new Error(
+          `Ferrite proof inventory rejects non-regular entry "${relative(canonicalRoot, path)}".`,
+        );
       }
       const contents = await readFile(path);
-      const relative = path.slice(root.length + 1);
+      const inventoryPath = relative(canonicalRoot, path).replaceAll("\\", "/");
       bytes += contents.byteLength;
       gzipBytes += gzipSync(contents).byteLength;
       files.push({
-        path: relative,
+        path: inventoryPath,
         bytes: contents.byteLength,
         sha256: createHash("sha256").update(contents).digest("hex"),
       });
     }
   }
-  await visit(root);
+  await visit(canonicalRoot);
   return { files, bytes, gzipBytes };
 }
 
@@ -860,13 +1141,14 @@ function allBufferOffsets(buffer, needle) {
   return offsets;
 }
 
-async function runCapture(command, args, options) {
+export async function runCapture(command, args, options) {
   const child = spawn(command, args, {
     cwd: options.cwd,
     env: options.env ?? process.env,
+    detached: platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const logs = captureChildOutput(child);
+  const logs = captureChildOutput(child, options.maxOutputBytes);
   const terminal = captureChildTerminal(child);
   let timeout;
   try {
@@ -880,19 +1162,15 @@ async function runCapture(command, args, options) {
       }),
     ]);
     if (result?.timeout) {
-      child.kill("SIGTERM");
-      let stopped = await waitForTerminal(terminal, 5_000);
-      if (!stopped) {
-        child.kill("SIGKILL");
-        stopped = await waitForTerminal(terminal, 5_000);
-      }
-      if (!stopped) {
-        throw new Error(
-          `${command} ${args.join(" ")} remained alive after SIGKILL.\n${logs.stdout}\n${logs.stderr}`,
-        );
-      }
+      await cleanupCapturedProcessTree(child, terminal, true);
       throw new Error(
         `${command} ${args.join(" ")} exceeded ${options.timeoutMs}ms.\n${logs.stdout}\n${logs.stderr}`,
+      );
+    }
+    const cleanup = await cleanupCapturedProcessTree(child, terminal, false);
+    if (cleanup.hadDescendants) {
+      throw new Error(
+        `${command} ${args.join(" ")} left ${cleanup.recordedDescendants} descendant process(es) after it exited; the verifier terminated them.\n${logs.stdout}\n${logs.stderr}`,
       );
     }
     if (result.error) {
@@ -911,10 +1189,65 @@ async function runCapture(command, args, options) {
   }
 }
 
-function captureChildOutput(child) {
+async function cleanupCapturedProcessTree(child, terminal, terminateRoot) {
+  const groupId = platform === "win32" ? undefined : child.pid;
+  const initial = groupId === undefined
+    ? child.pid === undefined
+      ? []
+      : await descendantProcesses(child.pid)
+    : (await processGroupProcesses(groupId)).filter(({ pid }) => pid !== child.pid);
+  const hadDescendants = initial.length > 0;
+
+  if (terminateRoot || hadDescendants) {
+    signalOwnedProcessTree(child, groupId, initial, "SIGTERM");
+  }
+
+  let terminalResult = await waitForTerminal(terminal, terminateRoot ? 5_000 : 100);
+  let live = groupId === undefined
+    ? await waitForRecordedProcessesToStop(initial, 5_000)
+    : await waitForProcessGroupToStop(groupId, 5_000);
+  let forced = false;
+  if (!terminalResult || live.length > 0) {
+    forced = true;
+    signalOwnedProcessTree(child, groupId, live, "SIGKILL");
+    terminalResult ??= await waitForTerminal(terminal, 5_000);
+    live = groupId === undefined
+      ? await waitForRecordedProcessesToStop(live, 5_000)
+      : await waitForProcessGroupToStop(groupId, 5_000);
+  }
+  if (!terminalResult || live.length > 0) {
+    throw new Error(
+      `Captured command process tree survived cleanup: ${live.map(({ pid }) => pid).join(", ") || child.pid || "unknown"}.`,
+    );
+  }
+  return {
+    hadDescendants,
+    recordedDescendants: initial.length,
+    forced,
+  };
+}
+
+function signalOwnedProcessTree(child, groupId, recorded, signal) {
+  if (groupId !== undefined) {
+    try {
+      process.kill(-groupId, signal);
+      return;
+    } catch (error) {
+      if (error?.code !== "ESRCH") {
+        throw error;
+      }
+    }
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill(signal);
+  }
+  signalRecordedProcesses(recorded, signal);
+}
+
+function captureChildOutput(child, maxOutputBytes = 256 * 1024) {
   const logs = { stdout: "", stderr: "" };
   const append = (name, chunk) => {
-    logs[name] = `${logs[name]}${chunk.toString("utf8")}`.slice(-256 * 1024);
+    logs[name] = `${logs[name]}${chunk.toString("utf8")}`.slice(-maxOutputBytes);
   };
   child.stdout.on("data", (chunk) => append("stdout", chunk));
   child.stderr.on("data", (chunk) => append("stderr", chunk));
@@ -1049,20 +1382,42 @@ async function descendantProcesses(rootPid) {
 }
 
 async function processTable() {
-  const { stdout } = await runCapture(
-    "ps",
-    ["-axo", "pid=,ppid=,command="],
-    { cwd: workspaceRoot, timeoutMs: 10_000 },
-  );
-  return stdout
+  const child = spawn("ps", ["-axo", "pid=,ppid=,pgid=,command="], {
+    cwd: workspaceRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const logs = captureChildOutput(child);
+  const terminal = captureChildTerminal(child);
+  let result = await waitForTerminal(terminal, 10_000);
+  if (!result) {
+    child.kill("SIGKILL");
+    result = await waitForTerminal(terminal, 5_000);
+  }
+  if (!result) {
+    throw new Error("ps remained alive after SIGKILL.");
+  }
+  if (result.error) {
+    throw new Error(`ps failed to start: ${result.error.message}`);
+  }
+  if (result.code !== 0) {
+    throw new Error(
+      `ps failed with ${result.signal ? `signal ${result.signal}` : `exit code ${result.code}`}.\n${logs.stderr}`,
+    );
+  }
+  return logs.stdout
     .split("\n")
-    .map((line) => line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/))
+    .map((line) => line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/))
     .filter(Boolean)
     .map((match) => ({
       pid: Number(match[1]),
       ppid: Number(match[2]),
-      command: match[3],
+      pgid: Number(match[3]),
+      command: match[4],
     }));
+}
+
+async function processGroupProcesses(groupId) {
+  return (await processTable()).filter(({ pgid }) => pgid === groupId);
 }
 
 async function matchingLiveProcesses(recorded) {
@@ -1095,6 +1450,16 @@ async function waitForRecordedProcessesToStop(recorded, timeoutMs) {
   while (live.length > 0 && Date.now() < deadline) {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
     live = await matchingLiveProcesses(recorded);
+  }
+  return live;
+}
+
+async function waitForProcessGroupToStop(groupId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let live = await processGroupProcesses(groupId);
+  while (live.length > 0 && Date.now() < deadline) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    live = await processGroupProcesses(groupId);
   }
   return live;
 }
