@@ -463,6 +463,7 @@ pub mod observability {
             assert_eq!(value["schema"], EVENT_SCHEMA);
             assert_eq!(value["version"], EVENT_SCHEMA_VERSION);
             assert_eq!(value["event"], "operation_completed");
+            assert!(value["emitted_at_unix_ms"].as_u64().unwrap() > 1);
             assert_eq!(value["component"], "server");
             assert_eq!(value["operation"], "http_request");
             assert_eq!(value["outcome"], "success");
@@ -473,6 +474,23 @@ pub mod observability {
             assert_eq!(value["http"]["response_mode"], "document");
             assert!(value.get("error_class").is_none());
             assert!(value.get("failure_phase").is_none());
+        }
+
+        #[test]
+        fn method_classification_is_closed_and_case_sensitive() {
+            for (method, expected) in [
+                ("GET", MethodClass::Get),
+                ("POST", MethodClass::Post),
+                ("HEAD", MethodClass::Head),
+                ("OPTIONS", MethodClass::Options),
+                ("PUT", MethodClass::Put),
+                ("PATCH", MethodClass::Patch),
+                ("DELETE", MethodClass::Delete),
+                ("get", MethodClass::Other),
+                ("CONNECT", MethodClass::Other),
+            ] {
+                assert_eq!(MethodClass::from_method(method), expected);
+            }
         }
 
         #[test]
@@ -518,6 +536,40 @@ pub mod observability {
             assert!(route.contains('?'));
             assert!(!line.contains("secret-query-token"));
             assert!(line.len() <= MAX_EVENT_BYTES);
+        }
+
+        #[test]
+        fn event_encoding_accepts_the_exact_ceiling_and_rejects_the_next_byte() {
+            let mut event = completed_event(None);
+            let original_route_bytes = event.http.as_ref().unwrap().route_pattern.as_str().len();
+            let original_json_bytes = serde_json::to_string(&event).unwrap().len();
+            let exact_route_bytes = MAX_EVENT_BYTES - (original_json_bytes - original_route_bytes);
+            event.http.as_mut().unwrap().route_pattern =
+                RoutePattern("x".repeat(exact_route_bytes));
+
+            let exact = event.to_json_line().unwrap();
+            assert_eq!(exact.len(), MAX_EVENT_BYTES);
+
+            event.http.as_mut().unwrap().route_pattern.0.push('x');
+            assert!(matches!(
+                event.to_json_line(),
+                Err(EventEncodingError::SizeLimit {
+                    actual,
+                    limit: MAX_EVENT_BYTES
+                }) if actual == MAX_EVENT_BYTES + 1
+            ));
+        }
+
+        #[test]
+        fn event_encoding_size_error_is_actionable() {
+            assert_eq!(
+                EventEncodingError::SizeLimit {
+                    actual: MAX_EVENT_BYTES + 1,
+                    limit: MAX_EVENT_BYTES,
+                }
+                .to_string(),
+                "event is 1025 bytes; limit is 1024"
+            );
         }
 
         #[test]

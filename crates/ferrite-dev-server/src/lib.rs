@@ -8423,6 +8423,166 @@ process.exit(17);
     }
 
     #[test]
+    fn structured_response_classification_covers_status_classes_and_phases() {
+        for (status, route_pattern, expected) in [
+            (200, None, (Outcome::Success, None, None)),
+            (
+                404,
+                Some("/posts/:id"),
+                (
+                    Outcome::Error,
+                    Some(ErrorClass::NotFound),
+                    Some(FailurePhase::Read),
+                ),
+            ),
+            (
+                408,
+                None,
+                (
+                    Outcome::Timeout,
+                    Some(ErrorClass::Timeout),
+                    Some(FailurePhase::Read),
+                ),
+            ),
+            (
+                504,
+                Some("/posts/:id"),
+                (
+                    Outcome::Timeout,
+                    Some(ErrorClass::Timeout),
+                    Some(FailurePhase::Render),
+                ),
+            ),
+            (
+                413,
+                Some("/posts/:id"),
+                (
+                    Outcome::Error,
+                    Some(ErrorClass::ResourceExhausted),
+                    Some(FailurePhase::Read),
+                ),
+            ),
+            (
+                401,
+                Some("/posts/:id"),
+                (
+                    Outcome::Error,
+                    Some(ErrorClass::Rejected),
+                    Some(FailurePhase::Read),
+                ),
+            ),
+            (
+                500,
+                None,
+                (
+                    Outcome::Error,
+                    Some(ErrorClass::Internal),
+                    Some(FailurePhase::Read),
+                ),
+            ),
+            (
+                500,
+                Some("/posts/:id"),
+                (
+                    Outcome::Error,
+                    Some(ErrorClass::Internal),
+                    Some(FailurePhase::Render),
+                ),
+            ),
+        ] {
+            let mut response = DevResponse::ok("text/plain; charset=utf-8", "body");
+            response.status = status;
+            assert_eq!(
+                classify_response_observability(&response, route_pattern),
+                expected,
+                "status {status} with route {route_pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_response_mode_classifies_every_bounded_content_type() {
+        for (content_type, expected) in [
+            (
+                SERVER_PAYLOAD_CONTENT_TYPE,
+                ObservabilityResponseMode::PayloadJson,
+            ),
+            (
+                SERVER_PAYLOAD_STREAM_CONTENT_TYPE,
+                ObservabilityResponseMode::PayloadStream,
+            ),
+            (
+                SERVER_ACTION_RESPONSE_CONTENT_TYPE,
+                ObservabilityResponseMode::Action,
+            ),
+            (
+                "text/html; charset=utf-8",
+                ObservabilityResponseMode::Document,
+            ),
+            (
+                "text/plain; version=0.0.4; charset=utf-8",
+                ObservabilityResponseMode::Metrics,
+            ),
+            ("application/octet-stream", ObservabilityResponseMode::Other),
+        ] {
+            assert_eq!(
+                response_mode_from_content_type(&DevResponse::ok(content_type, "body")),
+                expected,
+                "content type {content_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_request_error_emits_a_redacted_terminal_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(4);
+        let project = production_project_for(&app).with_observability_emitter(emitter);
+        let request_context = project.direct_request_context();
+        let error =
+            DevServerError::InvalidRequestPath("private-path?token=super-secret".to_owned());
+
+        project.emit_request_error("GET", &request_context, &error, Duration::from_millis(3));
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].component, ObservabilityComponent::Server);
+        assert_eq!(events[0].operation, ObservabilityOperation::HttpRequest);
+        assert_eq!(events[0].outcome, Some(Outcome::Error));
+        assert_eq!(events[0].error_class, Some(ErrorClass::InvalidInput));
+        assert_eq!(events[0].failure_phase, Some(FailurePhase::Read));
+        assert_eq!(events[0].http.as_ref().unwrap().method, MethodClass::Get);
+        let encoded = events[0].to_json_line().unwrap();
+        assert!(!encoded.contains("private-path"));
+        assert!(!encoded.contains("super-secret"));
+    }
+
+    #[test]
+    fn structured_io_classification_rejects_invalid_input_and_false_deadlines() {
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            assert_eq!(
+                classify_observability_io_error(&std::io::Error::from(kind)),
+                (Outcome::Error, ErrorClass::InvalidInput)
+            );
+        }
+
+        let unrelated_timeout = DevServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "unrelated private timeout detail",
+        ));
+        assert!(!is_response_write_deadline_error(&unrelated_timeout));
+        assert!(is_response_write_deadline_error(&DevServerError::Io(
+            response_write_deadline_error()
+        )));
+    }
+
+    #[test]
     fn structured_events_are_opt_in_by_default() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");

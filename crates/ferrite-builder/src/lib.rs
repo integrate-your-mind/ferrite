@@ -1990,6 +1990,29 @@ process.stdout.write(JSON.stringify({{
     }
 
     #[test]
+    fn observed_build_io_classification_distinguishes_timeout_and_invalid_input() {
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            assert_eq!(
+                classify_io_error(&std::io::Error::from(kind)),
+                (Outcome::Timeout, ErrorClass::Timeout)
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            assert_eq!(
+                classify_io_error(&std::io::Error::from(kind)),
+                (Outcome::Error, ErrorClass::InvalidInput)
+            );
+        }
+        assert_eq!(
+            classify_io_error(&std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            (Outcome::Error, ErrorClass::Io)
+        );
+    }
+
+    #[test]
     fn observed_build_success_is_correlated_and_reports_bounded_route_count() {
         let project = tempfile::tempdir().unwrap();
         let expected = BuildReport {
