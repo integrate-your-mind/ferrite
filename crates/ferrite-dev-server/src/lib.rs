@@ -6348,6 +6348,31 @@ process.exit(1);
     }
 
     #[test]
+    fn multipart_action_form_rejects_early_close_and_malformed_part_framing() {
+        let content_type = "multipart/form-data; boundary=FerriteBoundary";
+        for (body, expected_error) in [
+            (
+                &b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\naccepted-before-close\r\n--FerriteBoundary--\r\nignored\r\n--FerriteBoundary--\r\n"[..],
+                "bytes after its terminal boundary",
+            ),
+            (
+                &b"--FerriteBoundaryX\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nvalue\r\n--FerriteBoundary--\r\n"[..],
+                "boundary line is malformed",
+            ),
+            (
+                &b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\nvalue\r\n--FerriteBoundary--\r\n"[..],
+                "part is missing headers",
+            ),
+        ] {
+            let error = parse_multipart_form(content_type, body).unwrap_err();
+            assert!(
+                error.contains(expected_error),
+                "expected `{expected_error}`, received `{error}`"
+            );
+        }
+    }
+
+    #[test]
     fn multipart_action_form_rejects_every_truncated_prefix() {
         let content_type = "multipart/form-data; boundary=FerriteBoundary";
         let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\ncomplete\r\n--FerriteBoundary--";
@@ -6483,6 +6508,22 @@ process.exit(1);
     }
 
     #[test]
+    fn multipart_action_form_accepts_maximum_length_boundary() {
+        let boundary = "a".repeat(70);
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nmaximum\r\n--{boundary}--\r\n"
+        );
+
+        let form = parse_multipart_form(&content_type, body.as_bytes()).unwrap();
+
+        assert_eq!(
+            form.get("title"),
+            Some(&ServerActionFormValue::String("maximum".to_owned()))
+        );
+    }
+
+    #[test]
     fn multipart_action_form_rejects_invalid_boundary_parameters() {
         let body = b"--FerriteBoundary--\r\n";
         for (content_type, expected_error) in [
@@ -6510,6 +6551,11 @@ process.exit(1);
             (
                 "multipart/form-data; note=\"unterminated; boundary=FerriteBoundary",
                 "unsupported `note` parameter",
+            ),
+            ("multipart/form-data; boundary=", "boundary is invalid"),
+            (
+                "multipart/form-data; boundary=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "boundary is invalid",
             ),
             (
                 "multipart/form-data; boundary=contains space",
@@ -7062,6 +7108,11 @@ process.exit(1);
                 "filename traversal",
                 b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_action\"\r\n\r\napp/posts/[id]/page.tsx#savePost\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_route\"\r\n\r\n/posts/abc\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"asset\"; filename=\"../../etc/passwd\"\r\nContent-Type: application/octet-stream\r\n\r\nmust not execute\r\n--FerriteBoundary--\r\n",
                 "file parts",
+            ),
+            (
+                "early close with trailing file",
+                b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_action\"\r\n\r\napp/posts/[id]/page.tsx#savePost\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_route\"\r\n\r\n/posts/abc\r\n--FerriteBoundary--\r\nContent-Disposition: form-data; name=\"asset\"; filename=\"../../etc/passwd\"\r\nContent-Type: application/octet-stream\r\n\r\nmust not execute\r\n--FerriteBoundary--\r\n",
+                "bytes after its terminal boundary",
             ),
         ];
 
