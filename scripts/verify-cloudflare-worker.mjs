@@ -716,6 +716,7 @@ async function createFixture(root) {
       main: "./worker.mjs",
       compatibility_date: compatibilityDate,
       compatibility_flags: ["nodejs_compat"],
+      upload_source_maps: false,
       vars: { FERRITE_SSR_ROLLBACK: "0" },
       assets: {
         directory: "./assets",
@@ -900,6 +901,7 @@ async function writeExactBundleConfig(fixture, metafilePath, fixtureRoot, bundle
       ],
       compatibility_date: compatibilityDate,
       compatibility_flags: ["nodejs_compat"],
+      upload_source_maps: false,
       vars: { FERRITE_SSR_ROLLBACK: "0" },
       assets: {
         directory: "./assets",
