@@ -7073,6 +7073,50 @@ process.exit(1);
     }
 
     #[test]
+    fn dev_and_production_accept_text_multipart_on_real_sockets() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(
+            &app.join("posts/[id]/page.tsx"),
+            "export default function Page() {}",
+        );
+        let body = b"--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_action\"\r\n\r\napp/posts/[id]/page.tsx#savePost\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"__ferrite_route\"\r\n\r\n/posts/abc\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello multipart\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\nrust\r\n--FerriteBoundary\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\ntsx\r\n--FerriteBoundary--\r\n";
+        let request = format!(
+            "POST /_ferrite/action HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=\"FerriteBoundary\"\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let responses = [
+            (
+                "dev",
+                dev_http_request(
+                    action_project_for(&app, action_renderer_body()),
+                    request.as_bytes(),
+                ),
+            ),
+            (
+                "production",
+                production_http_request(
+                    action_production_project_for(&app, action_renderer_body()),
+                    request.as_bytes(),
+                ),
+            ),
+        ];
+
+        for (adapter, response) in responses {
+            let headers = response_headers(&response);
+            let body: Value = serde_json::from_slice(response_body(&response)).unwrap();
+            assert!(headers.starts_with("HTTP/1.1 200 OK"), "{adapter}");
+            assert!(headers.contains("Connection: close"), "{adapter}");
+            assert_eq!(body["status"], "ok", "{adapter}");
+            assert_eq!(body["data"]["routePath"], "/posts/abc", "{adapter}");
+            assert_eq!(body["data"]["title"], "Hello multipart", "{adapter}");
+            assert_eq!(body["data"]["tag"][0], "rust", "{adapter}");
+            assert_eq!(body["data"]["tag"][1], "tsx", "{adapter}");
+        }
+    }
+
+    #[test]
     fn dev_and_production_reject_unsafe_multipart_before_action_invocation() {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
