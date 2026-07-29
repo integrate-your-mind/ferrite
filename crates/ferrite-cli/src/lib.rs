@@ -1552,6 +1552,34 @@ mod tests {
         }
     }
 
+    struct BlockingEventWriter {
+        started: Option<mpsc::SyncSender<()>>,
+        release: mpsc::Receiver<()>,
+        finished: Option<mpsc::SyncSender<()>>,
+    }
+
+    impl Write for BlockingEventWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.try_send(());
+            }
+            let _ = self.release.recv();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for BlockingEventWriter {
+        fn drop(&mut self) {
+            if let Some(finished) = self.finished.take() {
+                let _ = finished.try_send(());
+            }
+        }
+    }
+
     #[test]
     fn initializes_a_minimal_typescript_project() {
         let parent = tempfile::tempdir().unwrap();
@@ -1937,6 +1965,54 @@ mod tests {
         );
         assert_eq!(event["component"], "builder");
         assert_eq!(event["operation"], "build_project");
+    }
+
+    #[test]
+    fn event_log_writer_drop_is_bounded_when_output_remains_blocked() {
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::channel();
+        let writer = EventLogWriter::start_with_writer(
+            EventLogFormat::Json,
+            BlockingEventWriter {
+                started: Some(started_sender),
+                release: release_receiver,
+                finished: Some(finished_sender),
+            },
+        )
+        .unwrap();
+        let emitter = writer.emitter();
+        assert_eq!(
+            emitter.emit(Event::started(
+                CorrelationId::generate(),
+                0,
+                ObservabilityComponent::Builder,
+                ObservabilityOperation::BuildProject,
+            )),
+            EmitResult::Sent
+        );
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("event writer should reach the blocked output");
+        drop(emitter);
+
+        let started = std::time::Instant::now();
+        drop(writer);
+        let elapsed = started.elapsed();
+
+        drop(release_sender);
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached event writer should finish after output is released");
+
+        assert!(
+            elapsed >= Duration::from_millis(75),
+            "drop returned before the configured shutdown wait: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "drop exceeded its bounded shutdown wait: {elapsed:?}"
+        );
     }
 
     #[test]

@@ -91,6 +91,13 @@ pub fn build_project_with_observability(
     config: &BuildConfig,
     emitter: &EventEmitter,
 ) -> Result<BuildReport> {
+    run_observed_build(emitter, || build_project_inner(config))
+}
+
+fn run_observed_build<F>(emitter: &EventEmitter, build: F) -> Result<BuildReport>
+where
+    F: FnOnce() -> Result<BuildReport>,
+{
     let correlation_id = CorrelationId::generate();
     let started = Instant::now();
     let _ = emitter.emit(
@@ -103,7 +110,7 @@ pub fn build_project_with_observability(
         .with_build(BuildFields::new(None)),
     );
 
-    let result = build_project_inner(config);
+    let result = build();
     let (outcome, error_class, routes) = match &result {
         Ok(report) => (Outcome::Success, None, Some(report.routes_count)),
         Err(error) => {
@@ -826,6 +833,47 @@ mod tests {
         let encoded = events[1].to_json_line().unwrap();
         assert!(!encoded.contains("overlaps Ferrite project source"));
         assert!(!encoded.contains(project.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn observed_build_success_is_correlated_and_reports_bounded_route_count() {
+        let project = tempfile::tempdir().unwrap();
+        let expected = BuildReport {
+            out_dir: project.path().join(".ferrite/build"),
+            routes_count: 3,
+            html_files: Vec::new(),
+            page_metadata: Vec::new(),
+            skipped_dynamic_routes: Vec::new(),
+            manifest_file: project.path().join(".ferrite/build/manifest.json"),
+            production_manifest_file: project.path().join(".ferrite/build/ferrite-build.json"),
+            production_build_id: "observed-build-test".to_owned(),
+            server_modules: Vec::new(),
+            client_bundles: Vec::new(),
+            server_action_manifests: Vec::new(),
+        };
+        let (emitter, receiver) = ferrite_core::observability::bounded_channel(4);
+
+        let report = run_observed_build(&emitter, || Ok(expected.clone())).unwrap();
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(report, expected);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event,
+            ferrite_core::observability::EventName::OperationStarted
+        );
+        assert_eq!(
+            events[1].event,
+            ferrite_core::observability::EventName::OperationCompleted
+        );
+        assert_eq!(events[0].correlation_id, events[1].correlation_id);
+        assert_eq!(events[0].sequence, 0);
+        assert_eq!(events[1].sequence, 1);
+        assert_eq!(events[0].build.as_ref().unwrap().routes, None);
+        assert_eq!(events[1].outcome, Some(Outcome::Success));
+        assert_eq!(events[1].error_class, None);
+        assert_eq!(events[1].failure_phase, None);
+        assert_eq!(events[1].build.as_ref().unwrap().routes, Some(3));
     }
 
     #[test]
