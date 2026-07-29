@@ -60,6 +60,10 @@ Ferrite currently provides a buildable framework foundation with:
 
 Ferrite is not a drop-in React or Next.js replacement. It does not yet provide a stable registry install path, full React Server Components, automatic `"use server"` discovery, distributed replay state, general auth middleware, file uploads, complete tracing, broad platform proof, or a supported public HTTP edge.
 
+See the [React compatibility matrix](docs/react-compatibility.md) for the
+source-backed JSX, hooks, events, hydration, serialization, and ecosystem
+boundary.
+
 ## Requirements
 
 The repository currently targets:
