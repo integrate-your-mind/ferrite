@@ -258,6 +258,75 @@ test("event names that end in Capture remain native event names", () => {
   assert.deepEqual(calls, ["got pointer capture"]);
 });
 
+test("native custom event names ending in Capture remain backward compatible", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+
+  const root = mount(
+    createElement(
+      "button",
+      {
+        onFileCapture: () => calls.push("file capture"),
+      },
+      "Upload",
+    ),
+    container,
+  );
+
+  const button = container.querySelector("button");
+  button?.dispatchEvent(new window.Event("file", { bubbles: true }));
+  button?.dispatchEvent(new window.Event("filecapture", { bubbles: true }));
+
+  root.update(
+    createElement(
+      "button",
+      {
+        onFileCapture: () => calls.push("updated file capture"),
+      },
+      "Upload",
+    ),
+  );
+  button?.dispatchEvent(new window.Event("filecapture", { bubbles: true }));
+
+  root.update(createElement("button", null, "Upload"));
+  button?.dispatchEvent(new window.Event("filecapture", { bubbles: true }));
+
+  assert.deepEqual(calls, ["file capture", "updated file capture"]);
+});
+
+test("native custom event names ending in Capture can opt into capture phase", () => {
+  const { window, container } = createContainer();
+  const calls = [];
+
+  mount(
+    createElement(
+      "div",
+      {
+        onFileCaptureCapture: () => calls.push("parent capture"),
+        onFileCapture: () => calls.push("parent bubble"),
+      },
+      createElement(
+        "button",
+        {
+          onFileCapture: () => calls.push("child bubble"),
+        },
+        "Upload",
+      ),
+    ),
+    container,
+  );
+
+  container
+    .querySelector("button")
+    ?.dispatchEvent(new window.Event("filecapture", { bubbles: true }));
+
+  assert.deepEqual(calls, [
+    "parent capture",
+    "child bubble",
+    "parent bubble",
+  ]);
+});
+
 test("capture handlers are replaced and removed without changing the DOM node", () => {
   const { window, container } = createContainer();
   const calls = [];

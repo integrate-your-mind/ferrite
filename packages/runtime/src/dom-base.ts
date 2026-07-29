@@ -2755,7 +2755,90 @@ function cloneErrorBoundaryState(source: Map<string, ErrorBoundaryState>): Map<s
 
 const EVENT_CAPTURE_SUFFIX = "Capture";
 const REACT_EVENT_NAME_ALIASES = new Map<string, string>([["DoubleClick", "dblclick"]]);
-const EVENT_NAMES_ENDING_IN_CAPTURE = new Set(["GotPointerCapture", "LostPointerCapture"]);
+// React documents Capture variants for these DOM event props. Unknown names
+// retain Ferrite's existing native custom-event mapping.
+const REACT_CAPTURE_EVENT_NAMES = new Set([
+  "Abort",
+  "AnimationEnd",
+  "AnimationIteration",
+  "AnimationStart",
+  "AuxClick",
+  "BeforeInput",
+  "Blur",
+  "CanPlay",
+  "CanPlayThrough",
+  "Cancel",
+  "Change",
+  "Click",
+  "Close",
+  "CompositionEnd",
+  "CompositionStart",
+  "CompositionUpdate",
+  "ContextMenu",
+  "Copy",
+  "Cut",
+  "DoubleClick",
+  "Drag",
+  "DragEnd",
+  "DragEnter",
+  "DragLeave",
+  "DragOver",
+  "DragStart",
+  "Drop",
+  "DurationChange",
+  "Emptied",
+  "Encrypted",
+  "Ended",
+  "Error",
+  "Focus",
+  "GotPointerCapture",
+  "Input",
+  "Invalid",
+  "KeyDown",
+  "KeyPress",
+  "KeyUp",
+  "Load",
+  "LoadedData",
+  "LoadedMetadata",
+  "LoadStart",
+  "LostPointerCapture",
+  "MouseDown",
+  "MouseMove",
+  "MouseOut",
+  "MouseOver",
+  "MouseUp",
+  "Paste",
+  "Pause",
+  "Play",
+  "Playing",
+  "PointerCancel",
+  "PointerDown",
+  "PointerMove",
+  "PointerOut",
+  "PointerOver",
+  "PointerUp",
+  "Progress",
+  "RateChange",
+  "Reset",
+  "Resize",
+  "Scroll",
+  "Seeked",
+  "Seeking",
+  "Select",
+  "Stalled",
+  "Submit",
+  "Suspend",
+  "TimeUpdate",
+  "Toggle",
+  "TouchCancel",
+  "TouchEnd",
+  "TouchMove",
+  "TouchStart",
+  "TransitionEnd",
+  "VolumeChange",
+  "Waiting",
+  "Wheel",
+]);
 
 function eventBindingFromProp(name: string): EventBinding | null {
   if (name.length <= 2 || !name.startsWith("on")) {
@@ -2767,11 +2850,14 @@ function eventBindingFromProp(name: string): EventBinding | null {
     return null;
   }
 
+  const captureCandidate = raw.endsWith(EVENT_CAPTURE_SUFFIX)
+    ? raw.slice(0, -EVENT_CAPTURE_SUFFIX.length)
+    : null;
   const capture =
-    raw.length > EVENT_CAPTURE_SUFFIX.length &&
-    raw.endsWith(EVENT_CAPTURE_SUFFIX) &&
-    !EVENT_NAMES_ENDING_IN_CAPTURE.has(raw);
-  const eventName = capture ? raw.slice(0, -EVENT_CAPTURE_SUFFIX.length) : raw;
+    captureCandidate !== null &&
+    (captureCandidate.endsWith(EVENT_CAPTURE_SUFFIX) ||
+      REACT_CAPTURE_EVENT_NAMES.has(captureCandidate));
+  const eventName = capture && captureCandidate !== null ? captureCandidate : raw;
 
   return {
     eventName: REACT_EVENT_NAME_ALIASES.get(eventName) ?? eventName.toLowerCase(),
