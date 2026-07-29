@@ -6,6 +6,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   readdir,
   realpath,
   rename,
@@ -77,7 +78,13 @@ export function rustBootstrapSupported(
   return platform === "linux" && arch === "x64";
 }
 
-export function buildPlan(cargo = "cargo") {
+export function buildPlan(cargo = "cargo", options = {}) {
+  const artifactDirectory =
+    options.artifactDirectory ?? join(website, ".ferrite", "build");
+  const distDirectory = options.distDirectory ?? websiteDist;
+  const typesOutput =
+    options.typesOutput ??
+    join(website, ".ferrite", "types", "routes.d.ts");
   return [
     {
       command: process.execPath,
@@ -102,6 +109,10 @@ export function buildPlan(cargo = "cargo") {
         "build",
         "--project",
         website,
+        "--out",
+        artifactDirectory,
+        "--types-out",
+        typesOutput,
         "--page-renderer",
         join(root, "packages", "runtime", "bin", "render-page.mjs"),
         "--client-bundler",
@@ -111,7 +122,11 @@ export function buildPlan(cargo = "cargo") {
     },
     {
       command: process.execPath,
-      args: [join(website, "deploy-adapter.mjs")],
+      args: [
+        join(website, "deploy-adapter.mjs"),
+        artifactDirectory,
+        distDirectory,
+      ],
       timeoutMs: 2 * 60_000,
     },
   ];
@@ -531,6 +546,65 @@ async function pathExists(path, lstatImpl = lstat) {
   }
 }
 
+async function siteOutputIdentity(path, options = {}) {
+  const lstatImpl = options.lstatImpl ?? lstat;
+  const readFileImpl = options.readFileImpl ?? readFile;
+  const readdirImpl = options.readdirImpl ?? readdir;
+  const realpathImpl = options.realpathImpl ?? realpath;
+  const canonicalRoot = await realpathImpl(path);
+  const records = [];
+
+  async function visit(parts) {
+    const absolute = join(path, ...parts);
+    const info = await lstatImpl(absolute);
+    if (info.isSymbolicLink()) {
+      throw new Error("website dist snapshot must not contain symlinks");
+    }
+    const expected = join(canonicalRoot, ...parts);
+    if ((await realpathImpl(absolute)) !== expected) {
+      throw new Error("website dist snapshot escaped its canonical root");
+    }
+    if (info.isDirectory()) {
+      records.push(["directory", parts]);
+      const entries = await readdirImpl(absolute, { withFileTypes: true });
+      entries.sort(({ name: left }, { name: right }) =>
+        left.localeCompare(right),
+      );
+      for (const entry of entries) {
+        if (
+          entry.isSymbolicLink() ||
+          (!entry.isDirectory() && !entry.isFile())
+        ) {
+          throw new Error(
+            "website dist snapshot must contain only directories and regular files",
+          );
+        }
+        await visit([...parts, entry.name]);
+      }
+      return;
+    }
+    if (!info.isFile()) {
+      throw new Error(
+        "website dist snapshot must contain only directories and regular files",
+      );
+    }
+    const bytes = await readFileImpl(absolute);
+    const after = await lstatImpl(absolute);
+    if (
+      after.isSymbolicLink() ||
+      !after.isFile() ||
+      after.size !== bytes.byteLength ||
+      (await realpathImpl(absolute)) !== expected
+    ) {
+      throw new Error("website dist changed during site output snapshot");
+    }
+    records.push(["file", parts, bytes.byteLength, sha256(bytes)]);
+  }
+
+  await visit([]);
+  return sha256(Buffer.from(JSON.stringify(records)));
+}
+
 async function ensureDestinationDirectory(
   path,
   { lstatImpl = lstat, mkdirImpl = mkdir, realpathImpl = realpath } = {},
@@ -560,6 +634,7 @@ export async function replaceSiteOutput(
   const lstatImpl = options.lstatImpl ?? lstat;
   const mkdirImpl = options.mkdirImpl ?? mkdir;
   const mkdtempImpl = options.mkdtempImpl ?? mkdtemp;
+  const readFileImpl = options.readFileImpl ?? readFile;
   const readdirImpl = options.readdirImpl ?? readdir;
   const realpathImpl = options.realpathImpl ?? realpath;
   const renameImpl = options.renameImpl ?? rename;
@@ -587,6 +662,16 @@ export async function replaceSiteOutput(
       );
     }
   }
+  const identityOptions = {
+    lstatImpl,
+    readFileImpl,
+    readdirImpl,
+    realpathImpl,
+  };
+  const sourceIdentity = await siteOutputIdentity(
+    sourceDist,
+    identityOptions,
+  );
 
   const destinationRoot = await ensureDestinationDirectory(destinationDist, {
     lstatImpl,
@@ -624,6 +709,20 @@ export async function replaceSiteOutput(
         errorOnExist: true,
         force: false,
       });
+    }
+    const sourceIdentityAfter = await siteOutputIdentity(
+      sourceDist,
+      identityOptions,
+    );
+    const stagingIdentity = await siteOutputIdentity(
+      stagingRoot,
+      identityOptions,
+    );
+    if (
+      sourceIdentityAfter !== sourceIdentity ||
+      stagingIdentity !== sourceIdentity
+    ) {
+      throw new Error("website dist changed during site output snapshot");
     }
     for (const name of SITE_OUTPUT_ENTRIES) {
       const destination = join(destinationRoot, name);
@@ -701,19 +800,72 @@ export async function buildSitesSource(options = {}) {
   const resolveCargoImpl = options.resolveCargoImpl ?? resolveCargo;
   const runImpl = options.runImpl ?? run;
   const planImpl = options.buildPlanImpl ?? buildPlan;
+  const mkdirImpl = options.mkdirImpl ?? mkdir;
+  const mkdtempImpl = options.mkdtempImpl ?? mkdtemp;
+  const rmImpl = options.rmImpl ?? rm;
+  const requireDirectoryImpl =
+    options.requireDirectoryImpl ?? requireDirectory;
+  const replaceSiteOutputImpl =
+    options.replaceSiteOutputImpl ?? replaceSiteOutput;
+  const scratchParent = options.scratchParent ?? join(root, ".ferrite");
+  const destination = options.outputDist ?? outputDist;
   const cargo = await resolveCargoImpl({ env: baseEnv });
   const env = { ...cargo.env, FERRITE_SITE_ORIGIN: origin };
+  let invocationRoot;
+  let result;
+  let operationError;
   try {
-    for (const step of planImpl(cargo.command)) {
+    await mkdirImpl(scratchParent, { recursive: true });
+    invocationRoot = await mkdtempImpl(
+      join(scratchParent, "sites-source-"),
+    );
+    const artifactDirectory = join(invocationRoot, "artifact");
+    const sourceDist = join(invocationRoot, "dist");
+    const typesOutput = join(invocationRoot, "types", "routes.d.ts");
+    for (const step of planImpl(cargo.command, {
+      artifactDirectory,
+      distDirectory: sourceDist,
+      typesOutput,
+    })) {
       await runImpl(step.command, step.args, env, step.timeoutMs);
     }
-    await requireDirectory(websiteDist, "website dist");
-    await replaceSiteOutput(websiteDist, outputDist);
-    await requireDirectory(outputDist, "root dist");
-    return { origin, outputDist };
-  } finally {
-    await cargo.cleanup();
+    await requireDirectoryImpl(sourceDist, "website dist");
+    await replaceSiteOutputImpl(sourceDist, destination);
+    await requireDirectoryImpl(destination, "root dist");
+    result = { origin, outputDist: destination };
+  } catch (error) {
+    operationError = error;
   }
+
+  const cleanupErrors = [];
+  if (invocationRoot) {
+    try {
+      await rmImpl(invocationRoot, { recursive: true, force: true });
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  try {
+    await cargo.cleanup();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+
+  if (operationError) {
+    if (cleanupErrors.length === 0) throw operationError;
+    throw new AggregateError(
+      [operationError, ...cleanupErrors],
+      `${operationError.message}; Sites source build cleanup failed`,
+    );
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(
+      cleanupErrors,
+      "Sites source build cleanup failed",
+    );
+  }
+  return result;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

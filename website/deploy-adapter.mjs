@@ -865,8 +865,27 @@ export function createSiteServer(distDirectory = join(root, "dist")) {
   });
 }
 
+export function parsePackageArguments(args) {
+  if (args.length === 0) return {};
+  if (
+    args.length !== 2 ||
+    args.some((value) => typeof value !== "string" || value.length === 0)
+  ) {
+    throw new Error(
+      "usage: node deploy-adapter.mjs [artifact-directory dist-directory]",
+    );
+  }
+  return {
+    artifactDirectory: args[0],
+    distDirectory: args[1],
+  };
+}
+
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  const result = await packageArtifact();
+  const { artifactDirectory, distDirectory } = parsePackageArguments(
+    process.argv.slice(2),
+  );
+  const result = await packageArtifact(artifactDirectory, distDirectory);
   if (process.env.FERRITE_SITES_SERVE === "1") {
     const port = Number(process.env.PORT ?? 8788);
     createSiteServer(result.dist).listen(port, "127.0.0.1", () => console.log(`Ferrite Sites adapter listening on 127.0.0.1:${port}`));
