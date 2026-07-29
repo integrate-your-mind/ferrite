@@ -15,7 +15,9 @@ ferrite serve --project ./app --artifact .ferrite/build --event-log json
 Events are written to stderr. Normal command output remains on its existing
 stream, and omitting `--event-log` creates no structured-event writer.
 `--event-log` cannot be combined with the PII-bearing legacy `--access-log` or
-`--action-log` streams.
+`--action-log` streams. Startup and user-facing diagnostics can still share
+stderr, so consumers must select records by the `ferrite.observability` schema
+rather than treating every stderr line as structured JSON.
 
 ## Version 1 Contract
 
@@ -60,6 +62,9 @@ The fixed fields are:
 Start events omit terminal outcome fields. Successful completion events omit
 error fields. Durations are capped at 24 hours, build route counts at one
 million, route patterns at 256 UTF-8 bytes, and each serialized event at 1 KiB.
+For correlated server events, `duration_ms` is elapsed time since Ferrite began
+handling the request, not a component-local span duration. Sequence numbers
+describe ordering only; they do not turn these records into tracing spans.
 
 ## Correlation Boundaries
 
@@ -71,11 +76,13 @@ events:
 1. sequence `0`: accepted HTTP operation started
 2. sequence `1`: matching render or navigation operation completed
 3. sequence `2`: application response completed
-4. sequence `3`: socket delivery completed or failed
+4. sequence `3`: the local socket write completed or failed
 
 Protocol rejections and unsupported methods can begin after request parsing has
 already failed, so they may emit only terminal server and transport events.
 Direct Rust `handle_get` and `handle_post` calls have no socket delivery event.
+A successful local write does not prove that the remote client received,
+processed, or retained every byte.
 
 Correlation IDs are opaque, process-local labels. Ferrite does not accept or
 propagate an inbound correlation header, create spans, implement W3C Trace
@@ -149,6 +156,8 @@ feature requires only omitting the emitter or CLI flag.
   build-wide timeout guarantee.
 - Response error classification is intentionally coarse where exposing an
   underlying child error would require retaining sensitive diagnostic data.
+- Renderer, navigation, server, and transport durations are request-relative;
+  Ferrite does not yet measure component-local spans.
 - A stream-render event describes the selected response mode; it does not prove
   that server rendering itself was incremental.
 - There is no sampling policy, exporter SDK, persistent spool, metrics bridge,

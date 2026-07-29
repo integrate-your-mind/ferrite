@@ -1293,13 +1293,18 @@ struct EventLogWriter {
 
 impl EventLogWriter {
     fn start(format: EventLogFormat) -> std::io::Result<Self> {
+        Self::start_with_writer(format, std::io::stderr())
+    }
+
+    fn start_with_writer<W>(format: EventLogFormat, mut output: W) -> std::io::Result<Self>
+    where
+        W: Write + Send + 'static,
+    {
         let (emitter, receiver) = bounded_channel(256);
         let (writer_done_sender, writer_done) = mpsc::sync_channel(1);
         let writer = thread::Builder::new()
             .name("ferrite-event-log".to_owned())
             .spawn(move || {
-                let stderr = std::io::stderr();
-                let mut stderr = stderr.lock();
                 for event in receiver {
                     let line = match format {
                         EventLogFormat::Json => event.to_json_line(),
@@ -1307,7 +1312,7 @@ impl EventLogWriter {
                     let Ok(line) = line else {
                         continue;
                     };
-                    if writeln!(stderr, "{line}").is_err() {
+                    if writeln!(output, "{line}").is_err() {
                         break;
                     }
                 }
@@ -1528,6 +1533,24 @@ enum TypecheckStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_core::observability::{
+        Component as ObservabilityComponent, CorrelationId, EmitResult, Event,
+        EventName as ObservabilityEventName, Operation as ObservabilityOperation,
+    };
+
+    #[derive(Clone)]
+    struct SharedEventBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedEventBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn initializes_a_minimal_typescript_project() {
@@ -1884,9 +1907,36 @@ mod tests {
     }
 
     #[test]
-    fn event_log_writer_joins_after_its_sender_closes() {
-        let writer = EventLogWriter::start(EventLogFormat::Json).unwrap();
+    fn event_log_writer_serializes_events_and_joins_after_its_sender_closes() {
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = EventLogWriter::start_with_writer(
+            EventLogFormat::Json,
+            SharedEventBuffer(Arc::clone(&output)),
+        )
+        .unwrap();
+        let emitter = writer.emitter();
+        assert_eq!(
+            emitter.emit(Event::started(
+                CorrelationId::generate(),
+                0,
+                ObservabilityComponent::Builder,
+                ObservabilityOperation::BuildProject,
+            )),
+            EmitResult::Sent
+        );
+        drop(emitter);
         drop(writer);
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(event["schema"], ferrite_core::observability::EVENT_SCHEMA);
+        assert_eq!(event["event"], "operation_started");
+        assert_eq!(
+            event["event"],
+            serde_json::to_value(ObservabilityEventName::OperationStarted).unwrap()
+        );
+        assert_eq!(event["component"], "builder");
+        assert_eq!(event["operation"], "build_project");
     }
 
     #[test]
