@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import {
   mkdir,
   mkdtemp,
@@ -236,6 +237,70 @@ test("Cloudflare proof records and monitors tracked input bytes", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("Cloudflare source monitor drains only pre-boundary watcher events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-watcher-boundary-"));
+  let emitChange;
+  let monitor;
+  try {
+    await writeFile(join(root, "source.mjs"), "export const value = 1;\n");
+    const watchImplementation = (_path, _options, listener) => {
+      const watcher = new EventEmitter();
+      watcher.close = () => {};
+      emitChange = () => listener("change");
+      setTimeout(emitChange, 0);
+      return watcher;
+    };
+
+    monitor = await startTrackedSourceMonitor(["source.mjs"], root, {
+      watchImplementation,
+      startupSettleMs: 25,
+    });
+    await monitor.assertUnchanged();
+
+    emitChange();
+    await assert.rejects(
+      monitor.assertUnchanged(),
+      /tracked source changed during the Worker proof/,
+    );
+  } finally {
+    monitor?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  "Cloudflare source monitor establishes a fresh macOS event boundary",
+  { skip: platform !== "darwin" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-event-boundary-"));
+    const source = join(root, "source.mjs");
+    const original = Buffer.from("export const value = 1;\n");
+    const replacement = Buffer.from("export const value = 2;\n");
+    let monitor;
+    try {
+      await writeFile(source, original);
+      for (let index = 0; index < 16; index += 1) {
+        await writeFile(source, replacement);
+        await writeFile(source, original);
+      }
+
+      monitor = await startTrackedSourceMonitor(["source.mjs"], root);
+      assert.deepEqual(await readFile(source), original);
+      await monitor.assertUnchanged();
+
+      await writeFile(source, replacement);
+      await writeFile(source, original);
+      await assert.rejects(
+        monitor.assertUnchanged(),
+        /tracked source changed during the Worker proof/,
+      );
+    } finally {
+      monitor?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("Cloudflare source monitor rejects a transient untracked Cargo build script", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-source-monitor-"));

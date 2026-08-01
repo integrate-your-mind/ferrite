@@ -1390,8 +1390,16 @@ export async function startTrackedSourceMonitor(
   {
     allowedWritePrefixes = [],
     rejectUnexpectedPaths = false,
+    watchImplementation = watch,
+    startupSettleMs = platform === "darwin" ? 250 : 0,
   } = {},
 ) {
+  if (typeof watchImplementation !== "function") {
+    throw new TypeError("Ferrite source monitor requires a watcher function.");
+  }
+  if (!Number.isInteger(startupSettleMs) || startupSettleMs < 0) {
+    throw new TypeError("Ferrite source monitor requires a non-negative startup settle time.");
+  }
   const trackedEntries = new Set(paths);
   const allowedWrites = allowedWritePrefixes.map((prefix) => {
     const normalized = prefix.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
@@ -1410,19 +1418,11 @@ export async function startTrackedSourceMonitor(
     directories.add(dirname(path));
   }
 
-  // FSEvents can deliver writes completed immediately before a directory
-  // watcher is registered. Establish the monitoring boundary only after those
-  // setup writes have settled; callers await this function before consuming
-  // any of the protected inputs.
-  if (platform === "darwin") {
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  }
-
   const changes = [];
   const watchers = [];
   try {
     for (const path of trackedEntries) {
-      const watcher = watch(
+      const watcher = watchImplementation(
         resolve(root, path),
         { persistent: false },
         (eventType) => {
@@ -1442,7 +1442,7 @@ export async function startTrackedSourceMonitor(
     if (rejectUnexpectedPaths) {
       for (const directory of directories) {
         const absoluteDirectory = resolve(root, directory);
-        const watcher = watch(
+        const watcher = watchImplementation(
           absoluteDirectory,
           { persistent: false },
           (eventType, filename) => {
@@ -1472,6 +1472,15 @@ export async function startTrackedSourceMonitor(
         });
         watchers.push(watcher);
       }
+    }
+
+    // FSEvents can deliver writes completed before a watcher was registered.
+    // Drain those historical notifications after registration, then establish
+    // the boundary returned to callers. The caller snapshots protected bytes
+    // immediately after this function returns, so later changes remain visible.
+    if (startupSettleMs > 0) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, startupSettleMs));
+      changes.length = 0;
     }
   } catch (error) {
     for (const watcher of watchers) {
