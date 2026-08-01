@@ -105,6 +105,8 @@ test("container template runs as a non-root runtime user with a health check", a
   assert.equal((dockerfile.match(/FROM \$\{NODE_IMAGE\}/g) ?? []).length, 2);
   assert.match(dockerfile, /COPY --from=node-toolchain \/usr\/local\/ \/usr\/local\//);
   assert.match(dockerfile, /node --version \| grep -q '\^v24\\\.'/);
+  assert.match(dockerfile, /corepack enable pnpm/);
+  assert.doesNotMatch(dockerfile, /corepack enable\s*\\/);
   assert.doesNotMatch(dockerfile, /deb\.nodesource\.com/);
   assert.doesNotMatch(dockerfile, /curl\s+-fsSL/);
   assert.doesNotMatch(dockerfile, /NODE_MAJOR/);

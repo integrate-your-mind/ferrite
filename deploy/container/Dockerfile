@@ -17,7 +17,7 @@ RUN rustc --version | grep -q '^rustc 1\.95\.0 ' \
   && rustup target add wasm32-unknown-unknown \
   && apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \
-  && corepack enable \
+  && corepack enable pnpm \
   && rm -rf /var/lib/apt/lists/*
 
 COPY . .
