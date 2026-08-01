@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 ferrite-builder = { path = "../ferrite-builder", version = "=0.1.0" }
 ferrite-client-bundler = { path = "../ferrite-client-bundler", version = "=0.1.0" }
+ferrite-core = { path = "../ferrite-core", version = "=0.1.0" }
 ferrite-page-renderer = { path = "../ferrite-page-renderer", version = "=0.1.0" }
 ferrite-protocol = { path = "../ferrite-protocol", version = "=0.1.0" }
 ferrite-router = { path = "../ferrite-router", version = "=0.1.0" }

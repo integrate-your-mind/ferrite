@@ -198,6 +198,7 @@ pnpm test:nginx:stack
 Production deployments should put Ferrite behind a mature edge such as nginx, Envoy, or Caddy. Do not expose it as a general-purpose public HTTP server. Use the checked deployment material for proxy headers, TLS, process supervision, smoke testing, logging, metrics, rollback, and failure handling:
 
 - [Deployment guide](docs/deployment.md)
+- [Structured observability](docs/observability.md)
 - [Architecture](docs/architecture.md)
 - [Production-readiness review](docs/production-readiness-review-2026-07-10.md)
 

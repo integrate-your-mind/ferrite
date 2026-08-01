@@ -202,6 +202,7 @@ name = "ferrite-builder"
 version = "0.1.0"
 dependencies = [
  "ferrite-client-bundler",
+ "ferrite-core",
  "ferrite-page-renderer",
  "ferrite-router",
  "libc",
@@ -220,6 +221,7 @@ dependencies = [
  "clap",
  "ferrite-builder",
  "ferrite-client-bundler",
+ "ferrite-core",
  "ferrite-dev-server",
  "ferrite-router",
  "ferrite-ssr",
@@ -249,6 +251,7 @@ name = "ferrite-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -257,6 +260,7 @@ version = "0.1.0"
 dependencies = [
  "ferrite-builder",
  "ferrite-client-bundler",
+ "ferrite-core",
  "ferrite-page-renderer",
  "ferrite-protocol",
  "ferrite-router",

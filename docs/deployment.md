@@ -187,7 +187,7 @@ Use command arguments for the current runtime knobs:
 
 The production adapter also has Rust API-level observer hooks. The CLI currently exposes the main request/render/write limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and in-memory Prometheus-style counters, but not tracing sinks or external audit sinks.
 
-If the response-write deadline expires before any bytes are sent, the connection closes with no response. If it expires after a header or body prefix is sent, the client receives a truncated response and the connection closes; Ferrite cannot safely replace an in-progress HTTP response with a new error document. The concurrent server emits a generic response-write deadline message to stderr. Overload `503` responses use the smaller of the configured deadline and 100 ms so rejected sockets do not hold the accept loop for the normal response budget.
+If the response-write deadline expires before any bytes are sent, the connection closes with no response. If it expires after a header or body prefix is sent, the client receives a truncated response and the connection closes; Ferrite cannot safely replace an in-progress HTTP response with a new error document. With `--event-log json`, the production adapter emits a bounded transport timeout event on a best-effort basis. Overload `503` responses use the smaller of the configured deadline and 100 ms so rejected sockets do not hold the accept loop for the normal response budget; those overload-pool responses are not yet represented in the structured event stream.
 
 ## Smoke Tests
 
@@ -250,7 +250,20 @@ Ferrite's Rust production API can also attach server-action observer hooks that 
 - client IP, derived from the same trusted-client-IP policy used for request logs
 - elapsed duration
 
-Applications embedding the Rust server should bridge those events into their logging, metrics, tracing, or audit stack. The CLI can expose in-memory request/action counters through `--metrics-path`; those counters intentionally label by method/status/route pattern and action outcome/status/route pattern, not request bodies, form fields, headers, CSRF tokens, or raw dynamic URL values. The CLI does not yet expose first-class external log sink configuration, trace IDs, tracing exporters, or external audit exporters.
+Applications embedding the Rust server can bridge those compatibility events into their own operational stack. The CLI can expose in-memory request/action counters through `--metrics-path`; those counters intentionally label by method/status/route pattern and action outcome/status/route pattern, not request bodies, form fields, headers, CSRF tokens, or raw dynamic URL values.
+
+The experimental structured event stream is a separate opt-in surface:
+
+```sh
+cargo run -p ferrite-cli -- build --project /srv/app --event-log json
+cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build --event-log json
+```
+
+It emits bounded JSON Lines to stderr with process-local correlation across build or accepted request work. Production request events separate the application response from socket delivery, so a successful render is not presented as proof that the client received every byte. Events use fixed enums, trusted route patterns, and size/cardinality limits. They omit raw paths, query strings, headers, bodies, form values, action IDs, client IPs, child diagnostics, error strings, and source paths.
+
+This is best-effort process-local telemetry. It has no vendor exporter, persistent spool, browser correlation, W3C Trace Context support, sampling contract, or distributed-tracing guarantee. See [Structured observability](observability.md) for the versioned schema, privacy contract, backpressure behavior, compatibility boundary, and known coverage gaps.
+
+Do not combine `--event-log` with the legacy `--access-log` or `--action-log` flags. The CLI rejects that configuration so PII-bearing compatibility records cannot be confused with the redacted structured stream.
 
 The nginx template returns `404` for the configured metrics path. A local collector should scrape the private `127.0.0.1:3000` upstream directly. The container template leaves metrics disabled by default because its `0.0.0.0:3000` listener may be published directly.
 
@@ -264,7 +277,7 @@ cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build -
 cargo run -p ferrite-cli -- serve --project /srv/app --artifact .ferrite/build --metrics-path /__ferrite/metrics
 ```
 
-Access log events include method, path, status, route pattern when known, derived client IP when available, and elapsed milliseconds. Action log events include action id, submitted route path, matched route pattern when known, status, accepted/rejected outcome, derived client IP when available, and elapsed milliseconds. Neither CLI log path includes request headers, request bodies, form fields, CSRF tokens, or replay nonces, so server-action form data and generated secrets are not logged by the Ferrite CLI access-log or action-log paths.
+The legacy access-log events include method, raw request path, status, route pattern when known, derived client IP when available, and elapsed milliseconds. Action-log events include action id, submitted route path, matched route pattern when known, status, accepted/rejected outcome, derived client IP when available, and elapsed milliseconds. Neither legacy path includes request headers, request bodies, form fields, CSRF tokens, or replay nonces, but raw paths can contain query values and client addresses are personal data. Treat these streams as sensitive compatibility data, protect collector access, and use `--event-log json` when the bounded redacted contract is appropriate.
 
 At the proxy layer, capture:
 
@@ -302,7 +315,7 @@ Current production hardening is incomplete. Ferrite can require one configured h
 
 Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately. If server actions are enabled in production, set `--server-action-csrf-token-env`, prefer `--server-action-csrf-cookie-name`, and set `--server-action-replay-ttl-ms` when a single Ferrite process owns the action form and action POST path. Rotate the referenced CSRF secret as part of the deployment process. The configured token must be cookie-safe when cookie binding is enabled. If the public TLS origin differs from the upstream Ferrite bind origin, set `--trusted-proxy-public-origin` and configure the proxy to own and sanitize the forwarded proto/host headers. If access logs need public client IPs behind the proxy, set `--trusted-proxy-client-ip-hops` to the exact number of trusted proxy hops and make the edge proxy overwrite `X-Forwarded-For`.
 
-Application code may expose an expected public action failure by throwing `FerriteActionError` from `@ferrite/runtime/server` with a stable uppercase code and a nonempty user-safe message. Any other thrown value fails the renderer and returns generic production `500` HTML. Detailed subprocess errors are written to server stderr and must be treated as potentially sensitive operational logs. Version-1 error packets without a code remain accepted for compatibility, but new application code should always use the typed error.
+Application code may expose an expected public action failure by throwing `FerriteActionError` from `@ferrite/runtime/server` with a stable uppercase code and a nonempty user-safe message. Any other thrown value fails the renderer and returns generic production `500` HTML. Detailed subprocess errors are written to server stderr under the default legacy diagnostic mode and must be treated as potentially sensitive operational logs. Enabling `--event-log json` suppresses per-request raw render, bundle, and write-timeout details and emits bounded classifications instead; see [Structured Observability](observability.md). Version-1 error packets without a code remain accepted for compatibility, but new application code should always use the typed error.
 
 ## Known Gaps
 

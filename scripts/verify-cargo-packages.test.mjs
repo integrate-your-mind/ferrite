@@ -27,7 +27,11 @@ test("workspace path dependencies exact-pin the unpublished Ferrite version", as
     }
   }
 
-  assert.equal(internalDependencies.length, 20);
+  assert.equal(
+    internalDependencies.length,
+    23,
+    "update the internal dependency inventory when adding or removing exact-pinned workspace edges",
+  );
 });
 
 test("Cargo packaging verifies clean archives with the locked dependency graph", async () => {

@@ -4,12 +4,14 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferrite_builder::{BuildConfig, BuildReport};
+use ferrite_core::observability::{EventEmitter, bounded_channel};
 use ferrite_dev_server::{
     DevProject, DevResponse, DevServerConfig, ProductionActionEvent, ProductionActionOutcome,
     ProductionProject, ProductionRequestEvent, ProductionServerConfig,
@@ -306,6 +308,13 @@ struct ServeArgs {
 
     #[arg(
         long,
+        value_enum,
+        help = "Emit bounded privacy-safe Ferrite v1 events to stderr; this is not distributed tracing"
+    )]
+    event_log: Option<EventLogFormat>,
+
+    #[arg(
+        long,
         help = "Expose in-memory production request/action counters as Prometheus text at this absolute path"
     )]
     metrics_path: Option<String>,
@@ -314,6 +323,11 @@ struct ServeArgs {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum AccessLogFormat {
     Plain,
+    Json,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum EventLogFormat {
     Json,
 }
 
@@ -360,6 +374,13 @@ struct BuildArgs {
         help = "Client bundler script path, relative to the current directory unless absolute"
     )]
     client_bundler: PathBuf,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Emit bounded privacy-safe Ferrite v1 build events to stderr; this is not distributed tracing"
+    )]
+    event_log: Option<EventLogFormat>,
 }
 
 #[derive(Debug)]
@@ -596,6 +617,11 @@ fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Commands::Serve(args) => {
+            validate_event_log_selection(
+                args.event_log.is_some(),
+                args.access_log.is_some(),
+                args.action_log.is_some(),
+            )?;
             let project = normalize_project_path(&args.project)?;
             let artifact = resolve_project_path(&project, &args.artifact);
             let page_renderer = normalize_current_path(&args.page_renderer)?;
@@ -616,6 +642,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 trusted_proxy.is_some(),
             )?;
             let metrics_path = resolve_metrics_path(args.metrics_path.as_deref())?;
+            let event_log = args.event_log.map(EventLogWriter::start).transpose()?;
             let mut config = ProductionServerConfig::from_artifact(
                 project.clone(),
                 artifact.clone(),
@@ -654,7 +681,11 @@ fn run_cli(cli: Cli) -> Result<()> {
                     eprintln!("{}", format_action_log_event(&event, format));
                 });
             }
-            let production_project = ProductionProject::from_artifact(config)?;
+            let mut production_project = ProductionProject::from_artifact(config)?;
+            if let Some(event_log) = &event_log {
+                production_project =
+                    production_project.with_observability_emitter(event_log.emitter());
+            }
             let production_limits = ServeLimitsOutput::from(production_project.config());
             let artifact_build_id = production_project
                 .config()
@@ -726,15 +757,21 @@ fn run_cli(cli: Cli) -> Result<()> {
             let types_out = resolve_project_path(&project, &args.types_out);
             let page_renderer = normalize_current_path(&args.page_renderer)?;
             let client_bundler = normalize_current_path(&args.client_bundler)?;
+            let event_log = args.event_log.map(EventLogWriter::start).transpose()?;
             let _signal_guard = BuildSignalGuard::register()?;
-            let report = ferrite_builder::build_project(&BuildConfig::new(
+            let config = BuildConfig::new(
                 project,
                 app_dir,
                 out_dir,
                 types_out,
                 page_renderer,
                 client_bundler,
-            ))?;
+            );
+            let report = if let Some(event_log) = &event_log {
+                ferrite_builder::build_project_with_observability(&config, &event_log.emitter())?
+            } else {
+                ferrite_builder::build_project(&config)?
+            };
 
             if cli.json {
                 print_json(&report)?;
@@ -1157,6 +1194,16 @@ fn resolve_metrics_path(path: Option<&str>) -> Result<Option<String>> {
     Ok(Some(path.to_owned()))
 }
 
+fn validate_event_log_selection(event_log: bool, access_log: bool, action_log: bool) -> Result<()> {
+    if event_log && (access_log || action_log) {
+        return Err(CliError::Config(
+            "--event-log cannot be combined with the PII-bearing legacy --access-log or --action-log streams"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn run_typescript_check(project: &Path) -> Result<()> {
     let tsconfig = project.join("tsconfig.json");
     if !tsconfig.is_file() {
@@ -1234,6 +1281,69 @@ fn format_action_log_event(event: &ProductionActionEvent, format: AccessLogForma
         }
         AccessLogFormat::Json => {
             serde_json::to_string(&output).expect("action log event output is serializable")
+        }
+    }
+}
+
+struct EventLogWriter {
+    emitter: Option<EventEmitter>,
+    writer: Option<JoinHandle<()>>,
+    writer_done: mpsc::Receiver<()>,
+}
+
+impl EventLogWriter {
+    fn start(format: EventLogFormat) -> std::io::Result<Self> {
+        Self::start_with_writer(format, std::io::stderr())
+    }
+
+    fn start_with_writer<W>(format: EventLogFormat, mut output: W) -> std::io::Result<Self>
+    where
+        W: Write + Send + 'static,
+    {
+        let (emitter, receiver) = bounded_channel(256);
+        let (writer_done_sender, writer_done) = mpsc::sync_channel(1);
+        let writer = thread::Builder::new()
+            .name("ferrite-event-log".to_owned())
+            .spawn(move || {
+                for event in receiver {
+                    let line = match format {
+                        EventLogFormat::Json => event.to_json_line(),
+                    };
+                    let Ok(line) = line else {
+                        continue;
+                    };
+                    if writeln!(output, "{line}").is_err() {
+                        break;
+                    }
+                }
+                let _ = writer_done_sender.try_send(());
+            })?;
+        Ok(Self {
+            emitter: Some(emitter),
+            writer: Some(writer),
+            writer_done,
+        })
+    }
+
+    fn emitter(&self) -> EventEmitter {
+        self.emitter
+            .as_ref()
+            .expect("event emitter remains available while the writer is active")
+            .clone()
+    }
+}
+
+impl Drop for EventLogWriter {
+    fn drop(&mut self) {
+        drop(self.emitter.take());
+        if let Some(writer) = self.writer.take() {
+            let writer_finished = matches!(
+                self.writer_done.recv_timeout(Duration::from_millis(100)),
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected)
+            );
+            if writer_finished {
+                let _ = writer.join();
+            }
         }
     }
 }
@@ -1423,6 +1533,52 @@ enum TypecheckStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_core::observability::{
+        Component as ObservabilityComponent, CorrelationId, EmitResult, Event,
+        EventName as ObservabilityEventName, Operation as ObservabilityOperation,
+    };
+
+    #[derive(Clone)]
+    struct SharedEventBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedEventBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingEventWriter {
+        started: Option<mpsc::SyncSender<()>>,
+        release: mpsc::Receiver<()>,
+        finished: Option<mpsc::SyncSender<()>>,
+    }
+
+    impl Write for BlockingEventWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.try_send(());
+            }
+            let _ = self.release.recv();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for BlockingEventWriter {
+        fn drop(&mut self) {
+            if let Some(finished) = self.finished.take() {
+                let _ = finished.try_send(());
+            }
+        }
+    }
 
     #[test]
     fn initializes_a_minimal_typescript_project() {
@@ -1740,6 +1896,137 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(args.action_log, Some(AccessLogFormat::Json));
+    }
+
+    #[test]
+    fn serve_accepts_event_log_format_flag() {
+        let cli =
+            Cli::try_parse_from(["ferrite", "serve", "--event-log", "json", "--once"]).unwrap();
+
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.event_log, Some(EventLogFormat::Json));
+    }
+
+    #[test]
+    fn build_accepts_event_log_format_flag() {
+        let cli = Cli::try_parse_from(["ferrite", "build", "--event-log", "json"]).unwrap();
+
+        let Commands::Build(args) = cli.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(args.event_log, Some(EventLogFormat::Json));
+    }
+
+    #[test]
+    fn event_logs_are_disabled_by_default() {
+        let serve = Cli::try_parse_from(["ferrite", "serve", "--once"]).unwrap();
+        let Commands::Serve(serve) = serve.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(serve.event_log, None);
+
+        let build = Cli::try_parse_from(["ferrite", "build"]).unwrap();
+        let Commands::Build(build) = build.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(build.event_log, None);
+    }
+
+    #[test]
+    fn event_log_writer_serializes_events_and_joins_after_its_sender_closes() {
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = EventLogWriter::start_with_writer(
+            EventLogFormat::Json,
+            SharedEventBuffer(Arc::clone(&output)),
+        )
+        .unwrap();
+        let emitter = writer.emitter();
+        assert_eq!(
+            emitter.emit(Event::started(
+                CorrelationId::generate(),
+                0,
+                ObservabilityComponent::Builder,
+                ObservabilityOperation::BuildProject,
+            )),
+            EmitResult::Sent
+        );
+        drop(emitter);
+        drop(writer);
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(event["schema"], ferrite_core::observability::EVENT_SCHEMA);
+        assert_eq!(event["event"], "operation_started");
+        assert_eq!(
+            event["event"],
+            serde_json::to_value(ObservabilityEventName::OperationStarted).unwrap()
+        );
+        assert_eq!(event["component"], "builder");
+        assert_eq!(event["operation"], "build_project");
+    }
+
+    #[test]
+    fn event_log_writer_drop_is_bounded_when_output_remains_blocked() {
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::channel();
+        let writer = EventLogWriter::start_with_writer(
+            EventLogFormat::Json,
+            BlockingEventWriter {
+                started: Some(started_sender),
+                release: release_receiver,
+                finished: Some(finished_sender),
+            },
+        )
+        .unwrap();
+        let emitter = writer.emitter();
+        assert_eq!(
+            emitter.emit(Event::started(
+                CorrelationId::generate(),
+                0,
+                ObservabilityComponent::Builder,
+                ObservabilityOperation::BuildProject,
+            )),
+            EmitResult::Sent
+        );
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("event writer should reach the blocked output");
+        drop(emitter);
+
+        let started = std::time::Instant::now();
+        drop(writer);
+        let elapsed = started.elapsed();
+
+        drop(release_sender);
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached event writer should finish after output is released");
+
+        assert!(
+            elapsed >= Duration::from_millis(75),
+            "drop returned before the configured shutdown wait: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "drop exceeded its bounded shutdown wait: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn structured_event_log_rejects_legacy_log_streams() {
+        let error = validate_event_log_selection(true, true, false).unwrap_err();
+        assert!(matches!(error, CliError::Config(_)));
+        assert!(error.to_string().contains("--access-log"));
+
+        let error = validate_event_log_selection(true, false, true).unwrap_err();
+        assert!(matches!(error, CliError::Config(_)));
+        assert!(error.to_string().contains("--action-log"));
+
+        validate_event_log_selection(true, false, false).unwrap();
+        validate_event_log_selection(false, true, true).unwrap();
     }
 
     #[test]
