@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync, watch } from "node:fs";
 import { createRequire } from "node:module";
 import {
@@ -1401,6 +1401,10 @@ export async function startTrackedSourceMonitor(
     rejectUnexpectedPaths = false,
     watchImplementation = watch,
     startupSettleMs = platform === "darwin" ? 250 : 0,
+    startupBoundaryTimeoutMs = 5_000,
+    startupBoundaryPulseMs = 25,
+    startupBoundaryWrite = (path, contents) => writeFile(path, contents),
+    startupBoundaryRemove = (path) => rm(path, { force: true }),
   } = {},
 ) {
   if (typeof watchImplementation !== "function") {
@@ -1408,6 +1412,18 @@ export async function startTrackedSourceMonitor(
   }
   if (!Number.isInteger(startupSettleMs) || startupSettleMs < 0) {
     throw new TypeError("Ferrite source monitor requires a non-negative startup settle time.");
+  }
+  if (!Number.isInteger(startupBoundaryTimeoutMs) || startupBoundaryTimeoutMs <= 0) {
+    throw new TypeError("Ferrite source monitor requires a positive startup boundary timeout.");
+  }
+  if (!Number.isInteger(startupBoundaryPulseMs) || startupBoundaryPulseMs <= 0) {
+    throw new TypeError("Ferrite source monitor requires a positive startup boundary pulse.");
+  }
+  if (
+    typeof startupBoundaryWrite !== "function" ||
+    typeof startupBoundaryRemove !== "function"
+  ) {
+    throw new TypeError("Ferrite source monitor requires startup boundary file handlers.");
   }
   const trackedEntries = new Set(paths);
   const allowedWrites = allowedWritePrefixes.map((prefix) => {
@@ -1429,24 +1445,50 @@ export async function startTrackedSourceMonitor(
 
   const changes = [];
   const watchers = [];
-  try {
-    for (const path of trackedEntries) {
-      const watcher = watchImplementation(
-        resolve(root, path),
-        { persistent: false },
-        (eventType) => {
-          if (changes.length >= 32) {
-            return;
-          }
-          changes.push(`${eventType}:${path}`);
-        },
-      );
-      watcher.on("error", (error) => {
-        if (changes.length < 32) {
-          changes.push(`watch-error:${path}:${error.message}`);
-        }
+  const boundaryFiles = new Map();
+  if (rejectUnexpectedPaths) {
+    for (const directory of directories) {
+      const path = `${directory}/.ferrite-watch-boundary-${process.pid}-${randomUUID()}`
+        .replace(/^\.\//, "");
+      let resolveObserved;
+      let rejectObserved;
+      const observed = new Promise((resolveBoundary, rejectBoundary) => {
+        resolveObserved = resolveBoundary;
+        rejectObserved = rejectBoundary;
       });
-      watchers.push(watcher);
+      const boundary = {
+        absolutePath: resolve(root, path),
+        observed,
+        observedEvent: false,
+        rejectObserved,
+        resolveObserved: () => {
+          boundary.observedEvent = true;
+          resolveObserved();
+        },
+      };
+      boundaryFiles.set(path, boundary);
+    }
+  }
+  try {
+    if (!rejectUnexpectedPaths) {
+      for (const path of trackedEntries) {
+        const watcher = watchImplementation(
+          resolve(root, path),
+          { persistent: false },
+          (eventType) => {
+            if (changes.length >= 32) {
+              return;
+            }
+            changes.push(`${eventType}:${path}`);
+          },
+        );
+        watcher.on("error", (error) => {
+          if (changes.length < 32) {
+            changes.push(`watch-error:${path}:${error.message}`);
+          }
+        });
+        watchers.push(watcher);
+      }
     }
     if (rejectUnexpectedPaths) {
       for (const directory of directories) {
@@ -1466,10 +1508,15 @@ export async function startTrackedSourceMonitor(
               root,
               resolve(absoluteDirectory, filename.toString()),
             ).replaceAll("\\", "/");
+            const boundary = boundaryFiles.get(path);
+            if (boundary) {
+              boundary.resolveObserved();
+              return;
+            }
             const allowedWrite = allowedWrites.some(
               (prefix) => path === prefix || path.startsWith(`${prefix}/`),
             );
-            if (!allowedWrite && !trackedEntries.has(path)) {
+            if (!allowedWrite) {
               changes.push(`${eventType}:${path}`);
             }
           },
@@ -1478,16 +1525,74 @@ export async function startTrackedSourceMonitor(
           if (changes.length < 32) {
             changes.push(`watch-error:${directory}:${error.message}`);
           }
+          for (const boundary of boundaryFiles.values()) {
+            boundary.rejectObserved(error);
+          }
         });
         watchers.push(watcher);
       }
+
+      const boundaryEntries = [...boundaryFiles.values()];
+      let rejectBoundaryWrite;
+      const boundaryWriteFailure = new Promise((_, rejectWrite) => {
+        rejectBoundaryWrite = rejectWrite;
+      });
+      const boundaryWrites = new Set();
+      let boundaryActive = true;
+      const pulseBoundaryFiles = () => {
+        if (!boundaryActive) {
+          return;
+        }
+        const writePulse = Promise.all(
+          boundaryEntries
+            .filter(({ observedEvent }) => !observedEvent)
+            .map(({ absolutePath }) =>
+              startupBoundaryWrite(
+                absolutePath,
+                `Ferrite watcher boundary ${process.pid}\n`,
+              )
+            ),
+        );
+        boundaryWrites.add(writePulse);
+        writePulse
+          .catch(rejectBoundaryWrite)
+          .finally(() => boundaryWrites.delete(writePulse));
+      };
+      let timeout;
+      let pulse;
+      try {
+        pulseBoundaryFiles();
+        pulse = setInterval(pulseBoundaryFiles, startupBoundaryPulseMs);
+        await Promise.race([
+          Promise.all(boundaryEntries.map(({ observed }) => observed)),
+          boundaryWriteFailure,
+          new Promise((_, rejectBoundary) => {
+            timeout = setTimeout(
+              () => rejectBoundary(new Error(
+                "Ferrite source monitor did not observe its startup boundary.",
+              )),
+              startupBoundaryTimeoutMs,
+            );
+          }),
+        ]);
+      } finally {
+        boundaryActive = false;
+        clearTimeout(timeout);
+        clearInterval(pulse);
+        await Promise.allSettled([...boundaryWrites]);
+        await Promise.all(
+          boundaryEntries.map(({ absolutePath }) =>
+            startupBoundaryRemove(absolutePath)
+          ),
+        );
+      }
+      changes.length = 0;
     }
 
-    // FSEvents can deliver writes completed before a watcher was registered.
-    // Drain those historical notifications after registration, then establish
-    // the boundary returned to callers. The caller snapshots protected bytes
-    // immediately after this function returns, so later changes remain visible.
-    if (startupSettleMs > 0) {
+    // File-only monitors do not create workspace files. Give their watcher
+    // callbacks a short setup drain; workspace-wide monitors use the causal
+    // per-directory boundary above instead of a timing assumption.
+    if (!rejectUnexpectedPaths && startupSettleMs > 0) {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, startupSettleMs));
       changes.length = 0;
     }
