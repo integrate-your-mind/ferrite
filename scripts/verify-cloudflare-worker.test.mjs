@@ -275,6 +275,44 @@ test("Cloudflare source monitor drains only pre-boundary directory events", asyn
   }
 });
 
+test("Cloudflare source monitor observes its boundary after a saturated startup burst", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-watcher-burst-"));
+  let emitChange;
+  let monitor;
+  try {
+    await writeFile(join(root, "source.mjs"), "export const value = 1;\n");
+    const watchImplementation = (_path, _options, listener) => {
+      const watcher = new EventEmitter();
+      watcher.close = () => {};
+      emitChange = (path = "source.mjs") => listener("change", path);
+      return watcher;
+    };
+
+    monitor = await startTrackedSourceMonitor(["source.mjs"], root, {
+      rejectUnexpectedPaths: true,
+      watchImplementation,
+      startupBoundaryTimeoutMs: 25,
+      startupBoundaryWrite: async (path) => {
+        for (let index = 0; index < 32; index += 1) {
+          emitChange(`pre-boundary-${index}.mjs`);
+        }
+        emitChange(basename(path));
+      },
+      startupBoundaryRemove: async () => {},
+    });
+    await monitor.assertUnchanged();
+
+    emitChange();
+    await assert.rejects(
+      monitor.assertUnchanged(),
+      /tracked source changed during the Worker proof/,
+    );
+  } finally {
+    monitor?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Cloudflare source monitor fails closed when its startup boundary is absent", async () => {
   const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-missing-boundary-"));
   try {
@@ -296,6 +334,35 @@ test("Cloudflare source monitor fails closed when its startup boundary is absent
       /did not observe its startup boundary/,
     );
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Cloudflare source monitor preserves protected events during boundary cleanup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-boundary-cleanup-"));
+  let emitChange;
+  let monitor;
+  try {
+    await writeFile(join(root, "source.mjs"), "export const value = 1;\n");
+    const watchImplementation = (_path, _options, listener) => {
+      const watcher = new EventEmitter();
+      watcher.close = () => {};
+      emitChange = (path = "source.mjs") => listener("change", path);
+      return watcher;
+    };
+
+    monitor = await startTrackedSourceMonitor(["source.mjs"], root, {
+      rejectUnexpectedPaths: true,
+      watchImplementation,
+      startupBoundaryWrite: async (path) => emitChange(basename(path)),
+      startupBoundaryRemove: async () => emitChange(),
+    });
+    await assert.rejects(
+      monitor.assertUnchanged(),
+      /tracked source changed during the Worker proof/,
+    );
+  } finally {
+    monitor?.close();
     await rm(root, { recursive: true, force: true });
   }
 });

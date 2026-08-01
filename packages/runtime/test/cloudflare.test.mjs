@@ -907,7 +907,11 @@ test("fails closed for malformed, unsupported, aborted, and unavailable fallback
 test("rejects server-action controls found in the rendered packet", async () => {
   for (const root of [
     [2, "form", { action: "/_ferrite/action" }, [[0, "Save"]]],
+    [2, "FORM", { ACTION: "/_ferrite/action" }, [[0, "Save"]]],
     [2, "section", {}, [[2, "input", { name: "__ferrite_action", value: "save" }, []]]],
+    [2, "section", {}, [[2, "INPUT", { NAME: "__ferrite_action", value: "save" }, []]]],
+    [2, "button", { FORMAction: "/_ferrite/action" }, [[0, "Save"]]],
+    [2, "input", { formaction: "/_ferrite/action", type: "submit" }, []],
   ]) {
     const seen = [];
     const handler = createCloudflareSsrHandler({
@@ -928,6 +932,51 @@ test("rejects server-action controls found in the rendered packet", async () => 
     assert.equal(response.headers.get("x-ferrite-render"), "static-fallback");
     assert.deepEqual(seen, [{ method: "GET", pathname: "/docs/index.html" }]);
   }
+});
+
+test("resolves HTML Accept ranges by specificity and quality", async () => {
+  const worker = createCloudflareSsrHandler({
+    routes: [{
+      module: routeModule(() => ({
+        ferrite: "render-packet",
+        version: 1,
+        root: [0, "request"],
+      })),
+    }],
+    renderer: textRenderer(),
+  });
+  const env = assets([]);
+  for (const [accept, status] of [
+    ["text/*", 200],
+    ["text/html;q=0.5", 200],
+    ["text/html;q=0, */*;q=1", 406],
+    ["text/html;q=0, text/*;q=1", 406],
+    ["text/html;q=bogus, */*;q=1", 406],
+  ]) {
+    const response = await worker.fetch(
+      new Request("https://example.test/docs", { headers: { Accept: accept } }),
+      env,
+    );
+    assert.equal(response.status, status, accept);
+  }
+});
+
+test("documents Fetch normalization of a raw single-encoded dot segment", async () => {
+  const request = new Request("https://example.test/%2e%2e/docs");
+  assert.equal(request.url, "https://example.test/docs");
+  const worker = createCloudflareSsrHandler({
+    routes: [{
+      module: routeModule(() => ({
+        ferrite: "render-packet",
+        version: 1,
+        root: [0, "request"],
+      })),
+    }],
+    renderer: textRenderer(),
+  });
+  const response = await worker.fetch(request, assets([]));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-ferrite-render"), "request");
 });
 
 test("rejects routes outside the initial static, action-free Worker compatibility tier", () => {

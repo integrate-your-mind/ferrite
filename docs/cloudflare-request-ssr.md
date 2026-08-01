@@ -27,7 +27,7 @@ The first tier deliberately accepts only:
 - HTML responses with a declared, same-route prerender fallback
 - buffered compact render packets and buffered HTML within explicit byte and wall-time limits
 
-It rejects dynamic/catch-all route patterns, server actions, reserved payload-stream requests, unsupported methods or representations, malformed and encoded separator/traversal paths, and application imports of Node built-ins. These are compatibility constraints, not future-complete claims.
+It rejects dynamic/catch-all route patterns, server actions, reserved payload-stream requests, unsupported methods or representations, malformed paths, residual encoded separators, double-encoded traversal segments, and application imports of Node built-ins. The Fetch API does not expose the raw HTTP request target: a single-encoded dot segment such as `/%2e%2e/docs` is normalized to `/docs` before the handler runs and can therefore match the allowlisted `/docs` route. This is an explicit platform-boundary limitation, not a raw-target rejection claim.
 
 The current Ferrite stream API resolves every deferred Suspense chunk before it returns a packet. The Worker adapter therefore does not claim progressive SSR streaming. A deadline or aborted request abandons the response path, but JavaScript cannot forcibly cancel an arbitrary user promise that ignores `AbortSignal`.
 
@@ -88,7 +88,9 @@ and checks:
 - static-asset passthrough and missing assets
 - route-exception, response-deadline, and rendered-server-action fallback
 - unsupported methods, representations, and payload streaming
-- encoded traversal and separator rejection
+- double-encoded traversal and encoded-separator rejection, plus a raw HTTP
+  probe documenting workerd's pre-handler normalization of single-encoded dot
+  segments
 - clean and unchanged Git HEAD/tree/branch plus exact working-file mode/blob
   equality with HEAD and the index at proof start and after cleanup; unsupported
   assume-unchanged and skip-worktree flags fail closed
@@ -111,7 +113,7 @@ Ferrite agent is available.
 Build the protocol WASM and runtime first, then generate one edge-profile route module:
 
 ```sh
-pnpm --filter @ferrite/protocol-wasm build
+PROFILE=release pnpm --filter @ferrite/protocol-wasm build
 pnpm --filter @ferrite/runtime build
 node packages/runtime/bin/render-page.mjs \
   --build-cloudflare-artifact \

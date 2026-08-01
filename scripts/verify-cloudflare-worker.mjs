@@ -18,7 +18,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { platform } from "node:process";
 import { gzipSync } from "node:zlib";
@@ -1075,6 +1075,9 @@ async function verifyScenarios(origin) {
   const traversal = await fetchChecked(`${origin}/%252e%252e/docs`);
   assert.equal(traversal.status, 400);
   assert.equal(traversal.headers.get("x-content-type-options"), "nosniff");
+  const normalizedTraversal = await rawHttpRequest(origin, "/%2e%2e/docs");
+  assert.equal(normalizedTraversal.status, 200);
+  assert.equal(normalizedTraversal.headers.get("x-ferrite-render"), "request");
   const encodedSeparator = await fetchChecked(`${origin}/docs%2Fprivate`);
   assert.equal(encodedSeparator.status, 400);
   assert.equal(encodedSeparator.headers.get("x-content-type-options"), "nosniff");
@@ -1093,10 +1096,72 @@ async function verifyScenarios(origin) {
     unsupportedMethod: "passed",
     unsupportedRepresentation: "passed",
     payloadStreamRejection: "passed",
-    encodedTraversalRejection: "passed",
+    residualEncodedTraversalRejection: "passed (double-encoded path rejected)",
+    singleEncodedDotSegmentNormalization:
+      "observed (raw /%2e%2e/docs reached the Worker as canonical /docs)",
     encodedSeparatorRejection: "passed",
     missingAsset: "passed",
   };
+}
+
+async function rawHttpRequest(origin, target) {
+  const url = new URL(origin);
+  assert.equal(url.protocol, "http:", "Raw workerd proof requires a local HTTP origin.");
+  assert.match(target, /^\/[\x21-\x7e]*$/, "Raw workerd target must be one bounded request-target.");
+  const port = Number(url.port);
+  assert.ok(Number.isSafeInteger(port) && port > 0, "Raw workerd proof requires an explicit port.");
+
+  return new Promise((resolveRequest, rejectRequest) => {
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    const socket = createConnection({ host: url.hostname, port });
+    const finish = (error, response) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.destroy();
+      if (error) rejectRequest(error);
+      else resolveRequest(response);
+    };
+    const timeout = setTimeout(
+      () => finish(new Error("Raw workerd request timed out.")),
+      5_000,
+    );
+    socket.on("connect", () => {
+      socket.end(
+        `GET ${target} HTTP/1.1\r\nHost: ${url.host}\r\nAccept: text/html\r\nConnection: close\r\n\r\n`,
+      );
+    });
+    socket.on("data", (chunk) => {
+      bytes += chunk.byteLength;
+      if (bytes > 64 * 1024) {
+        finish(new Error("Raw workerd response exceeded 64 KiB."));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    socket.on("error", (error) => finish(error));
+    socket.on("end", () => {
+      try {
+        const response = Buffer.concat(chunks).toString("latin1");
+        const headerEnd = response.indexOf("\r\n\r\n");
+        assert.notEqual(headerEnd, -1, "Raw workerd response omitted its header terminator.");
+        const [statusLine, ...headerLines] = response.slice(0, headerEnd).split("\r\n");
+        const status = Number(statusLine.match(/^HTTP\/1\.[01] ([0-9]{3})(?: |$)/)?.[1]);
+        assert.ok(Number.isInteger(status), `Raw workerd response had invalid status: ${statusLine}`);
+        const headers = new Headers();
+        for (const line of headerLines) {
+          const separator = line.indexOf(":");
+          assert.ok(separator > 0, `Raw workerd response had invalid header: ${line}`);
+          headers.append(line.slice(0, separator), line.slice(separator + 1).trim());
+        }
+        finish(null, { headers, status });
+      } catch (error) {
+        finish(error);
+      }
+    });
+  });
 }
 
 async function assertFallback(response, expectedText) {
@@ -1497,20 +1562,23 @@ export async function startTrackedSourceMonitor(
           absoluteDirectory,
           { persistent: false },
           (eventType, filename) => {
+            let path;
+            if (filename !== null) {
+              path = relative(
+                root,
+                resolve(absoluteDirectory, filename.toString()),
+              ).replaceAll("\\", "/");
+              const boundary = boundaryFiles.get(path);
+              if (boundary) {
+                boundary.resolveObserved();
+                return;
+              }
+            }
             if (changes.length >= 32) {
               return;
             }
-            if (filename === null) {
+            if (path === undefined) {
               changes.push(`${eventType}:<unknown>:${directory}`);
-              return;
-            }
-            const path = relative(
-              root,
-              resolve(absoluteDirectory, filename.toString()),
-            ).replaceAll("\\", "/");
-            const boundary = boundaryFiles.get(path);
-            if (boundary) {
-              boundary.resolveObserved();
               return;
             }
             const allowedWrite = allowedWrites.some(
@@ -1575,6 +1643,11 @@ export async function startTrackedSourceMonitor(
             );
           }),
         ]);
+        // Events ordered before each directory's sentinel belong to watcher
+        // startup. Arm the proof immediately after every sentinel is observed;
+        // protected events raised during write settling or sentinel cleanup
+        // must remain visible to assertUnchanged().
+        changes.length = 0;
       } finally {
         boundaryActive = false;
         clearTimeout(timeout);
@@ -1586,7 +1659,6 @@ export async function startTrackedSourceMonitor(
           ),
         );
       }
-      changes.length = 0;
     }
 
     // File-only monitors do not create workspace files. Give their watcher

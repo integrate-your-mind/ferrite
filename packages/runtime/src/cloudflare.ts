@@ -708,12 +708,25 @@ function containsServerAction(node: CompactNode): boolean {
     props &&
     typeof props === "object" &&
     !Array.isArray(props) &&
-    ((tag === "form" && props.action === SERVER_ACTION_URL) ||
-      (tag === "input" && props.name === SERVER_ACTION_ID_FIELD))
+    ((tag === "form" && hasHtmlAttributeValue(props, "action", SERVER_ACTION_URL)) ||
+      (["button", "input"].includes(tag) &&
+        hasHtmlAttributeValue(props, "formaction", SERVER_ACTION_URL)) ||
+      (["button", "input", "select", "textarea"].includes(tag) &&
+        hasHtmlAttributeValue(props, "name", SERVER_ACTION_ID_FIELD)))
   ) {
     return true;
   }
   return Array.isArray(node[3]) && node[3].some(containsServerAction);
+}
+
+function hasHtmlAttributeValue(
+  props: Record<string, unknown>,
+  attributeName: string,
+  expectedValue: string,
+): boolean {
+  return Object.entries(props).some(
+    ([name, value]) => name.toLowerCase() === attributeName && value === expectedValue,
+  );
 }
 
 function requestPath(request: Request): { url: URL; pathname: string; error?: never } | { error: Response } {
@@ -953,21 +966,36 @@ function acceptsHtml(accept: string | null): boolean {
   if (!accept || accept.trim() === "") {
     return true;
   }
-  return accept
-    .split(",")
-    .map((value) => {
-      const [mediaType, ...parameters] = value.split(";");
-      const quality = parameters
-        .map((parameter) => parameter.trim().match(/^q=(0(?:\.0*)?|1(?:\.0*)?)$/i)?.[1])
-        .find((parameter) => parameter !== undefined);
-      return {
-        mediaType: mediaType?.trim().toLowerCase(),
-        quality: quality === undefined ? 1 : Number(quality),
-      };
-    })
-    .some(({ mediaType, quality }) =>
-      quality > 0 && (mediaType === "*/*" || mediaType === "text/html")
-    );
+  let bestSpecificity = -1;
+  let bestQuality = 0;
+  for (const value of accept.split(",")) {
+    const [rawMediaType, ...parameters] = value.split(";");
+    const mediaType = rawMediaType?.trim().toLowerCase();
+    const specificity = mediaType === "text/html"
+      ? 2
+      : mediaType === "text/*"
+        ? 1
+        : mediaType === "*/*"
+          ? 0
+          : -1;
+    if (specificity < 0) {
+      continue;
+    }
+    const qualityParameters = parameters
+      .map((parameter) => parameter.trim().match(/^q=(.*)$/i)?.[1])
+      .filter((quality) => quality !== undefined);
+    const qualityText = qualityParameters.length === 0 ? "1" : qualityParameters[0];
+    const quality = qualityParameters.length <= 1 && /^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/.test(qualityText)
+      ? Number(qualityText)
+      : 0;
+    if (specificity > bestSpecificity) {
+      bestSpecificity = specificity;
+      bestQuality = quality;
+    } else if (specificity === bestSpecificity) {
+      bestQuality = Math.max(bestQuality, quality);
+    }
+  }
+  return bestSpecificity >= 0 && bestQuality > 0;
 }
 
 function positiveLimit(value: number | undefined, fallback: number, label: string): number {
