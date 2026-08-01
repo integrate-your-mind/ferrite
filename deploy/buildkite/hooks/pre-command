@@ -1,0 +1,52 @@
+#!/opt/homebrew/bin/node
+
+const allowedCommands = new Set([
+  "./.buildkite/scripts/upload-pipeline.mjs",
+  "./.buildkite/scripts/ci.mjs verify",
+  "./.buildkite/scripts/ci.mjs packages",
+  "./.buildkite/scripts/ci.mjs coverage-rust",
+  "./.buildkite/scripts/ci.mjs coverage-js",
+  "./.buildkite/scripts/ci.mjs native",
+  "./.buildkite/scripts/ci.mjs nginx",
+]);
+const deniedNames = new Set([
+  "BASH_ENV",
+  "BASHOPTS",
+  "BASH_COMPAT",
+  "BASH_LOADABLES_PATH",
+  "BASH_XTRACEFD",
+  "CDPATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "ENV",
+  "GIT_CONFIG_COUNT",
+  "LD_PRELOAD",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "PERL5OPT",
+  "PROMPT_COMMAND",
+  "PS4",
+  "PYTHONPATH",
+  "RUBYOPT",
+  "RUSTC_WRAPPER",
+  "RUSTC_WORKSPACE_WRAPPER",
+  "RUSTDOCFLAGS",
+  "RUSTFLAGS",
+  "SHELLOPTS",
+]);
+
+function fail(message) {
+  process.stderr.write(`Ferrite Buildkite trust check: ${message}\n`);
+  process.exit(1);
+}
+
+const denied = Object.keys(process.env)
+  .filter((name) => name.startsWith("BASH_FUNC_") || deniedNames.has(name))
+  .sort();
+if (denied.length > 0) {
+  fail(`disallowed environment variable: ${denied[0]}`);
+}
+if (!allowedCommands.has(process.env.BUILDKITE_COMMAND)) {
+  fail("command is not allowlisted");
+}

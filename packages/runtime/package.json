@@ -1,9 +1,21 @@
 {
   "name": "@ferrite/runtime",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "description": "TypeScript JSX runtime, DOM helpers, and server facade for the Rust-first Ferrite framework.",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/integrate-your-mind/ferrite.git",
+    "directory": "packages/runtime"
+  },
+  "homepage": "https://github.com/integrate-your-mind/ferrite#readme",
+  "bugs": {
+    "url": "https://github.com/integrate-your-mind/ferrite/issues"
+  },
   "keywords": [
     "ferrite",
     "jsx",

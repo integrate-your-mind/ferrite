@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,8 +12,17 @@ use ferrite_protocol::{ServerActionReferencePayload, ServerActionRequest, Server
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(not(windows))]
+use std::process::Child;
+
+#[cfg(windows)]
+use process_wrap::std::{JobObject, StdChildWrapper, StdCommandWrap};
+
 const MIN_RENDER_COMMAND_TIMEOUT: Duration = Duration::from_millis(1);
 const RENDER_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_RENDER_COMMAND_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum PageRenderError {
@@ -21,6 +31,8 @@ pub enum PageRenderError {
     Protocol(ferrite_protocol::ProtocolError),
     Ssr(ferrite_ssr::SsrError),
     NodeFailed { status: Option<i32>, stderr: String },
+    Cancelled,
+    OutputLimitExceeded { limit: usize },
     TimedOut { timeout: Duration },
 }
 
@@ -35,6 +47,10 @@ impl fmt::Display for PageRenderError {
                 Some(status) => write!(f, "page renderer failed with exit code {status}: {stderr}"),
                 None => write!(f, "page renderer was terminated: {stderr}"),
             },
+            PageRenderError::Cancelled => write!(f, "page renderer was cancelled"),
+            PageRenderError::OutputLimitExceeded { limit } => {
+                write!(f, "page renderer output exceeded {limit} bytes")
+            }
             PageRenderError::TimedOut { timeout } => {
                 write!(
                     f,
@@ -89,6 +105,7 @@ pub struct PageRenderer {
     prebuilt_artifact: bool,
     prebuilt_module_source: Option<Arc<[u8]>>,
     command_timeout: Option<Duration>,
+    cancellation_flag: Option<Arc<AtomicBool>>,
     server_action_csrf_token: Option<String>,
     server_action_replay_nonce: Option<String>,
 }
@@ -101,6 +118,7 @@ impl PageRenderer {
             prebuilt_artifact: false,
             prebuilt_module_source: None,
             command_timeout: None,
+            cancellation_flag: None,
             server_action_csrf_token: None,
             server_action_replay_nonce: None,
         }
@@ -113,6 +131,7 @@ impl PageRenderer {
             prebuilt_artifact: true,
             prebuilt_module_source: None,
             command_timeout: None,
+            cancellation_flag: None,
             server_action_csrf_token: None,
             server_action_replay_nonce: None,
         }
@@ -153,6 +172,11 @@ impl PageRenderer {
 
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = Some(timeout.max(MIN_RENDER_COMMAND_TIMEOUT));
+        self
+    }
+
+    pub fn with_cancellation_flag(mut self, cancellation_flag: Arc<AtomicBool>) -> Self {
+        self.cancellation_flag = Some(cancellation_flag);
         self
     }
 
@@ -744,8 +768,10 @@ impl PageRenderer {
     fn run_command(&self, command: Command) -> Result<RendererOutput> {
         let stdin = self.prebuilt_module_source.clone();
         match self.command_timeout {
-            Some(timeout) => run_command_with_timeout(command, timeout, stdin),
-            None => run_command_to_output(command, stdin),
+            Some(timeout) => {
+                run_command_with_timeout(command, timeout, stdin, self.cancellation_flag.as_deref())
+            }
+            None => run_command_to_output(command, stdin, self.cancellation_flag.as_deref()),
         }
     }
 }
@@ -757,76 +783,109 @@ struct RendererOutput {
     stderr: Vec<u8>,
 }
 
-fn run_command_to_output(mut command: Command, stdin: Option<Arc<[u8]>>) -> Result<RendererOutput> {
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let stdin_writer = stdin.map(|input| {
-        let mut child_stdin = child.stdin.take().expect("renderer stdin was piped");
-        thread::spawn(move || child_stdin.write_all(&input))
-    });
-    let output = child.wait_with_output()?;
-    if let Some(stdin_writer) = stdin_writer {
-        stdin_writer
-            .join()
-            .expect("renderer stdin writer panicked")?;
-    }
-    Ok(RendererOutput {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
+fn run_command_to_output(
+    command: Command,
+    stdin: Option<Arc<[u8]>>,
+    cancellation_flag: Option<&AtomicBool>,
+) -> Result<RendererOutput> {
+    run_command_with_limits(
+        command,
+        None,
+        stdin,
+        MAX_RENDER_COMMAND_OUTPUT_BYTES,
+        cancellation_flag,
+    )
 }
 
 fn run_command_with_timeout(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
     stdin: Option<Arc<[u8]>>,
+    cancellation_flag: Option<&AtomicBool>,
+) -> Result<RendererOutput> {
+    run_command_with_limits(
+        command,
+        Some(timeout),
+        stdin,
+        MAX_RENDER_COMMAND_OUTPUT_BYTES,
+        cancellation_flag,
+    )
+}
+
+fn run_command_with_limits(
+    mut command: Command,
+    timeout: Option<Duration>,
+    stdin: Option<Arc<[u8]>>,
+    max_output_bytes: usize,
+    cancellation_flag: Option<&AtomicBool>,
 ) -> Result<RendererOutput> {
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
+    let mut child = OwnedChild::spawn(command)?;
     let stdin_writer = stdin.map(|input| {
-        let mut child_stdin = child.stdin.take().expect("renderer stdin was piped");
+        let mut child_stdin = child.take_stdin().expect("renderer stdin was piped");
         thread::spawn(move || child_stdin.write_all(&input))
     });
-    let mut stdout = child.stdout.take().expect("renderer stdout was piped");
-    let mut stderr = child.stderr.take().expect("renderer stderr was piped");
-    let stdout_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stderr.read_to_end(&mut output).map(|_| output)
-    });
+    let stdout = child.take_stdout().expect("renderer stdout was piped");
+    let stderr = child.take_stderr().expect("renderer stderr was piped");
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_capped_reader(stdout, max_output_bytes, Arc::clone(&output_exceeded));
+    let stderr_reader = spawn_capped_reader(stderr, max_output_bytes, Arc::clone(&output_exceeded));
     let started = Instant::now();
 
     loop {
+        if cancellation_flag.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            terminate_process_tree(&mut child);
+            if let Some(stdin_writer) = stdin_writer {
+                let _ = stdin_writer.join();
+            }
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(PageRenderError::Cancelled);
+        }
+
+        if output_exceeded.load(Ordering::Acquire) {
+            terminate_process_tree(&mut child);
+            if let Some(stdin_writer) = stdin_writer {
+                let _ = stdin_writer.join();
+            }
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(PageRenderError::OutputLimitExceeded {
+                limit: max_output_bytes,
+            });
+        }
+
         if let Some(status) = child.try_wait()? {
+            terminate_process_tree(&mut child);
             if let Some(stdin_writer) = stdin_writer {
                 stdin_writer
                     .join()
                     .expect("renderer stdin writer panicked")?;
             }
+            let stdout = stdout_reader
+                .join()
+                .expect("renderer stdout reader panicked")?;
+            let stderr = stderr_reader
+                .join()
+                .expect("renderer stderr reader panicked")?;
+            if output_exceeded.load(Ordering::Acquire) {
+                return Err(PageRenderError::OutputLimitExceeded {
+                    limit: max_output_bytes,
+                });
+            }
             return Ok(RendererOutput {
                 status,
-                stdout: stdout_reader
-                    .join()
-                    .expect("renderer stdout reader panicked")?,
-                stderr: stderr_reader
-                    .join()
-                    .expect("renderer stderr reader panicked")?,
+                stdout,
+                stderr,
             });
         }
 
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            let timeout = timeout.expect("timeout was checked as present");
+            terminate_process_tree(&mut child);
             if let Some(stdin_writer) = stdin_writer {
                 let _ = stdin_writer.join();
             }
@@ -835,8 +894,131 @@ fn run_command_with_timeout(
             return Err(PageRenderError::TimedOut { timeout });
         }
 
-        thread::sleep(RENDER_TIMEOUT_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+        let sleep_for = timeout
+            .map(|timeout| {
+                RENDER_TIMEOUT_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed()))
+            })
+            .unwrap_or(RENDER_TIMEOUT_POLL_INTERVAL);
+        thread::sleep(sleep_for);
     }
+}
+
+fn spawn_capped_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    max_output_bytes: usize,
+    output_exceeded: Arc<AtomicBool>,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::with_capacity(max_output_bytes.min(64 * 1024));
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                return Ok(output);
+            }
+            let remaining = max_output_bytes.saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
+            if bytes_read > remaining {
+                output_exceeded.store(true, Ordering::Release);
+            }
+        }
+    })
+}
+
+struct OwnedChild {
+    #[cfg(not(windows))]
+    inner: Child,
+    #[cfg(windows)]
+    inner: Box<dyn StdChildWrapper>,
+    armed: bool,
+}
+
+impl OwnedChild {
+    fn spawn(command: Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = command;
+            command.process_group(0);
+            command
+        };
+        #[cfg(all(not(unix), not(windows)))]
+        let mut command = command;
+
+        #[cfg(windows)]
+        {
+            let mut command = StdCommandWrap::from(command);
+            command.wrap(JobObject);
+            return Ok(Self {
+                inner: command.spawn()?,
+                armed: true,
+            });
+        }
+
+        #[cfg(not(windows))]
+        Ok(Self {
+            inner: command.spawn()?,
+            armed: true,
+        })
+    }
+
+    fn take_stdin(&mut self) -> Option<ChildStdin> {
+        #[cfg(windows)]
+        return self.inner.stdin().take();
+
+        #[cfg(not(windows))]
+        self.inner.stdin.take()
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        #[cfg(windows)]
+        return self.inner.stdout().take();
+
+        #[cfg(not(windows))]
+        self.inner.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        #[cfg(windows)]
+        return self.inner.stderr().take();
+
+        #[cfg(not(windows))]
+        self.inner.stderr.take()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.inner.try_wait()
+    }
+
+    fn terminate(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Ok(process_group) = i32::try_from(self.inner.id()) {
+            // SAFETY: the child was spawned as the leader of a new process group.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+
+        #[cfg(windows)]
+        let _ = self.inner.start_kill();
+        #[cfg(not(windows))]
+        let _ = self.inner.kill();
+        let _ = self.inner.wait();
+        self.armed = false;
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn terminate_process_tree(child: &mut OwnedChild) {
+    child.terminate();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1353,6 +1535,7 @@ process.stdout.write(JSON.stringify({
         assert_eq!(
             response.outcome,
             ServerActionResponseOutcome::Error {
+                code: None,
                 message: "Action exploded".to_owned()
             }
         );
@@ -1493,6 +1676,209 @@ setInterval(() => {}, 1000);
         assert!(
             matches!(error, PageRenderError::TimedOut { timeout: actual } if actual == timeout)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_renderer_descendants_with_inherited_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let timeout = Duration::from_millis(500);
+        let renderer =
+            PageRenderer::new(temp.path().to_path_buf(), script).with_command_timeout(timeout);
+        let started = Instant::now();
+
+        let error = renderer.render_page_to_html(&page, &[], &[]).unwrap_err();
+        let pid = wait_for_pid_file(&descendant_pid, Duration::from_secs(2));
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(error, PageRenderError::TimedOut { timeout: actual } if actual == timeout)
+        );
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_renderer_cleans_descendants_before_collecting_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+descendant.unref();
+process.stdout.write(JSON.stringify({{ kind: "text", value: "complete" }}));
+"#
+            ),
+        );
+        let page = temp.path().join("page.tsx");
+        fs::write(&page, "").unwrap();
+        let renderer = PageRenderer::new(temp.path().to_path_buf(), script);
+        let started = Instant::now();
+
+        let html = renderer.render_page_to_html(&page, &[], &[]).unwrap();
+        let pid = wait_for_pid_file(&descendant_pid, Duration::from_secs(2));
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert_eq!(html, "complete");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_renderer_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        make_script(
+            &script,
+            &format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        );
+        let cancellation_flag = Arc::new(AtomicBool::new(false));
+        let cancellation_writer = Arc::clone(&cancellation_flag);
+        let pid_path = descendant_pid.clone();
+        let cancellation_thread = thread::spawn(move || {
+            let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
+            cancellation_writer.store(true, Ordering::Release);
+            pid
+        });
+        let mut command = Command::new("node");
+        command.arg(script).current_dir(temp.path());
+        let started = Instant::now();
+
+        let error =
+            run_command_with_limits(command, None, None, 1024, Some(cancellation_flag.as_ref()))
+                .unwrap_err();
+        let pid = cancellation_thread.join().unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(error, PageRenderError::Cancelled));
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[test]
+    fn renderer_output_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("render-page.mjs");
+        make_script(&script, "process.stdout.write('x'.repeat(65));\n");
+        let mut command = Command::new("node");
+        command.arg(script).current_dir(temp.path());
+
+        let error = run_command_with_limits(command, None, None, 64, None).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PageRenderError::OutputLimitExceeded { limit: 64 }
+        ));
+    }
+
+    #[cfg(unix)]
+    struct DescendantGuard(Option<i32>);
+
+    #[cfg(unix)]
+    impl Drop for DescendantGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                // SAFETY: this test records the PID of the child process it spawned.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(path: &Path, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(value) = fs::read_to_string(path) {
+                if let Ok(pid) = value.trim().parse::<i32>() {
+                    if pid > 0 {
+                        return pid;
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "renderer descendant did not publish a valid pid"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_waiter_ignores_incomplete_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("descendant.pid");
+        fs::write(&pid_path, "").unwrap();
+        let writer_path = pid_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            fs::write(&writer_path, "not-a-pid").unwrap();
+            thread::sleep(Duration::from_millis(10));
+            fs::write(&writer_path, " 42\n").unwrap();
+        });
+
+        assert_eq!(wait_for_pid_file(&pid_path, Duration::from_secs(1)), 42);
+        writer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            // SAFETY: signal 0 checks the recorded child PID without modifying it.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
     }
 
     #[test]

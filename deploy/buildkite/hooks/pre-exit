@@ -1,0 +1,46 @@
+#!/bin/bash -p
+
+if /usr/bin/env | /usr/bin/grep -E \
+  '^(BASH_FUNC_[^=]*%%|BASH_ENV|BASHOPTS|BASH_COMPAT|BASH_LOADABLES_PATH|BASH_XTRACEFD|ENV|PROMPT_COMMAND|PS4|SHELLOPTS)=' \
+  >/dev/null; then
+  /bin/echo "Ferrite Buildkite cleanup: shell startup controls are not allowed" >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+fail() {
+  printf 'Ferrite Buildkite cleanup: %s\n' "$*" >&2
+  exit 1
+}
+
+build_home="${FERRITE_BUILDKITE_BUILD_HOME:-}"
+tmp_input="${TMPDIR:-}"
+[[ -n "${build_home}" && -n "${tmp_input}" ]] ||
+  fail "per-build HOME and TMPDIR are required"
+[[ -d "${tmp_input}" ]] || fail "TMPDIR must be an existing directory"
+tmp_root="$(/bin/realpath "${tmp_input}")" || fail "could not canonicalize TMPDIR"
+[[ "${tmp_root}" != / ]] || fail "TMPDIR must not be the filesystem root"
+[[ "${build_home}" == /* ]] || fail "per-build HOME must be absolute"
+basename="${build_home##*/}"
+[[ "${basename}" =~ ^ferrite-buildkite-home-[A-Za-z0-9_.-]+$ ]] ||
+  fail "malformed Ferrite build-home basename"
+parent_input="${build_home%/*}"
+[[ -d "${parent_input}" ]] || fail "per-build HOME parent must exist"
+canonical_parent="$(/bin/realpath "${parent_input}")" ||
+  fail "could not canonicalize the per-build HOME parent"
+[[ "${canonical_parent}" == "${tmp_root}" ]] ||
+  fail "per-build HOME parent is outside canonical TMPDIR"
+canonical_home="${canonical_parent}/${basename}"
+[[ "${canonical_home}" != / && ! -L "${canonical_home}" ]] ||
+  fail "refusing to clean root or a symlink"
+
+# Idempotent: Buildkite may invoke pre-exit more than once for a job.
+[[ -e "${canonical_home}" ]] || exit 0
+verified_home="$(/bin/realpath "${canonical_home}")" ||
+  fail "could not canonicalize the per-build HOME"
+verified_parent="$(/bin/realpath "${verified_home%/*}")" ||
+  fail "could not canonicalize the verified per-build HOME parent"
+[[ "${verified_parent}" == "${tmp_root}" ]] ||
+  fail "per-build HOME parent is outside canonical TMPDIR"
+/bin/rm -rf -- "${verified_home}"

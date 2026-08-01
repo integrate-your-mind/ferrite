@@ -92,6 +92,16 @@ export const renderProofNginxConfig = (template, upstreamAlias = "ferrite-upstre
   )}`;
 };
 
+export const renderMissingCertificateControlConfig = (template) => {
+  const rendered = renderProofNginxConfig(template);
+  const networkUpstream = "proxy_pass http://ferrite-upstream:3000;";
+  const replacements = rendered.split(networkUpstream).length - 1;
+  if (replacements !== 1) {
+    throw new Error("nginx missing-certificate control requires one proof upstream");
+  }
+  return rendered.replace(networkUpstream, "proxy_pass http://127.0.0.1:3000;");
+};
+
 export const parseDockerPublishedPort = (output) => {
   const lines = output.trim().split(/\r?\n/).filter(Boolean);
   if (lines.length !== 1) {
@@ -112,7 +122,12 @@ export const assertExpectedFailure = (result, label, pattern) => {
   assert.notEqual(result.code, 0, `${label} unexpectedly succeeded`);
   assert.equal(result.timedOut, false, `${label} exceeded its outer process deadline`);
   const output = `${result.stdout}\n${result.stderr}`;
-  assert.match(output, pattern, `${label} failed for an unexpected reason`);
+  const diagnostic = output.length > 4_096 ? output.slice(-4_096) : output;
+  assert.match(
+    output,
+    pattern,
+    `${label} failed for an unexpected reason:\n${diagnostic}`,
+  );
 };
 
 export const assertProofSourceState = (sourceClean, dirtyOverride) => {
@@ -217,6 +232,41 @@ const assertCommandSucceeded = (result, label) => {
     ? "timed out"
     : `exited ${result.code ?? `from ${result.signal}`}`;
   throw new Error(`${label} ${reason}\n${result.stdout}\n${result.stderr}`.trim());
+};
+
+export const formatProofError = (error) => {
+  const active = new Set();
+
+  const render = (value, label = "", indent = "") => {
+    const prefix = label ? `${indent}${label}: ` : indent;
+    if (!(value instanceof Error)) return `${prefix}${String(value)}`;
+    if (active.has(value)) return `${prefix}[circular ${value.name}]`;
+    active.add(value);
+
+    try {
+      const stack = value.stack ?? `${value.name}: ${value.message}`;
+      const [summary, ...frames] = stack.split("\n");
+      const frameIndent = `${indent}${label ? "  " : ""}`;
+      const lines = [
+        `${prefix}${summary}`,
+        ...frames.map((frame) => `${frameIndent}${frame}`),
+      ];
+
+      if (value.cause !== undefined) {
+        lines.push(render(value.cause, "cause", `${indent}  `));
+      }
+      if (value instanceof AggregateError) {
+        value.errors.forEach((nested, index) => {
+          lines.push(render(nested, `errors[${index}]`, `${indent}  `));
+        });
+      }
+      return lines.join("\n");
+    } finally {
+      active.delete(value);
+    }
+  };
+
+  return render(error);
 };
 
 export const createCleanSourceSnapshot = async ({ sourceRoot, scratch, commit }) => {
@@ -561,6 +611,7 @@ const main = async () => {
     const certificateDirectory = join(scratch, "certificate");
     const missingCertificateDirectory = join(scratch, "missing-certificate");
     const nginxConfigPath = join(scratch, "default.conf");
+    const missingCertificateConfigPath = join(scratch, "missing-certificate.conf");
     const accessLogPath = join(scratch, "ferrite.log");
     await mkdir(certificateDirectory);
     await mkdir(missingCertificateDirectory);
@@ -593,6 +644,10 @@ const main = async () => {
 
     const template = await readFile(proofInputs.nginxTemplate, "utf8");
     await writeFile(nginxConfigPath, renderProofNginxConfig(template));
+    await writeFile(
+      missingCertificateConfigPath,
+      renderMissingCertificateControlConfig(template),
+    );
     assertCommandSucceeded(
       await runCommand("openssl", [
         "req",
@@ -745,7 +800,8 @@ const main = async () => {
       missingCertCheck,
       "--network",
       networkName,
-      ...commonNginxMounts,
+      "--volume",
+      `${missingCertificateConfigPath}:/etc/nginx/conf.d/default.conf:ro`,
       "--volume",
       `${missingCertificateDirectory}:/etc/letsencrypt/live/app.example.com:ro`,
       NGINX_IMAGE,
@@ -934,7 +990,7 @@ const isMain =
   process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url;
 if (isMain) {
   main().catch((error) => {
-    process.stderr.write(`${error.stack ?? error.message}\n`);
+    process.stderr.write(`${formatProofError(error)}\n`);
     process.exitCode = 1;
   });
 }

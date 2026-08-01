@@ -1,0 +1,138 @@
+#!/bin/bash -p
+
+if /usr/bin/env | /usr/bin/grep -E \
+  '^(BASH_FUNC_[^=]*%%|BASH_ENV|BASHOPTS|BASH_COMPAT|BASH_LOADABLES_PATH|BASH_XTRACEFD|ENV|PROMPT_COMMAND|PS4|SHELLOPTS)=' \
+  >/dev/null; then
+  /bin/echo "Ferrite Buildkite trust check: shell startup controls are not allowed" >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+fail() {
+  printf 'Ferrite Buildkite trust check: %s\n' "$*" >&2
+  exit 1
+}
+
+is_ferrite_repo() {
+  case "$1" in
+    git@github.com:integrate-your-mind/ferrite.git | \
+    https://github.com/integrate-your-mind/ferrite | \
+    https://github.com/integrate-your-mind/ferrite.git)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_ferrite_repo "${BUILDKITE_REPO:-}" ||
+  fail "job repository is not integrate-your-mind/ferrite"
+
+[[ "${FERRITE_BUILDKITE_APPROVED_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] ||
+  fail "FERRITE_BUILDKITE_APPROVED_COMMIT must be set outside the checkout"
+[[ "${BUILDKITE_COMMIT:-}" == "${FERRITE_BUILDKITE_APPROVED_COMMIT}" ]] ||
+  fail "job commit does not match the operator-approved commit"
+
+if [[ -n "${BUILDKITE_PULL_REQUEST_REPO:-}" ]] &&
+   [[ "${BUILDKITE_PULL_REQUEST_REPO}" != "false" ]]; then
+  is_ferrite_repo "${BUILDKITE_PULL_REQUEST_REPO}" ||
+    fail "fork pull-request jobs are not allowed on the local agent"
+fi
+
+for name in \
+  AWS_SECRET_ACCESS_KEY \
+  GOOGLE_APPLICATION_CREDENTIALS \
+  GITHUB_TOKEN \
+  NPM_TOKEN \
+  NODE_AUTH_TOKEN \
+  OPENAI_API_KEY; do
+  if [[ -n "${!name:-}" ]]; then
+    fail "${name} must not be exposed to Ferrite validation jobs"
+  fi
+done
+
+original_home="${HOME:-/tmp}"
+original_cargo_home="${CARGO_HOME:-${original_home}/.cargo}"
+original_rustup_home="${RUSTUP_HOME:-${original_home}/.rustup}"
+tmp_input="${TMPDIR:-/tmp}"
+[[ -d "${tmp_input}" ]] || fail "TMPDIR must be an existing directory"
+tmp_root="$(/bin/realpath "${tmp_input}")" || fail "could not canonicalize TMPDIR"
+[[ "${tmp_root}" != / ]] || fail "TMPDIR must not be the filesystem root"
+build_id="${BUILDKITE_JOB_ID:-${BUILDKITE_BUILD_ID:-$$}}"
+build_id="$(printf '%s' "${build_id}" | /usr/bin/sed 's/[^A-Za-z0-9_.-]/_/g')"
+build_home="${tmp_root}/ferrite-buildkite-home-${build_id}"
+/bin/mkdir -p -m 0700 \
+  "${build_home}/cargo" \
+  "${build_home}/npm" \
+  "${build_home}/docker" \
+  "${build_home}/aws" \
+  "${build_home}/gcloud" \
+  "${build_home}/pnpm"
+/bin/mkdir -p -m 0700 "${build_home}/toolchain/bin"
+/bin/chmod 0700 "${build_home}"
+
+# Rustup's proxies are copied into the per-build PATH so the original
+# user-writable Cargo bin directory is never executed from PATH. The installed
+# toolchains remain under the operator-selected RUSTUP_HOME.
+if [[ -x "${original_cargo_home}/bin/rustup" ]]; then
+  /bin/cp "${original_cargo_home}/bin/rustup" "${build_home}/toolchain/bin/rustup"
+  for proxy in cargo rustc cargo-clippy clippy-driver rustfmt rustdoc; do
+    /bin/ln -sf rustup "${build_home}/toolchain/bin/${proxy}"
+  done
+  if [[ -n "${original_rustup_home}" ]]; then
+    export RUSTUP_HOME="${original_rustup_home}"
+  fi
+fi
+for tool in cargo-audit cargo-llvm-cov; do
+  if [[ -x "${original_cargo_home}/bin/${tool}" ]]; then
+    /bin/cp "${original_cargo_home}/bin/${tool}" "${build_home}/toolchain/bin/${tool}"
+  fi
+done
+
+# Public package and cloud clients receive empty, per-build locations. These
+# files deliberately do not inherit the agent user's dotfiles or credentials.
+: > "${build_home}/cargo/credentials.toml"
+: > "${build_home}/npm/user.npmrc"
+: > "${build_home}/npm/global.npmrc"
+printf '{}\n' > "${build_home}/docker/config.json"
+: > "${build_home}/aws/credentials"
+: > "${build_home}/aws/config"
+printf '{}\n' > "${build_home}/gcloud/application_default_credentials.json"
+: > "${build_home}/gitconfig"
+/bin/chmod 0600 \
+  "${build_home}/cargo/credentials.toml" \
+  "${build_home}/npm/user.npmrc" \
+  "${build_home}/npm/global.npmrc" \
+  "${build_home}/docker/config.json" \
+  "${build_home}/aws/credentials" \
+  "${build_home}/aws/config" \
+  "${build_home}/gcloud/application_default_credentials.json" \
+  "${build_home}/gitconfig"
+
+export HOME="${build_home}"
+export TMPDIR="${tmp_root}"
+export CARGO_HOME="${build_home}/cargo"
+export PNPM_HOME="${build_home}/pnpm"
+export RUSTUP_HOME="${original_rustup_home}"
+export RUSTUP_TOOLCHAIN="1.95.0"
+export npm_config_userconfig="${build_home}/npm/user.npmrc"
+export NPM_CONFIG_USERCONFIG="${build_home}/npm/user.npmrc"
+export npm_config_globalconfig="${build_home}/npm/global.npmrc"
+export NPM_CONFIG_GLOBALCONFIG="${build_home}/npm/global.npmrc"
+export DOCKER_CONFIG="${build_home}/docker"
+export AWS_SHARED_CREDENTIALS_FILE="${build_home}/aws/credentials"
+export AWS_CONFIG_FILE="${build_home}/aws/config"
+export CLOUDSDK_CONFIG="${build_home}/gcloud"
+export GOOGLE_APPLICATION_CREDENTIALS="${build_home}/gcloud/application_default_credentials.json"
+export GIT_CONFIG_GLOBAL="${build_home}/gitconfig"
+export GIT_CONFIG_NOSYSTEM=1
+
+export BUILDKITE_GIT_SUBMODULES=false
+# Only fixed system tool paths are admitted by default. Operators that install
+# rustup/pnpm outside Homebrew must set CARGO_HOME/PNPM_HOME to dedicated,
+# non-user-writable locations in the agent service environment. HOME/bin and
+# HOME/Library/pnpm are intentionally never prepended.
+export PATH="${build_home}/toolchain/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export FERRITE_BUILDKITE_BUILD_HOME="${build_home}"

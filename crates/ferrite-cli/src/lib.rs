@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -11,10 +13,12 @@ use ferrite_builder::{BuildConfig, BuildReport};
 use ferrite_dev_server::{
     DevProject, DevResponse, DevServerConfig, ProductionActionEvent, ProductionActionOutcome,
     ProductionProject, ProductionRequestEvent, ProductionServerConfig,
-    ProductionTrustedProxyConfig,
+    ProductionShutdownController, ProductionTrustedProxyConfig,
 };
 use ferrite_router::{Route, scan_app_dir, write_route_types};
 use serde::Serialize;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::flag;
 
 #[derive(Debug, Parser)]
 #[command(name = "ferrite")]
@@ -56,12 +60,21 @@ enum Commands {
 
     #[command(about = "Build an immutable Ferrite production artifact")]
     Build(BuildArgs),
+
+    #[command(hide = true)]
+    InternalPublishDir(InternalPublishDirArgs),
 }
 
 #[derive(Debug, Args)]
 struct InitArgs {
     #[arg(default_value = ".", help = "Directory to initialize")]
     project: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct InternalPublishDirArgs {
+    source: PathBuf,
+    target: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -222,7 +235,7 @@ struct ServeArgs {
     #[arg(
         long,
         default_value_t = 5_000,
-        help = "Maximum milliseconds to wait while reading each production HTTP request"
+        help = "Maximum total milliseconds allowed to read each production HTTP request"
     )]
     request_read_timeout_ms: u64,
 
@@ -459,6 +472,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 println!("project: {}", project.display());
                 println!("next: npm install && npm run dev");
             }
+        }
+        Commands::InternalPublishDir(args) => {
+            publish_directory_no_replace(&args.source, &args.target)?;
         }
         Commands::Routes(args) => {
             let project = normalize_project_path(&args.project)?;
@@ -700,7 +716,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                         production_limits.max_in_flight_requests
                     );
                 }
-                ferrite_dev_server::serve_production(addr, production_project)?;
+                serve_production_until_signal(addr, production_project)?;
             }
         }
         Commands::Build(args) => {
@@ -710,6 +726,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             let types_out = resolve_project_path(&project, &args.types_out);
             let page_renderer = normalize_current_path(&args.page_renderer)?;
             let client_bundler = normalize_current_path(&args.client_bundler)?;
+            let _signal_guard = BuildSignalGuard::register()?;
             let report = ferrite_builder::build_project(&BuildConfig::new(
                 project,
                 app_dir,
@@ -728,6 +745,142 @@ fn run_cli(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn publish_directory_no_replace(source: &Path, target: &Path) -> Result<()> {
+    let source_metadata = fs::symlink_metadata(source)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(CliError::Config(format!(
+            "starter publication source is not a directory: {}",
+            source.display()
+        )));
+    }
+
+    let source_parent = source.parent().ok_or_else(|| {
+        CliError::Config(format!(
+            "starter publication source has no parent: {}",
+            source.display()
+        ))
+    })?;
+    let target_parent = target.parent().ok_or_else(|| {
+        CliError::Config(format!(
+            "starter publication target has no parent: {}",
+            target.display()
+        ))
+    })?;
+    if fs::canonicalize(source_parent)? != fs::canonicalize(target_parent)? {
+        return Err(CliError::Config(
+            "starter publication source and target must be siblings".to_string(),
+        ));
+    }
+
+    rename_directory_no_replace(source, target).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            CliError::Config(format!(
+                "starter target appeared during creation: {}",
+                target.display()
+            ))
+        } else {
+            CliError::Io(error)
+        }
+    })
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn rename_directory_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        target,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+fn rename_directory_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+    // Windows directory renames already fail when the destination exists.
+    fs::rename(source, target)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
+fn rename_directory_no_replace(_source: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "exclusive starter publication is unavailable on this platform",
+    ))
+}
+
+struct BuildSignalGuard {
+    cancellation_flag: Arc<AtomicBool>,
+    registrations: Vec<signal_hook::SigId>,
+}
+
+impl BuildSignalGuard {
+    fn register() -> Result<Self> {
+        let cancellation_flag = ferrite_builder::build_cancellation_flag();
+        cancellation_flag.store(false, Ordering::Release);
+        let mut registrations = Vec::new();
+        let registration_result = (|| -> std::io::Result<()> {
+            registrations.push(flag::register_conditional_shutdown(
+                SIGINT,
+                130,
+                Arc::clone(&cancellation_flag),
+            )?);
+            registrations.push(flag::register(SIGINT, Arc::clone(&cancellation_flag))?);
+            registrations.push(flag::register_conditional_shutdown(
+                SIGTERM,
+                143,
+                Arc::clone(&cancellation_flag),
+            )?);
+            registrations.push(flag::register(SIGTERM, Arc::clone(&cancellation_flag))?);
+            Ok(())
+        })();
+        if let Err(error) = registration_result {
+            for registration in registrations {
+                signal_hook::low_level::unregister(registration);
+            }
+            cancellation_flag.store(false, Ordering::Release);
+            return Err(error.into());
+        }
+        Ok(Self {
+            cancellation_flag,
+            registrations,
+        })
+    }
+}
+
+impl Drop for BuildSignalGuard {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+        self.cancellation_flag.store(false, Ordering::Release);
+    }
+}
+
+fn serve_production_until_signal(addr: String, project: ProductionProject) -> Result<()> {
+    let (controller, shutdown) = ProductionShutdownController::new_pair();
+    let shutdown_flag = controller.shutdown_flag();
+    let sigint = flag::register(SIGINT, Arc::clone(&shutdown_flag))?;
+    let sigterm = match flag::register(SIGTERM, shutdown_flag) {
+        Ok(sigterm) => sigterm,
+        Err(error) => {
+            signal_hook::low_level::unregister(sigint);
+            return Err(error.into());
+        }
+    };
+
+    let result = ferrite_dev_server::serve_production_with_shutdown(addr, project, shutdown);
+    signal_hook::low_level::unregister(sigint);
+    signal_hook::low_level::unregister(sigterm);
+    result.map_err(CliError::from)
 }
 
 fn initialize_project(project: &Path) -> Result<PathBuf> {
@@ -1316,6 +1469,57 @@ mod tests {
 
         assert!(error.to_string().contains("not a directory"));
         assert_eq!(fs::read_to_string(target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn internal_publish_moves_a_staged_directory_to_an_absent_sibling() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join(".app.staging");
+        let target = parent.path().join("app");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("package.json"), "{}\n").unwrap();
+
+        publish_directory_no_replace(&source, &target).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(target.join("package.json")).unwrap(),
+            "{}\n"
+        );
+    }
+
+    #[test]
+    fn internal_publish_does_not_replace_an_existing_empty_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join(".app.staging");
+        let target = parent.path().join("app");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("package.json"), "{}\n").unwrap();
+        fs::create_dir(&target).unwrap();
+
+        let error = publish_directory_no_replace(&source, &target).unwrap_err();
+
+        assert!(matches!(error, CliError::Config(_)));
+        assert!(error.to_string().contains("target appeared"));
+        assert!(source.join("package.json").is_file());
+        assert!(target.is_dir());
+        assert!(target.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn internal_publish_requires_a_sibling_target() {
+        let source_parent = tempfile::tempdir().unwrap();
+        let target_parent = tempfile::tempdir().unwrap();
+        let source = source_parent.path().join(".app.staging");
+        let target = target_parent.path().join("app");
+        fs::create_dir(&source).unwrap();
+
+        let error = publish_directory_no_replace(&source, &target).unwrap_err();
+
+        assert!(matches!(error, CliError::Config(_)));
+        assert!(error.to_string().contains("must be siblings"));
+        assert!(source.is_dir());
+        assert!(!target.exists());
     }
 
     #[test]

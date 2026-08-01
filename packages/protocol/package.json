@@ -1,9 +1,21 @@
 {
   "name": "@ferrite/protocol",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Browser-safe Ferrite protocol markers, builders, and validators generated from the Rust protocol crate.",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/integrate-your-mind/ferrite.git",
+    "directory": "packages/protocol"
+  },
+  "homepage": "https://github.com/integrate-your-mind/ferrite#readme",
+  "bugs": {
+    "url": "https://github.com/integrate-your-mind/ferrite/issues"
+  },
   "keywords": [
     "ferrite",
     "protocol",
@@ -26,8 +38,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check:generated": "node scripts/check-generated.mjs",
-    "test": "pnpm build && pnpm check:generated && node --test test/*.test.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "test": "pnpm build && pnpm check:generated && pnpm typecheck:compatibility && node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && pnpm typecheck:compatibility",
+    "typecheck:compatibility": "tsc -p tsconfig.compatibility.json"
   },
   "devDependencies": {
     "typescript": "6.0.3"

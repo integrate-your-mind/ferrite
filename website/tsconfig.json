@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+    "strict": true,
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@ferrite/runtime",
+    "paths": {
+      "@ferrite/runtime": ["../packages/runtime/src/index.ts"],
+      "@ferrite/runtime/jsx-runtime": ["../packages/runtime/src/jsx-runtime.ts"],
+      "@ferrite/runtime/server": ["../packages/runtime/src/server.ts"]
+    },
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["app/**/*.ts", "app/**/*.tsx", "tests/**/*.ts", "ferrite-env.d.ts"]
+}

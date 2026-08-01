@@ -1,0 +1,123 @@
+#!/opt/homebrew/bin/node
+
+import { readFileSync } from "node:fs";
+
+const allowedRepositories = new Set([
+  "git@github.com:integrate-your-mind/ferrite.git",
+  "https://github.com/integrate-your-mind/ferrite",
+  "https://github.com/integrate-your-mind/ferrite.git",
+]);
+const allowedCommands = new Set([
+  "./.buildkite/scripts/upload-pipeline.mjs",
+  "./.buildkite/scripts/ci.mjs verify",
+  "./.buildkite/scripts/ci.mjs packages",
+  "./.buildkite/scripts/ci.mjs coverage-rust",
+  "./.buildkite/scripts/ci.mjs coverage-js",
+  "./.buildkite/scripts/ci.mjs native",
+  "./.buildkite/scripts/ci.mjs nginx",
+]);
+const deniedNames = new Set([
+  "AWS_SECRET_ACCESS_KEY",
+  "BASH_ENV",
+  "BASHOPTS",
+  "BASH_COMPAT",
+  "BASH_LOADABLES_PATH",
+  "BASH_XTRACEFD",
+  "CDPATH",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "ENV",
+  "GIT_CONFIG_COUNT",
+  "GITHUB_TOKEN",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "LD_PRELOAD",
+  "NODE_AUTH_TOKEN",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "NPM_TOKEN",
+  "OPENAI_API_KEY",
+  "PERL5OPT",
+  "PROMPT_COMMAND",
+  "PS4",
+  "PYTHONPATH",
+  "RUBYOPT",
+  "RUSTC_WRAPPER",
+  "RUSTC_WORKSPACE_WRAPPER",
+  "RUSTDOCFLAGS",
+  "RUSTFLAGS",
+  "SHELLOPTS",
+]);
+const checkoutOnlyNames = new Set([
+  "GIT_ASKPASS",
+  "GIT_SSH_COMMAND",
+  "SSH_ASKPASS",
+  "SSH_AUTH_SOCK",
+]);
+
+function fail(message) {
+  process.stderr.write(`Ferrite Buildkite trust check: ${message}\n`);
+  process.exit(1);
+}
+
+function isDeniedName(name) {
+  return name.startsWith("BASH_FUNC_") || deniedNames.has(name);
+}
+
+const environmentPath = process.env.BUILDKITE_ENV_JSON_FILE;
+if (!environmentPath) {
+  fail("BUILDKITE_ENV_JSON_FILE is required");
+}
+
+let job;
+try {
+  job = JSON.parse(readFileSync(environmentPath, "utf8"));
+} catch {
+  fail("job environment JSON is unreadable or invalid");
+}
+if (job === null || Array.isArray(job) || typeof job !== "object") {
+  fail("job environment JSON must contain an object");
+}
+
+const denied = Object.keys(job).filter(isDeniedName).sort();
+if (denied.length > 0) {
+  fail(`disallowed job environment variable: ${denied[0]}`);
+}
+for (const name of checkoutOnlyNames) {
+  if (
+    job[name] !== undefined &&
+    job[name] !== (process.env[name] ?? undefined)
+  ) {
+    fail(`job attempted to override checkout-only variable: ${name}`);
+  }
+}
+if (!allowedRepositories.has(job.BUILDKITE_REPO)) {
+  fail("job repository is not integrate-your-mind/ferrite");
+}
+if (!allowedCommands.has(job.BUILDKITE_COMMAND)) {
+  fail("command is not allowlisted");
+}
+
+const approved = process.env.FERRITE_BUILDKITE_APPROVED_COMMIT ?? "";
+if (!/^[0-9a-f]{40}$/.test(approved)) {
+  fail("FERRITE_BUILDKITE_APPROVED_COMMIT must be set outside the job");
+}
+if (job.BUILDKITE_COMMIT !== approved) {
+  fail("job commit does not match the operator-approved commit");
+}
+if (
+  job.FERRITE_BUILDKITE_APPROVED_COMMIT !== undefined &&
+  job.FERRITE_BUILDKITE_APPROVED_COMMIT !== approved
+) {
+  fail("job attempted to override the operator-approved commit");
+}
+
+const pullRequestRepository = job.BUILDKITE_PULL_REQUEST_REPO;
+if (
+  pullRequestRepository !== undefined &&
+  pullRequestRepository !== "" &&
+  pullRequestRepository !== "false" &&
+  !allowedRepositories.has(pullRequestRepository)
+) {
+  fail("fork pull-request jobs are not allowed on the local agent");
+}

@@ -1,445 +1,1255 @@
-mod artifact;
+mod legacy;
+mod source_snapshot;
 
-pub use artifact::{
-    FERRITE_PRODUCTION_ARTIFACT_FORMAT, FERRITE_PRODUCTION_ARTIFACT_MAJOR,
-    FERRITE_PRODUCTION_ARTIFACT_MANIFEST, FERRITE_PRODUCTION_ARTIFACT_MINOR,
-    LoadedProductionArtifact, ProductionArtifactError, ProductionArtifactFile,
-    ProductionArtifactFormat, ProductionArtifactManifest, ProductionArtifactRoute,
-    artifact_file_record, finalize_production_artifact_manifest, load_production_artifact,
+pub use legacy::{
+    BuildConfig, BuildError, BuildReport, FERRITE_PRODUCTION_ARTIFACT_FORMAT,
+    FERRITE_PRODUCTION_ARTIFACT_MAJOR, FERRITE_PRODUCTION_ARTIFACT_MANIFEST,
+    FERRITE_PRODUCTION_ARTIFACT_MINOR, LoadedProductionArtifact, PageMetadataEntry,
+    ProductionArtifactError, ProductionArtifactFile, ProductionArtifactFormat,
+    ProductionArtifactManifest, ProductionArtifactRoute, Result, artifact_file_record,
+    finalize_production_artifact_manifest, load_production_artifact,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use ferrite_client_bundler::{
-    ClientBundle, ClientBundleError, ClientBundleOptions, ClientBundleRequest, ClientBundler,
-    fingerprint_client_bundle,
-};
-use ferrite_page_renderer::{
-    DocumentRenderOptions, PageMetadata, PageRenderError, PageRenderer, RouteConventions,
-    ServerActionManifest,
-};
-use ferrite_router::{Route, RouteParamKind, find_document_file, scan_app_dir, write_route_types};
-use serde::Serialize;
-use serde_json::Value;
+use ferrite_router::{Route, find_document_file, scan_app_dir, validate_route_types_output};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-#[derive(Debug)]
-pub enum BuildError {
-    Artifact(ProductionArtifactError),
-    ClientBundle(ClientBundleError),
-    DuplicateStaticOutput { route_path: String },
-    InvalidStaticParams { route: String, reason: String },
-    PageRender(PageRenderError),
-    Router(ferrite_router::RouterError),
-    Io(std::io::Error),
-    Json(serde_json::Error),
+use source_snapshot::ProjectSourceSnapshot;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(not(windows))]
+use std::process::Child;
+
+#[cfg(windows)]
+use process_wrap::std::{JobObject, StdChildWrapper, StdCommandWrap};
+
+const BUILD_INPUT_VERIFIER_TIMEOUT: Duration = Duration::from_secs(120);
+const BUILD_INPUT_VERIFIER_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const BUILD_INPUT_VERIFIER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+static BUILD_CANCELLATION_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+pub fn build_cancellation_flag() -> Arc<AtomicBool> {
+    Arc::clone(BUILD_CANCELLATION_FLAG.get_or_init(|| Arc::new(AtomicBool::new(false))))
 }
 
-impl fmt::Display for BuildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BuildError::Artifact(error) => write!(f, "{error}"),
-            BuildError::ClientBundle(error) => write!(f, "{error}"),
-            BuildError::DuplicateStaticOutput { route_path } => {
-                write!(f, "duplicate static output for route path `{route_path}`")
-            }
-            BuildError::InvalidStaticParams { route, reason } => {
-                write!(f, "invalid static params for route `{route}`: {reason}")
-            }
-            BuildError::PageRender(error) => write!(f, "{error}"),
-            BuildError::Router(error) => write!(f, "{error}"),
-            BuildError::Io(error) => write!(f, "{error}"),
-            BuildError::Json(error) => write!(f, "{error}"),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildInputContract {
+    routes: Vec<Route>,
+    document_file: Option<PathBuf>,
+    project_sources: ProjectSourceSnapshot,
+    server_inputs: Vec<ServerBuildInput>,
 }
 
-impl std::error::Error for BuildError {}
-
-impl From<ferrite_router::RouterError> for BuildError {
-    fn from(error: ferrite_router::RouterError) -> Self {
-        BuildError::Router(error)
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildOutputContract {
+    build: DestinationIdentity,
+    route_types: DestinationIdentity,
 }
 
-impl From<PageRenderError> for BuildError {
-    fn from(error: PageRenderError) -> Self {
-        BuildError::PageRender(error)
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DestinationIdentity {
+    Missing,
+    File { size: u64, sha256: String },
+    Directory(Vec<DestinationEntryIdentity>),
 }
 
-impl From<ClientBundleError> for BuildError {
-    fn from(error: ClientBundleError) -> Self {
-        BuildError::ClientBundle(error)
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DestinationEntryIdentity {
+    path: PathBuf,
+    kind: DestinationEntryKind,
+    size: u64,
+    sha256: Option<String>,
 }
 
-impl From<ProductionArtifactError> for BuildError {
-    fn from(error: ProductionArtifactError) -> Self {
-        BuildError::Artifact(error)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestinationEntryKind {
+    Directory,
+    File,
 }
 
-impl From<std::io::Error> for BuildError {
-    fn from(error: std::io::Error) -> Self {
-        BuildError::Io(error)
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerBuildInput {
+    path: String,
+    value: String,
 }
 
-impl From<serde_json::Error> for BuildError {
-    fn from(error: serde_json::Error) -> Self {
-        BuildError::Json(error)
-    }
-}
-
-pub type Result<T> = std::result::Result<T, BuildError>;
-
-const CLIENT_PUBLIC_PATH: &str = "/_ferrite/static";
-
-#[derive(Debug, Clone)]
-pub struct BuildConfig {
-    pub project: PathBuf,
-    pub app_dir: PathBuf,
-    pub out_dir: PathBuf,
-    pub types_out: PathBuf,
-    pub page_renderer: PathBuf,
-    pub client_bundler: PathBuf,
-}
-
-impl BuildConfig {
-    pub fn new(
-        project: PathBuf,
-        app_dir: PathBuf,
-        out_dir: PathBuf,
-        types_out: PathBuf,
-        page_renderer: PathBuf,
-        client_bundler: PathBuf,
-    ) -> Self {
-        Self {
-            project,
-            app_dir,
-            out_dir,
-            types_out,
-            page_renderer,
-            client_bundler,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct BuildReport {
-    pub out_dir: PathBuf,
-    pub routes_count: usize,
-    pub html_files: Vec<PathBuf>,
-    pub page_metadata: Vec<PageMetadataEntry>,
-    pub skipped_dynamic_routes: Vec<String>,
-    pub manifest_file: PathBuf,
-    pub production_manifest_file: PathBuf,
-    pub production_build_id: String,
-    pub server_modules: Vec<PathBuf>,
-    pub client_bundles: Vec<ClientBundle>,
-    pub server_action_manifests: Vec<ServerActionManifest>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PageMetadataEntry {
-    pub route_path: String,
-    pub metadata: PageMetadata,
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerBuildInputResponse {
+    inputs: Vec<ServerBuildInput>,
 }
 
 #[derive(Debug, Serialize)]
-struct BuildManifest<'a> {
-    routes: &'a [Route],
-    html_files: &'a [String],
-    page_metadata: &'a [PageMetadataEntry],
-    skipped_dynamic_routes: &'a [String],
-    client_bundles: &'a [ClientBundle],
-    server_action_manifests: &'a [ServerActionManifest],
-    production_manifest_file: &'a str,
-    production_build_id: &'a str,
-    server_modules: &'a [String],
+#[serde(rename_all = "camelCase")]
+struct ServerBuildInputRequest {
+    project: PathBuf,
+    routes: Vec<ServerBuildInputRoute>,
+    document_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerBuildInputRoute {
+    page_file: PathBuf,
+    layouts: Vec<PathBuf>,
+    loading_file: Option<PathBuf>,
+    error_file: Option<PathBuf>,
 }
 
 pub fn build_project(config: &BuildConfig) -> Result<BuildReport> {
+    let output_contract = validate_build_output_ownership(config)?;
+    let initial_contract = capture_build_input_contract(config)?;
     let out_parent = config.out_dir.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(out_parent)?;
-    let staged = tempfile::Builder::new()
-        .prefix(".ferrite-build-")
-        .tempdir_in(out_parent)?;
-    let mut staged_config = config.clone();
-    staged_config.out_dir = staged.path().to_path_buf();
-    let mut report = build_project_in_place(&staged_config)?;
-    let staged_path = staged.keep();
 
-    if let Err(error) = install_staged_build(&staged_path, &config.out_dir) {
-        let _ = fs::remove_dir_all(&staged_path);
-        return Err(error.into());
+    let candidate_holder = tempfile::Builder::new()
+        .prefix(".ferrite-verified-build-")
+        .tempdir_in(out_parent)?;
+    let candidate_path = candidate_holder.path().join("candidate");
+    let candidate_types_path = candidate_holder.path().join("types/routes.d.ts");
+    let mut candidate_config = config.clone();
+    candidate_config.out_dir = candidate_path.clone();
+    candidate_config.types_out = candidate_types_path.clone();
+
+    let mut report = legacy::build_project(&candidate_config)?;
+    ensure_build_contract_unchanged(&initial_contract, &capture_build_input_contract(config)?)?;
+    rebase_build_report(&mut report, &candidate_path, &config.out_dir)?;
+
+    let types_parent = config.types_out.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(types_parent)?;
+    let staged_types_holder = tempfile::Builder::new()
+        .prefix(".ferrite-verified-types-")
+        .tempdir_in(types_parent)?;
+    let staged_types_path = staged_types_holder.path().join("routes.d.ts");
+    fs::copy(&candidate_types_path, &staged_types_path)?;
+    fs::remove_file(&candidate_types_path)?;
+    if let Some(candidate_types_parent) = candidate_types_path.parent() {
+        fs::remove_dir(candidate_types_parent)?;
     }
-    rebase_build_report(&mut report, &staged_path, &config.out_dir)?;
+
+    let candidate_root = candidate_holder.keep();
+    let staged_types_root = staged_types_holder.keep();
+    let cancellation_flag = build_cancellation_flag();
+    let activation = install_verified_outputs_unless_cancelled(
+        &candidate_path,
+        &config.out_dir,
+        &staged_types_path,
+        &config.types_out,
+        cancellation_flag.as_ref(),
+        &output_contract,
+    );
+    let mut scratch_errors = Vec::new();
+    for (label, root, retained_path) in [
+        ("build", candidate_root.as_path(), candidate_path.as_path()),
+        (
+            "route types",
+            staged_types_root.as_path(),
+            staged_types_path.as_path(),
+        ),
+    ] {
+        if retained_path.exists() {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir(root) {
+            scratch_errors.push(format!(
+                "could not remove empty {label} scratch root `{}`: {error}; the scratch root was preserved",
+                root.display()
+            ));
+        }
+    }
+    if let Err(error) = activation {
+        return Err(activation_error(error, scratch_errors).into());
+    }
+    if !scratch_errors.is_empty() {
+        return Err(BuildError::Io(io::Error::other(format!(
+            "verified build outputs were activated, but scratch cleanup was incomplete: {}",
+            scratch_errors.join("; ")
+        ))));
+    }
     Ok(report)
 }
 
-fn build_project_in_place(config: &BuildConfig) -> Result<BuildReport> {
-    let routes = scan_app_dir(&config.app_dir)?;
-    fs::create_dir_all(&config.out_dir)?;
-    write_route_types(&routes, &config.types_out)?;
-    let document_file = find_document_file(&config.app_dir);
-    let page_renderer = PageRenderer::new(config.project.clone(), config.page_renderer.clone());
-    let client_bundler = ClientBundler::new(config.project.clone(), config.client_bundler.clone());
+fn validate_build_output_ownership(config: &BuildConfig) -> Result<BuildOutputContract> {
+    let project = normalized_path(&config.project)?;
+    let app_dir = normalized_path(&config.app_dir)?;
+    let out_dir = normalized_path(&config.out_dir)?;
+    let types_out = normalized_path(&config.types_out)?;
 
-    let mut html_files = Vec::new();
-    let mut page_metadata = Vec::new();
-    let mut skipped_dynamic_routes = Vec::new();
-    let mut client_bundles = Vec::new();
-    let mut server_action_manifests = Vec::new();
-    let mut production_routes = Vec::new();
-    let mut server_modules = Vec::new();
-    let mut generated_route_paths = BTreeSet::new();
-    let client_out_dir = config.out_dir.join("_ferrite/static");
-    let server_out_dir = config.out_dir.join("server");
-    fs::create_dir_all(&server_out_dir)?;
+    if out_dir == project || project.starts_with(&out_dir) || paths_overlap(&out_dir, &app_dir) {
+        return Err(invalid_output_path(format!(
+            "refusing build output `{}` because it overlaps Ferrite project source `{}`",
+            config.out_dir.display(),
+            config.app_dir.display()
+        )));
+    }
+    if types_out == project
+        || project.starts_with(&types_out)
+        || paths_overlap(&types_out, &app_dir)
+    {
+        return Err(invalid_output_path(format!(
+            "refusing route types output `{}` because it overlaps Ferrite project source `{}`",
+            config.types_out.display(),
+            config.app_dir.display()
+        )));
+    }
+    if paths_overlap(&out_dir, &types_out) {
+        return Err(invalid_output_path(format!(
+            "refusing overlapping build output `{}` and route types output `{}`",
+            config.out_dir.display(),
+            config.types_out.display()
+        )));
+    }
 
-    for (route_index, route) in routes.iter().enumerate() {
-        let static_param_sets = if route.params.is_empty() {
-            vec![BTreeMap::new()]
-        } else {
-            let generated = page_renderer.generate_static_params(&route.file)?;
-            if !generated.has_generate_static_params {
-                skipped_dynamic_routes.push(route.path.clone());
-                Vec::new()
-            } else {
-                generated.params
-            }
-        };
-        let artifact_param_set = static_param_sets
-            .first()
-            .cloned()
-            .unwrap_or_else(|| placeholder_route_params(route));
-        let artifact_params = ordered_route_params(route, &artifact_param_set)?;
-        let conventions = route_conventions(route);
-        let server_module_relative = format!("server/route-{route_index:04}.mjs");
-        let server_module = config.out_dir.join(&server_module_relative);
-        page_renderer.build_server_module(
-            &route.file,
-            &route.layouts,
-            document_file.as_deref(),
-            &conventions,
-            &route.path,
-            &server_module,
-        )?;
-        server_modules.push(server_module);
+    let build = validate_existing_build_destination(&project, &out_dir)?;
+    validate_route_types_output(&config.types_out)?;
+    let route_types = capture_destination_identity(&types_out)?;
+    Ok(BuildOutputContract { build, route_types })
+}
 
-        let artifact_action_manifest = page_renderer.collect_server_actions(
-            &route.file,
-            &route.layouts,
-            &artifact_params,
-            &conventions,
-        )?;
-        let route_client_bundle = bundle_production_route(
-            &client_bundler,
-            &route.file,
-            &route.layouts,
-            &route.path,
-            &artifact_params,
-            &client_out_dir,
-            !artifact_action_manifest.actions.is_empty(),
-        )?;
-        let mut prerendered = BTreeMap::new();
-
-        for params in static_param_sets {
-            let route_path = concrete_route_path(route, &params)?;
-            if !generated_route_paths.insert(route_path.clone()) {
-                return Err(BuildError::DuplicateStaticOutput { route_path });
-            }
-            let ordered_params = ordered_route_params(route, &params)?;
-            let html_path = output_html_path(&config.out_dir, &route_path);
-            if let Some(parent) = html_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let action_manifest = page_renderer.collect_server_actions(
-                &route.file,
-                &route.layouts,
-                &ordered_params,
-                &conventions,
-            )?;
-            let (document, metadata) = if let Some(document_file) = document_file.as_deref() {
-                let metadata =
-                    page_renderer.collect_metadata(&route.file, &route.layouts, &ordered_params)?;
-                page_renderer
-                    .render_document_to_html_with_conventions(
-                        &route.file,
-                        &route.layouts,
-                        document_file,
-                        &ordered_params,
-                        &DocumentRenderOptions {
-                            root_id: "ferrite-root".to_owned(),
-                            route_path: route_path.clone(),
-                            route_pattern: None,
-                            build_id: None,
-                            server_action_csrf_token: None,
-                            server_action_replay_nonce: None,
-                            metadata: metadata.clone(),
-                            preload_scripts: client_bundle_scripts(&route_client_bundle),
-                            styles: client_bundle_styles(&route_client_bundle),
-                            scripts: client_bundle_scripts(&route_client_bundle),
-                            default_title: "Ferrite".to_owned(),
-                        },
-                        &conventions,
-                    )
-                    .map(|document| (document, metadata))?
-            } else {
-                let page_html = page_renderer.render_page_to_html_with_conventions(
-                    &route.file,
-                    &route.layouts,
-                    &ordered_params,
-                    &conventions,
-                )?;
-                let metadata =
-                    page_renderer.collect_metadata(&route.file, &route.layouts, &ordered_params)?;
-                (
-                    render_static_document(
-                        &route_path,
-                        &route.path,
-                        &ordered_params,
-                        &page_html,
-                        &route_client_bundle,
-                        &metadata,
-                    ),
-                    metadata,
-                )
-            };
-            fs::write(&html_path, document)?;
-            let html_relative = artifact_relative_path(&config.out_dir, &html_path)?;
-            prerendered.insert(route_path.clone(), html_relative);
-            html_files.push(html_path);
-            page_metadata.push(PageMetadataEntry {
-                route_path,
-                metadata,
-            });
-            client_bundles.push(route_client_bundle.clone());
-            if !action_manifest.actions.is_empty() {
-                server_action_manifests.push(action_manifest);
-            }
+fn validate_existing_build_destination(
+    project: &Path,
+    out_dir: &Path,
+) -> Result<DestinationIdentity> {
+    let metadata = match fs::symlink_metadata(out_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DestinationIdentity::Missing);
         }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid_output_path(format!(
+            "refusing to replace non-build output `{}`",
+            out_dir.display()
+        )));
+    }
 
-        production_routes.push(ProductionArtifactRoute {
-            path: route.path.clone(),
-            params: route.params.clone(),
-            server_module: server_module_relative,
-            client_bundle: route_client_bundle,
-            prerendered,
-            observed_actions: artifact_action_manifest
-                .actions
-                .into_iter()
-                .map(|action| action.id)
-                .collect(),
+    let generated_root = normalized_path(&project.join(".ferrite"))?;
+    if out_dir.starts_with(&generated_root) || fs::read_dir(out_dir)?.next().is_none() {
+        return Ok(capture_destination_identity(out_dir)?);
+    }
+    if let Ok(artifact) = load_production_artifact(out_dir) {
+        let identity = capture_destination_identity(out_dir)?;
+        validate_exact_artifact_ownership(&artifact, &identity)?;
+        return Ok(identity);
+    }
+
+    Err(invalid_output_path(format!(
+        "refusing to replace non-build output `{}`",
+        out_dir.display()
+    )))
+}
+
+fn validate_exact_artifact_ownership(
+    artifact: &LoadedProductionArtifact,
+    identity: &DestinationIdentity,
+) -> Result<()> {
+    let DestinationIdentity::Directory(entries) = identity else {
+        return Err(invalid_output_path(format!(
+            "refusing to replace non-build output `{}`",
+            artifact.root.display()
+        )));
+    };
+
+    let mut allowed_files = artifact
+        .manifest
+        .files
+        .iter()
+        .map(|file| PathBuf::from(&file.path))
+        .collect::<BTreeSet<_>>();
+    allowed_files.insert(PathBuf::from(FERRITE_PRODUCTION_ARTIFACT_MANIFEST));
+    allowed_files.insert(PathBuf::from("ferrite-build.json"));
+
+    let mut allowed_directories = [
+        PathBuf::from("_ferrite"),
+        PathBuf::from("_ferrite/static"),
+        PathBuf::from("server"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for path in &allowed_files {
+        let mut parent = path.parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            allowed_directories.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+
+    for entry in entries {
+        let declared = match entry.kind {
+            DestinationEntryKind::Directory => allowed_directories.contains(&entry.path),
+            DestinationEntryKind::File => allowed_files.contains(&entry.path),
+        };
+        if !declared {
+            return Err(invalid_output_path(format!(
+                "refusing to replace artifact `{}` because it contains undeclared entry `{}`",
+                artifact.root.display(),
+                entry.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn capture_destination_identity(path: &Path) -> io::Result<DestinationIdentity> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DestinationIdentity::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("destination `{}` is a symbolic link", path.display()),
+        ));
+    }
+    if metadata.is_file() {
+        return Ok(DestinationIdentity::File {
+            size: metadata.len(),
+            sha256: sha256_file(path)?,
         });
     }
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "destination `{}` is not a regular file or directory",
+                path.display()
+            ),
+        ));
+    }
 
-    let mut artifact_paths = BTreeSet::new();
-    for route in &production_routes {
-        artifact_paths.insert(route.server_module.clone());
-        for output in route.client_bundle.outputs.iter().chain(
-            route
-                .client_bundle
-                .client_references
-                .iter()
-                .flat_map(|reference| reference.outputs.iter()),
-        ) {
-            artifact_paths.insert(format!(
-                "_ferrite/static/{}",
-                output.to_string_lossy().replace('\\', "/")
+    let canonical_root = fs::canonicalize(path)?;
+    let mut entries = Vec::new();
+    capture_directory_entries(path, path, &canonical_root, &mut entries)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(DestinationIdentity::Directory(entries))
+}
+
+fn capture_directory_entries(
+    root: &Path,
+    directory: &Path,
+    canonical_root: &Path,
+    entries: &mut Vec<DestinationEntryIdentity>,
+) -> io::Result<()> {
+    let mut children = fs::read_dir(directory)?.collect::<io::Result<Vec<_>>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("destination entry `{}` escaped its root", path.display()),
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination entry `{}` is a symbolic link",
+                    relative.display()
+                ),
             ));
         }
-        artifact_paths.extend(route.prerendered.values().cloned());
+        let canonical = fs::canonicalize(&path)?;
+        if !canonical.starts_with(canonical_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination entry `{}` resolves outside its root",
+                    relative.display()
+                ),
+            ));
+        }
+        if metadata.is_dir() {
+            entries.push(DestinationEntryIdentity {
+                path: relative.to_path_buf(),
+                kind: DestinationEntryKind::Directory,
+                size: 0,
+                sha256: None,
+            });
+            capture_directory_entries(root, &path, canonical_root, entries)?;
+        } else if metadata.is_file() {
+            entries.push(DestinationEntryIdentity {
+                path: relative.to_path_buf(),
+                kind: DestinationEntryKind::File,
+                size: metadata.len(),
+                sha256: Some(sha256_file(&path)?),
+            });
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination entry `{}` is not a regular file or directory",
+                    relative.display()
+                ),
+            ));
+        }
     }
-    let artifact_files = artifact_paths
-        .iter()
-        .map(|path| artifact_file_record(&config.out_dir, path))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let production_manifest = ProductionArtifactManifest::new(
-        CLIENT_PUBLIC_PATH,
-        document_file.is_some(),
-        production_routes,
-        artifact_files,
-    )?;
-    let production_manifest_file = config.out_dir.join(FERRITE_PRODUCTION_ARTIFACT_MANIFEST);
-    fs::write(
-        &production_manifest_file,
-        serde_json::to_string_pretty(&production_manifest)?,
-    )?;
+    Ok(())
+}
 
-    let manifest_file = config.out_dir.join("ferrite-build.json");
-    let manifest_html_files = html_files
-        .iter()
-        .map(|path| artifact_relative_path(&config.out_dir, path))
-        .collect::<Result<Vec<_>>>()?;
-    let manifest_server_modules = server_modules
-        .iter()
-        .map(|path| artifact_relative_path(&config.out_dir, path))
-        .collect::<Result<Vec<_>>>()?;
-    let manifest = BuildManifest {
-        routes: &routes,
-        html_files: &manifest_html_files,
-        page_metadata: &page_metadata,
-        skipped_dynamic_routes: &skipped_dynamic_routes,
-        client_bundles: &client_bundles,
-        server_action_manifests: &server_action_manifests,
-        production_manifest_file: FERRITE_PRODUCTION_ARTIFACT_MANIFEST,
-        production_build_id: &production_manifest.build_id,
-        server_modules: &manifest_server_modules,
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let digest = digest.finalize();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(io::Error::from)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))
+))]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "atomic no-clobber rename from `{}` to `{}` is unsupported on this platform",
+            source.display(),
+            destination.display()
+        ),
+    ))
+}
+
+#[cfg(windows)]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both buffers are NUL-terminated UTF-16 paths and remain alive for the call.
+    let result = unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn normalized_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
     };
-    fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("path escapes its filesystem root: {}", path.display()),
+                    ));
+                }
+            }
+            Component::Normal(part) => {
+                let candidate = resolved.join(part);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(_) => resolved = fs::canonicalize(candidate)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => resolved.push(part),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
 
-    Ok(BuildReport {
-        out_dir: config.out_dir.clone(),
-        routes_count: routes.len(),
-        html_files,
-        page_metadata,
-        skipped_dynamic_routes,
-        manifest_file,
-        production_manifest_file,
-        production_build_id: production_manifest.build_id,
-        server_modules,
-        client_bundles,
-        server_action_manifests,
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn invalid_output_path(message: String) -> BuildError {
+    io::Error::new(io::ErrorKind::InvalidInput, message).into()
+}
+
+fn capture_build_input_contract(config: &BuildConfig) -> Result<BuildInputContract> {
+    let routes = scan_app_dir(&config.app_dir)?;
+    let document_file = find_document_file(&config.app_dir);
+    let project_sources = ProjectSourceSnapshot::capture(
+        &config.project,
+        &[config.out_dir.clone(), config.types_out.clone()],
+    )?;
+    let server_inputs = capture_server_build_inputs(config, &routes, document_file.clone())?;
+
+    Ok(BuildInputContract {
+        routes,
+        document_file,
+        project_sources,
+        server_inputs,
     })
 }
 
-fn install_staged_build(staged: &Path, destination: &Path) -> std::io::Result<()> {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let mut backup = None;
-    if destination.exists() {
-        let backup_holder = tempfile::Builder::new()
-            .prefix(".ferrite-previous-")
-            .tempdir_in(parent)?;
-        let backup_path = backup_holder.keep();
-        fs::remove_dir(&backup_path)?;
-        fs::rename(destination, &backup_path)?;
-        backup = Some(backup_path);
+fn capture_server_build_inputs(
+    config: &BuildConfig,
+    routes: &[Route],
+    document_file: Option<PathBuf>,
+) -> Result<Vec<ServerBuildInput>> {
+    capture_server_build_inputs_with_limits(
+        config,
+        routes,
+        document_file,
+        BUILD_INPUT_VERIFIER_TIMEOUT,
+        BUILD_INPUT_VERIFIER_MAX_OUTPUT_BYTES,
+    )
+}
+
+fn capture_server_build_inputs_with_limits(
+    config: &BuildConfig,
+    routes: &[Route],
+    document_file: Option<PathBuf>,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<Vec<ServerBuildInput>> {
+    let verifier = config
+        .client_bundler
+        .parent()
+        .ok_or_else(|| {
+            BuildError::Io(io::Error::other(format!(
+                "Ferrite client bundler has no parent directory: {}",
+                config.client_bundler.display()
+            )))
+        })?
+        .join("verify-build-inputs.mjs");
+    if !verifier.is_file() {
+        return Err(BuildError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Ferrite build input verifier is missing beside the client bundler: {}",
+                verifier.display()
+            ),
+        )));
     }
 
-    if let Err(error) = fs::rename(staged, destination) {
-        if let Some(backup_path) = backup.as_ref() {
-            if let Err(rollback_error) = fs::rename(backup_path, destination) {
-                return Err(std::io::Error::new(
-                    error.kind(),
+    let request = ServerBuildInputRequest {
+        project: config.project.clone(),
+        routes: routes
+            .iter()
+            .map(|route| ServerBuildInputRoute {
+                page_file: route.file.clone(),
+                layouts: route.layouts.clone(),
+                loading_file: route.loading.clone(),
+                error_file: route.error.clone(),
+            })
+            .collect(),
+        document_file,
+    };
+    let request_json = serde_json::to_vec(&request)?;
+    let mut command = Command::new("node");
+    command.arg(&verifier).current_dir(&config.project);
+    let cancellation_flag = build_cancellation_flag();
+    let output = run_build_input_verifier(
+        command,
+        request_json,
+        timeout,
+        max_output_bytes,
+        cancellation_flag.as_ref(),
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(BuildError::Io(io::Error::other(format!(
+            "Ferrite build input preflight failed: {}",
+            if stderr.is_empty() {
+                "verifier exited without diagnostics"
+            } else {
+                &stderr
+            }
+        ))));
+    }
+
+    let response: ServerBuildInputResponse = serde_json::from_slice(&output.stdout)?;
+    validate_server_build_inputs(&response.inputs)?;
+    Ok(response.inputs)
+}
+
+struct BuildInputVerifierOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_build_input_verifier(
+    mut command: Command,
+    stdin: Vec<u8>,
+    timeout: Duration,
+    max_output_bytes: usize,
+    cancellation_flag: &AtomicBool,
+) -> io::Result<BuildInputVerifierOutput> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = OwnedChild::spawn(command)?;
+    let mut child_stdin = child
+        .take_stdin()
+        .expect("build input verifier stdin was piped");
+    let stdin_writer = thread::spawn(move || child_stdin.write_all(&stdin));
+    let stdout = child
+        .take_stdout()
+        .expect("build input verifier stdout was piped");
+    let stderr = child
+        .take_stderr()
+        .expect("build input verifier stderr was piped");
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_capped_reader(stdout, max_output_bytes, Arc::clone(&output_exceeded));
+    let stderr_reader = spawn_capped_reader(stderr, max_output_bytes, Arc::clone(&output_exceeded));
+    let started = Instant::now();
+
+    loop {
+        if cancellation_flag.load(Ordering::Acquire) {
+            terminate_process_tree(&mut child);
+            let _ = stdin_writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Ferrite build input verifier was cancelled",
+            ));
+        }
+
+        if output_exceeded.load(Ordering::Acquire) {
+            terminate_process_tree(&mut child);
+            let _ = stdin_writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Ferrite build input verifier output exceeded {max_output_bytes} bytes"),
+            ));
+        }
+
+        if let Some(status) = child.try_wait()? {
+            terminate_process_tree(&mut child);
+            let stdin_result = stdin_writer
+                .join()
+                .expect("build input verifier stdin writer panicked");
+            let stdout = stdout_reader
+                .join()
+                .expect("build input verifier stdout reader panicked")?;
+            let stderr = stderr_reader
+                .join()
+                .expect("build input verifier stderr reader panicked")?;
+            if output_exceeded.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
                     format!(
-                        "could not activate staged build: {error}; could not restore previous build from `{}`: {rollback_error}",
-                        backup_path.display()
+                        "Ferrite build input verifier output exceeded {max_output_bytes} bytes"
                     ),
                 ));
             }
+            if status.success() {
+                stdin_result?;
+            }
+            return Ok(BuildInputVerifierOutput {
+                status,
+                stdout,
+                stderr,
+            });
         }
-        return Err(error);
+
+        if started.elapsed() >= timeout {
+            terminate_process_tree(&mut child);
+            let _ = stdin_writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "Ferrite build input verifier timed out after {} ms",
+                    timeout.as_millis()
+                ),
+            ));
+        }
+
+        thread::sleep(
+            BUILD_INPUT_VERIFIER_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
+        );
+    }
+}
+
+fn spawn_capped_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    max_output_bytes: usize,
+    output_exceeded: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::with_capacity(max_output_bytes.min(64 * 1024));
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                return Ok(output);
+            }
+            let remaining = max_output_bytes.saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
+            if bytes_read > remaining {
+                output_exceeded.store(true, Ordering::Release);
+            }
+        }
+    })
+}
+
+struct OwnedChild {
+    #[cfg(not(windows))]
+    inner: Child,
+    #[cfg(windows)]
+    inner: Box<dyn StdChildWrapper>,
+    armed: bool,
+}
+
+impl OwnedChild {
+    fn spawn(command: Command) -> io::Result<Self> {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = command;
+            command.process_group(0);
+            command
+        };
+        #[cfg(all(not(unix), not(windows)))]
+        let mut command = command;
+
+        #[cfg(windows)]
+        {
+            let mut command = StdCommandWrap::from(command);
+            command.wrap(JobObject);
+            return Ok(Self {
+                inner: command.spawn()?,
+                armed: true,
+            });
+        }
+
+        #[cfg(not(windows))]
+        Ok(Self {
+            inner: command.spawn()?,
+            armed: true,
+        })
     }
 
-    if let Some(backup_path) = backup {
-        let _ = fs::remove_dir_all(backup_path);
+    fn take_stdin(&mut self) -> Option<ChildStdin> {
+        #[cfg(windows)]
+        return self.inner.stdin().take();
+
+        #[cfg(not(windows))]
+        self.inner.stdin.take()
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        #[cfg(windows)]
+        return self.inner.stdout().take();
+
+        #[cfg(not(windows))]
+        self.inner.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        #[cfg(windows)]
+        return self.inner.stderr().take();
+
+        #[cfg(not(windows))]
+        self.inner.stderr.take()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.inner.try_wait()
+    }
+
+    fn terminate(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Ok(process_group) = i32::try_from(self.inner.id()) {
+            // SAFETY: the child was spawned as the leader of a new process group.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+
+        #[cfg(windows)]
+        let _ = self.inner.start_kill();
+        #[cfg(not(windows))]
+        let _ = self.inner.kill();
+        let _ = self.inner.wait();
+        self.armed = false;
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn terminate_process_tree(child: &mut OwnedChild) {
+    child.terminate();
+}
+
+fn validate_server_build_inputs(inputs: &[ServerBuildInput]) -> Result<()> {
+    let mut previous: Option<&str> = None;
+    for input in inputs {
+        if input.path.is_empty() || !Path::new(&input.path).is_absolute() {
+            return Err(BuildError::Io(io::Error::other(
+                "Ferrite build input verifier returned a non-absolute path",
+            )));
+        }
+        if !is_sha256_value(&input.value) {
+            return Err(BuildError::Io(io::Error::other(format!(
+                "Ferrite build input verifier returned an invalid digest for {}",
+                input.path
+            ))));
+        }
+        if previous.is_some_and(|previous| previous >= input.path.as_str()) {
+            return Err(BuildError::Io(io::Error::other(
+                "Ferrite build input verifier returned unsorted or duplicate paths",
+            )));
+        }
+        previous = Some(&input.path);
     }
     Ok(())
+}
+
+fn is_sha256_value(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn ensure_build_contract_unchanged(
+    initial: &BuildInputContract,
+    current: &BuildInputContract,
+) -> Result<()> {
+    if initial == current {
+        return Ok(());
+    }
+
+    Err(BuildError::Io(io::Error::other(
+        "Ferrite project routes or build inputs changed during the production build; retry after the source tree is stable",
+    )))
+}
+
+fn install_verified_outputs(
+    candidate_build: &Path,
+    build_destination: &Path,
+    candidate_types: &Path,
+    types_destination: &Path,
+    expected: &BuildOutputContract,
+) -> io::Result<()> {
+    install_verified_outputs_with_ops(
+        candidate_build,
+        build_destination,
+        candidate_types,
+        types_destination,
+        expected,
+        rename_noreplace,
+        remove_owned_path,
+    )
+}
+
+fn install_verified_outputs_unless_cancelled(
+    candidate_build: &Path,
+    build_destination: &Path,
+    candidate_types: &Path,
+    types_destination: &Path,
+    cancellation_flag: &AtomicBool,
+    expected: &BuildOutputContract,
+) -> io::Result<()> {
+    if cancellation_flag.load(Ordering::Acquire) {
+        let primary = io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Ferrite build activation was cancelled",
+        );
+        let lifecycle_errors =
+            cleanup_candidates(candidate_build, candidate_types, &mut remove_owned_path);
+        return Err(activation_error(primary, lifecycle_errors));
+    }
+    install_verified_outputs(
+        candidate_build,
+        build_destination,
+        candidate_types,
+        types_destination,
+        expected,
+    )
+}
+
+fn install_verified_outputs_with_ops<R, C>(
+    candidate_build: &Path,
+    build_destination: &Path,
+    candidate_types: &Path,
+    types_destination: &Path,
+    expected: &BuildOutputContract,
+    mut move_noreplace: R,
+    mut cleanup: C,
+) -> io::Result<()>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+    C: FnMut(&Path) -> io::Result<()>,
+{
+    let build_backup = match claim_expected_destination(
+        build_destination,
+        &expected.build,
+        ".ferrite-previous-build-",
+        &mut move_noreplace,
+    ) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let lifecycle_errors =
+                cleanup_candidates(candidate_build, candidate_types, &mut cleanup);
+            return Err(activation_error(error, lifecycle_errors));
+        }
+    };
+    let types_backup = match claim_expected_destination(
+        types_destination,
+        &expected.route_types,
+        ".ferrite-previous-types-",
+        &mut move_noreplace,
+    ) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let mut lifecycle_errors = restore_backups(
+                build_backup.as_deref(),
+                build_destination,
+                None,
+                types_destination,
+                &mut move_noreplace,
+            );
+            lifecycle_errors.extend(cleanup_candidates(
+                candidate_build,
+                candidate_types,
+                &mut cleanup,
+            ));
+            return Err(activation_error(error, lifecycle_errors));
+        }
+    };
+
+    if let Err(error) = move_noreplace(candidate_build, build_destination) {
+        let error = candidate_activation_error(error, build_destination);
+        let mut lifecycle_errors = restore_backups(
+            build_backup.as_deref(),
+            build_destination,
+            types_backup.as_deref(),
+            types_destination,
+            &mut move_noreplace,
+        );
+        lifecycle_errors.extend(cleanup_candidates(
+            candidate_build,
+            candidate_types,
+            &mut cleanup,
+        ));
+        return Err(activation_error(error, lifecycle_errors));
+    }
+
+    if let Err(error) = move_noreplace(candidate_types, types_destination) {
+        let error = candidate_activation_error(error, types_destination);
+        let mut lifecycle_errors = return_installed_candidate(
+            "build",
+            build_destination,
+            candidate_build,
+            &mut move_noreplace,
+        );
+        lifecycle_errors.extend(restore_backups(
+            build_backup.as_deref(),
+            build_destination,
+            types_backup.as_deref(),
+            types_destination,
+            &mut move_noreplace,
+        ));
+        lifecycle_errors.extend(cleanup_candidates(
+            candidate_build,
+            candidate_types,
+            &mut cleanup,
+        ));
+        return Err(activation_error(error, lifecycle_errors));
+    }
+
+    let mut cleanup_errors = Vec::new();
+    for (label, backup) in [
+        ("previous build", build_backup.as_deref()),
+        ("previous route types", types_backup.as_deref()),
+    ] {
+        if let Some(backup) = backup
+            && let Err(error) = cleanup(backup)
+        {
+            cleanup_errors.push(format!(
+                "could not remove {label} recovery path `{}` after activation: {error}; the recovery path was preserved",
+                backup.display()
+            ));
+        }
+    }
+    if !cleanup_errors.is_empty() {
+        return Err(io::Error::other(format!(
+            "verified build outputs were activated, but recovery cleanup was incomplete: {}",
+            cleanup_errors.join("; ")
+        )));
+    }
+    Ok(())
+}
+
+fn claim_expected_destination<R>(
+    destination: &Path,
+    expected: &DestinationIdentity,
+    prefix: &str,
+    move_noreplace: &mut R,
+) -> io::Result<Option<PathBuf>>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    if matches!(expected, DestinationIdentity::Missing) {
+        // The final no-clobber move is the compare-and-swap for an absent destination.
+        // A separate existence check would only reopen a check-to-rename race.
+        return Ok(None);
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "destination `{}` changed after validation; the expected path is missing",
+                    destination.display()
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let backup_holder = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
+    let backup_path = backup_holder.keep();
+    fs::remove_dir(&backup_path)?;
+    move_noreplace(destination, &backup_path)?;
+
+    let claimed = capture_destination_identity(&backup_path);
+    if claimed.as_ref().is_ok_and(|claimed| claimed == expected) {
+        return Ok(Some(backup_path));
+    }
+
+    let primary = match claimed {
+        Ok(_) => io::Error::other(format!(
+            "destination `{}` changed after validation; refusing to activate over the claimed path",
+            destination.display()
+        )),
+        Err(error) => io::Error::new(
+            error.kind(),
+            format!(
+                "could not verify claimed destination `{}` after validation: {error}",
+                backup_path.display()
+            ),
+        ),
+    };
+    if let Err(restore_error) = move_noreplace(&backup_path, destination) {
+        return Err(activation_error(
+            primary,
+            vec![format!(
+                "could not restore changed destination from recovery path `{}` to `{}`: {restore_error}; the recovery path was preserved",
+                backup_path.display(),
+                destination.display()
+            )],
+        ));
+    }
+    Err(primary)
+}
+
+fn candidate_activation_error(error: io::Error, destination: &Path) -> io::Error {
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "destination `{}` changed after validation; atomic activation refused to replace it: {error}",
+                destination.display()
+            ),
+        )
+    } else {
+        error
+    }
+}
+
+fn return_installed_candidate<R>(
+    label: &str,
+    destination: &Path,
+    candidate: &Path,
+    move_noreplace: &mut R,
+) -> Vec<String>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    match move_noreplace(destination, candidate) {
+        Ok(()) => Vec::new(),
+        Err(error) => vec![format!(
+            "could not return candidate {label} from `{}` to `{}`: {error}; the active candidate path was preserved",
+            destination.display(),
+            candidate.display()
+        )],
+    }
+}
+
+fn restore_backups<R>(
+    build_backup: Option<&Path>,
+    build_destination: &Path,
+    types_backup: Option<&Path>,
+    types_destination: &Path,
+    move_noreplace: &mut R,
+) -> Vec<String>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    let mut errors = Vec::new();
+    for (label, backup, destination) in [
+        ("route types", types_backup, types_destination),
+        ("build", build_backup, build_destination),
+    ] {
+        if let Some(backup) = backup
+            && let Err(error) = move_noreplace(backup, destination)
+        {
+            errors.push(format!(
+                "could not restore previous {label} from `{}` to `{}`: {error}",
+                backup.display(),
+                destination.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn cleanup_candidates<C>(
+    candidate_build: &Path,
+    candidate_types: &Path,
+    cleanup: &mut C,
+) -> Vec<String>
+where
+    C: FnMut(&Path) -> io::Result<()>,
+{
+    let mut errors = Vec::new();
+    for (label, path) in [("build", candidate_build), ("route types", candidate_types)] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push(format!(
+                    "could not inspect candidate {label} at `{}` before cleanup: {error}; the candidate path was preserved",
+                    path.display()
+                ));
+                continue;
+            }
+        }
+        if let Err(error) = cleanup(path) {
+            errors.push(format!(
+                "could not remove candidate {label} at `{}`: {error}; the candidate path was preserved",
+                path.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn remove_owned_path(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to remove symbolic link `{}`", path.display()),
+        ));
+    }
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else if metadata.is_file() {
+        fs::remove_file(path)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to remove non-file, non-directory path `{}`",
+                path.display()
+            ),
+        ))
+    }
+}
+
+fn activation_error(primary: io::Error, lifecycle_errors: Vec<String>) -> io::Error {
+    if lifecycle_errors.is_empty() {
+        primary
+    } else {
+        io::Error::new(
+            primary.kind(),
+            format!(
+                "could not activate verified build outputs: {primary}; {}",
+                lifecycle_errors.join("; ")
+            ),
+        )
+    }
 }
 
 fn rebase_build_report(report: &mut BuildReport, from: &Path, to: &Path) -> Result<()> {
@@ -459,7 +1269,7 @@ fn rebase_build_report(report: &mut BuildReport, from: &Path, to: &Path) -> Resu
 fn rebase_build_path(path: &Path, from: &Path, to: &Path) -> Result<PathBuf> {
     let relative = path.strip_prefix(from).map_err(|_| {
         BuildError::Artifact(ProductionArtifactError::Invalid(format!(
-            "staged output `{}` is outside staging root `{}`",
+            "verified output `{}` is outside candidate root `{}`",
             path.display(),
             from.display()
         )))
@@ -467,1697 +1277,958 @@ fn rebase_build_path(path: &Path, from: &Path, to: &Path) -> Result<PathBuf> {
     Ok(to.join(relative))
 }
 
-fn route_conventions(route: &Route) -> RouteConventions {
-    RouteConventions {
-        loading: route.loading.clone(),
-        error: route.error.clone(),
-    }
-}
-
-fn placeholder_route_params(route: &Route) -> BTreeMap<String, Value> {
-    route
-        .params
-        .iter()
-        .filter_map(|param| match param.kind {
-            RouteParamKind::Dynamic => Some((
-                param.name.clone(),
-                Value::String("ferrite-build".to_owned()),
-            )),
-            RouteParamKind::CatchAll => Some((
-                param.name.clone(),
-                Value::Array(vec![Value::String("ferrite-build".to_owned())]),
-            )),
-            RouteParamKind::OptionalCatchAll => None,
-        })
-        .collect()
-}
-
-fn artifact_relative_path(root: &Path, path: &Path) -> Result<String> {
-    let relative = path.strip_prefix(root).map_err(|_| {
-        BuildError::Artifact(ProductionArtifactError::Invalid(format!(
-            "generated path `{}` is outside build output `{}`",
-            path.display(),
-            root.display()
-        )))
-    })?;
-    let relative = relative.to_str().ok_or_else(|| {
-        BuildError::Artifact(ProductionArtifactError::Invalid(format!(
-            "generated path `{}` is not valid UTF-8",
-            path.display()
-        )))
-    })?;
-    Ok(relative.replace('\\', "/"))
-}
-
-fn bundle_production_route(
-    client_bundler: &ClientBundler,
-    page_file: &Path,
-    layouts: &[PathBuf],
-    route_path: &str,
-    params: &[(String, Value)],
-    client_out_dir: &Path,
-    action_bootstrap: bool,
-) -> Result<ClientBundle> {
-    let mut client_bundle = client_bundler.bundle_route_request(ClientBundleRequest {
-        page_file,
-        layouts,
-        route_path,
-        params,
-        out_dir: client_out_dir,
-        public_path: CLIENT_PUBLIC_PATH,
-        options: ClientBundleOptions {
-            action_bootstrap,
-            runtime_props: true,
-        },
-    })?;
-    fingerprint_client_bundle(&mut client_bundle, client_out_dir, CLIENT_PUBLIC_PATH)?;
-    Ok(client_bundle)
-}
-
-fn output_html_path(out_dir: &Path, route_path: &str) -> PathBuf {
-    if route_path == "/" {
-        return out_dir.join("index.html");
-    }
-
-    let mut path = out_dir.to_path_buf();
-    for segment in route_path.trim_matches('/').split('/') {
-        path.push(segment);
-    }
-    path.join("index.html")
-}
-
-fn concrete_route_path(route: &Route, params: &BTreeMap<String, Value>) -> Result<String> {
-    if route.path == "/" {
-        return Ok("/".to_owned());
-    }
-
-    let mut segments = Vec::new();
-    for segment in route.path.trim_matches('/').split('/') {
-        if let Some(name) = segment.strip_prefix(':') {
-            let value = required_string_param(route, params, name)?;
-            validate_static_param_segment(route, name, value)?;
-            segments.push(value.to_owned());
-        } else if segment.starts_with('*') {
-            let optional = segment.ends_with('?');
-            let name = segment
-                .strip_prefix('*')
-                .expect("checked prefix")
-                .trim_end_matches('?');
-            let values = catch_all_param(route, params, name, optional)?;
-            segments.extend(values);
-        } else {
-            segments.push(segment.to_owned());
-        }
-    }
-
-    Ok(format!("/{}", segments.join("/")))
-}
-
-fn ordered_route_params(
-    route: &Route,
-    params: &BTreeMap<String, Value>,
-) -> Result<Vec<(String, Value)>> {
-    let expected = route
-        .params
-        .iter()
-        .map(|param| param.name.as_str())
-        .collect::<BTreeSet<_>>();
-
-    for key in params.keys() {
-        if !expected.contains(key.as_str()) {
-            return Err(invalid_static_params(route, format!("unknown `{key}`")));
-        }
-    }
-
-    route
-        .params
-        .iter()
-        .filter_map(|param| {
-            let value = match param.kind {
-                RouteParamKind::Dynamic => {
-                    let value = match required_string_param(route, params, &param.name) {
-                        Ok(value) => value,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    if let Err(error) = validate_static_param_segment(route, &param.name, value) {
-                        return Some(Err(error));
-                    }
-                    Value::String(value.to_owned())
-                }
-                RouteParamKind::CatchAll => {
-                    let values = match catch_all_param(route, params, &param.name, false) {
-                        Ok(values) => values,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    Value::Array(values.into_iter().map(Value::String).collect())
-                }
-                RouteParamKind::OptionalCatchAll => match params.get(&param.name) {
-                    Some(_) => {
-                        let values = match catch_all_param(route, params, &param.name, true) {
-                            Ok(values) => values,
-                            Err(error) => return Some(Err(error)),
-                        };
-                        Value::Array(values.into_iter().map(Value::String).collect())
-                    }
-                    None => return None,
-                },
-            };
-
-            Some(Ok((param.name.clone(), value)))
-        })
-        .collect()
-}
-
-fn required_string_param<'a>(
-    route: &Route,
-    params: &'a BTreeMap<String, Value>,
-    name: &str,
-) -> Result<&'a str> {
-    let value = params
-        .get(name)
-        .ok_or_else(|| invalid_static_params(route, format!("missing `{name}`")))?;
-
-    value
-        .as_str()
-        .ok_or_else(|| invalid_static_params(route, format!("`{name}` must be a string")))
-}
-
-fn catch_all_param(
-    route: &Route,
-    params: &BTreeMap<String, Value>,
-    name: &str,
-    optional: bool,
-) -> Result<Vec<String>> {
-    let Some(value) = params.get(name) else {
-        if optional {
-            return Ok(Vec::new());
-        }
-        return Err(invalid_static_params(route, format!("missing `{name}`")));
-    };
-
-    let values = value
-        .as_array()
-        .ok_or_else(|| invalid_static_params(route, format!("`{name}` must be a string array")))?;
-
-    if values.is_empty() && !optional {
-        return Err(invalid_static_params(
-            route,
-            format!("`{name}` must include at least one segment"),
-        ));
-    }
-
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let value = value.as_str().ok_or_else(|| {
-                invalid_static_params(route, format!("`{name}` segment {index} must be a string"))
-            })?;
-            validate_static_param_segment(route, name, value)?;
-            Ok(value.to_owned())
-        })
-        .collect()
-}
-
-fn validate_static_param_segment(route: &Route, name: &str, value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Err(invalid_static_params(
-            route,
-            format!("`{name}` cannot be empty"),
-        ));
-    }
-
-    if value == "." || value == ".." || value.contains('/') || value.contains('\\') {
-        return Err(invalid_static_params(
-            route,
-            format!("`{name}` must be a single safe path segment"),
-        ));
-    }
-
-    Ok(())
-}
-
-fn invalid_static_params(route: &Route, reason: impl Into<String>) -> BuildError {
-    BuildError::InvalidStaticParams {
-        route: route.path.clone(),
-        reason: reason.into(),
-    }
-}
-
-fn render_static_document(
-    route_path: &str,
-    route_pattern: &str,
-    params: &[(String, Value)],
-    page_html: &str,
-    client_bundle: &ClientBundle,
-    metadata: &PageMetadata,
-) -> String {
-    let page_props = serde_json::to_string(&serde_json::json!({
-        "params": params.iter().cloned().collect::<BTreeMap<_, _>>()
-    }))
-    .expect("validated route params serialize to JSON");
-    let metadata_tags = render_metadata_head_tags(metadata, "Ferrite");
-    let scripts = client_bundle_scripts(client_bundle);
-    let preloads = render_modulepreload_tags(&scripts);
-    let styles = client_bundle_styles(client_bundle)
-        .into_iter()
-        .map(|href| format!(r#"  <link rel="stylesheet" href="{}">"#, escape_html(&href)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let styles = if styles.is_empty() {
-        String::new()
-    } else {
-        format!("{styles}\n")
-    };
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-{metadata_tags}{preloads}{styles}{scripts}
-</head>
-<body>
-  <div id="ferrite-root" data-route="{route_path}" data-route-pattern="{route_pattern}" data-ferrite-page-props="{page_props}">{page_html}</div>
-</body>
-</html>"#,
-        route_path = escape_html(route_path),
-        route_pattern = escape_html(route_pattern),
-        page_props = escape_html(&page_props),
-        page_html = page_html,
-        metadata_tags = metadata_tags,
-        preloads = preloads,
-        styles = styles,
-        scripts = render_script_tags(&scripts),
-    )
-}
-
-fn client_bundle_styles(client_bundle: &ClientBundle) -> Vec<String> {
-    let mut styles = BTreeSet::new();
-    styles.extend(client_bundle.styles.iter().cloned());
-    for reference in &client_bundle.client_references {
-        styles.extend(reference.styles.iter().cloned());
-    }
-    styles.into_iter().collect()
-}
-
-fn client_bundle_scripts(client_bundle: &ClientBundle) -> Vec<String> {
-    let mut scripts = BTreeSet::new();
-    scripts.extend(client_bundle.script.iter().cloned());
-    scripts.extend(client_bundle.action_bootstrap.iter().cloned());
-    for reference in &client_bundle.client_references {
-        scripts.extend(reference.script.iter().cloned());
-    }
-    scripts.into_iter().collect()
-}
-
-fn render_script_tags(scripts: &[String]) -> String {
-    scripts
-        .iter()
-        .map(|script| {
-            format!(
-                r#"  <script type="module" src="{}"></script>"#,
-                escape_html(script)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn render_modulepreload_tags(scripts: &[String]) -> String {
-    let tags = scripts
-        .iter()
-        .map(|script| {
-            format!(
-                r#"  <link rel="modulepreload" href="{}">"#,
-                escape_html(script)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if tags.is_empty() {
-        String::new()
-    } else {
-        format!("{tags}\n")
-    }
-}
-
-fn render_metadata_head_tags(metadata: &PageMetadata, default_title: &str) -> String {
-    let mut tags = Vec::new();
-    let title = metadata.title.as_deref().unwrap_or(default_title);
-    tags.push(format!("  <title>{}</title>", escape_html(title)));
-
-    if let Some(description) = metadata.description.as_deref() {
-        tags.push(format!(
-            r#"  <meta name="description" content="{}">"#,
-            escape_html(description)
-        ));
-    }
-
-    if let Some(open_graph) = metadata.open_graph.as_ref() {
-        push_meta_property(&mut tags, "og:title", open_graph.title.as_deref());
-        push_meta_property(
-            &mut tags,
-            "og:description",
-            open_graph.description.as_deref(),
-        );
-        push_meta_property(&mut tags, "og:url", open_graph.url.as_deref());
-        push_meta_property(&mut tags, "og:site_name", open_graph.site_name.as_deref());
-        push_meta_property(&mut tags, "og:type", open_graph.kind.as_deref());
-
-        for image in &open_graph.images {
-            push_meta_property(&mut tags, "og:image", Some(image.url.as_str()));
-            push_meta_property(&mut tags, "og:image:alt", image.alt.as_deref());
-            push_meta_property(
-                &mut tags,
-                "og:image:width",
-                image.width.as_ref().map(ToString::to_string).as_deref(),
-            );
-            push_meta_property(
-                &mut tags,
-                "og:image:height",
-                image.height.as_ref().map(ToString::to_string).as_deref(),
-            );
-        }
-    }
-
-    for icon in &metadata.icons {
-        let rel = icon.rel.as_deref().unwrap_or("icon");
-        let mut tag = format!(
-            r#"  <link rel="{}" href="{}""#,
-            escape_html(rel),
-            escape_html(&icon.url)
-        );
-        if let Some(kind) = icon.kind.as_deref() {
-            tag.push_str(&format!(r#" type="{}""#, escape_html(kind)));
-        }
-        if let Some(sizes) = icon.sizes.as_deref() {
-            tag.push_str(&format!(r#" sizes="{}""#, escape_html(sizes)));
-        }
-        tag.push('>');
-        tags.push(tag);
-    }
-
-    if let Some(alternates) = metadata.alternates.as_ref() {
-        if let Some(canonical) = alternates.canonical.as_deref() {
-            tags.push(format!(
-                r#"  <link rel="canonical" href="{}">"#,
-                escape_html(canonical)
-            ));
-        }
-
-        for (language, href) in &alternates.languages {
-            tags.push(format!(
-                r#"  <link rel="alternate" hreflang="{}" href="{}">"#,
-                escape_html(language),
-                escape_html(href)
-            ));
-        }
-    }
-
-    format!("{}\n", tags.join("\n"))
-}
-
-fn push_meta_property(tags: &mut Vec<String>, property: &str, content: Option<&str>) {
-    if let Some(content) = content {
-        tags.push(format!(
-            r#"  <meta property="{}" content="{}">"#,
-            escape_html(property),
-            escape_html(content)
-        ));
-    }
-}
-
-fn escape_html(value: &str) -> String {
-    let mut out = String::new();
-    for char in value.chars() {
-        match char {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(char),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_router::GENERATED_ROUTE_TYPES_HEADER;
 
-    fn write(path: &Path, value: &str) {
+    fn test_config(root: &Path) -> BuildConfig {
+        let app_dir = root.join("app");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("page.tsx"),
+            "export default function Page() {}\n",
+        )
+        .unwrap();
+        BuildConfig::new(
+            root.to_path_buf(),
+            app_dir,
+            root.join(".ferrite/build"),
+            root.join(".ferrite/types/routes.d.ts"),
+            root.join("render-page.mjs"),
+            root.join("build-client.mjs"),
+        )
+    }
+
+    fn write_test_file(path: &Path, value: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, value).unwrap();
     }
 
-    fn assert_fingerprinted_public_path(path: &str, extension: &str) {
-        let file_name = Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("public path has file name");
-        let stem = file_name
-            .strip_suffix(extension)
-            .expect("public path has expected extension");
-        let hash = stem
-            .rsplit_once('.')
-            .map(|(_name, hash)| hash)
-            .expect("public path has fingerprint segment");
-        assert_eq!(hash.len(), 16);
-        assert!(hash.chars().all(|char| char.is_ascii_hexdigit()));
-    }
-
-    #[cfg(unix)]
-    fn make_script(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
-        write(path, &test_script_body(path, body));
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
-    #[cfg(not(unix))]
-    fn make_script(path: &Path, body: &str) {
-        write(path, &test_script_body(path, body));
-    }
-
-    fn test_script_body(path: &Path, body: &str) -> String {
-        if path.file_name().and_then(|name| name.to_str()) != Some("render-page.mjs") {
-            return body.to_owned();
-        }
-        format!(
+    fn successful_public_build_config(root: &Path) -> BuildConfig {
+        let config = test_config(root);
+        write_test_file(
+            &config.page_renderer,
             r#"
-if (process.argv[2] === "--build-artifact") {{
-  const fs = await import("node:fs/promises");
-  const path = await import("node:path");
-  const output = process.argv[4];
-  await fs.mkdir(path.dirname(output), {{ recursive: true }});
-  await fs.writeFile(output, "export const pageModule = {{}}; export const layoutModules = []; export const documentModule = null; export const conventionModules = {{}}; export const routePattern = '/';\n");
-  process.exit(0);
-}}
-{body}
-"#
-        )
-    }
-
-    fn build_config(root: &Path) -> BuildConfig {
-        let renderer = root.join("render-page.mjs");
-        let bundler = root.join("build-client.mjs");
-        make_script(
-            &renderer,
-            r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
 const mode = process.argv[2];
-const staticMode = mode === "--static-params";
-const metadataMode = mode === "--metadata";
-const documentMode = mode === "--document";
-const serverActionManifestMode = mode === "--server-action-manifest";
-const explicitMode = staticMode || metadataMode || documentMode || serverActionManifestMode;
-const page = explicitMode ? process.argv[3] : process.argv[2];
-if (staticMode) {
+if (mode === "--build-artifact") {
+  const output = process.argv[4];
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  await fs.writeFile(
+    output,
+    "export const pageModule = {}; export const layoutModules = []; export const documentModule = null; export const conventionModules = {}; export const routePattern = '/';\n",
+  );
+  process.exit(0);
+}
+if (mode === "--static-params") {
   process.stdout.write(JSON.stringify({ has_generate_static_params: false, params: [] }));
   process.exit(0);
 }
-const props = explicitMode ? JSON.parse(process.argv[4]) : {};
-if (serverActionManifestMode) {
+if (mode === "--server-action-manifest") {
   process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
   process.exit(0);
 }
-const title = page.includes("about") ? "About Page" : page.includes("docs") ? "Docs Page" : "Home Page";
-if (metadataMode) {
-  const metadataTitle = page.includes("[id]") ? `Post ${props.params.id}` : title;
-  process.stdout.write(JSON.stringify({
-    title: metadataTitle,
-    description: `Metadata for ${metadataTitle}`,
-    openGraph: {
-      title: `OG ${metadataTitle}`,
-      siteName: "Ferrite",
-      type: "website",
-      images: [{ url: "/og.png", alt: "OG", width: 1200, height: 630 }]
-    },
-    icons: [{ url: "/favicon.svg", type: "image/svg+xml", sizes: "any" }],
-    alternates: {
-      canonical: `https://example.com${page.includes("about") ? "/about" : "/"}`,
-      languages: { en: `https://example.com${page.includes("about") ? "/about" : "/"}` }
-    }
-  }));
+if (mode === "--metadata") {
+  process.stdout.write("{}");
   process.exit(0);
 }
-if (documentMode) {
-  const options = JSON.parse(process.argv[7]);
-  process.stdout.write(JSON.stringify({
-    kind: "element",
-    tag: "html",
-    props: { "data-document": "test" },
-    children: [
-      {
-        kind: "element",
-        tag: "head",
-        props: {},
-        children: [{ kind: "element", tag: "title", props: {}, children: [{ kind: "text", value: options.metadata.title || options.defaultTitle }] }]
-      },
-      {
-        kind: "element",
-        tag: "body",
-        props: {},
-        children: [{
-          kind: "element",
-          tag: "div",
-          props: { id: options.rootId, "data-route": options.routePath },
-          children: [{ kind: "element", tag: "h1", props: {}, children: [{ kind: "text", value: title }] }]
-        }]
-      }
-    ]
-  }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({
-  kind: "element",
-  tag: "main",
-  props: { "data-rendered": title },
-  children: [{ kind: "element", tag: "h1", props: {}, children: [{ kind: "text", value: title }] }]
-}));
+process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
 "#,
         );
-        make_script(
-            &bundler,
-            r#"
-const outDir = process.argv[3];
-const route = process.argv[5].replaceAll("/", "-").replace(/^-+|-+$/g, "") || "index";
-const fs = await import("node:fs/promises");
-const path = await import("node:path");
-await fs.mkdir(outDir, { recursive: true });
-const js = `route-${route || "index"}.js`;
-const css = `route-${route || "index"}.css`;
-await fs.writeFile(path.join(outDir, js), "console.log('client');\n//# sourceMappingURL=" + js + ".map\n");
-await fs.writeFile(path.join(outDir, js + ".map"), "{}");
-await fs.writeFile(path.join(outDir, css), ".page{color:red}");
-process.stdout.write(JSON.stringify({
-  script: `/_ferrite/static/${js}`,
-  styles: [`/_ferrite/static/${css}`],
-  outputs: [js, `${js}.map`, css],
-  sourcemaps: [`${js}.map`],
-  assets: []
-}));
-"#,
-        );
-        BuildConfig::new(
-            root.to_path_buf(),
-            root.join("app"),
-            root.join(".ferrite/build"),
-            root.join(".ferrite/types/routes.d.ts"),
-            renderer,
-            bundler,
-        )
-    }
-
-    #[test]
-    fn builds_static_route_output_and_manifest() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        write(
-            &temp.path().join("app/about/page.tsx"),
-            "export default function About() {}",
-        );
-
-        let report = build_project(&build_config(temp.path())).unwrap();
-
-        assert_eq!(report.routes_count, 2);
-        assert!(temp.path().join(".ferrite/build/index.html").is_file());
-        assert!(
-            temp.path()
-                .join(".ferrite/build/about/index.html")
-                .is_file()
-        );
-        assert!(
-            temp.path()
-                .join(".ferrite/build/ferrite-build.json")
-                .is_file()
-        );
-        let html = fs::read_to_string(temp.path().join(".ferrite/build/about/index.html")).unwrap();
-        assert!(html.contains("<title>About Page</title>"));
-        assert!(html.contains(r#"<meta name="description" content="Metadata for About Page">"#));
-        assert!(html.contains(r#"<meta property="og:title" content="OG About Page">"#));
-        assert!(html.contains(r#"<meta property="og:image" content="/og.png">"#));
-        assert!(
-            html.contains(
-                r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">"#
-            )
-        );
-        assert!(html.contains(r#"<link rel="canonical" href="https://example.com/about">"#));
-        assert!(
-            html.contains(
-                r#"<link rel="alternate" hreflang="en" href="https://example.com/about">"#
-            )
-        );
-        assert!(html.contains("<h1>About Page</h1>"));
-        assert!(html.contains(r#"<link rel="stylesheet" href="/_ferrite/static/"#));
-        assert!(html.contains(r#"<script type="module" src="/_ferrite/static/"#));
-        let about_script = html
-            .split("src=\"")
-            .find_map(|part| part.strip_prefix("/_ferrite/static/"))
-            .and_then(|part| part.split('"').next())
-            .map(|path| format!("/_ferrite/static/{path}"))
-            .expect("about script");
-        assert!(html.contains(&format!(
-            r#"<link rel="modulepreload" href="{about_script}">"#
-        )));
-        assert!(temp.path().join(".ferrite/types/routes.d.ts").is_file());
-        assert_eq!(report.page_metadata.len(), 2);
-        assert!(
-            report
-                .page_metadata
-                .iter()
-                .any(|entry| entry.route_path == "/about"
-                    && entry.metadata.title.as_deref() == Some("About Page"))
-        );
-        assert_eq!(report.client_bundles.len(), 2);
-        assert!(report.client_bundles[0].sourcemaps.len() == 1);
-        let static_dir = temp.path().join(".ferrite/build/_ferrite/static");
-        for bundle in &report.client_bundles {
-            let script = bundle.script.as_deref().expect("route script");
-            assert!(script.starts_with("/_ferrite/static/route-"));
-            assert_fingerprinted_public_path(script, ".js");
-            assert!(
-                static_dir
-                    .join(script.trim_start_matches("/_ferrite/static/"))
-                    .is_file()
-            );
-            for style in &bundle.styles {
-                assert!(style.starts_with("/_ferrite/static/route-"));
-                assert_fingerprinted_public_path(style, ".css");
-                assert!(
-                    static_dir
-                        .join(style.trim_start_matches("/_ferrite/static/"))
-                        .is_file()
-                );
-            }
-        }
-        assert!(!static_dir.join("route-index.js").exists());
-        assert!(report.skipped_dynamic_routes.is_empty());
-    }
-
-    #[test]
-    fn server_only_client_bundle_omits_route_assets_and_cleans_stale_static_output() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        let config = build_config(temp.path());
-        let stale_file = temp.path().join(".ferrite/build/_ferrite/static/stale.js");
-        write(&stale_file, "console.log('stale');");
-        make_script(
+        write_test_file(
             &config.client_bundler,
             r#"
-process.stdout.write(JSON.stringify({
-  script: null,
-  styles: [],
-  outputs: [],
-  sourcemaps: [],
-  assets: []
-}));
-"#,
-        );
-
-        let report = build_project(&config).unwrap();
-
-        assert_eq!(report.client_bundles.len(), 1);
-        assert_eq!(report.client_bundles[0].script, None);
-        assert!(!stale_file.exists());
-        assert!(!temp.path().join(".ferrite/build/_ferrite/static").exists());
-        let html = fs::read_to_string(temp.path().join(".ferrite/build/index.html")).unwrap();
-        assert!(!html.contains(r#"<link rel="stylesheet" href="/_ferrite/static/"#));
-        assert!(!html.contains(r#"<script type="module" src="/_ferrite/static/"#));
-    }
-
-    #[test]
-    fn build_manifest_records_client_references() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.client_bundler,
-            r#"
-const outDir = process.argv[3];
-const fs = await import("node:fs/promises");
-const path = await import("node:path");
-await fs.mkdir(outDir, { recursive: true });
-await fs.writeFile(path.join(outDir, "client-reference-app-Counter-tsx-default.js"), "console.log('counter');");
-await fs.writeFile(path.join(outDir, "client-reference-app-Counter-tsx-default.css"), ".counter{color:blue}");
 process.stdout.write(JSON.stringify({
   script: null,
   styles: [],
   outputs: [],
   sourcemaps: [],
   assets: [],
-  clientReferences: [
-    {
-      id: "app/Counter.tsx#default",
-      module: "app/Counter.tsx",
-      exportName: "default",
-      script: "/_ferrite/static/client-reference-app-Counter-tsx-default.js",
-      styles: ["/_ferrite/static/client-reference-app-Counter-tsx-default.css"],
-      outputs: [
-        "client-reference-app-Counter-tsx-default.css",
-        "client-reference-app-Counter-tsx-default.js"
-      ]
-    }
-  ]
+  inputSnapshot: []
 }));
 "#,
         );
+        write_test_file(
+            &root.join("verify-build-inputs.mjs"),
+            r#"
+for await (const _chunk of process.stdin) {}
+process.stdout.write(JSON.stringify({ inputs: [] }));
+"#,
+        );
+        config
+    }
+
+    fn seed_previous_outputs(config: &BuildConfig) {
+        write_test_file(
+            &config.out_dir.join("previous.txt"),
+            "previous build output\n",
+        );
+        write_test_file(
+            &config.types_out,
+            &format!("{GENERATED_ROUTE_TYPES_HEADER}\nprevious route types\n"),
+        );
+    }
+
+    fn assert_previous_outputs(config: &BuildConfig) {
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("previous.txt")).unwrap(),
+            "previous build output\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&config.types_out).unwrap(),
+            format!("{GENERATED_ROUTE_TYPES_HEADER}\nprevious route types\n")
+        );
+    }
+
+    fn output_contract_for(
+        build_destination: &Path,
+        types_destination: &Path,
+    ) -> BuildOutputContract {
+        BuildOutputContract {
+            build: capture_destination_identity(build_destination).unwrap(),
+            route_types: capture_destination_identity(types_destination).unwrap(),
+        }
+    }
+
+    fn seed_empty_owned_artifact(out_dir: &Path) {
+        fs::create_dir_all(out_dir).unwrap();
+        let manifest =
+            ProductionArtifactManifest::new("/_ferrite/static", false, Vec::new(), Vec::new())
+                .unwrap();
+        fs::write(
+            out_dir.join(FERRITE_PRODUCTION_ARTIFACT_MANIFEST),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(out_dir.join("ferrite-build.json"), "{}\n").unwrap();
+    }
+
+    #[test]
+    fn activates_build_and_route_types_as_one_verified_output_set() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        install_verified_outputs(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(build_destination.join("new.txt")).unwrap(),
+            "new build\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "new types\n"
+        );
+        assert!(!build_destination.join("old.txt").exists());
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn route_types_activation_failure_restores_both_previous_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                if from == candidate_types {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic route types activation failure",
+                    ));
+                }
+                rename_noreplace(from, to)
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read_to_string(build_destination.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "old types\n"
+        );
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn changed_destination_is_restored_without_activating_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+        write_test_file(
+            &build_destination.join("external-sentinel.txt"),
+            "preserve me\n",
+        );
+
+        let error = install_verified_outputs(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed after validation"));
+        assert_eq!(
+            fs::read_to_string(build_destination.join("external-sentinel.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(!build_destination.join("new.txt").exists());
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn cleanup_failure_after_activation_preserves_recovery_path() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            rename_noreplace,
+            |path| {
+                if path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".ferrite-previous-build-")
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic build backup cleanup failure",
+                    ));
+                }
+                remove_owned_path(path)
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("recovery cleanup was incomplete")
+        );
+        assert_eq!(
+            fs::read_to_string(build_destination.join("new.txt")).unwrap(),
+            "new build\n"
+        );
+        let recovery = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".ferrite-previous-build-")
+                })
+            })
+            .expect("build recovery path");
+        assert_eq!(
+            fs::read_to_string(recovery.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+    }
+
+    #[test]
+    fn activation_and_rollback_failures_preserve_previous_build() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                if from == candidate_types {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic route types activation failure",
+                    ));
+                }
+                if from == build_destination && to == candidate_build {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic build rollback failure",
+                    ));
+                }
+                rename_noreplace(from, to)
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("synthetic route types activation failure"));
+        assert!(message.contains("synthetic build rollback failure"));
+        assert!(message.contains("could not restore previous build"));
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "old types\n"
+        );
+        assert_eq!(
+            fs::read_to_string(build_destination.join("new.txt")).unwrap(),
+            "new build\n"
+        );
+        let recovery = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".ferrite-previous-build-")
+                })
+            })
+            .expect("preserved previous build");
+        assert_eq!(
+            fs::read_to_string(recovery.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+    }
+
+    #[test]
+    fn candidate_cleanup_failure_is_reported_and_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&candidate_types, "new types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+        write_test_file(&build_destination.join("external.txt"), "preserve me\n");
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            rename_noreplace,
+            |path| {
+                if path == candidate_build {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic candidate cleanup failure",
+                    ));
+                }
+                remove_owned_path(path)
+            },
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("changed after validation"));
+        assert!(message.contains("synthetic candidate cleanup failure"));
+        assert!(message.contains(&candidate_build.display().to_string()));
+        assert_eq!(
+            fs::read_to_string(build_destination.join("external.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert_eq!(
+            fs::read_to_string(candidate_build.join("new.txt")).unwrap(),
+            "new build\n"
+        );
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn cancelled_activation_preserves_both_previous_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        write_test_file(&types_destination, "old types\n");
+        let cancellation_flag = AtomicBool::new(true);
+        let expected = output_contract_for(&build_destination, &types_destination);
+
+        let error = install_verified_outputs_unless_cancelled(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &cancellation_flag,
+            &expected,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            fs::read_to_string(build_destination.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "old types\n"
+        );
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn successful_public_build_replaces_output_and_route_types_together() {
+        let root = tempfile::tempdir().unwrap();
+        let config = successful_public_build_config(root.path());
+        seed_previous_outputs(&config);
 
         build_project(&config).unwrap();
 
-        let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(config.out_dir.join("ferrite-build.json")).unwrap(),
-        )
-        .unwrap();
-        let reference = &manifest["client_bundles"][0]["clientReferences"][0];
-        assert_eq!(reference["id"].as_str(), Some("app/Counter.tsx#default"));
-        assert_eq!(reference["module"].as_str(), Some("app/Counter.tsx"));
-        assert_eq!(reference["exportName"].as_str(), Some("default"));
-        let script = reference["script"]
-            .as_str()
-            .expect("client reference script");
-        let style = reference["styles"][0]
-            .as_str()
-            .expect("client reference style");
-        assert!(script.starts_with("/_ferrite/static/client-reference-app-Counter-tsx-default."));
-        assert_fingerprinted_public_path(script, ".js");
-        assert!(style.starts_with("/_ferrite/static/client-reference-app-Counter-tsx-default."));
-        assert_fingerprinted_public_path(style, ".css");
-        let outputs = reference["outputs"]
-            .as_array()
-            .expect("client reference outputs")
-            .iter()
-            .map(|output| output.as_str().expect("output path"))
-            .collect::<Vec<_>>();
-        let script_output = script.trim_start_matches("/_ferrite/static/");
-        let style_output = style.trim_start_matches("/_ferrite/static/");
-        assert!(outputs.contains(&script_output));
-        assert!(outputs.contains(&style_output));
-        assert!(!outputs.contains(&"client-reference-app-Counter-tsx-default.js"));
-        assert!(!outputs.contains(&"client-reference-app-Counter-tsx-default.css"));
-        assert!(
-            config
-                .out_dir
-                .join("_ferrite/static")
-                .join(script_output)
-                .is_file()
-        );
-        assert!(
-            config
-                .out_dir
-                .join("_ferrite/static")
-                .join(style_output)
-                .is_file()
-        );
-        let html = fs::read_to_string(config.out_dir.join("index.html")).unwrap();
-        assert!(html.contains(&format!(r#"<link rel="modulepreload" href="{script}">"#)));
-        assert!(html.contains(&format!(r#"<link rel="stylesheet" href="{style}">"#)));
-        assert!(html.contains(&format!(
-            r#"<script type="module" src="{script}"></script>"#
-        )));
-        assert!(!html.contains(r#"<script type="module" src="/_ferrite/static/route-index.js"#));
+        assert!(!config.out_dir.join("previous.txt").exists());
+        let route_types = fs::read_to_string(&config.types_out).unwrap();
+        assert!(route_types.starts_with(GENERATED_ROUTE_TYPES_HEADER));
+        assert!(!route_types.contains("previous route types"));
     }
 
     #[test]
-    fn build_manifest_records_server_action_manifests() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/posts/[id]/page.tsx"),
-            "export function generateStaticParams() { return [{ id: 'alpha' }]; } export default function Page() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.client_bundler,
-            r#"
-const outDir = process.argv[3];
-const options = JSON.parse(process.argv[8] || "{}");
-const fs = await import("node:fs/promises");
-const path = await import("node:path");
-await fs.mkdir(outDir, { recursive: true });
-if (options.actionBootstrap === true) {
-  await fs.writeFile(path.join(outDir, "route-posts-alpha-action-bootstrap.js"), "console.log('action-bootstrap');");
-  process.stdout.write(JSON.stringify({
-    script: null,
-    actionBootstrap: "/_ferrite/static/route-posts-alpha-action-bootstrap.js",
-    styles: [],
-    outputs: ["route-posts-alpha-action-bootstrap.js"],
-    sourcemaps: [],
-    assets: []
-  }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({
-  script: null,
-  styles: [],
-  outputs: [],
-  sourcemaps: [],
-  assets: []
-}));
-"#,
-        );
-        make_script(
+    fn renderer_failure_preserves_previous_output_and_route_types() {
+        let root = tempfile::tempdir().unwrap();
+        let config = successful_public_build_config(root.path());
+        seed_previous_outputs(&config);
+        write_test_file(
             &config.page_renderer,
-            r#"
-const mode = process.argv[2];
-if (mode === "--static-params") {
-  process.stdout.write(JSON.stringify({ has_generate_static_params: true, params: [{ id: "alpha" }] }));
-  process.exit(0);
-}
-if (mode === "--metadata") {
-  process.stdout.write(JSON.stringify({ title: "Post alpha" }));
-  process.exit(0);
-}
-if (mode === "--server-action-manifest") {
-  const props = JSON.parse(process.argv[4]);
-  process.stdout.write(JSON.stringify({
-    routePath: `/posts/${props.params.id}`,
-    routePattern: "/posts/[id]",
-    actions: [{
-      ferrite: "server-action-reference",
-      version: 1,
-      id: "app/posts/[id]/page.tsx#savePost",
-      routePattern: "/posts/[id]",
-      url: "/_ferrite/action",
-      bound: {}
-    }]
-  }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({
-  kind: "element",
-  tag: "main",
-  props: {},
-  children: [{ kind: "text", value: "Post alpha" }]
-}));
-"#,
-        );
-
-        let report = build_project(&config).unwrap();
-
-        assert_eq!(report.server_action_manifests.len(), 1);
-        assert_eq!(report.server_action_manifests[0].route_path, "/posts/alpha");
-        assert_eq!(report.client_bundles.len(), 1);
-        assert_eq!(report.client_bundles[0].script, None);
-        let action_bootstrap = report.client_bundles[0]
-            .action_bootstrap
-            .as_deref()
-            .expect("server action route emits a standalone action bootstrap asset");
-        assert_fingerprinted_public_path(action_bootstrap, ".js");
-        let action_bootstrap_file = temp
-            .path()
-            .join(".ferrite/build/_ferrite/static")
-            .join(action_bootstrap.trim_start_matches("/_ferrite/static/"));
-        assert!(action_bootstrap_file.is_file());
-        let html =
-            fs::read_to_string(temp.path().join(".ferrite/build/posts/alpha/index.html")).unwrap();
-        assert!(html.contains(&format!(
-            r#"<script type="module" src="{action_bootstrap}"></script>"#
-        )));
-        assert!(!html.contains(r#"src="/_ferrite/static/route-posts-alpha.js"#));
-        let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(config.out_dir.join("ferrite-build.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            manifest["client_bundles"][0]["actionBootstrap"].as_str(),
-            Some(action_bootstrap)
-        );
-        assert_eq!(
-            manifest["server_action_manifests"][0]["actions"][0]["id"].as_str(),
-            Some("app/posts/[id]/page.tsx#savePost")
-        );
-        assert_eq!(
-            manifest["server_action_manifests"][0]["actions"][0]["routePattern"].as_str(),
-            Some("/posts/[id]")
-        );
-    }
-
-    #[test]
-    fn builds_with_custom_document_file() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/document.tsx"),
-            "export default function Document() {}",
-        );
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-
-        let report = build_project(&build_config(temp.path())).unwrap();
-
-        assert_eq!(report.routes_count, 1);
-        let html = fs::read_to_string(temp.path().join(".ferrite/build/index.html")).unwrap();
-        assert!(html.starts_with("<!doctype html>\n<html data-document=\"test\">"));
-        assert!(html.contains("<title>Home Page</title>"));
-        assert!(html.contains(r#"<div data-route="/" id="ferrite-root">"#));
-        assert!(html.contains("<h1>Home Page</h1>"));
-    }
-
-    #[test]
-    fn passes_route_conventions_to_page_renderer() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        write(
-            &temp.path().join("app/loading.tsx"),
-            "export default function Loading() {}",
-        );
-        write(
-            &temp.path().join("app/error.tsx"),
-            "export default function ErrorFile() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-const mode = process.argv[2];
-if (mode === "--static-params") {
-  process.stdout.write(JSON.stringify({ has_generate_static_params: false, params: [] }));
-  process.exit(0);
-}
-if (mode === "--metadata") {
-  process.stdout.write(JSON.stringify({ title: "Home Page", description: "Metadata for Home Page" }));
-  process.exit(0);
-}
-if (mode === "--server-action-manifest") {
-  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
-  process.exit(0);
-}
-const conventions = JSON.parse(process.argv[5]);
-process.stdout.write(JSON.stringify({
-  kind: "element",
-  tag: "main",
-  props: {},
-  children: [{
-    kind: "element",
-    tag: "p",
-    props: {},
-    children: [{ kind: "text", value: `${conventions.loading.endsWith("loading.tsx")}:${conventions.error.endsWith("error.tsx")}` }]
-  }]
-}));
-"#,
-        );
-
-        let report = build_project(&config).unwrap();
-
-        assert_eq!(report.routes_count, 1);
-        let html = fs::read_to_string(temp.path().join(".ferrite/build/index.html")).unwrap();
-        assert!(html.contains("<p>true:true</p>"));
-    }
-
-    #[test]
-    fn skips_dynamic_routes_without_static_params() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        write(
-            &temp.path().join("app/posts/[id]/page.tsx"),
-            "export default function Post() {}",
-        );
-
-        let report = build_project(&build_config(temp.path())).unwrap();
-
-        assert_eq!(report.routes_count, 2);
-        assert_eq!(report.skipped_dynamic_routes, vec!["/posts/:id"]);
-        assert!(
-            !temp
-                .path()
-                .join(".ferrite/build/posts/:id/index.html")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn builds_dynamic_routes_from_static_params() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        write(
-            &temp.path().join("app/posts/[id]/page.tsx"),
-            "export default function Post() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-const mode = process.argv[2];
-const staticMode = mode === "--static-params";
-const metadataMode = mode === "--metadata";
-const serverActionManifestMode = mode === "--server-action-manifest";
-const explicitMode = staticMode || metadataMode || serverActionManifestMode;
-const page = explicitMode ? process.argv[3] : process.argv[2];
-if (staticMode) {
-  const result = page.includes("[id]")
-    ? { has_generate_static_params: true, params: [{ id: "alpha" }, { id: "beta" }] }
-    : { has_generate_static_params: false, params: [] };
-  process.stdout.write(JSON.stringify(result));
-  process.exit(0);
-}
-const props = JSON.parse(explicitMode ? process.argv[4] : process.argv[3]);
-if (serverActionManifestMode) {
-  process.stdout.write(JSON.stringify({ routePath: page.includes("[id]") ? `/posts/${props.params.id}` : "/", actions: [] }));
-  process.exit(0);
-}
-const title = page.includes("[id]") ? `Post ${props.params.id}` : "Home Page";
-if (metadataMode) {
-  process.stdout.write(JSON.stringify({
-    title,
-    description: `Metadata for ${title}`
-  }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({
-  kind: "element",
-  tag: "main",
-  props: { "data-rendered": title },
-  children: [{ kind: "element", tag: "h1", props: {}, children: [{ kind: "text", value: title }] }]
-}));
-"#,
-        );
-
-        let report = build_project(&config).unwrap();
-
-        assert_eq!(report.routes_count, 2);
-        assert!(report.skipped_dynamic_routes.is_empty());
-        assert!(
-            temp.path()
-                .join(".ferrite/build/posts/alpha/index.html")
-                .is_file()
-        );
-        assert!(
-            temp.path()
-                .join(".ferrite/build/posts/beta/index.html")
-                .is_file()
-        );
-        let html =
-            fs::read_to_string(temp.path().join(".ferrite/build/posts/alpha/index.html")).unwrap();
-        assert!(html.contains("data-route=\"/posts/alpha\""));
-        assert!(html.contains("<title>Post alpha</title>"));
-        assert!(html.contains("<h1>Post alpha</h1>"));
-        assert_eq!(report.page_metadata.len(), 3);
-        assert!(
-            report
-                .page_metadata
-                .iter()
-                .any(|entry| entry.route_path == "/posts/alpha"
-                    && entry.metadata.title.as_deref() == Some("Post alpha"))
-        );
-        assert_eq!(report.client_bundles.len(), 3);
-    }
-
-    #[test]
-    fn builds_catch_all_routes_from_static_params() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/docs/[...slug]/page.tsx"),
-            "export default function Docs() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-const mode = process.argv[2];
-const staticMode = mode === "--static-params";
-const metadataMode = mode === "--metadata";
-const serverActionManifestMode = mode === "--server-action-manifest";
-if (staticMode) {
-  process.stdout.write(JSON.stringify({
-    has_generate_static_params: true,
-    params: [{ slug: ["guide", "intro"] }, { slug: ["api"] }]
-  }));
-  process.exit(0);
-}
-const props = JSON.parse(metadataMode || serverActionManifestMode ? process.argv[4] : process.argv[3]);
-if (serverActionManifestMode) {
-  process.stdout.write(JSON.stringify({ routePath: `/docs/${props.params.slug.join("/")}`, actions: [] }));
-  process.exit(0);
-}
-const title = `Docs ${props.params.slug.join("/")}`;
-if (metadataMode) {
-  process.stdout.write(JSON.stringify({ title, description: `Metadata for ${title}` }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({
-  kind: "element",
-  tag: "main",
-  props: { "data-rendered": title },
-  children: [{ kind: "element", tag: "h1", props: {}, children: [{ kind: "text", value: title }] }]
-}));
-"#,
-        );
-
-        let report = build_project(&config).unwrap();
-
-        assert_eq!(report.routes_count, 1);
-        assert!(report.skipped_dynamic_routes.is_empty());
-        assert!(
-            temp.path()
-                .join(".ferrite/build/docs/guide/intro/index.html")
-                .is_file()
-        );
-        assert!(
-            temp.path()
-                .join(".ferrite/build/docs/api/index.html")
-                .is_file()
-        );
-        let html = fs::read_to_string(
-            temp.path()
-                .join(".ferrite/build/docs/guide/intro/index.html"),
-        )
-        .unwrap();
-        assert!(html.contains("data-route=\"/docs/guide/intro\""));
-        assert!(html.contains("<title>Docs guide/intro</title>"));
-        assert!(html.contains("<h1>Docs guide/intro</h1>"));
-        assert_eq!(report.page_metadata.len(), 2);
-        assert!(
-            report
-                .page_metadata
-                .iter()
-                .any(|entry| entry.route_path == "/docs/guide/intro"
-                    && entry.metadata.title.as_deref() == Some("Docs guide/intro"))
-        );
-    }
-
-    #[test]
-    fn builds_optional_catch_all_routes_without_segments() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/docs/[[...slug]]/page.tsx"),
-            "export default function Docs() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-const mode = process.argv[2];
-const staticMode = mode === "--static-params";
-const metadataMode = mode === "--metadata";
-const serverActionManifestMode = mode === "--server-action-manifest";
-if (staticMode) {
-  process.stdout.write(JSON.stringify({
-    has_generate_static_params: true,
-    params: [{}, { slug: ["guide"] }]
-  }));
-  process.exit(0);
-}
-const props = JSON.parse(metadataMode || serverActionManifestMode ? process.argv[4] : process.argv[3]);
-const slug = Array.isArray(props.params.slug) ? props.params.slug.join("/") : "index";
-if (serverActionManifestMode) {
-  process.stdout.write(JSON.stringify({ routePath: slug === "index" ? "/docs" : `/docs/${slug}`, actions: [] }));
-  process.exit(0);
-}
-const title = `Docs ${slug}`;
-if (metadataMode) {
-  process.stdout.write(JSON.stringify({ title }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({
-  kind: "element",
-  tag: "main",
-  props: { "data-rendered": title },
-  children: [{ kind: "element", tag: "h1", props: {}, children: [{ kind: "text", value: title }] }]
-}));
-"#,
-        );
-
-        let report = build_project(&config).unwrap();
-
-        assert_eq!(report.routes_count, 1);
-        assert!(temp.path().join(".ferrite/build/docs/index.html").is_file());
-        assert!(
-            temp.path()
-                .join(".ferrite/build/docs/guide/index.html")
-                .is_file()
-        );
-        let index_html =
-            fs::read_to_string(temp.path().join(".ferrite/build/docs/index.html")).unwrap();
-        assert!(index_html.contains("<h1>Docs index</h1>"));
-        let guide_html =
-            fs::read_to_string(temp.path().join(".ferrite/build/docs/guide/index.html")).unwrap();
-        assert!(guide_html.contains("<h1>Docs guide</h1>"));
-        assert_eq!(
-            report
-                .page_metadata
-                .iter()
-                .map(|entry| entry.route_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["/docs", "/docs/guide"]
-        );
-    }
-
-    #[test]
-    fn rejects_duplicate_dynamic_static_outputs() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/posts/[id]/page.tsx"),
-            "export default function Post() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-if (process.argv[2] === "--static-params") {
-  process.stdout.write(JSON.stringify({
-    has_generate_static_params: true,
-    params: [{ id: "alpha" }, { id: "alpha" }]
-  }));
-  process.exit(0);
-}
-if (process.argv[2] === "--server-action-manifest") {
-  process.stdout.write(JSON.stringify({ routePath: "/posts/alpha", actions: [] }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
-"#,
-        );
-
-        let error = build_project(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::DuplicateStaticOutput { route_path } if route_path == "/posts/alpha"
-        ));
-    }
-
-    #[test]
-    fn rejects_duplicate_optional_catch_all_static_outputs() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/docs/[[...slug]]/page.tsx"),
-            "export default function Docs() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-if (process.argv[2] === "--static-params") {
-  process.stdout.write(JSON.stringify({
-    has_generate_static_params: true,
-    params: [{}, { slug: [] }]
-  }));
-  process.exit(0);
-}
-if (process.argv[2] === "--server-action-manifest") {
-  process.stdout.write(JSON.stringify({ routePath: "/docs", actions: [] }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
-"#,
-        );
-
-        let error = build_project(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::DuplicateStaticOutput { route_path } if route_path == "/docs"
-        ));
-    }
-
-    #[test]
-    fn rejects_duplicate_static_outputs_across_routes() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/docs/[id]/page.tsx"),
-            "export default function DocsPost() {}",
-        );
-        write(
-            &temp.path().join("app/docs/[...slug]/page.tsx"),
-            "export default function DocsCatchAll() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-if (process.argv[2] === "--static-params") {
-  const page = process.argv[3];
-  const params = page.includes("[...slug]")
-    ? [{ slug: ["api"] }]
-    : [{ id: "api" }];
-  process.stdout.write(JSON.stringify({
-    has_generate_static_params: true,
-    params
-  }));
-  process.exit(0);
-}
-if (process.argv[2] === "--server-action-manifest") {
-  process.stdout.write(JSON.stringify({ routePath: "/docs/api", actions: [] }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
-"#,
-        );
-
-        let error = build_project(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::DuplicateStaticOutput { route_path } if route_path == "/docs/api"
-        ));
-    }
-
-    #[test]
-    fn rejects_unsafe_static_param_segments() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/posts/[id]/page.tsx"),
-            "export default function Post() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-const staticMode = process.argv[2] === "--static-params";
-if (staticMode) {
-  process.stdout.write(JSON.stringify({
-    has_generate_static_params: true,
-    params: [{ id: "../secret" }]
-  }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
-"#,
-        );
-
-        let error = build_project(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::InvalidStaticParams { route, reason }
-                if route == "/posts/:id" && reason.contains("single safe path segment")
-        ));
-    }
-
-    #[test]
-    fn rejects_unsafe_catch_all_static_param_segments() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/docs/[...slug]/page.tsx"),
-            "export default function Docs() {}",
-        );
-        let config = build_config(temp.path());
-        make_script(
-            &config.page_renderer,
-            r#"
-const staticMode = process.argv[2] === "--static-params";
-if (staticMode) {
-  process.stdout.write(JSON.stringify({
-    has_generate_static_params: true,
-    params: [{ slug: ["guide", "../secret"] }]
-  }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
-"#,
-        );
-
-        let error = build_project(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::InvalidStaticParams { route, reason }
-                if route == "/docs/*slug" && reason.contains("single safe path segment")
-        ));
-    }
-
-    #[test]
-    fn rejects_missing_app_dir() {
-        let temp = tempfile::tempdir().unwrap();
-
-        let error = build_project(&build_config(temp.path())).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::Router(ferrite_router::RouterError::AppDirMissing(_))
-        ));
-    }
-
-    #[test]
-    fn escapes_route_metadata_in_html() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/docs/page.tsx"),
-            "export default function Docs() {}",
-        );
-
-        build_project(&build_config(temp.path())).unwrap();
-        let html = fs::read_to_string(temp.path().join(".ferrite/build/docs/index.html")).unwrap();
-
-        assert!(html.contains("data-route=\"/docs\""));
-        assert!(html.contains("<title>Docs Page</title>"));
-        assert!(html.contains(r#"<meta name="description" content="Metadata for Docs Page">"#));
-        assert!(html.contains("<h1>Docs Page</h1>"));
-    }
-
-    #[test]
-    fn fails_when_metadata_collection_fails() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        let renderer = temp.path().join("render-page.mjs");
-        make_script(
-            &renderer,
-            r#"
-if (process.argv[2] === "--metadata") {
-  console.error("metadata failed");
-  process.exit(1);
-}
-if (process.argv[2] === "--server-action-manifest") {
-  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
-"#,
-        );
-        let bundler = temp.path().join("build-client.mjs");
-        make_script(
-            &bundler,
-            r#"
-process.stdout.write(JSON.stringify({
-  script: null,
-  styles: [],
-  outputs: [],
-  sourcemaps: [],
-  assets: []
-}));
-"#,
-        );
-        let config = BuildConfig::new(
-            temp.path().to_path_buf(),
-            temp.path().join("app"),
-            temp.path().join(".ferrite/build"),
-            temp.path().join(".ferrite/types/routes.d.ts"),
-            renderer,
-            bundler,
-        );
-
-        let error = build_project(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::PageRender(PageRenderError::NodeFailed { stderr, .. })
-                if stderr == "metadata failed"
-        ));
-    }
-
-    #[test]
-    fn fails_when_document_render_fails() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/document.tsx"),
-            "export default function Document() {}",
-        );
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        let renderer = temp.path().join("render-page.mjs");
-        make_script(
-            &renderer,
-            r#"
-if (process.argv[2] === "--metadata") {
-  process.stdout.write("{}");
-  process.exit(0);
-}
-if (process.argv[2] === "--server-action-manifest") {
-  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
-  process.exit(0);
-}
-if (process.argv[2] === "--document") {
-  console.error("document failed");
-  process.exit(1);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
-"#,
-        );
-        let bundler = temp.path().join("build-client.mjs");
-        make_script(
-            &bundler,
-            r#"
-process.stdout.write(JSON.stringify({
-  script: null,
-  styles: [],
-  outputs: [],
-  sourcemaps: [],
-  assets: []
-}));
-"#,
-        );
-        let config = BuildConfig::new(
-            temp.path().to_path_buf(),
-            temp.path().join("app"),
-            temp.path().join(".ferrite/build"),
-            temp.path().join(".ferrite/types/routes.d.ts"),
-            renderer,
-            bundler,
-        );
-
-        let error = build_project(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::PageRender(PageRenderError::NodeFailed { stderr, .. })
-                if stderr == "document failed"
-        ));
-    }
-
-    #[test]
-    fn fails_when_page_execution_fails() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        let renderer = temp.path().join("render-page.mjs");
-        make_script(
-            &renderer,
-            r#"
-console.error("render failed");
-process.exit(1);
-"#,
-        );
-        let config = BuildConfig::new(
-            temp.path().to_path_buf(),
-            temp.path().join("app"),
-            temp.path().join(".ferrite/build"),
-            temp.path().join(".ferrite/types/routes.d.ts"),
-            renderer,
-            temp.path().join("build-client.mjs"),
-        );
-
-        let error = build_project(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BuildError::PageRender(PageRenderError::NodeFailed { stderr, .. })
-                if stderr == "render failed"
-        ));
-    }
-
-    #[test]
-    fn failed_build_preserves_the_previous_complete_output() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        let config = build_config(temp.path());
-        write(&config.out_dir.join("previous.txt"), "previous release");
-        make_script(
-            &config.page_renderer,
-            r#"
-console.error("intentional staged build failure");
-process.exit(1);
-"#,
+            "console.error('synthetic renderer failure'); process.exit(1);\n",
         );
 
         assert!(build_project(&config).is_err());
-        assert_eq!(
-            fs::read_to_string(config.out_dir.join("previous.txt")).unwrap(),
-            "previous release"
-        );
+
+        assert_previous_outputs(&config);
     }
 
     #[test]
-    fn failed_staged_activation_restores_the_previous_output() {
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("build");
-        write(&destination.join("previous.txt"), "previous release");
-
-        let error = install_staged_build(&temp.path().join("missing-stage"), &destination)
-            .expect_err("missing staged directory must fail activation");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        assert_eq!(
-            fs::read_to_string(destination.join("previous.txt")).unwrap(),
-            "previous release"
+    fn bundler_failure_preserves_previous_output_and_route_types() {
+        let root = tempfile::tempdir().unwrap();
+        let config = successful_public_build_config(root.path());
+        seed_previous_outputs(&config);
+        write_test_file(
+            &config.client_bundler,
+            "console.error('synthetic bundler failure'); process.exit(1);\n",
         );
+
+        assert!(build_project(&config).is_err());
+
+        assert_previous_outputs(&config);
     }
 
     #[test]
-    fn fails_when_client_bundling_fails() {
-        let temp = tempfile::tempdir().unwrap();
-        write(
-            &temp.path().join("app/page.tsx"),
-            "export default function Page() {}",
-        );
-        let renderer = temp.path().join("render-page.mjs");
-        make_script(
-            &renderer,
-            r#"
-if (process.argv[2] === "--metadata") {
-  process.stdout.write("{}");
-  process.exit(0);
-}
-if (process.argv[2] === "--server-action-manifest") {
-  process.stdout.write(JSON.stringify({ routePath: "/", actions: [] }));
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({ kind: "text", value: "ok" }));
-"#,
-        );
-        let bundler = temp.path().join("build-client.mjs");
-        make_script(
-            &bundler,
-            r#"
-console.error("client bundle failed");
-process.exit(1);
-"#,
-        );
-        let config = BuildConfig::new(
-            temp.path().to_path_buf(),
-            temp.path().join("app"),
-            temp.path().join(".ferrite/build"),
-            temp.path().join(".ferrite/types/routes.d.ts"),
-            renderer,
-            bundler,
+    fn source_drift_preserves_previous_output_and_route_types() {
+        let root = tempfile::tempdir().unwrap();
+        let counter = tempfile::NamedTempFile::new().unwrap();
+        let config = successful_public_build_config(root.path());
+        seed_previous_outputs(&config);
+        let counter_json = serde_json::to_string(counter.path()).unwrap();
+        let input_json = serde_json::to_string(&config.app_dir.join("page.tsx")).unwrap();
+        write_test_file(
+            &root.path().join("verify-build-inputs.mjs"),
+            &format!(
+                r#"
+const fs = await import("node:fs/promises");
+for await (const _chunk of process.stdin) {{}}
+const counter = {counter_json};
+const count = Number((await fs.readFile(counter, "utf8")) || "0");
+await fs.writeFile(counter, String(count + 1));
+process.stdout.write(JSON.stringify({{
+  inputs: [{{
+    path: {input_json},
+    value: `sha256:${{(count === 0 ? "a" : "b").repeat(64)}}`
+  }}]
+}}));
+"#
+            ),
         );
 
         let error = build_project(&config).unwrap_err();
 
-        assert!(matches!(
-            error,
-            BuildError::ClientBundle(ClientBundleError::NodeFailed { stderr, .. })
-                if stderr == "client bundle failed"
-        ));
+        assert!(
+            error
+                .to_string()
+                .contains("changed during the production build")
+        );
+        assert_previous_outputs(&config);
+    }
+
+    #[test]
+    fn rejects_build_output_that_overlaps_app_source() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        let page = config.app_dir.join("page.tsx");
+        config.out_dir = config.app_dir.clone();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("overlaps Ferrite project source")
+        );
+        assert_eq!(
+            fs::read_to_string(page).unwrap(),
+            "export default function Page() {}\n"
+        );
+    }
+
+    #[test]
+    fn rejects_existing_non_generated_route_types_output() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.types_out = project.path().join("notes.txt");
+        fs::write(&config.types_out, "keep this source file\n").unwrap();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("non-generated route types output")
+        );
+        assert_eq!(
+            fs::read_to_string(&config.types_out).unwrap(),
+            "keep this source file\n"
+        );
+    }
+
+    #[test]
+    fn rejects_existing_non_build_destination() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("docs");
+        fs::create_dir_all(&config.out_dir).unwrap();
+        fs::write(config.out_dir.join("owned.md"), "keep\n").unwrap();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(error.to_string().contains("non-build output"));
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("owned.md")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn rejects_valid_artifact_with_undeclared_sibling_without_mutation() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("dist");
+        seed_empty_owned_artifact(&config.out_dir);
+        fs::write(config.out_dir.join("sentinel.txt"), "preserve me\n").unwrap();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(error.to_string().contains("undeclared"));
+        assert_eq!(
+            fs::read_to_string(config.out_dir.join("sentinel.txt")).unwrap(),
+            "preserve me\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_owned_artifact_with_nested_symlink_without_mutation() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("dist");
+        seed_empty_owned_artifact(&config.out_dir);
+        fs::create_dir_all(config.out_dir.join("nested")).unwrap();
+        std::os::unix::fs::symlink(
+            project.path().join("app/page.tsx"),
+            config.out_dir.join("nested/escape"),
+        )
+        .unwrap();
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(config.out_dir.join("nested/escape").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_owned_artifact_with_special_file_without_mutation() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("dist");
+        seed_empty_owned_artifact(&config.out_dir);
+        let fifo = config.out_dir.join("unexpected.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid, NUL-terminated path owned by this temporary test directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let error = validate_build_output_ownership(&config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("not a regular file or directory")
+        );
+        assert!(fifo.exists());
+    }
+
+    #[test]
+    fn atomic_activation_rejects_destination_created_between_validation_and_move() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&candidate_types, "new types\n");
+
+        assert!(!build_destination.exists());
+        let expected = output_contract_for(&build_destination, &types_destination);
+        let mut injected_race = false;
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                if !injected_race && from == candidate_build && to == build_destination {
+                    injected_race = true;
+                    write_test_file(
+                        &build_destination.join("external-sentinel.txt"),
+                        "preserve me\n",
+                    );
+                }
+                rename_noreplace(from, to)
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        assert!(injected_race);
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("changed after validation"));
+        assert_eq!(
+            fs::read_to_string(build_destination.join("external-sentinel.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn claimed_destination_recreation_preserves_external_path_and_old_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&build_destination.join("old.txt"), "old build\n");
+        write_test_file(&candidate_types, "new types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+        let mut injected_race = false;
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                let result = rename_noreplace(from, to);
+                if result.is_ok()
+                    && !injected_race
+                    && from == build_destination
+                    && to.file_name().is_some_and(|name| {
+                        name.to_string_lossy()
+                            .starts_with(".ferrite-previous-build-")
+                    })
+                {
+                    injected_race = true;
+                    write_test_file(
+                        &build_destination.join("external-sentinel.txt"),
+                        "preserve me\n",
+                    );
+                }
+                result
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        assert!(injected_race);
+        let message = error.to_string();
+        assert!(message.contains("changed after validation"));
+        assert!(message.contains("could not restore previous build"));
+        assert_eq!(
+            fs::read_to_string(build_destination.join("external-sentinel.txt")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(!build_destination.join("new.txt").exists());
+        let recovery = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".ferrite-previous-build-")
+                })
+            })
+            .expect("preserved previous build");
+        assert_eq!(
+            fs::read_to_string(recovery.join("old.txt")).unwrap(),
+            "old build\n"
+        );
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn route_types_race_rolls_back_new_build_without_clobbering_external_file() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate_build = root.path().join("candidate-build");
+        let build_destination = root.path().join("build");
+        let candidate_types = root.path().join("candidate-types.d.ts");
+        let types_destination = root.path().join("types/routes.d.ts");
+        write_test_file(&candidate_build.join("new.txt"), "new build\n");
+        write_test_file(&candidate_types, "new types\n");
+        let expected = output_contract_for(&build_destination, &types_destination);
+        let mut injected_race = false;
+
+        let error = install_verified_outputs_with_ops(
+            &candidate_build,
+            &build_destination,
+            &candidate_types,
+            &types_destination,
+            &expected,
+            |from, to| {
+                if !injected_race && from == candidate_types && to == types_destination {
+                    injected_race = true;
+                    write_test_file(&types_destination, "external types\n");
+                }
+                rename_noreplace(from, to)
+            },
+            remove_owned_path,
+        )
+        .unwrap_err();
+
+        assert!(injected_race);
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("changed after validation"));
+        assert_eq!(
+            fs::read_to_string(&types_destination).unwrap(),
+            "external types\n"
+        );
+        assert!(!build_destination.exists());
+        assert!(!candidate_build.exists());
+        assert!(!candidate_types.exists());
+    }
+
+    #[test]
+    fn accepts_empty_custom_build_output_and_owned_route_types() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = test_config(project.path());
+        config.out_dir = project.path().join("dist");
+        fs::create_dir_all(&config.out_dir).unwrap();
+        fs::create_dir_all(config.types_out.parent().unwrap()).unwrap();
+        fs::write(
+            &config.types_out,
+            format!("{GENERATED_ROUTE_TYPES_HEADER}\nstale\n"),
+        )
+        .unwrap();
+
+        validate_build_output_ownership(&config).unwrap();
+    }
+
+    #[test]
+    fn build_input_verifier_output_is_bounded() {
+        let project = tempfile::tempdir().unwrap();
+        let config = test_config(project.path());
+        fs::write(&config.client_bundler, "").unwrap();
+        fs::write(
+            project.path().join("verify-build-inputs.mjs"),
+            "process.stdout.write('x'.repeat(4096));\n",
+        )
+        .unwrap();
+
+        let error =
+            capture_server_build_inputs_with_limits(&config, &[], None, Duration::from_secs(2), 64)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("output exceeded 64 bytes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_input_verifier_timeout_terminates_descendants() {
+        let project = tempfile::tempdir().unwrap();
+        let config = test_config(project.path());
+        let descendant_pid = project.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        fs::write(&config.client_bundler, "").unwrap();
+        fs::write(
+            project.path().join("verify-build-inputs.mjs"),
+            format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        )
+        .unwrap();
+        let timeout = Duration::from_millis(500);
+        let started = Instant::now();
+
+        let error =
+            capture_server_build_inputs_with_limits(&config, &[], None, timeout, 1024).unwrap_err();
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out after 500 ms"));
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_build_input_verifier_cleans_descendants() {
+        let project = tempfile::tempdir().unwrap();
+        let config = test_config(project.path());
+        let descendant_pid = project.path().join("descendant.pid");
+        let descendant_pid_json = serde_json::to_string(&descendant_pid).unwrap();
+        fs::write(&config.client_bundler, "").unwrap();
+        fs::write(
+            project.path().join("verify-build-inputs.mjs"),
+            format!(
+                r#"
+import {{ spawn }} from "node:child_process";
+import {{ writeFileSync }} from "node:fs";
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{
+  stdio: ["ignore", "inherit", "inherit"],
+}});
+writeFileSync({descendant_pid_json}, String(descendant.pid));
+descendant.unref();
+process.stdout.write(JSON.stringify({{ inputs: [] }}));
+"#
+            ),
+        )
+        .unwrap();
+        let started = Instant::now();
+
+        let inputs = capture_server_build_inputs_with_limits(
+            &config,
+            &[],
+            None,
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap();
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut guard = DescendantGuard(Some(pid));
+
+        assert!(inputs.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(wait_for_process_exit(pid, Duration::from_secs(2)));
+        guard.0 = None;
+    }
+
+    #[cfg(unix)]
+    struct DescendantGuard(Option<i32>);
+
+    #[cfg(unix)]
+    impl Drop for DescendantGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                // SAFETY: this test records the PID of the child process it spawned.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            // SAFETY: signal 0 checks the recorded child PID without modifying it.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
     }
 }

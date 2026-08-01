@@ -20,7 +20,9 @@ import {
   CleanupStack,
   createCleanSourceSnapshot,
   createProofInterruption,
+  formatProofError,
   parseDockerPublishedPort,
+  renderMissingCertificateControlConfig,
   renderProofNginxConfig,
   resolveProofInputPaths,
 } from "./verify-nginx-stack.mjs";
@@ -63,6 +65,14 @@ test("nginx proof config replaces one validated upstream without shell interpola
     () => renderProofNginxConfig(template, "upstream;return-200"),
     /unsupported characters/,
   );
+});
+
+test("missing-certificate control does not depend on proof-network DNS", () => {
+  const template = "server { proxy_pass http://127.0.0.1:3000; }";
+  const rendered = renderMissingCertificateControlConfig(template);
+  assert.match(rendered, /proxy_pass http:\/\/127\.0\.0\.1:3000/);
+  assert.doesNotMatch(rendered, /ferrite-upstream/);
+  assert.match(rendered, /log_format ferrite_proof escape=json/);
 });
 
 test("nginx proof accepts only one loopback Docker port mapping", () => {
@@ -208,6 +218,35 @@ test("cleanup remains LIFO and continues after one cleanup failure", async () =>
   assert.match(errors[0].message, /broken: synthetic cleanup failure/);
 });
 
+test("proof error output preserves primary, cleanup, and nested cause details", () => {
+  const primary = new Error("candidate image build failed");
+  const cleanupCause = new Error("Docker daemon stopped responding");
+  const cleanup = new Error("candidate image cleanup failed", { cause: cleanupCause });
+  const failure = new AggregateError(
+    [primary, new AggregateError([cleanup], "nginx proof cleanup failed")],
+    "nginx proof and cleanup failed",
+  );
+
+  const output = formatProofError(failure);
+  assert.match(output, /nginx proof and cleanup failed/);
+  assert.match(output, /candidate image build failed/);
+  assert.match(output, /nginx proof cleanup failed/);
+  assert.match(output, /candidate image cleanup failed/);
+  assert.match(output, /Docker daemon stopped responding/);
+
+  const circular = new Error("circular cleanup failure");
+  circular.cause = circular;
+  assert.match(formatProofError(circular), /cause: \[circular Error\]/);
+  assert.equal(formatProofError("non-error failure"), "non-error failure");
+
+  const shared = new Error("shared cleanup failure");
+  const sharedOutput = formatProofError(
+    new AggregateError([shared, shared], "repeated cleanup failure"),
+  );
+  assert.equal(sharedOutput.match(/Error: shared cleanup failure/g)?.length, 2);
+  assert.doesNotMatch(sharedOutput, /\[circular Error\]/);
+});
+
 test("expected-failure controls reject success, outer timeout, and wrong failure causes", () => {
   assert.doesNotThrow(() =>
     assertExpectedFailure(
@@ -241,7 +280,7 @@ test("expected-failure controls reject success, outer timeout, and wrong failure
         "TLS control",
         /certificate rejected/,
       ),
-    /unexpected reason/,
+    /unexpected reason:\n\nconnection refused/,
   );
 });
 

@@ -1,0 +1,15 @@
+# Supply BUILDKITE_AGENT_TOKEN from the agent environment. Never store it here.
+name="%hostname-ferrite-%spawn"
+tags="queue=ferrite-local,project=ferrite,os=darwin,arch=arm64"
+build-path="/opt/homebrew/var/buildkite-agent/ferrite-builds"
+hooks-path="/opt/homebrew/etc/buildkite-agent/ferrite-hooks"
+plugins-path="/opt/homebrew/var/buildkite-agent/ferrite-plugins"
+git-submodules=false
+git-clean-flags="-ffxdq"
+no-plugins=true
+no-local-hooks=true
+disconnect-after-idle-timeout=300
+disconnect-after-uptime=14400
+strict-single-hooks=true
+enable-environment-variable-allowlist=true
+allowed-environment-variables="^HOME$,^PATH$,^SHELL$,^USER$,^LOGNAME$,^TMPDIR$,^LANG$,^LC_.*$,^RUSTUP_HOME$,^FERRITE_BUILDKITE_APPROVED_COMMIT$"

@@ -256,6 +256,7 @@ export type ServerActionErrorResponse = {
   ferrite: typeof SERVER_ACTION_RESPONSE_MARKER;
   version: typeof SERVER_ACTION_RESPONSE_VERSION;
   status: "error";
+  code?: string;
   message: string;
 };
 
@@ -357,11 +358,12 @@ export function createServerActionRedirectResponse(input: { location: string }):
   return validateServerActionResponse(response) as ServerActionRedirectResponse;
 }
 
-export function createServerActionErrorResponse(input: { message: string }): ServerActionErrorResponse {
+export function createServerActionErrorResponse(input: { code?: string; message: string }): ServerActionErrorResponse {
   const response: ServerActionErrorResponse = {
     ferrite: SERVER_ACTION_RESPONSE_MARKER,
     version: SERVER_ACTION_RESPONSE_VERSION,
     status: "error",
+    ...(input.code === undefined ? {} : { code: input.code }),
     message: input.message,
   };
   return validateServerActionResponse(response) as ServerActionErrorResponse;
@@ -531,7 +533,11 @@ export function validateServerActionResponse(response: unknown): ServerActionRes
   }
 
   if (candidate.status === "error") {
-    assertOnlyServerActionResponseFields(candidate, ["ferrite", "version", "status", "message"], "error");
+    assertOnlyServerActionResponseFields(candidate, ["ferrite", "version", "status", "code", "message"], "error");
+    const code = (candidate as Partial<ServerActionErrorResponse>).code;
+    if (code !== undefined) {
+      validateServerActionErrorCode(code);
+    }
     const message = (candidate as Partial<ServerActionErrorResponse>).message;
     if (typeof message !== "string" || message.length === 0) {
       throw new TypeError("server action error message must be non-empty.");
@@ -683,6 +689,12 @@ function validateServerActionUrl(url: string): void {
   }
   if (url.includes("\\") || /[\u0000-\u001F\u007F]/.test(url)) {
     throw new TypeError(`invalid server action url "${url}"`);
+  }
+}
+
+function validateServerActionErrorCode(code: unknown): asserts code is string {
+  if (typeof code !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(code)) {
+    throw new TypeError("server action error code must be 1-64 uppercase ASCII letters, digits, or underscores and start with a letter.");
   }
 }
 
@@ -933,7 +945,11 @@ pub enum ServerActionResponseOutcome {
     #[serde(rename = "redirect")]
     Redirect { location: String },
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        message: String,
+    },
     #[serde(rename = "payload")]
     Payload { payload: ServerPayloadPacket },
 }
@@ -1193,7 +1209,10 @@ pub fn validate_server_action_response(response: &ServerActionResponse) -> Resul
             }
             validate_server_action_url(location)?;
         }
-        ServerActionResponseOutcome::Error { message } => {
+        ServerActionResponseOutcome::Error { code, message } => {
+            if let Some(code) = code {
+                validate_server_action_error_code(code)?;
+            }
             if message.is_empty() {
                 return Err(ProtocolError::new(
                     "server action error message must be non-empty.",
@@ -1293,6 +1312,19 @@ fn validate_server_action_url(url: &str) -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+fn validate_server_action_error_code(code: &str) -> Result<()> {
+    let mut bytes = code.bytes();
+    let valid = code.len() <= 64
+        && bytes.next().is_some_and(|byte| byte.is_ascii_uppercase())
+        && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    if !valid {
+        return Err(ProtocolError::new(
+            "server action error code must be 1-64 uppercase ASCII letters, digits, or underscores and start with a letter.",
+        ));
+    }
     Ok(())
 }
 
@@ -1796,10 +1828,36 @@ mod tests {
             ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),
             version: SERVER_ACTION_RESPONSE_VERSION,
             outcome: ServerActionResponseOutcome::Error {
+                code: Some("POST_CONFLICT".to_owned()),
                 message: "Could not save post.".to_owned(),
             },
         };
         assert!(validate_server_action_response(&error).is_ok());
+
+        let legacy_error = ServerActionResponse {
+            ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),
+            version: SERVER_ACTION_RESPONSE_VERSION,
+            outcome: ServerActionResponseOutcome::Error {
+                code: None,
+                message: "Legacy public error.".to_owned(),
+            },
+        };
+        assert!(validate_server_action_response(&legacy_error).is_ok());
+
+        let invalid_error = ServerActionResponse {
+            ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),
+            version: SERVER_ACTION_RESPONSE_VERSION,
+            outcome: ServerActionResponseOutcome::Error {
+                code: Some("post-conflict".to_owned()),
+                message: "Could not save post.".to_owned(),
+            },
+        };
+        assert_eq!(
+            validate_server_action_response(&invalid_error)
+                .unwrap_err()
+                .message(),
+            "server action error code must be 1-64 uppercase ASCII letters, digits, or underscores and start with a letter."
+        );
 
         let payload = ServerActionResponse {
             ferrite: SERVER_ACTION_RESPONSE_MARKER.to_owned(),

@@ -94,6 +94,25 @@ test("container template runs as a non-root runtime user with a health check", a
   const dockerfile = await text("deploy/container/Dockerfile");
   const dockerignore = await text(".dockerignore");
 
+  assert.match(
+    dockerfile,
+    /ARG RUST_IMAGE=rust:1\.95\.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1/,
+  );
+  assert.match(
+    dockerfile,
+    /ARG NODE_IMAGE=node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d/,
+  );
+  assert.equal((dockerfile.match(/FROM \$\{NODE_IMAGE\}/g) ?? []).length, 2);
+  assert.match(dockerfile, /COPY --from=node-toolchain \/usr\/local\/ \/usr\/local\//);
+  assert.match(dockerfile, /node --version \| grep -q '\^v24\\\.'/);
+  assert.match(dockerfile, /corepack enable pnpm/);
+  assert.doesNotMatch(dockerfile, /corepack enable\s*\\/);
+  assert.doesNotMatch(dockerfile, /deb\.nodesource\.com/);
+  assert.doesNotMatch(dockerfile, /curl\s+-fsSL/);
+  assert.doesNotMatch(dockerfile, /NODE_MAJOR/);
+  assert.doesNotMatch(dockerfile, /^FROM node:24-bookworm-slim AS runtime$/m);
+  assert.match(dockerfile, /rustc --version \| grep -q '\^rustc 1\\\.95\\\.0 '/);
+  assert.doesNotMatch(dockerfile, /ARG RUST_IMAGE=rust:1-bookworm/);
   assert.match(dockerfile, /USER ferrite/);
   assert.match(dockerfile, /ferrite build --project examples\/basic/);
   assert.match(dockerfile, /examples\/basic\/\.ferrite\/build/);
@@ -105,6 +124,7 @@ test("container template runs as a non-root runtime user with a health check", a
   assert.doesNotMatch(dockerfile, /\/srv\/ferrite\/app\/node_modules/);
   assert.match(dockerfile, /HEALTHCHECK /);
   assert.match(dockerfile, /EXPOSE 3000/);
+  assert.match(dockerfile, /CMD \["sh", "-c", "exec ferrite serve/);
   assert.doesNotMatch(dockerfile, /FERRITE_ACTION_CSRF=[a-zA-Z0-9_-]{24,}/);
   assert.match(dockerignore, /^target$/m);
   assert.match(dockerignore, /^node_modules$/m);

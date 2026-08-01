@@ -1,0 +1,1 @@
+export default function DocsNav() { return <nav className="subnav" aria-label="Documentation sections"><a href="/docs">Overview</a><a href="/docs/getting-started">Getting started</a><a href="/docs/architecture">Architecture</a><a href="/docs/limitations">Limitations</a><a href="/docs/deployment">Deployment</a></nav>; }

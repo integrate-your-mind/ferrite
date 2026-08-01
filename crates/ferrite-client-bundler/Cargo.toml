@@ -3,13 +3,22 @@ name = "ferrite-client-bundler"
 description = "Rust orchestration for Ferrite browser bundle generation and validation."
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-ferrite-protocol = { path = "../ferrite-protocol", version = "0.1.0" }
+ferrite-protocol = { path = "../ferrite-protocol", version = "=0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

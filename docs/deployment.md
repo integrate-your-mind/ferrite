@@ -21,8 +21,8 @@ Ferrite can:
 - derive access-log client IPs from the TCP peer by default, or from `X-Forwarded-For` only when an explicit trusted-proxy hop count is configured
 - emit request outcome access logs and server-action audit logs to stderr in plain or JSON format
 - gzip eligible HTML and payload responses when `Accept-Encoding` allows it
-- bound request reads, request size, in-flight workers, and render subprocess timeouts
-- drain accepted production requests through the Rust shutdown-aware listener API
+- bound each request read with one absolute deadline, plus request size, in-flight workers, and render subprocess timeouts
+- stop admission and drain accepted production requests on CLI `SIGINT`/`SIGTERM` or through the Rust shutdown-aware listener API
 
 ## Release Prerequisites
 
@@ -47,19 +47,27 @@ cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/b
 cargo run -p ferrite-cli -- serve --project examples/basic --artifact .ferrite/build --page-renderer packages/runtime/bin/render-artifact.mjs --once --request-path '/posts/abc?__ferrite_payload=stream'
 ```
 
-Remote release gates are still required before release. The GitHub repository and PR flow now exist, but hosted Actions has not yet produced job-level proof for this codebase:
+Buildkite is the active CI path. Its dedicated macOS arm64 agent executes repository-owned commands through the allowlisted hooks documented in
+[`buildkite-local-ci.md`](buildkite-local-ci.md). A passed Buildkite build must
+be bound to the exact release commit and include every required job:
 
-- CI lint, typecheck, build, tests, and browser tests
-- npm package tarball verification in CI
-- native prebuild dry-run matrix on supported hosted runners
+- lint, typecheck, build, tests, and browser tests
+- npm package tarball verification
+- Rust and JavaScript coverage
+- native prebuild verification
+- nginx proxy/runtime proof
 - artifact upload and review for npm package reports and native prebuilds
+
+Because the agent runs on a maintainer-controlled local Mac, a green Buildkite
+build is exact-SHA CI evidence but not independent hosted-runner or
+cross-platform proof. GitHub Actions is not used.
 
 ## Private Alpha Operator Gate
 
 Before giving this to an external private-alpha team, capture evidence for the
 exact revision and artifact they will use:
 
-- GitHub PR and remote CI link for the revision.
+- GitHub PR and exact-commit Buildkite link for the revision.
 - Release artifact source, either private npm package, verified tarball bundle,
   or pinned source checkout.
 - Hosted staging URL behind the chosen proxy/TLS boundary.
@@ -162,13 +170,13 @@ Use command arguments for the current runtime knobs:
 - `--host`: bind address
 - `--port`: bind port
 - `--render-timeout-ms`: maximum duration for each production artifact-runner subprocess
-- `--request-read-timeout-ms`: maximum time to wait while reading each production HTTP request
+- `--request-read-timeout-ms`: absolute budget across all header and body reads for one production HTTP request; trickled bytes do not renew it and the minimum effective value is 1 ms
 - `--response-write-timeout-ms`: absolute budget across headers and all fixed, gzip, or chunked writes for one production HTTP response; the minimum effective value is 1 ms
 - `--max-request-bytes`: maximum bytes allowed for each production HTTP request header and body
 - `--max-in-flight-requests`: maximum accepted production sockets across active and queued work; excess connections receive `503 Service Unavailable`
 - `--server-action-csrf-token-env`: environment variable containing the token rendered into server-action forms and required on action POSTs
 - `--server-action-csrf-cookie-name`: optional cookie name that binds action POSTs to the configured CSRF token; it requires `--server-action-csrf-token-env`, sets `Path=/; SameSite=Lax; HttpOnly; Secure` on production route responses, and rejects action POSTs without a matching cookie value
-- `--server-action-replay-ttl-ms`: optional positive TTL for one-time server-action replay nonces rendered into production forms; it requires `--server-action-csrf-token-env`, rejects missing or reused nonces, stores nonce state in the current Ferrite process, and treats a nonce as single-use for the rendered response
+- `--server-action-replay-ttl-ms`: optional positive TTL for one-time server-action replay nonces rendered into production forms; it requires `--server-action-csrf-token-env`, rejects missing or reused nonces, stores at most 4,096 live nonces in the current Ferrite process, rejects new nonce issuance with `503 Service Unavailable` while every slot contains a live nonce, and treats a nonce as single-use for the rendered response
 - `--trusted-proxy-public-origin`: optional public HTTP(S) origin for server-action POST origin checks behind a trusted reverse proxy; when set, action POSTs require matching `X-Forwarded-Proto` and `X-Forwarded-Host`
 - `--trusted-proxy-client-ip-hops`: optional `X-Forwarded-For` trust policy for access-log `client_ip`; it requires `--trusted-proxy-public-origin` and selects the client IP before the configured number of trusted proxy hops. The edge proxy must overwrite client-supplied `X-Forwarded-For` before any trusted internal proxy appends to it.
 - `--access-log`: optional `plain` or `json` production request outcome logs emitted to stderr
@@ -207,7 +215,7 @@ This command requires Node.js, OpenSSL, `tar`, and a reachable Docker daemon. It
 
 The harness runs the production image and nginx as separate containers on the same private bridge network. It does not rely on Docker host networking or a platform-specific host-gateway alias. The successful local certificate is intentionally self-signed; the harness disables verification only for the successful matrix and separately proves that the secure default rejects it. Run this command from a clean exact commit for release evidence. `FERRITE_NGINX_ALLOW_DIRTY=1` exists only for non-release development runs; such runs are labeled dirty and are not exact-SHA proof. The harness prints the candidate image id, source labels, nginx digest and architecture, and the Ferrite production build id emitted by the image build.
 
-The nginx reference is an immutable multi-platform index, so the harness records the architecture-specific image that Docker resolves rather than claiming the same image id across platforms. The candidate Dockerfile still starts from mutable Rust and Node image tags and installs packages from external repositories; this is executable source/runtime proof, not a bit-for-bit reproducible image build. The harness currently assumes POSIX process signals and Docker's `127.0.0.1:<port>` publication format, as provided by the tested macOS/Linux Docker path. Native Windows host behavior remains unproven.
+The nginx reference is an immutable multi-platform index, so the harness records the architecture-specific image that Docker resolves rather than claiming the same image id across platforms. The candidate Dockerfile pins its Rust 1.95.0 builder and Node 24 toolchain/runtime to immutable multi-platform index digests, asserts their versions, and installs no toolchain through a mutable remote setup script. Debian package snapshots and transitive package metadata can still change across rebuilds, so this is executable source/runtime proof rather than a complete bit-for-bit reproducible image claim. The harness currently assumes POSIX process signals and Docker's `127.0.0.1:<port>` publication format, as provided by the tested macOS/Linux Docker path. Native Windows host behavior remains unproven.
 
 To test an already-running candidate proxy instead, start Ferrite with `--access-log json`, retain its absolute log path, and invoke the lower-level raw framing verifier:
 
@@ -294,12 +302,12 @@ Current production hardening is incomplete. Ferrite can require one configured h
 
 Until those exist, deploy server actions only for controlled beta scenarios or behind app-owned authentication and CSRF middleware that has been reviewed separately. If server actions are enabled in production, set `--server-action-csrf-token-env`, prefer `--server-action-csrf-cookie-name`, and set `--server-action-replay-ttl-ms` when a single Ferrite process owns the action form and action POST path. Rotate the referenced CSRF secret as part of the deployment process. The configured token must be cookie-safe when cookie binding is enabled. If the public TLS origin differs from the upstream Ferrite bind origin, set `--trusted-proxy-public-origin` and configure the proxy to own and sanitize the forwarded proto/host headers. If access logs need public client IPs behind the proxy, set `--trusted-proxy-client-ip-hops` to the exact number of trusted proxy hops and make the edge proxy overwrite `X-Forwarded-For`.
 
-Production artifact-runner failures return generic `500` or `504` HTML. Detailed subprocess errors are written to server stderr and must be treated as potentially sensitive operational logs.
+Application code may expose an expected public action failure by throwing `FerriteActionError` from `@ferrite/runtime/server` with a stable uppercase code and a nonempty user-safe message. Any other thrown value fails the renderer and returns generic production `500` HTML. Detailed subprocess errors are written to server stderr and must be treated as potentially sensitive operational logs. Version-1 error packets without a code remain accepted for compatibility, but new application code should always use the typed error.
 
 ## Known Gaps
 
 - No npm packages are published yet.
-- The GitHub remote and PR path exist, but hosted Actions has not yet produced job-level CI proof; exact-SHA local receipts remain the current executable evidence.
+- The GitHub remote and PR path exist. Buildkite is the active CI path, but its maintainer-controlled local agent does not establish independent hosted-runner or cross-platform proof.
 - Native prebuild artifacts have local and workflow dry-run proof, but not hosted-runner proof from this checkout.
 - The production CLI exposes the main request/render/write limits, server-action CSRF cookie binding, server-action trusted-proxy public-origin checks, trusted forwarded client-IP log policy, stderr request access logs, stderr action audit logs, and an in-memory Prometheus text metrics endpoint, but not tracing sinks or external audit sinks.
 - First-pass container, systemd, and nginx templates exist with local static verification; the self-contained Docker harness builds a clean exact Git archive into the artifact-only production image and runs 43 raw HTTP/1 TLS cases, seven negotiated HTTP/2 cases, five proxy-level no-upstream framing checks, nine proxy-level no-upstream malformed-target checks, and fail-closed controls against official nginx 1.29.3 selected by immutable index digest. No official container image, Helm chart, managed platform adapter, or hosted staging proof exists yet.

@@ -3,7 +3,9 @@ name = "ferrite-cli"
 description = "Command-line interface for checking, building, and serving Ferrite applications."
 version.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
@@ -12,12 +14,20 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
-ferrite-builder = { path = "../ferrite-builder", version = "0.1.0" }
-ferrite-dev-server = { path = "../ferrite-dev-server", version = "0.1.0" }
-ferrite-router = { path = "../ferrite-router", version = "0.1.0" }
-ferrite-ssr = { path = "../ferrite-ssr", version = "0.1.0" }
+ferrite-builder = { path = "../ferrite-builder", version = "=0.1.0" }
+ferrite-dev-server = { path = "../ferrite-dev-server", version = "=0.1.0" }
+ferrite-router = { path = "../ferrite-router", version = "=0.1.0" }
+ferrite-ssr = { path = "../ferrite-ssr", version = "=0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+signal-hook = { workspace = true }
+
+[target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
+ferrite-client-bundler = { path = "../ferrite-client-bundler", version = "=0.1.0" }
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

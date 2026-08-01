@@ -1,7 +1,7 @@
 # Ferrite Go-to-Market Plan (Private Beta Readiness)
 
-**Updated:** July 13, 2026
-**Current project state:** The GitHub repository and PR path now exist, and the local checkout has an artifact-backed, source-independent build/serve path with fail-closed integrity, strict HTTP request-framing, a 43-case nginx HTTP/1 TLS verifier plus seven negotiated HTTP/2 edge cases, concurrent execution, and bounded sustained-load proof. Clean proxy evidence is built from an immutable exact Git archive and requires five ambiguous framing probes plus nine raw-target probes to show no upstream status; dirty-worktree runs are development evidence only. Hosted Actions lacks job-level proof, and no hosted deployment has been proven. This plan assumes a narrow private beta only after explicit delivery gates are met.
+**Updated:** July 29, 2026
+**Current project state:** The GitHub repository and PR path now exist, and the local checkout has an artifact-backed, source-independent build/serve path with fail-closed integrity, strict HTTP request-framing, a 43-case nginx HTTP/1 TLS verifier plus seven negotiated HTTP/2 edge cases, concurrent execution, and bounded sustained-load proof. Clean proxy evidence is built from an immutable exact Git archive and requires five ambiguous framing probes plus nine raw-target probes to show no upstream status; dirty-worktree runs are development evidence only. GitHub Actions is no longer the active CI path. A dedicated local Buildkite-agent lane is defined, but exact-pushed-SHA Buildkite execution and hosted deployment have not been proven. This plan assumes a narrow private beta only after explicit delivery gates are met.
 
 ## Positioning
 
@@ -40,7 +40,7 @@ Current demoable scope is the local `examples/basic` end-to-end path:
 - Production HTTP boundary: exact HTTP/1.1 origin-form requests, fail-closed framing and authority validation, one request per closed connection, and an authority-rejecting buffering nginx template with a self-contained, exact-source raw-TLS matrix.
 
 Not sellable yet as a hosted platform:
-- No npm publish in this checkout, no hosted CI job-level run, no hosted staging run of the deployment templates, and only local/prototype operational proof.
+- No npm publish in this checkout, no exact-pushed-SHA Buildkite job, no hosted staging run of the deployment templates, and only local/prototype operational proof. A trusted local Buildkite run would still not establish independent hosted-runner or cross-platform evidence.
 - Server-action security remains incomplete for real mutable user flows.
 
 ## Fastest Path To Market
@@ -65,8 +65,8 @@ Disallowed alpha claims until proven:
 
 ### ASAP Alpha Launch Gate
 
-1. Keep launch work on focused GitHub PRs and preserve exact-SHA local proof receipts while hosted Actions remains unable to start jobs.
-2. Run the full release gate on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, artifact-backed example integration, npm and Cargo package verification, and native prebuild dry-run. Prefer hosted job-level evidence when available; do not discard independent exact-SHA local receipts.
+1. Keep launch work on focused GitHub PRs and bind each Buildkite run and local proof receipt to the exact candidate SHA.
+2. Run the full release gate on the exact commit offered to alpha users: lint, typecheck, build, unit tests, browser tests, artifact-backed example integration, npm and Cargo package verification, coverage, native prebuild dry-run, and nginx proof. A maintainer-controlled local Buildkite agent is CI evidence, not independent hosted-runner or cross-platform proof.
 3. Prove the artifact-backed container or systemd template in hosted staging behind a real proxy/TLS boundary, including startup integrity rejection, dynamic route/payload/action smoke, private metrics scrape, logs, overload rejection, restart, and rollback.
 4. Define throughput and latency targets and run hosted capacity tests; bounded mixed-load, concurrent slow-reader, controlled saturation, and artifact-runner recovery are now local regression gates, not capacity benchmarks.
 5. Publish a private-alpha onboarding page that states allowed use, disallowed use, install prerequisites, release artifact source, support channel, and no-SLA terms.
@@ -81,8 +81,8 @@ Disallowed alpha claims until proven:
 - Production sockets have a configurable absolute response-write deadline with fixed, gzip, chunked, parse-error, overload, shutdown-drain, concurrent slow-reader, and post-saturation regression coverage. Hosted throughput and capacity remain unproven.
 
 2. Remote delivery proof gaps
-- GitHub remote, push, PR, review, and merge proof exist, but hosted Actions currently fails before allocating jobs.
-- `release:verify:npm` has exact-revision local proof but is not yet backed by a hosted job artifact.
+- GitHub remote, push, PR, review, and merge proof exist. Buildkite is the active CI path, but the dedicated maintainer-controlled local agent does not establish independent hosted-runner or cross-platform execution.
+- `release:verify:npm` requires an exact-source passed Buildkite build and byte-verified package artifacts; the current candidate still needs that terminal proof.
 
 3. npm publishing and native package distribution
 - No real `npm publish` has been performed.
@@ -110,7 +110,7 @@ Disallowed alpha claims until proven:
 **Objective:** Reach a defensible private beta that is explicitly limited to trusted teams and explicit risks.
 
 ### Week 1
-- Day 1–2: finish PR #2's exact-head candidate-image/nginx proof packet, obtain distinct review, and resolve the GitHub Actions startup failure without bypassing checks.
+- Day 1–2: finish the current exact-head candidate-image/nginx proof packet, obtain distinct review, and run every required Buildkite job without bypassing checks.
 - Day 3–4: define service-level targets and run hosted capacity and long-duration tests around the completed response-write, mixed-load, controlled-overload, and artifact-runner recovery regressions.
 - Day 5: complete hosted deployment hardening pass 1:
   - run `ferrite serve` smoke and payload-action smoke behind a known reverse proxy,
@@ -121,7 +121,7 @@ Disallowed alpha claims until proven:
   - trusted-proxy deployment test matrix, including forwarded proto/host and forwarded client-IP policy.
 
 ### Week 2
-- Day 8: harden CI proof by running the full local gate set in remote CI (release lint/test/build, example integration, pinned-nginx candidate-image proof, npm/Cargo package verification, native prebuild dry-run, browser proof).
+- Day 8: harden CI proof by running the full gate set through Buildkite (release lint/test/build, example integration, pinned-nginx candidate-image proof, npm/Cargo package verification, coverage, native prebuild dry-run, browser proof), then separately exercise supported cross-platform or hosted staging paths.
 - Day 9–10: close server-action reliability and UX:
   - exercise server-action production failure-path audit logs in hosted staging and decide the external sink contract,
   - validate rejection/mismatch flows in real browser automation and one negative-path test per route/action class.
@@ -151,7 +151,7 @@ These are hypotheses to validate via 4–8 design-partner conversions and churn-
 
 - **R1: Remote proof never completed in time**
   Impact: cannot trust build quality.
-  Mitigation: make remote CI proof a hard release gate and include artifact links in weekly review.
+  Mitigation: make exact-SHA Buildkite proof a hard release gate, retain its local-agent trust boundary, and include artifact links in weekly review.
 
 - **R2: Server-action security incident before auth hardening**
   Impact: trust loss and legal exposure in authenticated workloads.
@@ -173,9 +173,9 @@ These are hypotheses to validate via 4–8 design-partner conversions and churn-
 
 Launch here means paid beta availability to external teams under explicit usage limits.
 
-- Remote GitHub proof:
-  - Remote CI with lint/typecheck/test/build, `release:verify:npm`, native prebuild workflow, browser proof.
-  - CI runs on same commit used for beta release.
+- GitHub and Buildkite proof:
+  - Exact-source Buildkite CI with lint/typecheck/test/build, `release:verify:npm`, coverage, native prebuild workflow, nginx, and browser proof.
+  - CI runs on the same commit used for beta release, while independent hosted and cross-platform proof remains a separate claim.
 - Publishing proof:
   - Proven npm publish workflow with provenance/trusted publishing or `NPM_TOKEN`.
   - Release artifacts for `@ferrite/*` visible and reproducible; prebuild packages emitted and verified.

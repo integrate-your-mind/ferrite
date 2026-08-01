@@ -1,0 +1,83 @@
+steps:
+  - label: "Ferrite verify"
+    key: "ferrite-verify"
+    command: "./.buildkite/scripts/ci.mjs verify"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 30
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite packages"
+    key: "ferrite-packages"
+    command: "./.buildkite/scripts/ci.mjs packages"
+    depends_on: "ferrite-verify"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 30
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite Rust coverage"
+    key: "ferrite-coverage-rust"
+    command: "./.buildkite/scripts/ci.mjs coverage-rust"
+    depends_on: "ferrite-packages"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 45
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite JavaScript coverage"
+    key: "ferrite-coverage-js"
+    command: "./.buildkite/scripts/ci.mjs coverage-js"
+    depends_on: "ferrite-coverage-rust"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 30
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite native"
+    key: "ferrite-native"
+    command: "./.buildkite/scripts/ci.mjs native"
+    depends_on: "ferrite-coverage-js"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 30
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"
+
+  - label: "Ferrite nginx"
+    key: "ferrite-nginx"
+    command: "./.buildkite/scripts/ci.mjs nginx"
+    depends_on: "ferrite-native"
+    agents:
+      queue: "ferrite-local"
+      project: "ferrite"
+      os: "darwin"
+      arch: "arm64"
+    timeout_in_minutes: 45
+    artifact_paths:
+      - "dist/ci/**/*"
+      - "dist/npm-packages/**/*"

@@ -36,6 +36,7 @@ import {
   serverPayloadRequestUrl,
   serverPayloadStreamRequestUrl,
 } from "../dist/dom.js";
+import { createServerPayloadNavigator as createBaseServerPayloadNavigator } from "../dist/dom-base.js";
 import {
   collectPageMetadata,
   collectStaticParams,
@@ -66,7 +67,7 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function navigationDocumentPayload(route, text, title, headChildren = []) {
+function navigationDocumentPayload(route, text, title, headChildren = [], routeChildren = []) {
   return {
     ferrite: "server-payload",
     version: 1,
@@ -76,7 +77,12 @@ function navigationDocumentPayload(route, text, title, headChildren = []) {
       {},
       [
         [2, "head", {}, [[2, "title", {}, [[0, title]]], ...headChildren]],
-        [2, "body", {}, [[2, "div", { id: "ferrite-root", "data-route": route }, [[2, "h1", {}, [[0, text]]]]]]],
+        [
+          2,
+          "body",
+          {},
+          [[2, "div", { id: "ferrite-root", "data-route": route }, [[2, "h1", {}, [[0, text]]], ...routeChildren]]],
+        ],
       ],
     ],
     clientReferences: [],
@@ -875,7 +881,7 @@ test("fetchAndApplyServerPayload updates a mounted root from shell and chunks", 
   assert.equal(container.querySelector("main")?.getAttribute("data-route"), "/posts/alpha");
   assert.equal(container.querySelector("h1")?.textContent, "Post alpha");
   assert.equal(container.querySelector("strong")?.textContent, "Loaded chunk");
-  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "");
+  assert.equal(container.querySelector("strong")?.getAttribute("data-loaded"), "true");
   assert.equal(container.textContent, "Post alphaLoaded chunk");
 });
 
@@ -1355,7 +1361,7 @@ test("server action form bootstrap is idempotent for generated entrypoints", asy
   assert.deepEqual(submissions, ["submit"]);
 });
 
-test("server payload navigator streams shell before chunks and updates history after completion", async () => {
+test("server payload navigator commits history with the streamed shell", async () => {
   const { window, container } = createContainer("https://example.com/posts/old");
   window.document.head.innerHTML = "<title>Old title</title>";
   const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
@@ -1422,7 +1428,7 @@ test("server payload navigator streams shell before chunks and updates history a
   await flushScheduledWork();
 
   assert.deepEqual(requests, ["https://example.com/posts/stream?__ferrite_payload=stream"]);
-  assert.equal(window.location.href, "https://example.com/posts/old");
+  assert.equal(window.location.href, "https://example.com/posts/stream");
   assert.equal(window.document.title, "Stream title");
   assert.equal(container.textContent, "Stream routeLoading chunk");
 
@@ -1444,6 +1450,262 @@ test("server payload navigator streams shell before chunks and updates history a
   assert.equal(container.querySelector("#ferrite-root")?.getAttribute("data-route"), "/posts/stream");
   assert.equal(container.textContent, "Stream routeLoaded chunk");
 
+  navigator.destroy();
+});
+
+test("base server payload navigator prevents a stale stream from replacing a newer route", async () => {
+  const { window, container } = createContainer("https://example.com/posts/old");
+  window.document.head.innerHTML = "<title>Old title</title>";
+  const root = mount(createElement("div", { id: "ferrite-root", "data-route": "/posts/old" }, "Old"), container);
+  const encoder = new TextEncoder();
+  const controllers = new Map();
+  const navigator = createBaseServerPayloadNavigator(root, {
+    window,
+    stream: true,
+    fetch: async (input) => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      body: new ReadableStream({
+        start(controller) {
+          controllers.set(new URL(input).pathname, controller);
+        },
+      }),
+    }),
+  });
+
+  const frame = (route, text) =>
+    encoder.encode(
+      `${JSON.stringify(
+        serverPayloadStreamFrame({
+          kind: "shell",
+          shell: navigationDocumentPayload(route, text, `${text} title`).shell,
+          clientReferences: [],
+        }),
+      )}\n`,
+    );
+
+  const slow = navigator.navigate("/posts/slow");
+  await flushScheduledWork();
+  const fast = navigator.navigate("/posts/fast");
+  await flushScheduledWork();
+
+  controllers.get("/posts/fast").enqueue(frame("/posts/fast", "Fast"));
+  controllers.get("/posts/fast").close();
+  await fast;
+  assert.equal(window.location.pathname, "/posts/fast");
+  assert.equal(window.document.title, "Fast title");
+  assert.equal(container.textContent, "Fast");
+
+  controllers.get("/posts/slow").enqueue(frame("/posts/slow", "Slow"));
+  controllers.get("/posts/slow").close();
+  assert.equal(await slow, null);
+  assert.equal(window.location.pathname, "/posts/fast");
+  assert.equal(window.document.title, "Fast title");
+  assert.equal(container.textContent, "Fast");
+
+  navigator.destroy();
+});
+
+test("base server payload navigator keeps a reentrant body, head, and history commit coherent", async () => {
+  const { window, container } = createContainer("https://example.com/start");
+  window.document.title = "Start";
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  let navigator;
+  let replacement;
+
+  class NavigationTrigger extends window.HTMLElement {
+    connectedCallback() {
+      if (!replacement) {
+        replacement = navigator.navigate("/new");
+        void replacement.catch(() => undefined);
+      }
+    }
+  }
+  window.customElements.define("ferrite-base-navigation-trigger", NavigationTrigger);
+
+  navigator = createBaseServerPayloadNavigator(root, {
+    window,
+    fetch: async (input) => {
+      const path = new URL(input).pathname;
+      if (path === "/new") {
+        throw new Error("replacement failed");
+      }
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => navigationDocumentPayload(
+          "/old",
+          "Old",
+          "Old title",
+          [],
+          [[2, "ferrite-base-navigation-trigger", {}, []]],
+        ),
+      };
+    },
+  });
+
+  assert.equal(await navigator.navigate("/old"), null);
+  assert.ok(replacement, "the mounted custom element must start a replacement navigation");
+  await assert.rejects(replacement, /replacement failed/);
+  assert.equal(container.querySelector("h1")?.textContent, "Old");
+  assert.equal(window.document.title, "Old title");
+  assert.equal(window.location.pathname, "/old");
+  navigator.destroy();
+});
+
+test("base server payload navigator defers destroy through a mounted route commit", async () => {
+  const { window, container } = createContainer("https://example.com/start");
+  window.document.title = "Start";
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  let navigator;
+
+  class DestroyTrigger extends window.HTMLElement {
+    connectedCallback() {
+      navigator.destroy();
+    }
+  }
+  window.customElements.define("ferrite-base-destroy-trigger", DestroyTrigger);
+
+  navigator = createBaseServerPayloadNavigator(root, {
+    window,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => navigationDocumentPayload(
+        "/old",
+        "Old",
+        "Old title",
+        [],
+        [[2, "ferrite-base-destroy-trigger", {}, []]],
+      ),
+    }),
+  });
+
+  assert.equal(await navigator.navigate("/old"), null);
+  assert.equal(container.querySelector("h1")?.textContent, "Old");
+  assert.equal(window.document.title, "Old title");
+  assert.equal(window.location.pathname, "/old");
+  await assert.rejects(navigator.navigate("/after-destroy"), /destroyed/);
+});
+
+test("base stream destroy rejects reentrant work without a second request", async () => {
+  const { window, container } = createContainer("https://example.com/start");
+  window.document.title = "Start";
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  const requests = [];
+  let navigator;
+  let afterDestroy;
+
+  class StreamDestroyTrigger extends window.HTMLElement {
+    connectedCallback() {
+      navigator.destroy();
+      afterDestroy = navigator.navigate("/after-destroy");
+      void afterDestroy.catch(() => undefined);
+    }
+  }
+  window.customElements.define("ferrite-base-stream-destroy-trigger", StreamDestroyTrigger);
+
+  navigator = createBaseServerPayloadNavigator(root, {
+    window,
+    stream: true,
+    fetch: async (input) => {
+      requests.push(input);
+      return serverPayloadStreamResponse([
+        serverPayloadStreamFrame({
+          kind: "shell",
+          shell: navigationDocumentPayload(
+            "/first",
+            "First",
+            "First title",
+            [],
+            [[2, "ferrite-base-stream-destroy-trigger", {}, []]],
+          ).shell,
+          clientReferences: [],
+        }),
+      ]);
+    },
+  });
+
+  assert.equal(await navigator.navigate("/first"), null);
+  assert.ok(afterDestroy, "the mounted stream element must exercise post-destroy navigation");
+  await assert.rejects(afterDestroy, /destroyed/);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0], /\/first\?__ferrite_payload=stream$/);
+  assert.equal(container.querySelector("h1")?.textContent, "First");
+  assert.equal(window.document.title, "First title");
+  assert.equal(window.location.pathname, "/first");
+});
+
+test("base server payload navigator suppresses fallback after onError starts recovery", async () => {
+  const { window, container } = createContainer("https://example.com/start");
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  const fallbackUrls = [];
+  let navigator;
+  let recovery;
+  navigator = createBaseServerPayloadNavigator(root, {
+    window,
+    fallback: (url) => fallbackUrls.push(url.href),
+    async onError(_error, url) {
+      if (url.pathname === "/bad") {
+        await Promise.resolve();
+        recovery = navigator.navigate("/recovery");
+        void recovery.catch(() => undefined);
+      }
+    },
+    fetch: async (input) => {
+      const path = new URL(input).pathname;
+      if (path === "/bad") {
+        throw new Error("bad route failed");
+      }
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => navigationDocumentPayload("/recovery", "Recovered", "Recovered title"),
+      };
+    },
+  });
+
+  assert.equal(await navigator.navigate("/bad", { fallbackOnError: true }), null);
+  assert.ok(recovery, "onError must start recovery");
+  await recovery;
+  assert.deepEqual(fallbackUrls, []);
+  assert.equal(container.querySelector("h1")?.textContent, "Recovered");
+  assert.equal(window.document.title, "Recovered title");
+  assert.equal(window.location.pathname, "/recovery");
+  navigator.destroy();
+});
+
+test("base server payload navigator invalidates pending work on non-Ferrite popstate", async () => {
+  const { window, container } = createContainer("https://example.com/start");
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  let resolvePending;
+  const navigator = createBaseServerPayloadNavigator(root, {
+    window,
+    fetch: async () => new Promise((resolve) => {
+      resolvePending = resolve;
+    }),
+  });
+
+  const pending = navigator.navigate("/pending");
+  await flushScheduledWork();
+  assert.ok(resolvePending, "the pending payload request must start");
+  window.history.pushState({ external: true }, "", "/external");
+  window.dispatchEvent(new window.PopStateEvent("popstate", { state: { external: true } }));
+  await Promise.resolve();
+  resolvePending({
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    json: async () => navigationDocumentPayload("/pending", "Pending", "Pending title"),
+  });
+
+  assert.equal(await pending, null);
+  assert.equal(window.location.pathname, "/external");
+  assert.equal(container.textContent, "Start");
   navigator.destroy();
 });
 
@@ -2315,6 +2577,77 @@ test("toRenderPacket emits compact text, fragment, and element nodes", () => {
     version: 1,
     root: [1, [[2, "h1", { class: "title" }, [[0, "Ferrite"]]], [0, " bridge"]]],
   });
+});
+
+test("form defaults serialize to effective HTML attributes", () => {
+  const packet = toRenderPacket(
+    createElement("input", {
+      name: "title",
+      type: "checkbox",
+      defaultValue: "Draft",
+      defaultChecked: true,
+    }),
+  );
+
+  assert.deepEqual(packet, {
+    ferrite: "render-packet",
+    version: 1,
+    root: [2, "input", { name: "title", type: "checkbox", value: "Draft", checked: true }, []],
+  });
+});
+
+test("controlled input props deterministically override default aliases", () => {
+  for (const props of [
+    { value: "Controlled", defaultValue: "Fallback", checked: false, defaultChecked: true },
+    { defaultValue: "Fallback", value: "Controlled", defaultChecked: true, checked: false },
+  ]) {
+    const packet = toRenderPacket(createElement("input", props));
+    assert.deepEqual(packet.root, [2, "input", { value: "Controlled" }, []]);
+
+    const { container } = createContainer();
+    const root = mount(createElement("input", props), container);
+    const input = container.querySelector("input");
+    assert.equal(input?.getAttribute("value"), "Controlled");
+    assert.equal(input?.hasAttribute("checked"), false);
+    root.unmount();
+
+    const { container: hydrationContainer } = createContainer();
+    hydrationContainer.innerHTML = '<input value="Controlled">';
+    const serverInput = hydrationContainer.querySelector("input");
+    const hydratedRoot = hydrate(createElement("input", props), hydrationContainer);
+    assert.equal(hydrationContainer.querySelector("input"), serverInput);
+    hydratedRoot.unmount();
+  }
+});
+
+test("nullish controlled input props fall back to default aliases", () => {
+  for (const props of [
+    { value: null, defaultValue: "Fallback", checked: undefined, defaultChecked: true },
+    { defaultValue: "Fallback", value: null, defaultChecked: true, checked: undefined },
+  ]) {
+    const packet = toRenderPacket(createElement("input", props));
+    assert.deepEqual(packet.root, [2, "input", { value: "Fallback", checked: true }, []]);
+
+    const { container } = createContainer();
+    container.innerHTML = '<input value="Fallback" checked>';
+    const serverInput = container.querySelector("input");
+    const root = hydrate(createElement("input", props), container);
+    assert.equal(container.querySelector("input"), serverInput);
+    root.unmount();
+  }
+});
+
+test("intrinsic input tags normalize before default prop serialization", () => {
+  const element = createElement("INPUT", { defaultValue: "Draft", defaultChecked: true });
+  const packet = toRenderPacket(element);
+  assert.deepEqual(packet.root, [2, "input", { value: "Draft", checked: true }, []]);
+
+  const { container } = createContainer();
+  const root = mount(element, container);
+  const input = container.querySelector("input");
+  assert.equal(input?.getAttribute("value"), "Draft");
+  assert.equal(input?.hasAttribute("checked"), true);
+  root.unmount();
 });
 
 test("toRenderPacket uses an empty fragment for empty output", () => {

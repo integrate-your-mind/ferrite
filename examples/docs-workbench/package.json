@@ -1,0 +1,18 @@
+{
+  "name": "ferrite-docs-workbench",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ferrite/runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "26.0.1",
+    "typescript": "6.0.3"
+  },
+  "scripts": {
+    "check": "cargo run --manifest-path ../../Cargo.toml -p ferrite-cli -- check --project .",
+    "dev": "cargo run --manifest-path ../../Cargo.toml -p ferrite-cli -- dev --project . --page-renderer ../../packages/runtime/bin/render-page.mjs --client-bundler ../../packages/runtime/bin/build-client.mjs",
+    "build": "cargo run --manifest-path ../../Cargo.toml -p ferrite-cli -- build --project . --page-renderer ../../packages/runtime/bin/render-page.mjs --client-bundler ../../packages/runtime/bin/build-client.mjs",
+    "serve": "cargo run --manifest-path ../../Cargo.toml -p ferrite-cli -- serve --project . --artifact .ferrite/build --page-renderer ../../packages/runtime/bin/render-artifact.mjs"
+  }
+}

@@ -1,13 +1,20 @@
 import { spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, readdir, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { argv, cwd, exit } from "node:process";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { argv, cwd, env, exit } from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { gunzip as gunzipCallback } from "node:zlib";
 
-import { SUPPORTED_NATIVE_PREBUILD_TARGETS } from "../packages/node/binding.js";
+import {
+  SUPPORTED_NATIVE_PREBUILD_TARGETS,
+  nativePrebuildPackageName,
+} from "../packages/node/binding.js";
+import { createPrebuildPackage } from "../packages/node/scripts/create-prebuild-package.mjs";
+import { verifyPrebuildPackageDirs } from "../packages/node/scripts/verify-prebuild-package.mjs";
+import { createSourceStarter } from "./create-source-starter.mjs";
 
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const reportDir = join(workspaceRoot, "dist", "npm-packages");
@@ -103,6 +110,7 @@ export function validateManifestMetadata({
 }) {
   assertString(sourceManifest.description, `${packageName}: package description is required.`);
   assertString(sourceManifest.license, `${packageName}: package license is required.`);
+  assertString(sourceManifest.engines?.node, `${packageName}: engines.node is required.`);
   assertArray(sourceManifest.keywords, `${packageName}: package keywords are required.`);
   assertArray(sourceManifest.files, `${packageName}: package files are required.`);
   if (!sourceManifest.exports || typeof sourceManifest.exports !== "object") {
@@ -137,6 +145,21 @@ export function validatePackFiles({ packageName, files, requiredFiles, forbidden
   }
 }
 
+export function validatePackedLicense({ packageName, expectedLicenseContent, packedLicenseContent }) {
+  if (typeof packedLicenseContent === "undefined") {
+    throw new Error(`${packageName}: packed package must include LICENSE.`);
+  }
+  const expected = Buffer.isBuffer(expectedLicenseContent)
+    ? expectedLicenseContent
+    : Buffer.from(String(expectedLicenseContent));
+  const packed = Buffer.isBuffer(packedLicenseContent)
+    ? packedLicenseContent
+    : Buffer.from(String(packedLicenseContent));
+  if (!expected.equals(packed)) {
+    throw new Error(`${packageName}: packed LICENSE does not match the repository LICENSE.`);
+  }
+}
+
 export function validatePackedManifest({ packageName, releaseManifest, packedManifest }) {
   if (packedManifest.name !== releaseManifest.name) {
     throw new Error(`${packageName}: tarball manifest name ${packedManifest.name ?? "<missing>"} does not match.`);
@@ -162,16 +185,42 @@ export async function verifyNpmPackages({
   reportDir: packageReportDir = reportDir,
   runCommand = run,
   packPackage,
+  packNativePackage = npmPackPackage,
+  prepareNativePackage = packCurrentNativePrebuild,
   installPackageSet = installPackedPackageSet,
+  renamePath = rename,
+  sourceIdentity,
+  buildIdentity,
+  readSourceIdentity,
 } = {}) {
   const packageVerifier = packPackage ?? npmPackPackage;
   const packageVersions = new Map();
   const manifests = new Map();
   const results = [];
   const installablePackages = [];
+  const reportPhase = (phase) => console.error(`npm package verification: ${phase}`);
+  const sourceReader = readSourceIdentity ?? (sourceIdentity ? null : readGitIdentity);
+  const capturedSource = sourceIdentity ?? await sourceReader(packageWorkspaceRoot);
   const stageRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-stage-"));
+  let preserveStageRoot = false;
 
   try {
+    let licenseContent;
+    try {
+      licenseContent = await readFile(join(packageWorkspaceRoot, "LICENSE"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      if (publishManifestMode) {
+        throw new Error(
+          "npm publish-manifest verification requires the repository LICENSE.",
+        );
+      }
+    }
+    if (writeReports) {
+      await refusePublicationReceipt(packageReportDir);
+      await refuseStaleReportBackup(packageReportDir);
+      await refuseStaleVerificationLock(packageReportDir);
+    }
     for (const config of releasePackages) {
       const sourceManifest =
         packageManifests?.get(config.name) ??
@@ -202,14 +251,24 @@ export async function verifyNpmPackages({
         stageRoot,
         packageName: config.name,
         releaseManifest,
+        licensePath: licenseContent !== undefined ? join(packageWorkspaceRoot, "LICENSE") : undefined,
       });
       const packResult = normalizePackResult(config.name, await packageVerifier(stagedPackageDir));
+      const tarball = await inspectTarballIdentity(config.name, packResult, stageRoot);
       validatePackFiles({
         packageName: config.name,
         files: packResult.files,
-        requiredFiles: config.requiredFiles,
+        requiredFiles: licenseContent !== undefined ? [...config.requiredFiles, "LICENSE"] : config.requiredFiles,
         forbiddenFiles: config.forbiddenFiles,
       });
+      if (licenseContent !== undefined && packResult.tarballPath) {
+        const inspected = await inspectNpmTarball(packResult.tarballPath, { includeContents: true });
+        validatePackedLicense({
+          packageName: config.name,
+          expectedLicenseContent: licenseContent,
+          packedLicenseContent: inspected.contents?.LICENSE,
+        });
+      }
       if (packResult.packedManifest) {
         validatePackedManifest({
           packageName: config.name,
@@ -227,6 +286,9 @@ export async function verifyNpmPackages({
       if (packResult.packedManifest) {
         result.packedManifest = packResult.packedManifest;
       }
+      if (tarball) {
+        result.tarball = tarball;
+      }
       results.push(result);
       installablePackages.push({
         ...result,
@@ -234,18 +296,484 @@ export async function verifyNpmPackages({
       });
     }
 
-    await installPackageSet(installablePackages, { runCommand });
+    if (manifests.has("@ferrite/node")) {
+      const nativeResult = await prepareNativePackage({
+        packageWorkspaceRoot,
+        packPackage: packNativePackage,
+        publishManifestMode,
+        stageRoot,
+        licenseContent,
+      });
+      const { tarball: nativeTarball, tarballPath: _tarballPath, ...nativeReport } = nativeResult;
+      const tarball = nativeTarball ?? (await inspectTarballIdentity(nativeResult.name, nativeResult, stageRoot));
+      if (tarball) {
+        nativeReport.tarball = tarball;
+      }
+      results.push(nativeReport);
+      installablePackages.push(nativeResult);
+    }
+
+    await installPackageSet(installablePackages, {
+      runCommand,
+      onPhase: reportPhase,
+    });
 
     if (writeReports) {
-      await rm(packageReportDir, { force: true, recursive: true });
+      const assertSourceStable = async () => {
+        if (!sourceReader) return;
+        const currentSource = await sourceReader(packageWorkspaceRoot);
+        if (!isDeepStrictEqual(currentSource, capturedSource)) {
+          throw new Error("npm package report source commit/tree changed during verification.");
+        }
+      };
       await mkdir(packageReportDir, { recursive: true });
-      await writeFile(join(packageReportDir, "npm-package-report.json"), `${JSON.stringify(results, null, 2)}\n`);
+      const verificationLock = await acquireVerificationLock(packageReportDir);
+      let reportError;
+      try {
+        reportPhase("report:source-stability-before");
+        await assertSourceStable();
+        reportPhase("report:source-stability-confirmed");
+        await refusePublicationReceipt(packageReportDir);
+        await refuseStaleReportBackup(packageReportDir);
+        reportPhase("report:publication-receipt-clear");
+        const backupRoot = await mkdtemp(join(packageReportDir, ".previous-report-"));
+        const reportPath = join(packageReportDir, "npm-package-report.json");
+        const tarballPath = join(packageReportDir, "tarballs");
+        const backupReportPath = join(backupRoot, "npm-package-report.json");
+        const backupTarballPath = join(backupRoot, "tarballs");
+        let backedReport;
+        let backedTarballs;
+        try {
+          ({ backedReport, backedTarballs } = await acquireReportBackups({
+            backupReportPath,
+            backupRoot,
+            backupTarballPath,
+            renamePath,
+            reportPath,
+            tarballPath,
+          }));
+        } catch (error) {
+          if (error instanceof AggregateError) preserveStageRoot = true;
+          throw error;
+        }
+        try {
+          await rm(reportPath, { force: true });
+          await rm(tarballPath, { force: true, recursive: true });
+          await mkdir(packageReportDir, { recursive: true });
+          reportPhase("report:persist-tarballs");
+          await persistVerifiedTarballs(results, installablePackages, packageReportDir);
+          reportPhase("report:source-stability-after-persist");
+          await assertSourceStable();
+          const report = createPackageReport({
+            packages: results,
+            source: capturedSource,
+            build: buildIdentity ?? readBuildIdentity(env),
+          });
+          reportPhase("report:write");
+          await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+          reportPhase("report:source-stability-after-write");
+          await assertSourceStable();
+        } catch (error) {
+          const rollbackErrors = [];
+          await rm(reportPath, { force: true }).catch((rollbackError) => {
+            rollbackErrors.push(rollbackError);
+          });
+          await rm(tarballPath, { force: true, recursive: true }).catch((rollbackError) => {
+            rollbackErrors.push(rollbackError);
+          });
+          if (backedReport) {
+            await renamePath(backupReportPath, reportPath).catch((rollbackError) => {
+              rollbackErrors.push(rollbackError);
+            });
+          }
+          if (backedTarballs) {
+            await renamePath(backupTarballPath, tarballPath).catch((rollbackError) => {
+              rollbackErrors.push(rollbackError);
+            });
+          }
+          if (rollbackErrors.length > 0) {
+            preserveStageRoot = true;
+            throw new AggregateError(
+              [error, ...rollbackErrors],
+              `npm package verification failed and prior output restoration was incomplete; inspect preserved backup ${backupRoot} and report directory ${packageReportDir}.`,
+            );
+          }
+          throw error;
+        }
+        reportPhase("report:cleanup-backup");
+        await rm(backupRoot, { force: true, recursive: true }).catch((cleanupError) => {
+          preserveStageRoot = true;
+          throw new Error(
+            `npm package verification succeeded, but prior-output cleanup failed; inspect ${backupRoot} without replacing the verified report at ${packageReportDir}.`,
+            { cause: cleanupError },
+          );
+        });
+        reportPhase("report:complete");
+      } catch (error) {
+        reportError = error;
+      }
+      let lockReleaseError;
+      await rmdir(verificationLock).catch((error) => {
+        preserveStageRoot = true;
+        lockReleaseError = error;
+      });
+      if (reportError && lockReleaseError) {
+        throw new AggregateError(
+          [reportError, lockReleaseError],
+          `npm package verification failed and could not release ${verificationLock}; preserve and reconcile the locked report directory.`,
+        );
+      }
+      if (lockReleaseError) {
+        throw new Error(
+          `npm package verification completed but could not release ${verificationLock}; preserve and reconcile the locked report directory.`,
+          { cause: lockReleaseError },
+        );
+      }
+      if (reportError) throw reportError;
     }
 
     return results;
   } finally {
-    await rm(stageRoot, { force: true, recursive: true });
+    if (!preserveStageRoot) {
+      reportPhase("cleanup:stage-root");
+      await rm(stageRoot, { force: true, recursive: true });
+      reportPhase("cleanup:stage-root-complete");
+    }
   }
+}
+
+async function refusePublicationReceipt(packageReportDir) {
+  const receiptPath = await findPublicationReceipt(packageReportDir);
+  if (receiptPath) {
+    throw new Error(
+      `npm package verification refuses to regenerate artifacts while publication receipt exists at ${receiptPath}; preserve and reconcile it first.`,
+    );
+  }
+}
+
+async function refuseStaleReportBackup(packageReportDir) {
+  let entries;
+  try {
+    entries = await readdir(packageReportDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const staleBackup = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(".previous-report-"))
+    .map((entry) => entry.name)
+    .sort()[0];
+  if (staleBackup) {
+    throw new Error(
+      `npm package verification refuses to replace artifacts while interrupted backup exists at ${join(packageReportDir, staleBackup)}; preserve and reconcile it first.`,
+    );
+  }
+}
+
+async function refuseStaleVerificationLock(packageReportDir) {
+  let entries;
+  try {
+    entries = await readdir(packageReportDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  if (entries.includes(".verification-lock")) {
+    throw verificationLockError(join(packageReportDir, ".verification-lock"));
+  }
+}
+
+async function acquireVerificationLock(packageReportDir) {
+  const lockPath = join(packageReportDir, ".verification-lock");
+  try {
+    await mkdir(lockPath);
+    return lockPath;
+  } catch (error) {
+    if (error?.code === "EEXIST") throw verificationLockError(lockPath, error);
+    throw error;
+  }
+}
+
+function verificationLockError(lockPath, cause) {
+  return new Error(
+    `npm package verification lock exists at ${lockPath}; preserve and reconcile it before replacing artifacts.`,
+    cause ? { cause } : undefined,
+  );
+}
+
+async function acquireReportBackups({
+  backupReportPath,
+  backupRoot,
+  backupTarballPath,
+  renamePath,
+  reportPath,
+  tarballPath,
+}) {
+  let backedReport = false;
+  let backedTarballs = false;
+  try {
+    backedReport = await moveIfPresent(reportPath, backupReportPath, renamePath);
+    backedTarballs = await moveIfPresent(tarballPath, backupTarballPath, renamePath);
+    return { backedReport, backedTarballs };
+  } catch (error) {
+    const recoveryErrors = [];
+    if (backedReport) {
+      await renamePath(backupReportPath, reportPath).catch((recoveryError) => {
+        recoveryErrors.push(recoveryError);
+      });
+    }
+    if (backedTarballs) {
+      await renamePath(backupTarballPath, tarballPath).catch((recoveryError) => {
+        recoveryErrors.push(recoveryError);
+      });
+    }
+    await rmdir(backupRoot).catch((recoveryError) => {
+      recoveryErrors.push(recoveryError);
+    });
+    if (recoveryErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...recoveryErrors],
+        `npm package backup acquisition failed and prior output restoration was incomplete; inspect preserved backup ${backupRoot}.`,
+      );
+    }
+    throw error;
+  }
+}
+
+async function moveIfPresent(source, destination, renamePath = rename) {
+  try {
+    await renamePath(source, destination);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function findPublicationReceipt(root) {
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isFile() && entry.name === "npm-publication-receipt.json") return path;
+    if (entry.isDirectory()) {
+      const nested = await findPublicationReceipt(path);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+export function createPackageReport({ packages, source, build }) {
+  validateSourceIdentity(source);
+  validateBuildIdentity(build);
+  const packageSet = packageSetIdentity(packages);
+  return {
+    schemaVersion: 1,
+    source: structuredClone(source),
+    build: structuredClone(build),
+    packageSetSha256: createHash("sha256").update(JSON.stringify(packageSet)).digest("hex"),
+    packages,
+  };
+}
+
+export function packageSetIdentity(packages) {
+  if (!Array.isArray(packages)) {
+    throw new Error("npm package report packages must be an array.");
+  }
+  return packages
+    .map((pkg) => ({
+      name: pkg?.name,
+      version: pkg?.version,
+      publishArtifact: pkg?.publishArtifact ?? null,
+    }))
+    .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+}
+
+export async function readGitIdentity(root = workspaceRoot) {
+  const [commit, tree, status] = await Promise.all([
+    run("git", ["rev-parse", "HEAD"], { cwd: root, capture: true }),
+    run("git", ["rev-parse", "HEAD^{tree}"], { cwd: root, capture: true }),
+    run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: root, capture: true }),
+  ]);
+  if (status.trim() !== "") {
+    throw new Error("npm package report requires a clean tracked and untracked Git worktree.");
+  }
+  const source = { commit: commit.trim(), tree: tree.trim() };
+  validateSourceIdentity(source);
+  return source;
+}
+
+export function readBuildIdentity(environment = env) {
+  if (environment.BUILDKITE === "true") {
+    const build = {
+      provider: "buildkite",
+      organization: environment.BUILDKITE_ORGANIZATION_SLUG,
+      pipeline: environment.BUILDKITE_PIPELINE_SLUG,
+      buildId: environment.BUILDKITE_BUILD_ID,
+      buildNumber: environment.BUILDKITE_BUILD_NUMBER,
+      jobId: environment.BUILDKITE_JOB_ID,
+      url: environment.BUILDKITE_BUILD_URL,
+    };
+    validateBuildIdentity(build);
+    return build;
+  }
+  return { provider: "local" };
+}
+
+function validateSourceIdentity(source) {
+  if (
+    !source ||
+    !/^[0-9a-f]{40}$/.test(source.commit ?? "") ||
+    !/^[0-9a-f]{40}$/.test(source.tree ?? "")
+  ) {
+    throw new Error("npm package report requires exact 40-character Git commit and tree identities.");
+  }
+}
+
+function validateBuildIdentity(build) {
+  if (!build || !["local", "buildkite"].includes(build.provider)) {
+    throw new Error("npm package report requires an explicit local or Buildkite build identity.");
+  }
+  if (build.provider === "buildkite") {
+    for (const field of ["organization", "pipeline", "buildId", "buildNumber", "jobId", "url"]) {
+      if (typeof build[field] !== "string" || build[field].trim() === "") {
+        throw new Error(`npm package report Buildkite identity requires ${field}.`);
+      }
+    }
+  }
+}
+
+async function persistVerifiedTarballs(results, installablePackages, packageReportDir) {
+  const tarballDir = join(packageReportDir, "tarballs");
+  const filenames = new Set();
+
+  for (const pkg of installablePackages) {
+    if (!pkg.tarball || typeof pkg.tarballPath !== "string") {
+      continue;
+    }
+    if (filenames.has(pkg.tarball.filename)) {
+      throw new Error(`${pkg.name}: duplicate verified tarball filename ${pkg.tarball.filename}.`);
+    }
+    filenames.add(pkg.tarball.filename);
+    await mkdir(tarballDir, { recursive: true });
+    const destination = join(tarballDir, pkg.tarball.filename);
+    await copyFile(pkg.tarballPath, destination);
+    const copiedIdentity = await inspectTarballIdentity(
+      pkg.name,
+      {
+        tarballPath: destination,
+        npmReportedSize: pkg.tarball.size,
+      },
+      tarballDir,
+    );
+    if (copiedIdentity.sha256 !== pkg.tarball.sha256) {
+      throw new Error(`${pkg.name}: persisted tarball digest does not match the verified source tarball.`);
+    }
+    const result = results.find((candidate) => candidate.name === pkg.name);
+    if (!result) {
+      throw new Error(`${pkg.name}: verified tarball has no report entry.`);
+    }
+    result.publishArtifact = {
+      path: `tarballs/${pkg.tarball.filename}`,
+      ...copiedIdentity,
+    };
+  }
+}
+
+export async function packCurrentNativePrebuild({
+  packageWorkspaceRoot = workspaceRoot,
+  packPackage = npmPackPackage,
+  publishManifestMode = false,
+  stageRoot,
+  licenseContent,
+  createPrebuildPackageImpl = createPrebuildPackage,
+  verifyPrebuildPackageDirsImpl = verifyPrebuildPackageDirs,
+} = {}) {
+  if (!stageRoot) {
+    throw new Error("Current native prebuild packaging requires a staging directory.");
+  }
+  const packageName = nativePrebuildPackageName();
+  if (!packageName) {
+    throw new Error(`No Ferrite native prebuild package is supported on ${process.platform}/${process.arch}.`);
+  }
+
+  const directory = join(stageRoot, sanitizePackageName(packageName));
+  await createPrebuildPackageImpl({
+    packageRoot: join(packageWorkspaceRoot, "packages", "node"),
+    destinationRoot: directory,
+  });
+  let expectedLicenseContent = licenseContent;
+  if (expectedLicenseContent === undefined) {
+    try {
+      expectedLicenseContent = await readFile(join(packageWorkspaceRoot, "LICENSE"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      if (publishManifestMode) {
+        throw new Error(
+          "npm publish-manifest verification requires the repository LICENSE.",
+        );
+      }
+    }
+  }
+  if (expectedLicenseContent !== undefined) {
+    await writeFile(join(directory, "LICENSE"), expectedLicenseContent, {
+      flag: "wx",
+    });
+  }
+  await verifyPrebuildPackageDirsImpl([directory], {
+    expectedPackages: [packageName],
+  });
+
+  const releaseManifest = await readJson(join(directory, "package.json"));
+  validateManifestMetadata({
+    packageName,
+    sourceManifest: releaseManifest,
+    releaseManifest,
+    publishManifestMode,
+  });
+  const packResult = normalizePackResult(packageName, await packPackage(directory));
+  const tarball = await inspectTarballIdentity(packageName, packResult, stageRoot);
+  validatePackFiles({
+    packageName,
+    files: packResult.files,
+    requiredFiles: [
+      "ferrite-node.node",
+      "ferrite-node.sha256.json",
+      ...(expectedLicenseContent === undefined ? [] : ["LICENSE"]),
+    ],
+    forbiddenFiles: [],
+  });
+  if (expectedLicenseContent !== undefined && packResult.tarballPath) {
+    const inspected = await inspectNpmTarball(packResult.tarballPath, {
+      includeContents: true,
+    });
+    validatePackedLicense({
+      packageName,
+      expectedLicenseContent,
+      packedLicenseContent: inspected.contents?.LICENSE,
+    });
+  }
+  if (packResult.packedManifest) {
+    validatePackedManifest({ packageName, releaseManifest, packedManifest: packResult.packedManifest });
+  }
+
+  return {
+    name: packageName,
+    directory: "packages/node/dist/prebuild",
+    version: releaseManifest.version,
+    files: packResult.files,
+    releaseManifest,
+    ...(packResult.packedManifest ? { packedManifest: packResult.packedManifest } : {}),
+    ...(tarball ? { tarball } : {}),
+    tarballPath: packResult.tarballPath,
+    kind: "native-prebuild",
+  };
 }
 
 function rewriteWorkspaceDependencies(manifest, packageVersions) {
@@ -313,12 +841,15 @@ function packageDirectoryFor(packageName) {
   return config.directory;
 }
 
-async function stageReleasePackage({ sourceDir, stageRoot, packageName, releaseManifest }) {
+async function stageReleasePackage({ sourceDir, stageRoot, packageName, releaseManifest, licensePath }) {
   const stagedPackageDir = join(stageRoot, sanitizePackageName(packageName));
   await cp(sourceDir, stagedPackageDir, {
     recursive: true,
     filter: (source) => !source.split(/[\\/]/).includes("node_modules"),
   });
+  if (licensePath) {
+    await copyFile(licensePath, join(stagedPackageDir, "LICENSE"));
+  }
   await writeFile(join(stagedPackageDir, "package.json"), `${JSON.stringify(releaseManifest, null, 2)}\n`);
   return stagedPackageDir;
 }
@@ -329,7 +860,7 @@ function sanitizePackageName(packageName) {
 
 function normalizePackResult(packageName, packResult) {
   if (Array.isArray(packResult)) {
-    return { files: packResult, packedManifest: undefined };
+    return { files: packResult, packedManifest: undefined, npmReportedSize: undefined };
   }
   if (!packResult || typeof packResult !== "object" || !Array.isArray(packResult.files)) {
     throw new Error(`${packageName}: package verifier did not return a packed file list.`);
@@ -338,25 +869,90 @@ function normalizePackResult(packageName, packResult) {
     files: packResult.files,
     packedManifest: packResult.packedManifest,
     tarballPath: packResult.tarballPath,
+    npmReportedSize: packResult.npmReportedSize ?? packResult.size,
   };
 }
 
-async function npmPackPackage(packageDir) {
+async function inspectTarballIdentity(packageName, { tarballPath, npmReportedSize } = {}, allowedRoot) {
+  if (typeof tarballPath !== "string" || tarballPath.trim() === "") {
+    return undefined;
+  }
+
+  const filename = basename(tarballPath);
+  assertSafeTarballFilename(packageName, filename);
+  const [resolvedAllowedRoot, resolvedTarballPath] = await Promise.all([
+    realpath(allowedRoot),
+    realpath(tarballPath),
+  ]);
+  const relativeTarballPath = relative(resolvedAllowedRoot, resolvedTarballPath);
+  if (
+    relativeTarballPath === "" ||
+    relativeTarballPath === ".." ||
+    relativeTarballPath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+    isAbsolute(relativeTarballPath)
+  ) {
+    throw new Error(`${packageName}: packed tarball resolves outside the staging directory.`);
+  }
+
+  const bytes = await readFile(resolvedTarballPath);
+  if (typeof npmReportedSize !== "undefined") {
+    if (!Number.isSafeInteger(npmReportedSize) || npmReportedSize < 0) {
+      throw new Error(`${packageName}: npm pack returned an invalid tarball size.`);
+    }
+    if (npmReportedSize !== bytes.byteLength) {
+      throw new Error(
+        `${packageName}: npm pack reported tarball size ${npmReportedSize}, actual bytes are ${bytes.byteLength}.`,
+      );
+    }
+  }
+
+  return {
+    filename,
+    size: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+
+function assertSafeTarballFilename(packageName, filename) {
+  if (
+    typeof filename !== "string" ||
+    filename.trim() === "" ||
+    filename === "." ||
+    filename === ".." ||
+    filename !== filename.split(/[\\/]/).at(-1) ||
+    /[\u0000-\u001f\u007f]/.test(filename)
+  ) {
+    throw new Error(`${packageName}: npm pack returned an unsafe tarball filename.`);
+  }
+}
+
+export async function npmPackPackage(
+  packageDir,
+  { runCommand = run } = {},
+) {
   const tarballDir = join(dirname(packageDir), ".tarballs");
   await mkdir(tarballDir, { recursive: true });
-  const output = await run("npm", ["pack", "--json", "--pack-destination", tarballDir], { cwd: packageDir, capture: true });
+  const output = await runCommand(
+    "npm",
+    ["pack", "--json", "--pack-destination", tarballDir],
+    { cwd: packageDir, capture: true },
+  );
   let parsed;
   try {
     parsed = JSON.parse(output);
   } catch (error) {
     throw new Error(`${packageDir}: npm pack --json returned invalid JSON: ${error.message}`);
   }
-  const [entry] = parsed;
+  const entry = normalizeNpmPackJsonEntry(parsed, packageDir);
   if (!entry || !Array.isArray(entry.files)) {
     throw new Error(`${packageDir}: npm pack output did not include a file list.`);
   }
   if (typeof entry.filename !== "string" || entry.filename.trim() === "") {
     throw new Error(`${packageDir}: npm pack output did not include a tarball filename.`);
+  }
+  assertSafeTarballFilename(packageDir, entry.filename);
+  if (!Number.isSafeInteger(entry.size) || entry.size < 0) {
+    throw new Error(`${packageDir}: npm pack output did not include a valid tarball size.`);
   }
   const tarballPath = join(tarballDir, entry.filename);
   const packedManifest = await readTarballPackageManifest(tarballPath);
@@ -364,14 +960,34 @@ async function npmPackPackage(packageDir) {
     files: entry.files.map((file) => file.path),
     packedManifest,
     tarballPath,
+    npmReportedSize: entry.size,
   };
+}
+
+export function normalizeNpmPackJsonEntry(value, packageDir) {
+  const entries = Array.isArray(value)
+    ? value
+    : value && typeof value === "object"
+      ? Object.values(value)
+      : [];
+  if (
+    entries.length !== 1 ||
+    !entries[0] ||
+    typeof entries[0] !== "object" ||
+    Array.isArray(entries[0])
+  ) {
+    throw new Error(
+      `${packageDir}: npm pack output must identify exactly one package.`,
+    );
+  }
+  return entries[0];
 }
 
 async function readJson(path) {
   return JSON.parse(await readFile(path, "utf8"));
 }
 
-export async function installPackedPackageSet(packages, { runCommand = run } = {}) {
+export async function installPackedPackageSet(packages, { runCommand = run, onPhase = () => {} } = {}) {
   assertInstallablePackages(packages);
   const installRoot = await mkdtemp(join(tmpdir(), "ferrite-npm-install-"));
   try {
@@ -396,43 +1012,45 @@ export async function installPackedPackageSet(packages, { runCommand = run } = {
       capture: true,
     });
     if (packages.some((pkg) => pkg.name === "@ferrite/runtime")) {
-      await verifyCleanDeveloperWorkflow(installRoot, { packages, runCommand });
+      await verifyCleanDeveloperWorkflow(installRoot, { packages, runCommand, onPhase });
     }
   } finally {
+    onPhase("consumer:cleanup-install-root");
     await rm(installRoot, { force: true, recursive: true });
+    onPhase("consumer:install-root-cleaned");
   }
 }
 
 export async function verifyCleanDeveloperWorkflow(
   installRoot,
-  { packages = [], runCommand = run, cliSource = join(workspaceRoot, "target", "debug", process.platform === "win32" ? "ferrite.exe" : "ferrite") } = {},
+  {
+    packages = [],
+    runCommand = run,
+    cliSource = join(workspaceRoot, "target", "debug", process.platform === "win32" ? "ferrite.exe" : "ferrite"),
+    onPhase = () => {},
+  } = {},
 ) {
-  const cliPath = join(installRoot, process.platform === "win32" ? "ferrite.exe" : "ferrite");
   const project = join(installRoot, "starter");
+  await createSourceStarter({ target: project, packages, cliSource, runCommand, onPhase });
+  const cliPath = join(project, ".ferrite-source", "bin", process.platform === "win32" ? "ferrite.exe" : "ferrite");
   const runtimeBin = join(project, "node_modules", "@ferrite", "runtime", "bin");
-  await cp(cliSource, cliPath);
-  await runCommand(cliPath, ["init", project], { cwd: installRoot, capture: true });
-  if (packages.length > 0) {
-    await runCommand(
-      "npm",
-      ["install", "--ignore-scripts", "--package-lock=false", "--no-audit", "--fund=false", ...packages.map((pkg) => pkg.tarballPath)],
-      { cwd: project, capture: true },
-    );
-  }
 
+  onPhase("consumer:missing-artifact");
   await assertCommandFails(
     runCommand,
     cliPath,
     ["serve", "--project", project, "--artifact", ".ferrite/build", "--page-renderer", join(runtimeBin, "render-artifact.mjs"), "--once"],
     { cwd: project, capture: true },
+    /artifact directory[\s\S]*\bos error (?:2|3)\b/i,
     "clean install serve must reject a missing build artifact",
   );
-  await runCommand(cliPath, ["check", "--project", project], { cwd: project, capture: true });
+  onPhase("consumer:build");
   await runCommand(
     cliPath,
     ["build", "--project", project, "--page-renderer", join(runtimeBin, "render-page.mjs"), "--client-bundler", join(runtimeBin, "build-client.mjs")],
     { cwd: project, capture: true },
   );
+  onPhase("consumer:serve");
   const output = await runCommand(
     cliPath,
     ["serve", "--project", project, "--artifact", ".ferrite/build", "--page-renderer", join(runtimeBin, "render-artifact.mjs"), "--once"],
@@ -441,13 +1059,18 @@ export async function verifyCleanDeveloperWorkflow(
   if (!output.includes("Rust-first application runtime.")) {
     throw new Error("clean install artifact serve did not render the fixture page");
   }
+  onPhase("consumer:served");
 }
 
-async function assertCommandFails(runCommand, command, args, options, message) {
+async function assertCommandFails(runCommand, command, args, options, expectedError, message) {
   try {
     await runCommand(command, args, options);
-  } catch {
-    return;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (expectedError.test(errorMessage)) {
+      return;
+    }
+    throw new Error(`${message}: unexpected failure: ${errorMessage}`, { cause: error });
   }
   throw new Error(message);
 }
@@ -477,6 +1100,25 @@ if (packageNames.has("@ferrite/protocol")) {
   if (typeof protocol.validateServerPayloadPacket !== "function") {
     throw new TypeError("@ferrite/protocol did not expose validateServerPayloadPacket.");
   }
+  const validPayload = {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [0, "packed protocol"],
+    clientReferences: [],
+    chunks: [],
+  };
+  if (protocol.validateServerPayloadPacket(validPayload) !== validPayload) {
+    throw new TypeError("@ferrite/protocol did not validate the packaged protocol payload.");
+  }
+  let invalidPayloadRejected = false;
+  try {
+    protocol.validateServerPayloadPacket({ ...validPayload, version: 99 });
+  } catch {
+    invalidPayloadRejected = true;
+  }
+  if (!invalidPayloadRejected) {
+    throw new TypeError("@ferrite/protocol accepted an unsupported payload version.");
+  }
 }
 
 if (packageNames.has("@ferrite/protocol-wasm")) {
@@ -484,35 +1126,97 @@ if (packageNames.has("@ferrite/protocol-wasm")) {
   if (typeof wasm.instantiateFerriteProtocolWasm !== "function") {
     throw new TypeError("@ferrite/protocol-wasm did not expose instantiateFerriteProtocolWasm.");
   }
+  const wasmBytes = await readFile("node_modules/@ferrite/protocol-wasm/dist/ferrite_protocol_wasm.wasm");
+  const protocolWasm = await wasm.instantiateFerriteProtocolWasm(wasmBytes);
+  const validPayload = {
+    ferrite: "server-payload",
+    version: 1,
+    shell: [0, "packed wasm"],
+    clientReferences: [],
+    chunks: [],
+  };
+  if (protocolWasm.validateServerPayload(validPayload) !== validPayload) {
+    throw new TypeError("@ferrite/protocol-wasm did not validate the packaged WASM payload.");
+  }
+  let invalidPayloadRejected = false;
+  try {
+    protocolWasm.validateServerPayload({ ...validPayload, version: 99 });
+  } catch {
+    invalidPayloadRejected = true;
+  }
+  if (!invalidPayloadRejected) {
+    throw new TypeError("@ferrite/protocol-wasm packaged WASM accepted an unsupported payload version.");
+  }
 }
 
 if (packageNames.has("@ferrite/runtime")) {
   const runtime = await import("@ferrite/runtime");
+  const dom = await import("@ferrite/runtime/dom");
+  const jsxRuntime = await import("@ferrite/runtime/jsx-runtime");
+  const server = await import("@ferrite/runtime/server");
   if (typeof runtime.createElement !== "function") {
     throw new TypeError("@ferrite/runtime did not expose createElement.");
+  }
+  if (typeof dom.mount !== "function" || typeof jsxRuntime.jsx !== "function" || typeof server.renderPageModule !== "function") {
+    throw new TypeError("@ferrite/runtime package subpath exports are incomplete.");
   }
 }
 
 if (packageNames.has("@ferrite/node")) {
-  const manifest = JSON.parse(await readFile("node_modules/@ferrite/node/package.json", "utf8"));
-  if (manifest.name !== "@ferrite/node") {
-    throw new TypeError("@ferrite/node was not installed from the local tarball set.");
+  const node = await import("@ferrite/node");
+  const html = node.renderJsonToHtml(JSON.stringify({
+    ferrite: "render-packet",
+    version: 1,
+    root: [2, "main", {}, [[0, "packed native"]]],
+  }));
+  if (html !== "<main>packed native</main>") {
+    throw new TypeError("@ferrite/node did not load and render through the packaged native prebuild.");
+  }
+  let invalidPacketRejected = false;
+  try {
+    node.renderJsonToHtml(JSON.stringify({ ferrite: "render-packet", version: 99, root: [0, "bad"] }));
+  } catch {
+    invalidPacketRejected = true;
+  }
+  if (!invalidPacketRejected) {
+    throw new TypeError("@ferrite/node accepted an unsupported render packet version.");
   }
 }
 `;
 }
 
-async function readTarballPackageManifest(tarballPath) {
-  const archive = await gunzip(await readFile(tarballPath));
+export async function inspectNpmTarball(tarballPath, { includeContents = false } = {}) {
+  let archive;
+  try {
+    archive = await gunzip(await readFile(tarballPath));
+  } catch (error) {
+    throw new Error(`${tarballPath}: npm artifact is not a valid gzip archive: ${error.message}`);
+  }
+  const files = [];
+  const contents = includeContents ? {} : undefined;
+  const paths = new Set();
+  let manifest;
   let offset = 0;
   while (offset + 512 <= archive.length) {
     const header = archive.subarray(offset, offset + 512);
     if (header.every((byte) => byte === 0)) {
       break;
     }
+    validateTarHeaderChecksum(tarballPath, header);
     const name = readTarString(header, 0, 100);
     const prefix = readTarString(header, 345, 155);
     const path = prefix ? `${prefix}/${name}` : name;
+    if (
+      !path.startsWith("package/") ||
+      path.startsWith("/") ||
+      path.split("/").some((segment) => segment === ".." || segment === "")
+    ) {
+      throw new Error(`${tarballPath}: unsafe npm tar entry ${path || "<empty>"}.`);
+    }
+    if (paths.has(path)) {
+      throw new Error(`${tarballPath}: duplicate npm tar entry ${path}.`);
+    }
+    paths.add(path);
     const sizeText = readTarString(header, 124, 12).trim();
     const size = Number.parseInt(sizeText || "0", 8);
     if (!Number.isFinite(size) || size < 0) {
@@ -523,12 +1227,56 @@ async function readTarballPackageManifest(tarballPath) {
     if (dataEnd > archive.length) {
       throw new Error(`${tarballPath}: truncated tar entry for ${path}.`);
     }
-    if (path === "package/package.json") {
-      return JSON.parse(archive.subarray(dataStart, dataEnd).toString("utf8"));
+    const type = header[156];
+    const regularFile = type === 0 || type === 48;
+    if (regularFile) {
+      files.push(path.slice("package/".length));
+      if (contents) contents[path.slice("package/".length)] = archive.subarray(dataStart, dataEnd);
+      if (path === "package/package.json") {
+        try {
+          manifest = JSON.parse(archive.subarray(dataStart, dataEnd).toString("utf8"));
+        } catch (error) {
+          throw new Error(`${tarballPath}: package/package.json is invalid JSON: ${error.message}`);
+        }
+      }
+    } else if (type !== 53) {
+      throw new Error(`${tarballPath}: unsupported npm tar entry type ${type} for ${path}.`);
     }
     offset = dataStart + Math.ceil(size / 512) * 512;
   }
-  throw new Error(`${tarballPath}: package/package.json was not found.`);
+  if (!manifest) {
+    throw new Error(`${tarballPath}: package/package.json was not found.`);
+  }
+  return { manifest, files: files.sort(), ...(contents ? { contents } : {}) };
+}
+
+async function readTarballPackageManifest(tarballPath) {
+  return (await inspectNpmTarball(tarballPath)).manifest;
+}
+
+function validateTarHeaderChecksum(tarballPath, header) {
+  const checksumText = readTarString(header, 148, 8).trim();
+  const expected = Number.parseInt(checksumText || "0", 8);
+  if (!Number.isFinite(expected)) {
+    throw new Error(`${tarballPath}: invalid tar header checksum.`);
+  }
+  let actual = 0;
+  for (let index = 0; index < header.length; index += 1) {
+    actual += index >= 148 && index < 156 ? 32 : header[index];
+  }
+  if (actual !== expected) {
+    throw new Error(`${tarballPath}: tar header checksum does not match.`);
+  }
+}
+
+export function validateTarballAgainstReport(packageName, entry, inspected) {
+  if (!isDeepStrictEqual(inspected.manifest, entry.packedManifest)) {
+    throw new Error(`${packageName}: retained tarball manifest does not match the package report.`);
+  }
+  const reportedFiles = [...(entry.files ?? [])].sort();
+  if (!isDeepStrictEqual(inspected.files, reportedFiles)) {
+    throw new Error(`${packageName}: retained tarball file list does not match the package report.`);
+  }
 }
 
 function readTarString(buffer, start, length) {
