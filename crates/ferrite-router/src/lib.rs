@@ -552,7 +552,6 @@ mod tests {
     fn rejects_static_routes_that_cannot_reach_the_http_matcher() {
         let cases = [
             "hello world",
-            "abc%20 ",
             "check-✓",
             "%",
             "%2",
@@ -573,6 +572,11 @@ mod tests {
                 "expected `{route}` to be rejected before route publication, got {error}"
             );
         }
+    }
+
+    #[test]
+    fn request_reachable_static_segment_checks_bytes_after_percent_escape() {
+        assert!(!is_request_reachable_static_segment("abc%20 "));
     }
 
     #[test]
