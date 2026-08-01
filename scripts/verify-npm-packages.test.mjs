@@ -7,6 +7,7 @@ import test from "node:test";
 import { gzipSync } from "node:zlib";
 
 import {
+  RELEASE_PACKAGES,
   RELEASE_PACKAGE_NAMES,
   createReleaseManifest,
   normalizeNpmPackJsonEntry,
@@ -16,6 +17,7 @@ import {
   validatePackFiles,
   validatePackedLicense,
   validatePackedManifest,
+  validatePackedArtifacts,
   verifyCleanDeveloperWorkflow,
   verifyNpmPackages,
 } from "./verify-npm-packages.mjs";
@@ -1040,6 +1042,200 @@ test("verifier validates packages and writes the inspected report", async () => 
     assert.deepEqual(report.build, testReportIdentity.buildIdentity);
     assert.match(report.packageSetSha256, /^[a-f0-9]{64}$/);
     assert.deepEqual(report.packages, results);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("release verifier binds the release-profile WASM to the packed tarball", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-wasm-binding-"));
+  const wasmBytes = Buffer.from("release-profile wasm bytes\n");
+  const packageDir = join(root, "packages", "protocol-wasm");
+  const buildCalls = [];
+  try {
+    await mkdir(join(packageDir, "dist"), { recursive: true });
+    await writeFile(join(packageDir, "dist", "index.js"), "export {};\n");
+    await writeFile(join(packageDir, "dist", "index.d.ts"), "export {};\n");
+    await writeFile(
+      join(packageDir, "dist", "ferrite_protocol_wasm.wasm"),
+      wasmBytes,
+    );
+    const releasePackage = {
+      name: "@ferrite/protocol-wasm",
+      directory: "packages/protocol-wasm",
+      build: ["pnpm", ["--filter", "@ferrite/protocol-wasm", "build"]],
+      buildEnvironment: { PROFILE: "release" },
+      boundArtifacts: ["dist/ferrite_protocol_wasm.wasm"],
+      requiredFiles: [
+        "dist/index.js",
+        "dist/index.d.ts",
+        "dist/ferrite_protocol_wasm.wasm",
+      ],
+      forbiddenFiles: ["src/index.ts", "test"],
+    };
+    const results = await verifyNpmPackages({
+      ...testReportIdentity,
+      releasePackages: [releasePackage],
+      nativePackageNames: [],
+      packageManifests: new Map([
+        ["@ferrite/protocol-wasm", completeSourceManifest("@ferrite/protocol-wasm")],
+      ]),
+      workspaceRoot: root,
+      reportDir: join(root, "reports"),
+      runCommand: async (command, args, options) => {
+        buildCalls.push({ command, args, options });
+      },
+      packPackage: async (stagedPackageDir) => {
+        const manifest = JSON.parse(
+          await readFile(join(stagedPackageDir, "package.json"), "utf8"),
+        );
+        const tarballBytes = npmTarball({
+          "package/package.json": `${JSON.stringify(manifest)}\n`,
+          "package/dist/index.js": "export {};\n",
+          "package/dist/index.d.ts": "export {};\n",
+          "package/dist/ferrite_protocol_wasm.wasm": wasmBytes,
+        });
+        const tarballPath = join(dirname(stagedPackageDir), "protocol-wasm-0.1.0.tgz");
+        await writeFile(tarballPath, tarballBytes);
+        return {
+          files: [
+            "package/package.json",
+            "package/dist/index.js",
+            "package/dist/index.d.ts",
+            "package/dist/ferrite_protocol_wasm.wasm",
+          ],
+          packedManifest: manifest,
+          tarballPath,
+          size: tarballBytes.byteLength,
+        };
+      },
+      installPackageSet: async () => {},
+    });
+
+    const expectedIdentity = {
+      path: "dist/ferrite_protocol_wasm.wasm",
+      size: wasmBytes.byteLength,
+      sha256: createHash("sha256").update(wasmBytes).digest("hex"),
+    };
+    assert.equal(buildCalls.length, 1);
+    assert.equal(buildCalls[0].options.environment.PROFILE, "release");
+    assert.equal(buildCalls[0].options.environment.PATH, process.env.PATH);
+    assert.deepEqual(results[0].boundArtifacts, [expectedIdentity]);
+    const report = JSON.parse(
+      await readFile(join(root, "reports", "npm-package-report.json"), "utf8"),
+    );
+    assert.deepEqual(report.packages[0].boundArtifacts, [expectedIdentity]);
+
+    const defaultConfig = RELEASE_PACKAGES.find(
+      ({ name }) => name === "@ferrite/protocol-wasm",
+    );
+    assert.deepEqual(defaultConfig.buildEnvironment, { PROFILE: "release" });
+    assert.deepEqual(defaultConfig.boundArtifacts, [
+      "dist/ferrite_protocol_wasm.wasm",
+    ]);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("bound artifact validation fails closed for missing and mismatched packed bytes", () => {
+  const builtArtifacts = [{
+    path: "dist/ferrite_protocol_wasm.wasm",
+    size: 4,
+    sha256: createHash("sha256").update("wasm").digest("hex"),
+  }];
+
+  assert.throws(
+    () => validatePackedArtifacts({
+      packageName: "@ferrite/protocol-wasm",
+      builtArtifacts,
+      packedContents: {},
+    }),
+    /packed tarball is missing bound artifact dist\/ferrite_protocol_wasm\.wasm/,
+  );
+  assert.throws(
+    () => validatePackedArtifacts({
+      packageName: "@ferrite/protocol-wasm",
+      builtArtifacts,
+      packedContents: {
+        "dist/ferrite_protocol_wasm.wasm": Buffer.from("WASM"),
+      },
+    }),
+    /packed bound artifact dist\/ferrite_protocol_wasm\.wasm does not match the built bytes/,
+  );
+});
+
+test("release verifier requires an inspectable tarball for bound artifacts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-wasm-tarball-"));
+  const packageDir = join(root, "packages", "protocol-wasm");
+  try {
+    await mkdir(join(packageDir, "dist"), { recursive: true });
+    await writeFile(join(packageDir, "dist", "index.js"), "export {};\n");
+    await writeFile(join(packageDir, "dist", "index.d.ts"), "export {};\n");
+    await writeFile(
+      join(packageDir, "dist", "ferrite_protocol_wasm.wasm"),
+      "release wasm\n",
+    );
+    const releasePackage = RELEASE_PACKAGES.find(
+      ({ name }) => name === "@ferrite/protocol-wasm",
+    );
+
+    await assert.rejects(
+      verifyNpmPackages({
+        ...testReportIdentity,
+        writeReports: false,
+        releasePackages: [releasePackage],
+        nativePackageNames: [],
+        packageManifests: new Map([
+          ["@ferrite/protocol-wasm", completeSourceManifest("@ferrite/protocol-wasm")],
+        ]),
+        workspaceRoot: root,
+        runCommand: async () => {},
+        packPackage: async () => ({
+          files: [
+            "package/package.json",
+            "package/dist/index.js",
+            "package/dist/index.d.ts",
+            "package/dist/ferrite_protocol_wasm.wasm",
+          ],
+          packedManifest: completeReleaseManifest("@ferrite/protocol-wasm"),
+        }),
+        installPackageSet: async () => {},
+      }),
+      /bound artifacts require an inspectable npm tarball/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("release verifier rejects unsafe bound artifact paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ferrite-npm-wasm-path-"));
+  const packageDir = join(root, "packages", "protocol-wasm");
+  try {
+    await mkdir(packageDir, { recursive: true });
+    const releasePackage = RELEASE_PACKAGES.find(
+      ({ name }) => name === "@ferrite/protocol-wasm",
+    );
+    await assert.rejects(
+      verifyNpmPackages({
+        ...testReportIdentity,
+        writeReports: false,
+        releasePackages: [{
+          ...releasePackage,
+          boundArtifacts: ["../outside.wasm"],
+        }],
+        nativePackageNames: [],
+        packageManifests: new Map([
+          ["@ferrite/protocol-wasm", completeSourceManifest("@ferrite/protocol-wasm")],
+        ]),
+        workspaceRoot: root,
+        runCommand: async () => {},
+        packPackage: async () => assert.fail("unsafe artifact reached npm pack"),
+        installPackageSet: async () => {},
+      }),
+      /bound artifact path "\.\.\/outside\.wasm" is unsafe/,
+    );
   } finally {
     await rm(root, { force: true, recursive: true });
   }
