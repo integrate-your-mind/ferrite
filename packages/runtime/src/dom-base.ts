@@ -135,7 +135,7 @@ export type ServerPayloadNavigationOptions = FetchServerPayloadOptions & {
   prefetch?: boolean;
   stream?: boolean;
   fallback?: (url: URL) => void;
-  onError?: (error: unknown, url: URL) => void;
+  onError?: (error: unknown, url: URL) => void | PromiseLike<void>;
 };
 
 export type ServerPayloadNavigateOptions = {
@@ -670,6 +670,10 @@ export function createServerPayloadNavigator(
   };
   const prefetchedPayloads = new Map<string, ServerPayloadPacket | Promise<ServerPayloadPacket>>();
   let destroyed = false;
+  let destroyRequested = false;
+  let activeNavigationId = 0;
+  let navigationCommitDepth = 0;
+  let destroyNow: () => void;
 
   seedNavigationHistory(navigationWindow);
 
@@ -679,33 +683,101 @@ export function createServerPayloadNavigator(
     }
   };
 
-  const applyNavigationPacket = (packet: ServerPayloadPacket): void => {
+  const assertNavigatorAcceptingWork = (): void => {
+    if (destroyed || destroyRequested) {
+      throw new TypeError("Ferrite server payload navigator has been destroyed.");
+    }
+  };
+
+  const beginNavigation = (): number => {
     assertNavigatorActive();
+    activeNavigationId += 1;
+    return activeNavigationId;
+  };
+
+  const isNavigationActive = (navigationId: number): boolean =>
+    !destroyed && navigationId === activeNavigationId;
+
+  const assertNavigationActive = (navigationId: number): void => {
+    assertNavigatorActive();
+    if (!isNavigationActive(navigationId)) {
+      throw new TypeError("Ferrite navigation was replaced by a newer request.");
+    }
+  };
+
+  const beginNavigationCommit = (navigationId: number): void => {
+    assertNavigationActive(navigationId);
+    navigationCommitDepth += 1;
+  };
+
+  const finishNavigationCommit = (): void => {
+    navigationCommitDepth -= 1;
+    if (navigationCommitDepth === 0 && destroyRequested) {
+      destroyNow();
+    }
+  };
+
+  const finishNavigationCommitAfterCurrentStack = (): void => {
+    globalThis.queueMicrotask(finishNavigationCommit);
+  };
+
+  const applyNavigationPacket = (
+    packet: ServerPayloadPacket,
+    navigationId: number,
+    onCommit?: () => void,
+  ): void => {
+    assertNavigationActive(navigationId);
     const headPlan =
       options.reconcileHead === false ? null : prepareHeadReconciliation(packet, navigationWindow.document);
     const child = navigationPayloadToChild(packet, options.routeRootId);
-    root.update(child);
-    headPlan?.apply();
+    beginNavigationCommit(navigationId);
+    try {
+      root.update(child);
+      assertNavigationActive(navigationId);
+      headPlan?.apply();
+      assertNavigationActive(navigationId);
+      onCommit?.();
+    } finally {
+      finishNavigationCommit();
+    }
   };
 
-  const fetchApplyNavigationPacket = async (url: URL): Promise<ServerPayloadPacket> => {
+  const fetchApplyNavigationPacket = async (
+    url: URL,
+    navigationId: number,
+    onCommit?: () => void,
+  ): Promise<ServerPayloadPacket> => {
     const packet = await fetchServerPayload(url, fetchOptions);
-    applyNavigationPacket(packet);
+    applyNavigationPacket(packet, navigationId, onCommit);
     return packet;
   };
 
   const fetchApplyNavigationStream = async (
     url: URL,
+    navigationId: number,
     onShellCommit?: () => void,
   ): Promise<ServerPayloadPacket> => {
     let shellCommitted = false;
     const guardedRoot: RootHandle = {
       update(nextChild) {
-        assertNavigatorActive();
-        root.update(nextChild);
+        assertNavigationActive(navigationId);
+        beginNavigationCommit(navigationId);
+        try {
+          root.update(nextChild);
+          assertNavigationActive(navigationId);
+        } finally {
+          finishNavigationCommitAfterCurrentStack();
+        }
       },
       unmount() {
-        root.unmount();
+        assertNavigationActive(navigationId);
+        beginNavigationCommit(navigationId);
+        try {
+          root.unmount();
+          assertNavigationActive(navigationId);
+        } finally {
+          finishNavigationCommitAfterCurrentStack();
+        }
       },
     };
 
@@ -721,14 +793,18 @@ export function createServerPayloadNavigator(
         },
       });
     } catch (error) {
-      if (!shellCommitted && !destroyed) {
-        return fetchApplyNavigationPacket(url);
+      if (!isNavigationActive(navigationId)) {
+        throw error;
+      }
+      if (!shellCommitted && !destroyed && !fetchOptions.requestInit?.signal?.aborted) {
+        return fetchApplyNavigationPacket(url, navigationId, onShellCommit);
       }
       throw error;
     }
   };
 
   const prefetch = async (input: string | URL): Promise<ServerPayloadPacket | null> => {
+    assertNavigatorAcceptingWork();
     const url = navigationUrl(input, navigationWindow);
     if (!isSameOriginNavigation(url, navigationWindow)) {
       return null;
@@ -767,45 +843,64 @@ export function createServerPayloadNavigator(
 
   const applyNavigationUrl = async (
     url: URL,
+    navigationId: number,
     onShellCommit?: () => void,
   ): Promise<ServerPayloadPacket> => {
     const prefetched = takePrefetchedNavigationPacket(url);
     if (prefetched) {
       const packet = await prefetched;
-      applyNavigationPacket(packet);
+      applyNavigationPacket(packet, navigationId, onShellCommit);
       return packet;
     }
 
     if (options.stream === true) {
-      return fetchApplyNavigationStream(url, onShellCommit);
+      return fetchApplyNavigationStream(url, navigationId, onShellCommit);
     }
 
-    return fetchApplyNavigationPacket(url);
+    return fetchApplyNavigationPacket(url, navigationId, onShellCommit);
   };
 
   const navigate = async (
     input: string | URL,
     navigateOptions: ServerPayloadNavigateOptions = {},
   ): Promise<ServerPayloadPacket | null> => {
+    assertNavigatorAcceptingWork();
     const url = navigationUrl(input, navigationWindow);
     if (!isSameOriginNavigation(url, navigationWindow)) {
       return null;
     }
+    await Promise.resolve();
+    if (destroyed || destroyRequested) {
+      return null;
+    }
+    const navigationId = beginNavigation();
 
     try {
       const internalOptions = navigateOptions as InternalServerPayloadNavigateOptions;
       let historyCommitted = false;
       const commitHistory = (): void => {
-        if (!historyCommitted && internalOptions.history !== false) {
+        if (
+          isNavigationActive(navigationId)
+          && !historyCommitted
+          && internalOptions.history !== false
+        ) {
           updateNavigationHistory(navigationWindow, url, navigateOptions.replace === true);
           historyCommitted = true;
         }
       };
-      const packet = await applyNavigationUrl(url, commitHistory);
+      const packet = await applyNavigationUrl(url, navigationId, commitHistory);
+      assertNavigationActive(navigationId);
       commitHistory();
       return packet;
     } catch (error) {
-      options.onError?.(error, url);
+      if (!isNavigationActive(navigationId)) {
+        return null;
+      }
+      await options.onError?.(error, url);
+      await Promise.resolve();
+      if (!isNavigationActive(navigationId)) {
+        return null;
+      }
       if (navigateOptions.fallbackOnError) {
         fallback(url);
         return null;
@@ -825,16 +920,23 @@ export function createServerPayloadNavigator(
   };
 
   const restore = async (url: URL): Promise<void> => {
+    await Promise.resolve();
+    if (destroyed || destroyRequested) {
+      return;
+    }
+    const navigationId = beginNavigation();
     try {
-      const packet = await applyNavigationUrl(url);
-      if (destroyed) {
-        return;
-      }
+      await applyNavigationUrl(url, navigationId);
+      assertNavigationActive(navigationId);
     } catch (error) {
-      if (destroyed) {
+      if (!isNavigationActive(navigationId)) {
         return;
       }
-      options.onError?.(error, url);
+      await options.onError?.(error, url);
+      await Promise.resolve();
+      if (!isNavigationActive(navigationId)) {
+        return;
+      }
       fallback(url);
     }
   };
@@ -842,6 +944,11 @@ export function createServerPayloadNavigator(
   const handlePopState = (event: PopStateEvent) => {
     const url = restoredNavigationUrl(event.state, navigationWindow);
     if (!url) {
+      globalThis.queueMicrotask(() => {
+        if (!destroyed) {
+          activeNavigationId += 1;
+        }
+      });
       return;
     }
 
@@ -864,18 +971,34 @@ export function createServerPayloadNavigator(
   }
   navigationWindow.addEventListener("popstate", handlePopState);
 
+  destroyNow = () => {
+    if (destroyed) {
+      return;
+    }
+    destroyed = true;
+    destroyRequested = false;
+    activeNavigationId += 1;
+    prefetchedPayloads.clear();
+    eventRoot.removeEventListener("click", handleClick);
+    if (options.prefetch === true) {
+      eventRoot.removeEventListener("pointerover", handlePrefetchIntent);
+      eventRoot.removeEventListener("focusin", handlePrefetchIntent);
+    }
+    navigationWindow.removeEventListener("popstate", handlePopState);
+  };
+
   return {
     prefetch,
     navigate,
     destroy() {
-      destroyed = true;
-      prefetchedPayloads.clear();
-      eventRoot.removeEventListener("click", handleClick);
-      if (options.prefetch === true) {
-        eventRoot.removeEventListener("pointerover", handlePrefetchIntent);
-        eventRoot.removeEventListener("focusin", handlePrefetchIntent);
+      if (destroyed || destroyRequested) {
+        return;
       }
-      navigationWindow.removeEventListener("popstate", handlePopState);
+      if (navigationCommitDepth > 0) {
+        destroyRequested = true;
+        return;
+      }
+      destroyNow();
     },
   };
 }

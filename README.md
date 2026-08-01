@@ -96,6 +96,13 @@ pnpm typecheck
 pnpm test
 ```
 
+Generated route types are replaced atomically as a new file. Ferrite preserves
+portable permission bits and rechecks effective write access before activation,
+but inode-specific ownership, ACLs, extended attributes, and platform security
+descriptors are not part of the generated-file contract. Put durable access
+policy on the output directory or reapply it after generation; do not attach
+user-owned metadata to `.ferrite/types/routes.d.ts`.
+
 Run package verification when changing package or release files:
 
 ```sh

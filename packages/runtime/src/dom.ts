@@ -140,6 +140,9 @@ export function createServerPayloadNavigator(
   let activeNavigation: { id: number; controller: AbortController } | null = null;
   let nextNavigationId = 1;
   let destroyed = false;
+  let destroyRequested = false;
+  let navigationCommitDepth = 0;
+  let destroyNow: () => void;
   seedNavigationHistory(navigationWindow);
 
   const assertActive = (id: number): void => {
@@ -148,8 +151,24 @@ export function createServerPayloadNavigator(
     }
   };
 
+  const beginNavigationCommit = (id: number): void => {
+    assertActive(id);
+    navigationCommitDepth += 1;
+  };
+
+  const finishNavigationCommit = (): void => {
+    navigationCommitDepth -= 1;
+    if (navigationCommitDepth === 0 && destroyRequested) {
+      destroyNow();
+    }
+  };
+
+  const finishNavigationCommitAfterCurrentStack = (): void => {
+    globalThis.queueMicrotask(finishNavigationCommit);
+  };
+
   const prefetch = async (input: string | URL): Promise<ServerPayloadPacket | null> => {
-    assertNavigatorAlive(destroyed);
+    assertNavigatorAlive(destroyed || destroyRequested);
     const url = navigationUrl(input, navigationWindow);
     if (!isSameOriginNavigation(url, navigationWindow)) {
       return null;
@@ -200,9 +219,13 @@ export function createServerPayloadNavigator(
     navigateOptions: ServerPayloadNavigateOptions = {},
     updateHistory = true,
   ): Promise<ServerPayloadPacket | null> => {
-    assertNavigatorAlive(destroyed);
+    assertNavigatorAlive(destroyed || destroyRequested);
     const url = navigationUrl(input, navigationWindow);
     if (!isSameOriginNavigation(url, navigationWindow)) {
+      return null;
+    }
+    await Promise.resolve();
+    if (destroyed || destroyRequested) {
       return null;
     }
 
@@ -218,11 +241,23 @@ export function createServerPayloadNavigator(
     const guardedRoot: RootHandle = {
       update(nextChild) {
         assertActive(id);
-        root.update(nextChild);
+        beginNavigationCommit(id);
+        try {
+          root.update(nextChild);
+          assertActive(id);
+        } finally {
+          finishNavigationCommitAfterCurrentStack();
+        }
       },
       unmount() {
         assertActive(id);
-        root.unmount();
+        beginNavigationCommit(id);
+        try {
+          root.unmount();
+          assertActive(id);
+        } finally {
+          finishNavigationCommitAfterCurrentStack();
+        }
       },
     };
 
@@ -230,9 +265,15 @@ export function createServerPayloadNavigator(
     try {
       const packet = prefetched ? await prefetched.promise : undefined;
       assertActive(id);
+      const bounded = boundedFetch(options.fetch ?? globalThis.fetch, safety, "auto");
       const fetchImpl: ServerPayloadFetch = packet
         ? async () => packetResponse(packet)
-        : boundedFetch(options.fetch ?? globalThis.fetch, safety, "auto");
+        : async (fetchInput, fetchInit) => {
+            assertActive(id);
+            const response = await bounded(fetchInput, fetchInit);
+            assertActive(id);
+            return response;
+          };
       transient = baseCreateServerPayloadNavigator(guardedRoot, {
         window: navigationWindow,
         eventRoot: navigationWindow.document.createDocumentFragment(),
@@ -255,7 +296,11 @@ export function createServerPayloadNavigator(
       if (destroyed || activeNavigation?.id !== id) {
         return null;
       }
-      options.onError?.(error, url);
+      await options.onError?.(error, url);
+      await Promise.resolve();
+      if (destroyed || activeNavigation?.id !== id) {
+        return null;
+      }
       if (navigateOptions.fallbackOnError) {
         fallback(url);
         return null;
@@ -287,9 +332,14 @@ export function createServerPayloadNavigator(
   };
   const handlePopState = (event: PopStateEvent): void => {
     const url = restoredNavigationUrl(event.state, navigationWindow);
-    if (url) {
-      void navigate(url, { replace: true, fallbackOnError: true }, false);
+    if (!url) {
+      globalThis.queueMicrotask(() => {
+        activeNavigation?.controller.abort(abortError("Ferrite navigation was superseded by browser history."));
+        activeNavigation = null;
+      });
+      return;
     }
+    void navigate(url, { replace: true, fallbackOnError: true }, false);
   };
 
   eventRoot.addEventListener("click", handleClick);
@@ -299,26 +349,38 @@ export function createServerPayloadNavigator(
   }
   navigationWindow.addEventListener("popstate", handlePopState);
 
+  destroyNow = () => {
+    if (destroyed) {
+      return;
+    }
+    destroyed = true;
+    destroyRequested = false;
+    activeNavigation?.controller.abort(abortError("Ferrite navigator was destroyed."));
+    activeNavigation = null;
+    for (const entry of cache.values()) {
+      entry.controller.abort(abortError("Ferrite prefetch was cancelled."));
+    }
+    cache.clear();
+    eventRoot.removeEventListener("click", handleClick);
+    if (options.prefetch === true) {
+      eventRoot.removeEventListener("pointerover", handleIntent);
+      eventRoot.removeEventListener("focusin", handleIntent);
+    }
+    navigationWindow.removeEventListener("popstate", handlePopState);
+  };
+
   return {
     prefetch,
     navigate,
     destroy() {
-      if (destroyed) {
+      if (destroyed || destroyRequested) {
         return;
       }
-      destroyed = true;
-      activeNavigation?.controller.abort(abortError("Ferrite navigator was destroyed."));
-      activeNavigation = null;
-      for (const entry of cache.values()) {
-        entry.controller.abort(abortError("Ferrite prefetch was cancelled."));
+      if (navigationCommitDepth > 0) {
+        destroyRequested = true;
+        return;
       }
-      cache.clear();
-      eventRoot.removeEventListener("click", handleClick);
-      if (options.prefetch === true) {
-        eventRoot.removeEventListener("pointerover", handleIntent);
-        eventRoot.removeEventListener("focusin", handleIntent);
-      }
-      navigationWindow.removeEventListener("popstate", handlePopState);
+      destroyNow();
     },
   };
 }

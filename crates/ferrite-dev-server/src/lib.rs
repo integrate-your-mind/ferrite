@@ -417,14 +417,20 @@ fn prometheus_label_value(value: &str) -> String {
 #[derive(Debug)]
 struct ProductionReplayNonces {
     ttl: Duration,
+    capacity: usize,
     entries: BTreeMap<String, Instant>,
     issuance_order: VecDeque<String>,
 }
 
 impl ProductionReplayNonces {
     fn new(ttl: Duration) -> Self {
+        Self::with_capacity(ttl, MAX_PRODUCTION_REPLAY_NONCES)
+    }
+
+    fn with_capacity(ttl: Duration, capacity: usize) -> Self {
         Self {
             ttl,
+            capacity,
             entries: BTreeMap::new(),
             issuance_order: VecDeque::new(),
         }
@@ -432,6 +438,9 @@ impl ProductionReplayNonces {
 
     fn issue(&mut self) -> std::result::Result<String, Box<DevResponse>> {
         self.prune_expired(Instant::now());
+        if self.entries.len() >= self.capacity {
+            return Err(Box::new(DevResponse::service_unavailable()));
+        }
         let nonce = generate_server_action_replay_nonce().map_err(|error| {
             Box::new(
                 DevResponse::internal_error(format!(
@@ -440,14 +449,6 @@ impl ProductionReplayNonces {
                 .with_cache_control("no-store"),
             )
         })?;
-        while self.entries.len() >= MAX_PRODUCTION_REPLAY_NONCES {
-            let Some(oldest) = self.issuance_order.pop_front() else {
-                break;
-            };
-            if self.entries.remove(&oldest).is_some() {
-                break;
-            }
-        }
         self.entries
             .insert(nonce.clone(), Instant::now() + self.ttl);
         self.issuance_order.push_back(nonce.clone());
@@ -7164,17 +7165,20 @@ process.exit(1);
     fn production_replay_nonce_store_stays_bounded() {
         let mut replay_nonces = ProductionReplayNonces::new(Duration::from_secs(30));
         let first = replay_nonces.issue().unwrap();
-        let mut newest = String::new();
-        for _ in 0..4_096 {
-            newest = replay_nonces.issue().unwrap();
+        for _ in 1..MAX_PRODUCTION_REPLAY_NONCES {
+            replay_nonces.issue().unwrap();
         }
 
-        assert!(
-            replay_nonces.entries.len() <= MAX_PRODUCTION_REPLAY_NONCES,
-            "replay nonce storage must not grow without a hard bound"
+        let overflow = replay_nonces.issue().unwrap_err();
+        assert_eq!(overflow.status, 503);
+        assert_eq!(overflow.cache_control, Some("no-store"));
+        assert_eq!(replay_nonces.entries.len(), MAX_PRODUCTION_REPLAY_NONCES);
+        assert_eq!(
+            replay_nonces.issuance_order.len(),
+            MAX_PRODUCTION_REPLAY_NONCES
         );
-        assert!(!replay_nonces.consume(&first));
-        assert!(replay_nonces.consume(&newest));
+        assert!(replay_nonces.consume(&first));
+        assert!(replay_nonces.issue().is_ok());
     }
 
     #[test]
@@ -7200,6 +7204,51 @@ process.exit(1);
                 .entries
                 .is_empty(),
             "unmatched requests must not allocate replay state"
+        );
+    }
+
+    #[test]
+    fn production_route_nonce_saturation_preserves_earlier_live_nonces() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        write(&app.join("page.tsx"), "export default function Page() {}");
+        let config = production_project_for(&app)
+            .config
+            .with_server_action_replay_ttl(Duration::from_secs(30));
+        let project = ProductionProject::new(config);
+        project
+            .replay_nonces
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .capacity = 2;
+
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+        let first = project
+            .replay_nonces
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .issuance_order
+            .front()
+            .cloned()
+            .unwrap();
+        assert_eq!(project.handle_get("/").unwrap().status, 200);
+
+        let saturated = project.handle_get("/").unwrap();
+        assert_eq!(saturated.status, 503);
+        assert_eq!(saturated.cache_control, Some("no-store"));
+        assert!(
+            project
+                .replay_nonces
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .consume(&first),
+            "caller-controlled route requests must not evict an earlier live nonce"
         );
     }
 

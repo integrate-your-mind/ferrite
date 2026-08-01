@@ -11,7 +11,7 @@ import {
   mount,
 } from "../dist/dom.js";
 
-function documentPayload(route, text) {
+function documentPayload(route, text, routeChildren = []) {
   return {
     ferrite: "server-payload",
     version: 1,
@@ -21,7 +21,12 @@ function documentPayload(route, text) {
       {},
       [
         [2, "head", {}, [[2, "title", {}, [[0, text]]]]],
-        [2, "body", {}, [[2, "div", { id: "ferrite-root", "data-route": route }, [[2, "h1", {}, [[0, text]]]]]]],
+        [
+          2,
+          "body",
+          {},
+          [[2, "div", { id: "ferrite-root", "data-route": route }, [[2, "h1", {}, [[0, text]]], ...routeChildren]]],
+        ],
       ],
     ],
     clientReferences: [],
@@ -37,6 +42,28 @@ function jsonResponse(packet) {
     headers: new Headers({ "content-type": "application/json" }),
     body: null,
     json: async () => packet,
+  };
+}
+
+function streamResponse(packet) {
+  const frame = {
+    ferrite: "server-payload-frame",
+    version: 1,
+    kind: "shell",
+    shell: packet.shell,
+    clientReferences: packet.clientReferences,
+  };
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers(),
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`${JSON.stringify(frame)}\n`));
+        controller.close();
+      },
+    }),
   };
 }
 
@@ -73,6 +100,189 @@ test("a slower older navigation cannot replace a newer route", async () => {
   assert.equal(await slow, null);
   assert.equal(container.querySelector("h1")?.textContent, "Fast");
   assert.equal(window.location.pathname, "/fast");
+  navigator.destroy();
+});
+
+test("reentrant navigation cannot split an older body from its head and history", async () => {
+  const window = new Window({ url: "https://example.com/start" });
+  window.document.title = "Start";
+  const container = window.document.createElement("div");
+  window.document.body.append(container);
+  const root = mount(createElement("div", { id: "ferrite-root" }, createElement("h1", null, "Start")), container);
+  let navigator;
+  let replacement;
+
+  class NavigationTrigger extends window.HTMLElement {
+    connectedCallback() {
+      if (!replacement) {
+        replacement = navigator.navigate("/new");
+        void replacement.catch(() => undefined);
+      }
+    }
+  }
+  window.customElements.define("ferrite-navigation-trigger", NavigationTrigger);
+
+  const fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/new") {
+      throw new Error("replacement failed");
+    }
+    return jsonResponse(
+      documentPayload("/old", "Old", [[2, "ferrite-navigation-trigger", {}, []]]),
+    );
+  };
+  navigator = createServerPayloadNavigator(root, { window, fetch });
+
+  const old = await navigator.navigate("/old");
+  assert.ok(replacement, "the mounted custom element must trigger the replacement navigation");
+  await assert.rejects(replacement, /replacement failed/);
+
+  assert.equal(old, null);
+  assert.equal(container.querySelector("h1")?.textContent, "Old");
+  assert.equal(window.location.pathname, "/old");
+  assert.equal(window.document.title, "Old");
+  navigator.destroy();
+});
+
+test("destroy during a mounted route waits for its body, head, and history commit", async () => {
+  const window = new Window({ url: "https://example.com/start" });
+  window.document.title = "Start";
+  const container = window.document.createElement("div");
+  window.document.body.append(container);
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  let navigator;
+
+  class DestroyTrigger extends window.HTMLElement {
+    connectedCallback() {
+      navigator.destroy();
+    }
+  }
+  window.customElements.define("ferrite-destroy-trigger", DestroyTrigger);
+
+  navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => jsonResponse(
+      documentPayload("/old", "Old", [[2, "ferrite-destroy-trigger", {}, []]]),
+    ),
+  });
+
+  assert.equal(await navigator.navigate("/old"), null);
+  assert.equal(container.querySelector("h1")?.textContent, "Old");
+  assert.equal(window.document.title, "Old");
+  assert.equal(window.location.pathname, "/old");
+  await assert.rejects(navigator.navigate("/after-destroy"), /destroyed/);
+});
+
+test("an onError recovery navigation suppresses the failed route fallback", async () => {
+  const window = new Window({ url: "https://example.com/start" });
+  const container = window.document.createElement("div");
+  window.document.body.append(container);
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  const fallbackUrls = [];
+  let navigator;
+  let recovery;
+  navigator = createServerPayloadNavigator(root, {
+    window,
+    fallback: (url) => fallbackUrls.push(url.href),
+    async onError(_error, url) {
+      if (url.pathname === "/bad") {
+        await Promise.resolve();
+        recovery = navigator.navigate("/recovery");
+        void recovery.catch(() => undefined);
+      }
+    },
+    fetch: async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/bad") {
+        throw new Error("bad route failed");
+      }
+      return jsonResponse(documentPayload("/recovery", "Recovered"));
+    },
+  });
+
+  assert.equal(await navigator.navigate("/bad", { fallbackOnError: true }), null);
+  assert.ok(recovery, "onError must start the recovery navigation");
+  await recovery;
+
+  assert.deepEqual(fallbackUrls, []);
+  assert.equal(container.querySelector("h1")?.textContent, "Recovered");
+  assert.equal(window.document.title, "Recovered");
+  assert.equal(window.location.pathname, "/recovery");
+  navigator.destroy();
+});
+
+test("a superseded stream cannot issue its obsolete JSON fallback request", async () => {
+  const window = new Window({ url: "https://example.com/start" });
+  const container = window.document.createElement("div");
+  window.document.body.append(container);
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  const requests = [];
+  let slowController;
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    stream: true,
+    fetch: async (input) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.includes("/slow?") && url.includes("__ferrite_payload=stream")) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: new Headers(),
+          body: new ReadableStream({
+            start(controller) {
+              slowController = controller;
+            },
+          }),
+        };
+      }
+      if (url.includes("/slow?")) {
+        return jsonResponse(documentPayload("/slow", "Obsolete"));
+      }
+      return streamResponse(documentPayload("/fast", "Fast"));
+    },
+  });
+
+  const slow = navigator.navigate("/slow");
+  await waitFor(() => Boolean(slowController));
+  await navigator.navigate("/fast");
+  slowController.close();
+
+  assert.equal(await slow, null);
+  assert.equal(
+    requests.filter((request) => request.includes("/slow?")).length,
+    1,
+    "the stale stream must not retry as a JSON payload",
+  );
+  assert.equal(container.querySelector("h1")?.textContent, "Fast");
+  assert.equal(window.location.pathname, "/fast");
+  navigator.destroy();
+});
+
+test("a non-Ferrite popstate invalidates an in-flight navigation", async () => {
+  const window = new Window({ url: "https://example.com/start" });
+  const container = window.document.createElement("div");
+  window.document.body.append(container);
+  const root = mount(createElement("div", { id: "ferrite-root" }, "Start"), container);
+  let resolvePending;
+  const navigator = createServerPayloadNavigator(root, {
+    window,
+    fetch: async () => new Promise((resolve) => {
+      resolvePending = resolve;
+    }),
+  });
+
+  const pending = navigator.navigate("/pending");
+  await waitFor(() => Boolean(resolvePending));
+  window.history.pushState({ external: true }, "", "/external");
+  window.dispatchEvent(new window.PopStateEvent("popstate", { state: { external: true } }));
+  await Promise.resolve();
+  resolvePending(jsonResponse(documentPayload("/pending", "Pending")));
+
+  assert.equal(await pending, null);
+  assert.equal(window.location.pathname, "/external");
+  assert.equal(container.textContent, "Start");
   navigator.destroy();
 });
 
@@ -541,6 +751,25 @@ test("destroy aborts an active navigation", async () => {
   assert.equal(signal.aborted, true);
   resolveRequest(jsonResponse(documentPayload("/slow", "Slow")));
   assert.equal(await navigation, null);
+});
+
+test("destroy cancels a navigation before deferred ownership without fetching", async () => {
+  const window = new Window({ url: "https://example.test/" });
+  let fetchCalls = 0;
+  const navigator = createServerPayloadNavigator({ update() {}, unmount() {} }, {
+    window,
+    fetch: async () => {
+      fetchCalls += 1;
+      return jsonResponse(documentPayload("/never", "Never"));
+    },
+  });
+
+  const navigation = navigator.navigate("/never");
+  navigator.destroy();
+
+  assert.equal(await navigation, null);
+  assert.equal(fetchCalls, 0);
+  await assert.rejects(navigator.navigate("/after-destroy"), /destroyed/);
 });
 
 function delayedReadableStream(chunks, onCancel = () => undefined) {
