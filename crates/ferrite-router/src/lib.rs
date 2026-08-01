@@ -552,6 +552,7 @@ mod tests {
     fn rejects_static_routes_that_cannot_reach_the_http_matcher() {
         let cases = [
             "hello world",
+            "abc%20 ",
             "check-✓",
             "%",
             "%2",
@@ -581,6 +582,8 @@ mod tests {
         write_page(&app, "%20");
         write_page(&app, "%68ello");
         write_page(&app, "double-%252F");
+        write_page(&app, "lower-%6a");
+        write_page(&app, "upper-%4A");
 
         let routes = scan_app_dir(&app).unwrap();
         assert_eq!(
@@ -588,7 +591,13 @@ mod tests {
                 .iter()
                 .map(|route| route.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/%20", "/%68ello", "/double-%252F"]
+            vec![
+                "/%20",
+                "/%68ello",
+                "/double-%252F",
+                "/lower-%6a",
+                "/upper-%4A"
+            ]
         );
     }
 
@@ -667,12 +676,14 @@ mod tests {
         let missing = temp.path().join("missing.d.ts");
         let generated = temp.path().join("generated.d.ts");
         let foreign = temp.path().join("foreign.d.ts");
+        let directory = temp.path().join("directory.d.ts");
         fs::write(
             &generated,
             format!("{GENERATED_ROUTE_TYPES_HEADER}\nstable\n"),
         )
         .unwrap();
         fs::write(&foreign, "export type UserSource = true;\n").unwrap();
+        fs::create_dir(&directory).unwrap();
 
         validate_route_types_output(&missing).unwrap();
         validate_route_types_output(&generated).unwrap();
@@ -682,6 +693,25 @@ mod tests {
                 .to_string()
                 .contains("non-generated route types output")
         );
+        let error = validate_route_types_output(&directory).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("non-generated route types output")
+        );
+    }
+
+    #[test]
+    fn route_types_output_validation_preserves_metadata_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("x".repeat(1024));
+
+        let error = validate_route_types_output(&output).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RouterError::Io(ref source) if source.kind() != io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
@@ -724,6 +754,43 @@ mod tests {
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
 
         write_route_types(&[], &output).unwrap();
+        assert!(
+            fs::read_to_string(output)
+                .unwrap()
+                .contains("export type RoutePath = never;")
+        );
+    }
+
+    #[test]
+    fn route_type_generation_stages_next_to_the_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("routes.d.ts");
+
+        write_route_types_with(
+            &[],
+            &output,
+            |file, contents| {
+                file.write_all(contents)?;
+                file.flush()
+            },
+            |path| {
+                let parent = path.parent().expect("output must have a parent");
+                let staged_entries = fs::read_dir(parent)?
+                    .filter_map(std::result::Result::ok)
+                    .filter(|entry| entry.path() != path)
+                    .count();
+                if staged_entries == 1 {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "expected one staged sibling, found {staged_entries}"
+                    )))
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
         assert!(
             fs::read_to_string(output)
                 .unwrap()
