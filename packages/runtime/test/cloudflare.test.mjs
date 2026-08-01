@@ -863,6 +863,39 @@ test("fails closed for malformed, unsupported, aborted, and unavailable fallback
     }
   }
 
+  for (const contentType of [
+    "text/html; charset=iso-8859-1",
+    "text/html; charset=utf-8; charset=utf-8",
+    "text/html; profile=private",
+  ]) {
+    const rejected = await handler.fetch(
+      new Request("https://example.test/docs", {
+        headers: { Accept: "text/html;charset=utf-8;q=1, */*;q=0" },
+      }),
+      assets([], new Response(DEFAULT_FALLBACK_BODY, {
+        status: 200,
+        headers: { "Content-Type": contentType },
+      })),
+    );
+    assert.equal(rejected.status, 500, contentType);
+    assert.equal(await rejected.text(), "Internal server error", contentType);
+  }
+
+  for (const contentType of ["text/html", 'text/html; charset="UTF-8"']) {
+    const accepted = await handler.fetch(
+      new Request("https://example.test/docs", {
+        headers: { Accept: "text/html;charset=utf-8;q=1, */*;q=0" },
+      }),
+      assets([], new Response(DEFAULT_FALLBACK_BODY, {
+        status: 200,
+        headers: { "Content-Type": contentType },
+      })),
+    );
+    assert.equal(accepted.status, 200, contentType);
+    assert.equal(accepted.headers.get("content-type"), "text/html; charset=utf-8", contentType);
+    assert.equal(await accepted.text(), DEFAULT_FALLBACK_BODY, contentType);
+  }
+
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(

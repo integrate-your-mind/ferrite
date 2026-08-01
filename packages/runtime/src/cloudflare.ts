@@ -826,12 +826,8 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
       request.signal,
       deadline,
     );
-    const mediaType = response.headers
-      .get("content-type")
-      ?.split(";", 1)[0]
-      ?.trim()
-      .toLowerCase();
-    if (response.status !== 200 || mediaType !== "text/html") {
+    if (response.status !== 200 ||
+        !isUtf8HtmlContentType(response.headers.get("content-type"))) {
       return errorResponse(
         failureStatus,
         failureStatus === 504 ? "Gateway timeout" : "Internal server error",
@@ -859,15 +855,17 @@ async function fetchFallback<Env extends CloudflareSsrEnv>(
         `Ferrite Cloudflare fallback "${fallbackFile.path}" does not match its asset manifest identity.`,
       );
     }
+    const fallbackHeaders = responseHeaders("no-cache", {
+      ...Object.fromEntries(response.headers),
+      "X-Ferrite-Render": "static-fallback",
+    });
+    fallbackHeaders.set("Content-Type", "text/html; charset=utf-8");
     return new Response(
       request.method === "HEAD" ? null : body,
       {
         status: response.status,
         statusText: response.statusText,
-        headers: responseHeaders("no-cache", {
-          ...Object.fromEntries(response.headers),
-          "X-Ferrite-Render": "static-fallback",
-        }),
+        headers: fallbackHeaders,
       },
     );
   } catch (error) {
@@ -1034,6 +1032,31 @@ function acceptsHtml(accept: string | null): boolean {
     }
   }
   return bestMediaSpecificity >= 0 && bestQuality > 0;
+}
+
+function isUtf8HtmlContentType(contentType: string | null): boolean {
+  if (!contentType) {
+    return false;
+  }
+  const [rawMediaType, ...parameters] = contentType.split(";");
+  if (rawMediaType?.trim().toLowerCase() !== "text/html") {
+    return false;
+  }
+  let charsetSeen = false;
+  for (const rawParameter of parameters) {
+    const separator = rawParameter.indexOf("=");
+    if (separator < 0) {
+      return false;
+    }
+    const name = rawParameter.slice(0, separator).trim().toLowerCase();
+    const value = parseMediaParameterValue(rawParameter.slice(separator + 1).trim());
+    if (!MEDIA_PARAMETER_TOKEN.test(name) || value === null ||
+        name !== "charset" || charsetSeen || !htmlMediaParameterMatches(name, value)) {
+      return false;
+    }
+    charsetSeen = true;
+  }
+  return true;
 }
 
 function parseMediaParameterValue(value: string): string | null {
