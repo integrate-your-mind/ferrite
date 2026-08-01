@@ -23,6 +23,7 @@ const DEFAULT_RESPONSE_DEADLINE_MS = 1_000;
 const MAX_ASSET_MANIFEST_BYTES = 64 * 1024;
 const SERVER_ACTION_URL = "/_ferrite/action";
 const SERVER_ACTION_ID_FIELD = "__ferrite_action";
+const MEDIA_PARAMETER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
 export type CloudflareAssetsBinding = {
   fetch(request: Request): Promise<Response>;
@@ -966,36 +967,104 @@ function acceptsHtml(accept: string | null): boolean {
   if (!accept || accept.trim() === "") {
     return true;
   }
-  let bestSpecificity = -1;
+  let bestMediaSpecificity = -1;
+  let bestParameterSpecificity = -1;
   let bestQuality = 0;
   for (const value of accept.split(",")) {
     const [rawMediaType, ...parameters] = value.split(";");
     const mediaType = rawMediaType?.trim().toLowerCase();
-    const specificity = mediaType === "text/html"
+    const mediaSpecificity = mediaType === "text/html"
       ? 2
       : mediaType === "text/*"
         ? 1
         : mediaType === "*/*"
           ? 0
           : -1;
-    if (specificity < 0) {
+    if (mediaSpecificity < 0) {
       continue;
     }
-    const qualityParameters = parameters
-      .map((parameter) => parameter.trim().match(/^q=(.*)$/i)?.[1])
-      .filter((quality) => quality !== undefined);
-    const qualityText = qualityParameters.length === 0 ? "1" : qualityParameters[0];
-    const quality = qualityParameters.length <= 1 && /^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/.test(qualityText)
-      ? Number(qualityText)
-      : 0;
-    if (specificity > bestSpecificity) {
-      bestSpecificity = specificity;
+    let quality = 1;
+    let qualitySeen = false;
+    let rangeMatches = true;
+    let parameterSpecificity = 0;
+    const matchedParameterNames = new Set<string>();
+    for (const rawParameter of parameters) {
+      const separator = rawParameter.indexOf("=");
+      const name = (separator < 0 ? rawParameter : rawParameter.slice(0, separator))
+        .trim()
+        .toLowerCase();
+      const rawParameterValue = separator < 0 ? null : rawParameter.slice(separator + 1).trim();
+      if (name === "q") {
+        if (qualitySeen || rawParameterValue === null ||
+            !/^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/.test(rawParameterValue)) {
+          quality = 0;
+        } else {
+          quality = Number(rawParameterValue);
+        }
+        qualitySeen = true;
+        continue;
+      }
+      if (qualitySeen) {
+        continue;
+      }
+      const parameterValue = rawParameterValue === null
+        ? null
+        : parseMediaParameterValue(rawParameterValue);
+      if (!MEDIA_PARAMETER_TOKEN.test(name) || parameterValue === null ||
+          matchedParameterNames.has(name) ||
+          !htmlMediaParameterMatches(name, parameterValue)) {
+        rangeMatches = false;
+        continue;
+      }
+      matchedParameterNames.add(name);
+      parameterSpecificity += 1;
+    }
+    if (!rangeMatches) {
+      continue;
+    }
+    if (mediaSpecificity > bestMediaSpecificity ||
+        (mediaSpecificity === bestMediaSpecificity &&
+          parameterSpecificity > bestParameterSpecificity)) {
+      bestMediaSpecificity = mediaSpecificity;
+      bestParameterSpecificity = parameterSpecificity;
       bestQuality = quality;
-    } else if (specificity === bestSpecificity) {
+    } else if (mediaSpecificity === bestMediaSpecificity &&
+        parameterSpecificity === bestParameterSpecificity) {
       bestQuality = Math.max(bestQuality, quality);
     }
   }
-  return bestSpecificity >= 0 && bestQuality > 0;
+  return bestMediaSpecificity >= 0 && bestQuality > 0;
+}
+
+function parseMediaParameterValue(value: string): string | null {
+  if (MEDIA_PARAMETER_TOKEN.test(value)) {
+    return value;
+  }
+  if (value.length < 2 || value[0] !== '"' || value[value.length - 1] !== '"') {
+    return null;
+  }
+  let decoded = "";
+  for (let index = 1; index < value.length - 1; index += 1) {
+    const character = value[index];
+    if (character === "\\") {
+      index += 1;
+      if (index >= value.length - 1) {
+        return null;
+      }
+      decoded += value[index];
+      continue;
+    }
+    const code = character.charCodeAt(0);
+    if (character === '"' || code === 0x7f || (code < 0x20 && code !== 0x09)) {
+      return null;
+    }
+    decoded += character;
+  }
+  return decoded;
+}
+
+function htmlMediaParameterMatches(name: string, value: string): boolean {
+  return name === "charset" && value.toLowerCase() === "utf-8";
 }
 
 function positiveLimit(value: number | undefined, fallback: number, label: string): number {

@@ -952,6 +952,13 @@ test("resolves HTML Accept ranges by specificity and quality", async () => {
     ["text/html;q=0, */*;q=1", 406],
     ["text/html;q=0, text/*;q=1", 406],
     ["text/html;q=bogus, */*;q=1", 406],
+    ["text/html;level=1;q=0, */*;q=1", 200],
+    ["text/html;level=1;q=1, */*;q=0", 406],
+    ["text/html;charset=utf-8;q=0, */*;q=1", 406],
+    ["text/html;q=0.5, text/html;charset=UTF-8;q=0", 406],
+    ["text/html;charset=\"utf-8\";q=0.5, */*;q=0", 200],
+    ["text/html;charset=iso-8859-1;q=1, */*;q=0", 406],
+    ["text/html;q=1;ext=accepted, */*;q=0", 200],
   ]) {
     const response = await worker.fetch(
       new Request("https://example.test/docs", { headers: { Accept: accept } }),
