@@ -46,6 +46,7 @@ const commandTimeoutMs = 120_000;
 const workerName = "ferrite-cloudflare-request-ssr-proof";
 const workspaceProofOutputPaths = Object.freeze([
   ".ferrite",
+  "packages/protocol/dist",
   "packages/protocol-wasm/dist",
   "packages/runtime/dist",
   "target",
@@ -57,10 +58,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 
 async function verifyCloudflareWorker() {
-  // Cargo can initialize a missing target directory through a temporary sibling.
-  // Establish the declared output root before source monitoring so build output
-  // never appears in an untrusted workspace namespace.
-  await mkdir(join(workspaceRoot, "target"), { recursive: true });
+  // Compilers can initialize missing output directories through temporary
+  // siblings. Establish every declared output root before source monitoring so
+  // build output never appears in an untrusted workspace namespace.
+  await Promise.all(
+    workspaceProofOutputPaths.map((path) =>
+      mkdir(join(workspaceRoot, path), { recursive: true })
+    ),
+  );
   const committedSource = await committedSourceContract();
   const trackedPaths = committedSource.records.map(({ path }) => path);
   const sourceMonitor = await startTrackedSourceMonitor(trackedPaths, workspaceRoot, {
