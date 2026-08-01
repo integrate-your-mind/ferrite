@@ -1,13 +1,26 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { platform } from "node:process";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { createServerActionRequest, validateServerActionResponse } from "../dist/index.js";
@@ -17,6 +30,8 @@ const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..
 const buildClientScript = join(workspaceRoot, "packages/runtime/bin/build-client.mjs");
 const renderPageScript = join(workspaceRoot, "packages/runtime/bin/render-page.mjs");
 const runtimePackage = join(workspaceRoot, "packages/runtime");
+const protocolPackage = join(workspaceRoot, "packages/protocol");
+const CLOUDFLARE_BUILD_ID = `sha256:${"a".repeat(64)}`;
 
 async function withTempProject(run) {
   const projectRoot = await mkdtemp(join(tmpdir(), "ferrite-render-page-"));
@@ -36,6 +51,33 @@ async function linkRuntimePackage(projectRoot) {
   const scopeDir = join(projectRoot, "node_modules/@ferrite");
   await mkdir(scopeDir, { recursive: true });
   await symlink(runtimePackage, join(scopeDir, "runtime"), platform === "win32" ? "junction" : "dir");
+}
+
+async function installCopiedRuntime(projectRoot, { nestedProtocol = false } = {}) {
+  const scope = join(projectRoot, "node_modules/@ferrite");
+  const installedRuntime = join(scope, "runtime");
+  const installedProtocol = nestedProtocol
+    ? join(installedRuntime, "node_modules/@ferrite/protocol")
+    : join(scope, "protocol");
+  const installedScript = join(installedRuntime, "bin/render-page.mjs");
+  await Promise.all([
+    mkdir(dirname(installedScript), { recursive: true }),
+    mkdir(installedProtocol, { recursive: true }),
+    mkdir(join(projectRoot, "node_modules"), { recursive: true }),
+  ]);
+  await Promise.all([
+    copyFile(join(runtimePackage, "package.json"), join(installedRuntime, "package.json")),
+    copyFile(renderPageScript, installedScript),
+    cp(join(runtimePackage, "dist"), join(installedRuntime, "dist"), { recursive: true }),
+    copyFile(join(protocolPackage, "package.json"), join(installedProtocol, "package.json")),
+    cp(join(protocolPackage, "dist"), join(installedProtocol, "dist"), { recursive: true }),
+    symlink(
+      join(workspaceRoot, "node_modules/esbuild"),
+      join(projectRoot, "node_modules/esbuild"),
+      platform === "win32" ? "junction" : "dir",
+    ),
+  ]);
+  return installedScript;
 }
 
 async function renderPage(projectRoot, pageFile, props = {}) {
@@ -79,6 +121,39 @@ async function renderPageActionManifest(projectRoot, pageFile, props = {}) {
     },
   );
   return JSON.parse(stdout);
+}
+
+async function buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+  layouts = [],
+  document = null,
+  conventions = {},
+  routePattern = "/",
+  script = renderPageScript,
+  cloudflareMetadata = {
+    assetBuildId: CLOUDFLARE_BUILD_ID,
+    fallbackPath: "/index.html",
+    observedActions: [],
+  },
+} = {}) {
+  await execFileAsync(
+    "node",
+    [
+      script,
+      "--build-cloudflare-artifact",
+      pageFile,
+      outputFile,
+      JSON.stringify(layouts),
+      JSON.stringify(document),
+      JSON.stringify(conventions),
+      routePattern,
+      JSON.stringify(cloudflareMetadata),
+    ],
+    {
+      cwd: projectRoot,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  return JSON.parse(await readFile(`${outputFile}.receipt.json`, "utf8"));
 }
 
 async function buildClient(projectRoot, pageFile) {
@@ -211,6 +286,458 @@ test("build-client reports deterministic module-graph cycles and unresolved impo
     } finally {
       await rm(outsideFile, { force: true });
     }
+  });
+});
+
+test("build-cloudflare-artifact emits an isolate-targeted route module with only the runtime async context external", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        "let renders = 0;",
+        "export default function Page() {",
+        "  renders += 1;",
+        "  return <main data-render={renders}>Ferrite & Workers</main>;",
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    const receipt = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    const source = await readFile(outputFile, "utf8");
+    assert.match(source, /node:async_hooks/);
+    assert.doesNotMatch(source, /node:(?:child_process|fs|http|path)/);
+    assert.equal(receipt.module.sha256, sha256(source).slice("sha256:".length));
+    assert.match(receipt.sourceBuildId, /^sha256:[a-f0-9]{64}$/);
+    assert.match(receipt.metadataBuildId, /^sha256:[a-f0-9]{64}$/);
+    assert.match(receipt.moduleBuildId, /^sha256:[a-f0-9]{64}$/);
+    assert.deepEqual(
+      {
+        minifyIdentifiers: receipt.compiler.minifyIdentifiers,
+        minifySyntax: receipt.compiler.minifySyntax,
+        minifyWhitespace: receipt.compiler.minifyWhitespace,
+      },
+      {
+        minifyIdentifiers: false,
+        minifySyntax: true,
+        minifyWhitespace: true,
+      },
+    );
+    assert.ok(
+      receipt.inputs.some(({ path }) => path === "@ferrite/protocol/dist/index.js"),
+      "The source receipt must bind the exact Ferrite protocol bytes bundled into the route.",
+    );
+
+    const route = await import(`${pathToFileURL(outputFile).href}?test=${Date.now()}`);
+    assert.equal(route.routePattern, "/");
+    assert.deepEqual(route.cloudflare, {
+      format: "ferrite-cloudflare-route",
+      version: 2,
+      sourceBuildId: receipt.sourceBuildId,
+      metadataBuildId: receipt.metadataBuildId,
+      moduleBuildId: receipt.moduleBuildId,
+      assetBuildId: CLOUDFLARE_BUILD_ID,
+      path: "/",
+      fallbackPath: "/index.html",
+      observedActions: [],
+    });
+    const first = await route.serverRuntime.renderPageModuleToPacket(
+      route.pageModule,
+      {},
+      route.layoutModules,
+      route.conventionModules,
+      { routePath: "/", routePattern: "/" },
+    );
+    const second = await route.serverRuntime.renderPageModuleToPacket(
+      route.pageModule,
+      {},
+      route.layoutModules,
+      route.conventionModules,
+      { routePath: "/", routePattern: "/" },
+    );
+    assert.equal(first.root[2]["data-render"], 1);
+    assert.equal(second.root[2]["data-render"], 2);
+  });
+});
+
+test("build-cloudflare-artifact rejects project paths that spoof the runtime async-context importer", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const spoofedRuntime = join(projectRoot, "packages/runtime/src/server.ts");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await mkdir(dirname(spoofedRuntime), { recursive: true });
+    await writeFile(
+      spoofedRuntime,
+      [
+        `import { AsyncLocalStorage } from "node:async_hooks";`,
+        "export const spoofedRuntimeContext = new AsyncLocalStorage();",
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      pageFile,
+      [
+        `import { spoofedRuntimeContext } from "../packages/runtime/src/server";`,
+        "export default function Page() {",
+        "  return <main>{String(Boolean(spoofedRuntimeContext))}</main>;",
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile),
+      /cannot import Node builtin "node:async_hooks"/,
+    );
+    await assert.rejects(readFile(outputFile), { code: "ENOENT" });
+    await assert.rejects(readFile(`${outputFile}.receipt.json`), { code: "ENOENT" });
+  });
+});
+
+test("build-cloudflare-artifact verifies copied Ferrite packages inside project node_modules", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-installed-"));
+  try {
+    const installedScript = await installCopiedRuntime(projectRoot);
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(projectRoot, "package.json"),
+        JSON.stringify({ private: true, type: "module" }, null, 2),
+      ),
+      writeFile(
+        pageFile,
+        "export default function Page() { return <main>Installed edge route</main>; }\n",
+      ),
+    ]);
+
+    const receipt = await buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+      script: installedScript,
+    });
+    assert.ok(receipt.inputs.some(({ path }) => path.startsWith("@ferrite/runtime/dist/")));
+    assert.ok(receipt.inputs.some(({ path }) => path === "@ferrite/protocol/dist/index.js"));
+    assert.equal(
+      receipt.inputs.some(({ path }) => path.includes("node_modules")),
+      false,
+      "Published package inputs must use stable Ferrite namespaces instead of install paths.",
+    );
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("build-cloudflare-artifact selects the deepest verified nested package root", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "ferrite-cloudflare-nested-"));
+  try {
+    const installedScript = await installCopiedRuntime(projectRoot, {
+      nestedProtocol: true,
+    });
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(projectRoot, "package.json"),
+        JSON.stringify({ private: true, type: "module" }, null, 2),
+      ),
+      writeFile(
+        pageFile,
+        "export default function Page() { return <main>Nested dependency route</main>; }\n",
+      ),
+    ]);
+
+    const receipt = await buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+      script: installedScript,
+    });
+    assert.ok(receipt.inputs.some(({ path }) => path.startsWith("@ferrite/runtime/dist/")));
+    assert.ok(receipt.inputs.some(({ path }) => path === "@ferrite/protocol/dist/index.js"));
+    assert.equal(
+      receipt.inputs.some(({ path }) =>
+        path.startsWith("@ferrite/runtime/node_modules/")
+      ),
+      false,
+    );
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("build-cloudflare-artifact derives stable receipts and rejects stale or tampered inputs", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const sharedFile = join(projectRoot, "app/shared.ts");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      'import { label } from "./shared"; export default function Page() { return <main>{label}</main>; }\n',
+    );
+    await writeFile(sharedFile, 'export const label = "one";\n');
+
+    const first = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    const firstModule = await readFile(outputFile);
+    const second = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    assert.deepEqual(second, first);
+    assert.deepEqual(await readFile(outputFile), firstModule);
+
+    await writeFile(sharedFile, 'export const label = "two";\n');
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+        cloudflareMetadata: {
+          sourceBuildId: first.sourceBuildId,
+          assetBuildId: CLOUDFLARE_BUILD_ID,
+          fallbackPath: "/index.html",
+          observedActions: [],
+        },
+      }),
+      /sourceBuildId is stale/,
+    );
+    const changed = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    assert.notEqual(changed.sourceBuildId, first.sourceBuildId);
+    assert.notEqual(changed.moduleBuildId, first.moduleBuildId);
+    assert.notEqual(changed.module.sha256, first.module.sha256);
+
+    const changedModule = await readFile(outputFile);
+    const receiptPath = `${outputFile}.receipt.json`;
+    const changedReceiptSource = await readFile(receiptPath, "utf8");
+    const changedReceipt = JSON.parse(changedReceiptSource);
+    for (const invalidPath of [
+      "@ferrite/protocol/src/index.ts",
+      "@ferrite/protocol/dist/../src/index.ts",
+      "@ferrite/runtime-evil/dist/server.js",
+      "project/node_modules/escape.js",
+    ]) {
+      const invalidReceipt = structuredClone(changedReceipt);
+      invalidReceipt.inputs[0].path = invalidPath;
+      await writeFile(receiptPath, `${JSON.stringify(invalidReceipt, null, 2)}\n`);
+      await assert.rejects(
+        execFileAsync(
+          "node",
+          [
+            renderPageScript,
+            "--verify-cloudflare-artifact-receipt",
+            outputFile,
+            receiptPath,
+          ],
+          { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+        ),
+        /invalid input manifest/,
+      );
+    }
+    await writeFile(receiptPath, changedReceiptSource);
+
+    await writeFile(outputFile, Buffer.concat([changedModule, Buffer.from(" ")]));
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        [
+          renderPageScript,
+          "--verify-cloudflare-artifact-receipt",
+          outputFile,
+        ],
+        { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+      ),
+      /does not match its receipt/,
+    );
+
+    await writeFile(outputFile, changedModule);
+    const tamperedReceipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    tamperedReceipt.fallbackPath = "/private.html";
+    await writeFile(receiptPath, `${JSON.stringify(tamperedReceipt, null, 2)}\n`);
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        [
+          renderPageScript,
+          "--verify-cloudflare-artifact-receipt",
+          outputFile,
+          receiptPath,
+        ],
+        { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+      ),
+      /metadata identity is invalid/,
+    );
+  });
+});
+
+test("build-cloudflare-artifact rejects a transitive input that changes during its identity passes", { skip: platform === "win32" }, async () => {
+  await withTempProject(async (projectRoot) => {
+    const app = join(projectRoot, "app");
+    const pageFile = join(app, "page.tsx");
+    const sharedFile = join(app, "shared.ts");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    const filler = Array.from(
+      { length: 20_000 },
+      (_value, index) => `export const filler${index} = ${index};`,
+    ).join("\n");
+    await mkdir(app, { recursive: true });
+    await writeFile(join(app, "filler.ts"), `${filler}\n`);
+    await writeFile(sharedFile, 'export const label = "zero";\n');
+    await writeFile(
+      pageFile,
+      'import "./filler"; import { label } from "./shared"; export default function Page() { return <main>{label}</main>; }\n',
+    );
+
+    let settled = false;
+    const outcome = buildCloudflareArtifact(projectRoot, pageFile, outputFile)
+      .then(() => ({ error: undefined }))
+      .catch((error) => ({ error }))
+      .finally(() => {
+        settled = true;
+      });
+    await waitForDirectoryWithPrefix(
+      join(projectRoot, ".ferrite", "tmp"),
+      "server-artifact-",
+    );
+    let revision = 0;
+    while (!settled && revision < 1_000) {
+      const replacement = `${sharedFile}.${revision}.tmp`;
+      await writeFile(replacement, `export const label = "revision-${revision}";\n`);
+      await rename(replacement, sharedFile);
+      revision += 1;
+      await delay(1);
+    }
+    const { error } = await outcome;
+    assert.ok(error, "A changing Cloudflare input must not produce an artifact.");
+    assert.match(
+      String(error),
+      /changed (?:during bundling|while esbuild was reading|between identity capture and final bundling)/,
+    );
+  });
+});
+
+test("build-cloudflare-artifact binds fallback metadata into the canonical module identity", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, "export default function Page() { return <main>Edge</main>; }\n");
+
+    const first = await buildCloudflareArtifact(projectRoot, pageFile, outputFile);
+    const changed = await buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+      cloudflareMetadata: {
+        assetBuildId: CLOUDFLARE_BUILD_ID,
+        fallbackPath: "/fallback/index.html",
+        observedActions: [],
+      },
+    });
+    assert.equal(changed.sourceBuildId, first.sourceBuildId);
+    assert.notEqual(changed.metadataBuildId, first.metadataBuildId);
+    assert.notEqual(changed.moduleBuildId, first.moduleBuildId);
+    assert.notEqual(changed.module.sha256, first.module.sha256);
+  });
+});
+
+test("build-cloudflare-artifact rejects transitive source that resolves outside its receipt roots", async () => {
+  await withTempProject(async (projectRoot) => {
+    const outside = join(tmpdir(), `ferrite-cloudflare-outside-${process.pid}-${Date.now()}.ts`);
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const link = join(projectRoot, "app/outside.ts");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    try {
+      await mkdir(dirname(pageFile), { recursive: true });
+      await writeFile(outside, 'export const label = "outside";\n');
+      await symlink(outside, link);
+      await writeFile(
+        pageFile,
+        'import { label } from "./outside"; export default function Page() { return <main>{label}</main>; }\n',
+      );
+      await assert.rejects(
+        buildCloudflareArtifact(projectRoot, pageFile, outputFile),
+        /outside the project and Ferrite package roots/,
+      );
+    } finally {
+      await rm(outside, { force: true });
+    }
+  });
+});
+
+test("build-cloudflare-artifact rejects non-canonical project paths before publication", { skip: platform === "win32" }, async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page\\odd.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      "export default function Page() { return <main>Odd path</main>; }\n",
+    );
+
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile),
+      /non-canonical project input/,
+    );
+    for (const unpublished of [outputFile, `${outputFile}.receipt.json`]) {
+      await assert.rejects(
+        stat(unpublished),
+        (error) => error?.code === "ENOENT",
+      );
+    }
+  });
+});
+
+test("build-cloudflare-artifact requires manifest-bound identity and rejects observed server actions", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(pageFile, "export default function Page() { return <main>Edge</main>; }\n");
+
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        [
+          renderPageScript,
+          "--build-cloudflare-artifact",
+          pageFile,
+          outputFile,
+          "[]",
+          "null",
+          "{}",
+          "/",
+        ],
+        { cwd: projectRoot, maxBuffer: 1024 * 1024 },
+      ),
+      /require metadata JSON/,
+    );
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile, {
+        cloudflareMetadata: {
+          sourceBuildId: CLOUDFLARE_BUILD_ID,
+          assetBuildId: CLOUDFLARE_BUILD_ID,
+          fallbackPath: "/index.html",
+          observedActions: ["save"],
+        },
+      }),
+      /do not support routes with observed server actions/,
+    );
+  });
+});
+
+test("build-cloudflare-artifact rejects application Node builtins instead of shipping a false edge claim", async () => {
+  await withTempProject(async (projectRoot) => {
+    const pageFile = join(projectRoot, "app/page.tsx");
+    const outputFile = join(projectRoot, "out/route.mjs");
+    await mkdir(dirname(pageFile), { recursive: true });
+    await writeFile(
+      pageFile,
+      [
+        'import { readFile } from "node:fs/promises";',
+        "export default function Page() {",
+        "  return <main>{typeof readFile}</main>;",
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    await assert.rejects(
+      buildCloudflareArtifact(projectRoot, pageFile, outputFile),
+      /cannot import Node builtin "node:fs\/promises"/,
+    );
   });
 });
 

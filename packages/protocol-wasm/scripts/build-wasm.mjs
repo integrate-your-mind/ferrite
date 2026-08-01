@@ -10,6 +10,9 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaceRoot = resolve(packageRoot, "../..");
 const target = "wasm32-unknown-unknown";
 const profile = env.PROFILE || "debug";
+if (profile !== "debug" && profile !== "release") {
+  throw new TypeError("Ferrite protocol WASM PROFILE must be either debug or release.");
+}
 const targetRoot = cargoTargetRoot();
 const source = join(targetRoot, target, profile, "ferrite_protocol_wasm.wasm");
 const outDir = join(packageRoot, "dist");
@@ -18,9 +21,14 @@ const rustupTools = await rustupToolchainExecutables();
 const cargo = env.CARGO || rustupTools.cargo || "cargo";
 const rustc = env.RUSTC || rustupTools.rustc;
 
+const cargoArgs = ["build", "-p", "ferrite-protocol-wasm", "--target", target];
+if (profile === "release") {
+  cargoArgs.push("--release");
+}
+
 await execFileAsync(
   cargo,
-  ["build", "-p", "ferrite-protocol-wasm", "--target", target],
+  cargoArgs,
   {
     cwd: workspaceRoot,
     env: rustc ? { ...env, RUSTC: rustc } : env,

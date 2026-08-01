@@ -27,7 +27,11 @@ test("workspace path dependencies exact-pin the unpublished Ferrite version", as
     }
   }
 
-  assert.equal(internalDependencies.length, 20);
+  assert.ok(
+    internalDependencies.includes("ferrite-protocol-wasm:ferrite-ssr"),
+    "the Worker renderer dependency must remain an exact-pinned internal edge",
+  );
+  assert.equal(internalDependencies.length, 21);
 });
 
 test("Cargo packaging verifies clean archives with the locked dependency graph", async () => {

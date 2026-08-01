@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { access, readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 const systemBrowserCandidates = (platform, env) => {
   if (platform === "darwin") {
@@ -44,6 +44,17 @@ export function browserExecutableCandidates({
   };
 }
 
+export function cargoTargetRoot({
+  env = process.env,
+  repoRoot,
+} = {}) {
+  const configured = env.CARGO_TARGET_DIR;
+  if (!configured) {
+    return join(repoRoot, "target");
+  }
+  return isAbsolute(configured) ? configured : resolve(repoRoot, configured);
+}
+
 export async function launchVerifiedBrowser({
   chromium,
   candidates,
@@ -82,6 +93,32 @@ export async function launchVerifiedBrowser({
     ? "FERRITE_BROWSER_EXECUTABLE did not identify a launchable Chromium browser"
     : "No launchable Chromium browser was found; set FERRITE_BROWSER_EXECUTABLE or install Chromium";
   throw new AggregateError(failures, guidance);
+}
+
+export async function withVerifiedBrowser(launchOptions, operation) {
+  const browserProof = await launchVerifiedBrowser(launchOptions);
+  let result;
+  let operationError;
+  try {
+    result = await operation(browserProof);
+  } catch (error) {
+    operationError = error;
+  }
+
+  try {
+    await browserProof.browser.close();
+  } catch (error) {
+    if (operationError) {
+      throw new AggregateError(
+        [operationError, error],
+        "demo browser proof and shared browser cleanup failed",
+      );
+    }
+    throw error;
+  }
+
+  if (operationError) throw operationError;
+  return result;
 }
 
 export async function listArtifactFiles(root, relativeRoot = "") {

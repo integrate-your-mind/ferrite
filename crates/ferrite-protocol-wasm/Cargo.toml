@@ -13,4 +13,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ferrite-protocol = { path = "../ferrite-protocol", version = "=0.1.0" }
+ferrite-ssr = { path = "../ferrite-ssr", version = "=0.1.0" }
 serde_json = { workspace = true }

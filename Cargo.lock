@@ -302,6 +302,7 @@ name = "ferrite-protocol-wasm"
 version = "0.1.0"
 dependencies = [
  "ferrite-protocol",
+ "ferrite-ssr",
  "serde_json",
 ]
 

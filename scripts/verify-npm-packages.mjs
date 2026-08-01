@@ -27,7 +27,7 @@ export const RELEASE_PACKAGE_NAMES = Object.freeze([
   "@ferrite/node",
 ]);
 
-const RELEASE_PACKAGES = Object.freeze([
+export const RELEASE_PACKAGES = Object.freeze([
   Object.freeze({
     name: "@ferrite/protocol",
     directory: "packages/protocol",
@@ -39,6 +39,8 @@ const RELEASE_PACKAGES = Object.freeze([
     name: "@ferrite/protocol-wasm",
     directory: "packages/protocol-wasm",
     build: ["pnpm", ["--filter", "@ferrite/protocol-wasm", "build"]],
+    buildEnvironment: Object.freeze({ PROFILE: "release" }),
+    boundArtifacts: Object.freeze(["dist/ferrite_protocol_wasm.wasm"]),
     requiredFiles: [
       "dist/index.js",
       "dist/index.d.ts",
@@ -232,8 +234,17 @@ export async function verifyNpmPackages({
     assertAlignedVersions(packageVersions);
 
     for (const config of releasePackages) {
-      await runCommand(config.build[0], config.build[1], { cwd: packageWorkspaceRoot });
+      const buildOptions = { cwd: packageWorkspaceRoot };
+      if (config.buildEnvironment !== undefined) {
+        buildOptions.environment = mergeBuildEnvironment(config.name, config.buildEnvironment);
+      }
+      await runCommand(config.build[0], config.build[1], buildOptions);
       const packageDir = join(packageWorkspaceRoot, config.directory);
+      const boundArtifacts = await inspectBuiltArtifacts({
+        packageName: config.name,
+        packageDir,
+        paths: config.boundArtifacts,
+      });
       const sourceManifest = manifests.get(config.name);
       const releaseManifest = createReleaseManifest(sourceManifest, {
         packageVersions,
@@ -261,12 +272,27 @@ export async function verifyNpmPackages({
         requiredFiles: licenseContent !== undefined ? [...config.requiredFiles, "LICENSE"] : config.requiredFiles,
         forbiddenFiles: config.forbiddenFiles,
       });
-      if (licenseContent !== undefined && packResult.tarballPath) {
-        const inspected = await inspectNpmTarball(packResult.tarballPath, { includeContents: true });
+      let inspectedTarball;
+      if ((licenseContent !== undefined || boundArtifacts.length > 0) && packResult.tarballPath) {
+        inspectedTarball = await inspectNpmTarball(packResult.tarballPath, { includeContents: true });
+      }
+      if (licenseContent !== undefined && inspectedTarball) {
         validatePackedLicense({
           packageName: config.name,
           expectedLicenseContent: licenseContent,
-          packedLicenseContent: inspected.contents?.LICENSE,
+          packedLicenseContent: inspectedTarball.contents?.LICENSE,
+        });
+      }
+      if (boundArtifacts.length > 0) {
+        if (!inspectedTarball) {
+          throw new Error(
+            `${config.name}: bound artifacts require an inspectable npm tarball.`,
+          );
+        }
+        validatePackedArtifacts({
+          packageName: config.name,
+          builtArtifacts: boundArtifacts,
+          packedContents: inspectedTarball.contents,
         });
       }
       if (packResult.packedManifest) {
@@ -288,6 +314,9 @@ export async function verifyNpmPackages({
       }
       if (tarball) {
         result.tarball = tarball;
+      }
+      if (boundArtifacts.length > 0) {
+        result.boundArtifacts = boundArtifacts;
       }
       results.push(result);
       installablePackages.push({
@@ -873,6 +902,103 @@ function normalizePackResult(packageName, packResult) {
   };
 }
 
+function mergeBuildEnvironment(packageName, buildEnvironment) {
+  if (
+    !buildEnvironment ||
+    typeof buildEnvironment !== "object" ||
+    Array.isArray(buildEnvironment)
+  ) {
+    throw new TypeError(`${packageName}: build environment must be an object.`);
+  }
+  const merged = { ...env };
+  for (const [name, value] of Object.entries(buildEnvironment)) {
+    if (typeof value !== "string") {
+      throw new TypeError(`${packageName}: build environment ${name} must be a string.`);
+    }
+    merged[name] = value;
+  }
+  return merged;
+}
+
+async function inspectBuiltArtifacts({ packageName, packageDir, paths }) {
+  if (paths === undefined) return [];
+  if (!Array.isArray(paths)) {
+    throw new TypeError(`${packageName}: bound artifacts must be an array.`);
+  }
+  const identities = [];
+  const seen = new Set();
+  const resolvedPackageDir = await realpath(packageDir);
+  for (const path of paths) {
+    assertSafeBoundArtifactPath(packageName, path);
+    if (seen.has(path)) {
+      throw new Error(`${packageName}: duplicate bound artifact ${path}.`);
+    }
+    seen.add(path);
+    let resolvedArtifactPath;
+    try {
+      resolvedArtifactPath = await realpath(join(resolvedPackageDir, path));
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw new Error(`${packageName}: bound artifact ${path} was not produced by its build.`);
+      }
+      throw error;
+    }
+    const relativeArtifactPath = relative(resolvedPackageDir, resolvedArtifactPath);
+    if (
+      relativeArtifactPath === "" ||
+      relativeArtifactPath === ".." ||
+      relativeArtifactPath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+      isAbsolute(relativeArtifactPath)
+    ) {
+      throw new Error(`${packageName}: bound artifact ${path} resolves outside its package.`);
+    }
+    const bytes = await readFile(resolvedArtifactPath);
+    identities.push({
+      path,
+      size: bytes.byteLength,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+  }
+  return identities;
+}
+
+function assertSafeBoundArtifactPath(packageName, path) {
+  if (
+    typeof path !== "string" ||
+    path.trim() === "" ||
+    isAbsolute(path) ||
+    path.includes("\\") ||
+    path.split("/").some((segment) => segment === "" || segment === "." || segment === "..") ||
+    /[\u0000-\u001f\u007f]/.test(path)
+  ) {
+    throw new Error(`${packageName}: bound artifact path ${JSON.stringify(path)} is unsafe.`);
+  }
+}
+
+export function validatePackedArtifacts({ packageName, builtArtifacts, packedContents }) {
+  if (!packedContents || typeof packedContents !== "object") {
+    throw new Error(`${packageName}: packed artifact contents are unavailable.`);
+  }
+  for (const identity of builtArtifacts) {
+    const packedBytes = packedContents[identity.path];
+    if (!Buffer.isBuffer(packedBytes)) {
+      throw new Error(`${packageName}: packed tarball is missing bound artifact ${identity.path}.`);
+    }
+    const packedIdentity = {
+      size: packedBytes.byteLength,
+      sha256: createHash("sha256").update(packedBytes).digest("hex"),
+    };
+    if (
+      packedIdentity.size !== identity.size ||
+      packedIdentity.sha256 !== identity.sha256
+    ) {
+      throw new Error(
+        `${packageName}: packed bound artifact ${identity.path} does not match the built bytes.`,
+      );
+    }
+  }
+}
+
 async function inspectTarballIdentity(packageName, { tarballPath, npmReportedSize } = {}, allowedRoot) {
   if (typeof tarballPath !== "string" || tarballPath.trim() === "") {
     return undefined;
@@ -1297,10 +1423,15 @@ function assertArray(value, message) {
   }
 }
 
-function run(command, args, { cwd: runCwd = cwd(), capture = false } = {}) {
+function run(
+  command,
+  args,
+  { cwd: runCwd = cwd(), capture = false, environment = env } = {},
+) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, {
       cwd: runCwd,
+      env: environment,
       shell: false,
       stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
     });

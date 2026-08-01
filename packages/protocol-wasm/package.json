@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22"
   },
-  "description": "Rust-backed WASM validation for Ferrite server payload protocol packets.",
+  "description": "Rust-backed WASM validation and bounded HTML rendering for Ferrite protocol packets.",
   "license": "MIT",
   "repository": {
     "type": "git",
