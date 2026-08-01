@@ -57,6 +57,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
 }
 
 async function verifyCloudflareWorker() {
+  // Cargo can initialize a missing target directory through a temporary sibling.
+  // Establish the declared output root before source monitoring so build output
+  // never appears in an untrusted workspace namespace.
+  await mkdir(join(workspaceRoot, "target"), { recursive: true });
   const committedSource = await committedSourceContract();
   const trackedPaths = committedSource.records.map(({ path }) => path);
   const sourceMonitor = await startTrackedSourceMonitor(trackedPaths, workspaceRoot, {
